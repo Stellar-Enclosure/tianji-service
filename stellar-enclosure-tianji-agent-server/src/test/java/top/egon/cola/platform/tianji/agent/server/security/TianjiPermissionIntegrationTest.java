@@ -100,7 +100,8 @@ class TianjiPermissionIntegrationTest {
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(),
                     Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API,
                             TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
-                            TianjiAgentPermissions.SESSION_START_API),
+                            TianjiAgentPermissions.SESSION_START_API, TianjiAgentPermissions.LINKED_SUBMIT_API,
+                            TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API),
                     NOW.plusSeconds(30));
         }
     };
@@ -155,6 +156,97 @@ class TianjiPermissionIntegrationTest {
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal));
         assertThrows(org.springframework.security.authentication.AuthenticationCredentialsNotFoundException.class,
                 () -> access().require(TianjiAgentPermissions.GET_API));
+    }
+
+    @Test
+    void linked_resources_are_service_only_and_require_their_separate_scopes() {
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(),
+                URI.create("https://idp.example/tenants/20")));
+        assertNotNull(access().require(TianjiAgentPermissions.LINKED_RESOLVE_API));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access().require(TianjiAgentPermissions.LINKED_CLOSE_API));
+        var request = new MockHttpServletRequest(); request.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, "https://idp.example/tenants/20");
+        VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        granted.set(Set.of(TianjiAgentPermissions.LINKED_RESOLVE));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.LINKED_RESOLVE_SCOPE))));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access().require(TianjiAgentPermissions.LINKED_RESOLVE_API));
+    }
+
+    @Test
+    void linked_paths_require_service_credentials_at_the_identity_filter_boundary() {
+        var policy = new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy();
+        for (String action : List.of("submit", "resolve", "close")) {
+            var request = new MockHttpServletRequest("POST", "/api/tianji/v1/agent-process-dispatches/" + action);
+            assertEquals(top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement.SERVICE,
+                    policy.requirement(request));
+        }
+    }
+
+    @Test
+    void linked_method_annotation_matches_the_compiled_service_policy() throws Exception {
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(),
+                URI.create("https://idp.example/tenants/20")));
+        MethodInvocation invocation = mock(MethodInvocation.class);
+        when(invocation.getMethod()).thenReturn(top.egon.cola.platform.tianji.agent.server.api.LinkedAgentDispatchController.class
+                .getMethod("resolve", top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery.class));
+        var manager = new Rbac3MethodAuthorizationManager(mock(AuthorizationService.class), permissionGuard());
+        assertTrue(manager.check(() -> SecurityContextHolder.getContext().getAuthentication(), invocation).isGranted());
+    }
+
+    @Test
+    void linked_resolve_passes_the_real_identity_filter_and_service_policy_guard() throws Exception {
+        URI issuer = URI.create("https://idp.example/tenants/20");
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "service-token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        var verifier = mock(IdpJwtVerifier.class);
+        when(verifier.verifyService("service-token")).thenReturn(new AccessTokenVerification.Valid<>(principal, principal.scopes(), null, issuer));
+        when(verifier.verifyService("user-token")).thenReturn(new AccessTokenVerification.Invalid<>("JWT_PRINCIPAL_TYPE_INVALID"));
+        var identity = IdpBearerAuthenticationFilter.create(new UserAccessTokenVerifier(verifier), new ServiceAccessTokenVerifier(verifier),
+                new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy(), new com.fasterxml.jackson.databind.ObjectMapper(),
+                new VerifiedTenantContextFilter(), verifier);
+        var rbac = new Rbac3BearerAuthenticationFilter(new AuthorizationSnapshotLoader(client, "tianji", CLOCK), new com.fasterxml.jackson.databind.ObjectMapper());
+        var issuers = mock(top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.class);
+        when(issuers.findByIssuer(issuer.toString())).thenReturn(java.util.Optional.of(
+                new top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.TrustedIssuerVO(issuer,
+                        URI.create("https://idp.example/jwks"), "tenant:20", top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.RealmType.TENANT,
+                        "20", top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.Status.ACTIVE, 1)));
+        var binding = new TianjiLinkedDispatchProperties.Binding(issuer, 20, "worker", "worker", "xingyuan", "worker", "test",
+                "process-east", Set.of(top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum.BPMN), List.of());
+        var properties = new TianjiLinkedDispatchProperties(true, false, List.of(binding));
+        var submissions = mock(top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLinkedSubmissionService.class);
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", issuer.toString());
+        var link = new top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink("process-east",
+                top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum.BPMN, "process", "occurrence",
+                "a".repeat(64), NOW.plusSeconds(30).truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+        var query = new top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery("intent", link);
+        when(submissions.resolve(actor, query)).thenReturn(java.util.Optional.empty());
+        var beans = new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        var controller = new top.egon.cola.platform.tianji.agent.server.api.LinkedAgentDispatchController(submissions, access(),
+                new TianjiLinkedDispatchBindings(properties, issuers, CLOCK), properties, beans.getBeanProvider(TianjiLinkedServiceAdmission.class));
+        var mvc = MockMvcBuilders.standaloneSetup(controller).addFilters(new org.springframework.web.filter.RequestContextFilter(),
+                identity, new VerifiedAgentIssuerFilter(), rbac).setControllerAdvice(new top.egon.cola.platform.tianji.agent.server.api.AgentApiErrors(),
+                new top.egon.cola.platform.tianji.agent.server.api.AgentRequestBodyAdvice()).build();
+        byte[] body = tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsBytes(query);
+        mvc.perform(post("/api/tianji/v1/agent-process-dispatches/resolve").header("Authorization", "Bearer user-token")
+                        .contentType(MediaType.APPLICATION_JSON).content(body)).andExpect(status().isUnauthorized());
+        verify(submissions, never()).resolve(any(), any());
+        var result = mvc.perform(post("/api/tianji/v1/agent-process-dispatches/resolve").header("Authorization", "Bearer service-token")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.found").value(false)).andReturn();
+        verify(submissions).resolve(actor, query);
+        assertNull(result.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
+        assertNull(SecurityContextHolder.getContext().getAuthentication());
     }
 
     @Test
@@ -382,7 +474,8 @@ class TianjiPermissionIntegrationTest {
         var scopes = new Rbac3StarterProperties.UserScopePolicyProperties().setEnabled(true)
                 .setPermissionScopes(Map.of(TianjiAgentPermissions.READ, Set.of(TianjiAgentPermissions.READ_SCOPE),
                         TianjiAgentPermissions.START, Set.of(TianjiAgentPermissions.START_SCOPE),
-                        TianjiAgentPermissions.SESSION_DELETE, Set.of(TianjiAgentPermissions.SESSION_DELETE_SCOPE)));
+                        TianjiAgentPermissions.SESSION_DELETE, Set.of(TianjiAgentPermissions.SESSION_DELETE_SCOPE),
+                        TianjiAgentPermissions.LINKED_RESOLVE, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE)));
         return new PermissionExecutionGuard(registry, new CurrentRbac3User(),
                 new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
                 new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
@@ -449,13 +542,29 @@ class TianjiPermissionIntegrationTest {
                 List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
                 List.of(TianjiAgentPermissions.READ_SCOPE, TianjiAgentPermissions.SESSION_DELETE_SCOPE),
                 new PermissionManifest.I18nReference("tianji.permissions", "api.session.delete"), DefinitionLifecycle.ACTIVE);
+        var linkedSubmit = linkedResource(TianjiAgentPermissions.LINKED_SUBMIT_API, "submit", TianjiAgentPermissions.LINKED_SUBMIT,
+                TianjiAgentPermissions.LINKED_SUBMIT_SCOPE);
+        var linkedResolve = linkedResource(TianjiAgentPermissions.LINKED_RESOLVE_API, "resolve", TianjiAgentPermissions.LINKED_RESOLVE,
+                TianjiAgentPermissions.LINKED_RESOLVE_SCOPE);
+        var linkedClose = linkedResource(TianjiAgentPermissions.LINKED_CLOSE_API, "close", TianjiAgentPermissions.LINKED_CLOSE,
+                TianjiAgentPermissions.LINKED_CLOSE_SCOPE);
         return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
                 new PermissionManifest.Producer("tianji-java", PermissionManifest.ProducerKind.JAVA,
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji."), List.of("agent-server"),
                         List.of("agent-server"), false),
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
-                List.of(), List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START, TianjiAgentPermissions.SESSION_DELETE),
-                List.of(resource, events, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete), List.of(), List.of());
+                List.of(), List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START, TianjiAgentPermissions.SESSION_DELETE,
+                        TianjiAgentPermissions.LINKED_SUBMIT, TianjiAgentPermissions.LINKED_RESOLVE, TianjiAgentPermissions.LINKED_CLOSE),
+                List.of(resource, events, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete,
+                        linkedSubmit, linkedResolve, linkedClose), List.of(), List.of());
+    }
+
+    private static PermissionManifest.ResourceDefinition linkedResource(String key, String operation, String permission, String scope) {
+        return new PermissionManifest.ResourceDefinition(key, ResourceType.API,
+                Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/agent-process-dispatches/" + operation)),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(permission)), null,
+                List.of(PermissionManifest.PrincipalType.SERVICE), List.of(scope),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.linked." + operation), DefinitionLifecycle.ACTIVE);
     }
 
     private RuntimePolicyBinding binding() {
@@ -471,7 +580,8 @@ class TianjiPermissionIntegrationTest {
                 null, null, permissions, Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API,
                         TianjiAgentPermissions.EVENTS_API, TianjiAgentPermissions.CURRENT_AUTH_API,
                         TianjiAgentPermissions.START_API, TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_START_API,
-                        TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API),
+                        TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API,
+                        TianjiAgentPermissions.LINKED_SUBMIT_API, TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API),
                 Map.of(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }

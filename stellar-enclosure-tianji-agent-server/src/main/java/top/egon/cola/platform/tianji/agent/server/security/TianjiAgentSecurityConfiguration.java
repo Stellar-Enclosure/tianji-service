@@ -46,6 +46,8 @@ public class TianjiAgentSecurityConfiguration {
                             .authenticated()
                         .requestMatchers("/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**")
                             .authenticated()
+                        .requestMatchers("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**")
+                            .authenticated()
                         .anyRequest().denyAll())
                 .exceptionHandling(errors -> errors
                         .authenticationEntryPoint((request, response, failure) -> {
@@ -80,7 +82,8 @@ public class TianjiAgentSecurityConfiguration {
     @ConditionalOnMissingBean(IdpEndpointAuthenticationPolicy.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy tianjiEndpointAuthenticationPolicy() {
-        return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"), List.of(),
+        return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
+                List.of("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**"),
                 List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**",
                         "/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**"), true);
     }

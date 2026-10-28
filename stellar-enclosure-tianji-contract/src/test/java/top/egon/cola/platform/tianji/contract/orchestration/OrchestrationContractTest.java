@@ -106,7 +106,11 @@ class OrchestrationContractTest {
         var start = new top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand("review", 1, null, "intent-1", null, "trace-1",
                 new top.egon.cola.platform.tianji.contract.agent.AgentInputDTO("private-fixture", List.of(), Map.of()), null);
         var command = new LinkedAgentStartCommand(start, link);
-        assertEquals(link, new LinkedAgentLookupQuery("intent-1", link).link());
+        var query = new LinkedAgentLookupQuery("intent-1", link);
+        assertEquals(link, query.link());
+        assertFalse(new LinkedAgentLookupResult(query, false, null).found());
+        assertThrows(IllegalArgumentException.class, () -> new LinkedAgentLookupResult(query, true, null));
+        assertTrue(new LinkedAgentCloseResult(query, new LinkedAgentSubmissionDTO(true, null)).submission().closed());
         assertFalse(command.toString().contains("private-fixture"));
         assertFalse(List.of(AgentProcessLink.class.getRecordComponents()).stream()
                 .anyMatch(component -> component.getName().equalsIgnoreCase("tenantId")));
