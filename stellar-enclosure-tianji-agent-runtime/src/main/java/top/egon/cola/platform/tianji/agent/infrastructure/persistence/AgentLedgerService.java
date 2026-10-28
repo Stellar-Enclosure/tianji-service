@@ -4,6 +4,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -30,6 +31,8 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
 
 import javax.sql.DataSource;
 import java.time.Clock;
@@ -107,13 +110,32 @@ public final class AgentLedgerService {
 
     /** Atomically records the queued run and its first event; no model is called in this transaction. */
     public AgentRunDTO start(TrustedAgentActor actor, StartAgentRunCommand command) {
+        return start(actor, command, null);
+    }
+
+    /** Called only while the linked-submission fence is locked in the same transaction. */
+    AgentRunDTO startLinked(TrustedAgentActor actor, LinkedAgentStartCommand command) {
+        Objects.requireNonNull(command, "command");
+        if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
+                || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw new IllegalStateException("Linked Agent submission requires a verified service and its fence transaction");
+        }
+        return start(actor, command.start(), command.link());
+    }
+
+    private AgentRunDTO start(TrustedAgentActor actor, StartAgentRunCommand command, AgentProcessLink processLink) {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(command, "command");
-        String requestHash = json.requestHash(command);
+        String requestHash = processLink == null ? json.requestHash(command) : json.linkedRequestHash(command, processLink);
         return transaction.execute(status -> {
+            if (processLink != null) requireDispatchTime(processLink);
             Optional<JdbcAgentLedgerRepository.StoredRun> existing =
                     repository.byIdempotencyKey(actor, command.idempotencyKey());
             if (existing.isPresent()) {
+                if (processLink != null && !processLink.equals(json.readSnapshot(existing.get().snapshotJson()).processLink())) {
+                    throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Linked Agent request changed");
+                }
                 return sameRequest(existing.get(), requestHash);
             }
             if (command.sessionId() != null && !repository.lockOwnedSession(actor, command.sessionId())) {
@@ -121,23 +143,48 @@ public final class AgentLedgerService {
             }
             JdbcAgentLedgerRepository.DefinitionRow definition = repository.definition(actor.tenantId(),
                     command.definitionKey(), command.definitionVersion()).orElseThrow(AgentLedgerService::notFound);
+            if (processLink != null && !definition.hash().equals(processLink.definitionContentSha256())) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEFINITION_VERSION_CONFLICT, "Linked Agent definition changed");
+            }
             ExecutionPolicyDTO policy = ExecutionPolicyReducer.reduce(definition.specification().policy(),
                     command.policyOverride());
-            String snapshot = json.snapshot(definition.specification(), definition.hash(), policy, command);
+            String snapshot = json.snapshot(definition.specification(), definition.hash(), policy, command, processLink);
             Instant now = now();
+            if (processLink != null && !processLink.dispatchNotAfter().isAfter(now)) throw dispatchExpired();
             String runId = UUID.randomUUID().toString();
             int inserted = repository.insertRun(actor, runId, command.definitionKey(), command.definitionVersion(),
                     command.idempotencyKey(), requestHash, command.sessionId(), command.correlationId(),
                     now.plus(policy.totalTimeout()), snapshot, now);
             if (inserted == 0) {
+                if (processLink != null) requireDispatchTime(processLink);
                 return sameRequest(repository.byIdempotencyKey(actor, command.idempotencyKey()).orElseThrow(),
                         requestHash);
             }
             repository.insertEvent(actor.tenantId(), new AgentEventDTO(UUID.randomUUID().toString(), runId, 1,
                     "RUN_QUEUED", null, null, null, now, command.correlationId(), "1",
                     Map.of("status", AgentRunStatusEnum.QUEUED.name())));
+            if (processLink != null) requireDispatchTime(processLink);
             return repository.run(actor, runId).orElseThrow().run();
         });
+    }
+
+    void requireDispatchTime(AgentProcessLink link) {
+        Instant current = now();
+        if (!link.dispatchNotAfter().isAfter(current)) throw dispatchExpired();
+        if (link.dispatchNotAfter().isAfter(current.plus(Duration.ofMinutes(15)))) {
+            throw invalid("Linked Agent dispatch deadline exceeds its maximum window");
+        }
+    }
+
+    private static AgentLedgerException dispatchExpired() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DISPATCH_EXPIRED, "Linked Agent dispatch has expired");
+    }
+
+    AgentRunDTO lockForLinkedClose(TrustedAgentActor actor, String runId) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw new IllegalStateException("Linked Agent close requires its fence transaction");
+        }
+        return repository.runForUpdate(actor, runId).orElseThrow(AgentLedgerService::notFound).run();
     }
 
     public AgentRunDTO get(TrustedAgentActor actor, GetAgentRunQuery query) {

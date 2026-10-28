@@ -15,6 +15,7 @@ import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -62,6 +63,20 @@ final class AgentJsonCodec {
         return hash(write(content, MAX_SNAPSHOT_BYTES));
     }
 
+    String linkedRequestHash(StartAgentRunCommand command, AgentProcessLink link) {
+        Map<String, Object> content = new TreeMap<>();
+        content.put("bindingVersion", 1);
+        content.put("startRequestSha256", requestHash(command));
+        content.put("idempotencyKey", command.idempotencyKey());
+        content.put("correlationId", command.correlationId());
+        content.put("processLink", link);
+        return hash(write(content, MAX_SNAPSHOT_BYTES));
+    }
+
+    String processLinkHash(AgentProcessLink link) {
+        return hash(write(Map.of("bindingVersion", 1, "processLink", link), MAX_SNAPSHOT_BYTES));
+    }
+
     String cancelHash(CancelAgentRunCommand command) {
         Map<String, Object> content = new TreeMap<>();
         content.put("runId", command.runId());
@@ -73,24 +88,31 @@ final class AgentJsonCodec {
     /** Stable V1 binding for the immutable inputs actually used by an execution. */
     String executionSnapshotHash(AgentExecutionSnapshot snapshot) {
         Map<String, Object> content = new TreeMap<>();
-        content.put("bindingVersion", 1);
+        content.put("bindingVersion", snapshot.processLink() == null ? 1 : 2);
         content.put("definitionKey", snapshot.definition().definitionKey());
         content.put("definitionVersion", snapshot.definition().version());
         content.put("definitionContentSha256", snapshot.definitionContentSha256());
         content.put("effectivePolicy", policy(snapshot.effectivePolicy()));
         content.put("input", snapshot.input());
         content.put("businessKey", snapshot.businessKey());
+        if (snapshot.processLink() != null) content.put("processLink", snapshot.processLink());
         return hash(write(content, MAX_SNAPSHOT_BYTES));
     }
 
     String snapshot(AgentDefinitionSpecDTO spec, String definitionHash,
                     ExecutionPolicyDTO effective, StartAgentRunCommand command) {
+        return snapshot(spec, definitionHash, effective, command, null);
+    }
+
+    String snapshot(AgentDefinitionSpecDTO spec, String definitionHash,
+                    ExecutionPolicyDTO effective, StartAgentRunCommand command, AgentProcessLink processLink) {
         Map<String, Object> snapshot = new TreeMap<>();
         snapshot.put("definition", spec);
         snapshot.put("definitionContentSha256", definitionHash);
         snapshot.put("effectivePolicy", policy(effective));
         snapshot.put("input", command.input());
         snapshot.put("businessKey", command.businessKey());
+        if (processLink != null) snapshot.put("processLink", processLink);
         return write(snapshot, MAX_SNAPSHOT_BYTES);
     }
 

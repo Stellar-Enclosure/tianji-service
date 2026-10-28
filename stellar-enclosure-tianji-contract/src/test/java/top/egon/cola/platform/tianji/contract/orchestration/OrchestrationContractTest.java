@@ -98,4 +98,25 @@ class OrchestrationContractTest {
         assertFalse(List.of(AcquireWorkerTaskCommand.class.getRecordComponents()).stream()
                 .anyMatch(component -> component.getName().equalsIgnoreCase("tenantId")));
     }
+
+    @Test
+    void linked_agent_contract_bounds_occurrence_and_deadline_without_accepting_tenant_identity() {
+        Instant deadline = Instant.parse("2026-01-01T00:00:30.123456Z");
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "process-1", "occurrence-1", "a".repeat(64), deadline);
+        var start = new top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand("review", 1, null, "intent-1", null, "trace-1",
+                new top.egon.cola.platform.tianji.contract.agent.AgentInputDTO("private-fixture", List.of(), Map.of()), null);
+        var command = new LinkedAgentStartCommand(start, link);
+        assertEquals(link, new LinkedAgentLookupQuery("intent-1", link).link());
+        assertFalse(command.toString().contains("private-fixture"));
+        assertFalse(List.of(AgentProcessLink.class.getRecordComponents()).stream()
+                .anyMatch(component -> component.getName().equalsIgnoreCase("tenantId")));
+        assertThrows(IllegalArgumentException.class, () -> new AgentProcessLink("source", WorkerScopeTypeEnum.BPMN,
+                "process", "occurrence", "bad", deadline));
+        assertThrows(IllegalArgumentException.class, () -> new AgentProcessLink("source", WorkerScopeTypeEnum.BPMN,
+                "process", "occurrence", "a".repeat(64), deadline.plusNanos(1)));
+        assertThrows(IllegalArgumentException.class, () -> new AgentProcessLink("source", WorkerScopeTypeEnum.BPMN,
+                "汉".repeat(200), "occurrence", "a".repeat(64), deadline));
+        var noTrace = new top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand("review", 1, null, "intent-1", null, null, start.input(), null);
+        assertThrows(IllegalArgumentException.class, () -> new LinkedAgentStartCommand(noTrace, link));
+    }
 }

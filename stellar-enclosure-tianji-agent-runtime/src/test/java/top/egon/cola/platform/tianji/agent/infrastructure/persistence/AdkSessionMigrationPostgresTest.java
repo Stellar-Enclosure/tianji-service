@@ -110,7 +110,7 @@ class AdkSessionMigrationPostgresTest {
         assertEquals(1, version5.migrate().migrationsExecuted);
         Integer v5Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='5'", Integer.class);
         Flyway current = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("6").cleanDisabled(true).load();
         assertEquals(1, current.migrate().migrationsExecuted);
         current.validate();
         Map<String, Integer> after = jdbc.query("SELECT version, checksum FROM tianji_agent.flyway_schema_history "

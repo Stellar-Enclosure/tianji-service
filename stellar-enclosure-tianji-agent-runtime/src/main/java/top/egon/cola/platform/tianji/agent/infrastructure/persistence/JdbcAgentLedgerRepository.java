@@ -88,6 +88,15 @@ final class JdbcAgentLedgerRepository {
                 .stream().findFirst();
     }
 
+    Optional<StoredRun> runForUpdate(TrustedAgentActor actor, String runId) {
+        return jdbc.query("""
+                SELECT * FROM tianji_agent.agent_run
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
+                FOR UPDATE
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId)
+                .stream().findFirst();
+    }
+
     List<AgentRunDTO> list(TrustedAgentActor actor, Instant beforeCreatedAt, String beforeRunId, int limit) {
         String base = "SELECT " + RUN_COLUMNS + " FROM tianji_agent.agent_run "
                 + "WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? ";

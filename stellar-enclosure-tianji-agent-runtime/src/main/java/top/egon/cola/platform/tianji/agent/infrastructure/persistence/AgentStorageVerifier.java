@@ -72,6 +72,89 @@ public final class AgentStorageVerifier {
         }
     }
 
+    /** Linked process submissions additionally require the separately provisioned V7 fence. */
+    public void verifyLinked() {
+        verify();
+        try {
+            transaction.executeWithoutResult(status -> {
+                int expected = checksum("V7__add_process_dispatch_fence.sql");
+                List<Boolean> history = jdbc.query("SELECT success,checksum FROM tianji_agent.flyway_schema_history "
+                                + "WHERE version='7' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
+                                && rs.getObject("checksum") != null && rs.getInt("checksum") == expected);
+                if (history.size() != 1 || !history.getFirst()) throw invalid();
+                verifyLinkedColumns();
+                Set<Key> constraints = Set.of(
+                        key("agent_process_dispatch", "p", "tenant_id", "subject_issuer", "subject_id", "idempotency_key"),
+                        key("agent_process_dispatch", "u", "tenant_id", "source_id", "scope_type", "scope_id", "occurrence_id"),
+                        key("agent_process_dispatch", "u", "tenant_id", "run_id"),
+                        foreign("agent_process_dispatch", RUN_KEY, "agent_run", RUN_KEY, "a"));
+                if (!readConstraints().containsAll(constraints)) throw invalid();
+                verifyLinkedChecks();
+                String table = "tianji_agent.agent_process_dispatch";
+                Boolean permitted = jdbc.queryForObject("SELECT has_table_privilege(current_user, ?, 'SELECT') "
+                        + "AND has_table_privilege(current_user, ?, 'INSERT') AND has_table_privilege(current_user, ?, 'UPDATE')",
+                        Boolean.class, table, table, table);
+                if (!Boolean.TRUE.equals(permitted)) throw invalid();
+            });
+        } catch (DataAccessException failure) {
+            throw invalid();
+        }
+    }
+
+    private void verifyLinkedColumns() {
+        Map<String, Column> expected = Map.ofEntries(
+                column("tenant_id", "bigint", true, false),
+                column("subject_issuer", "character varying(64)", true, true),
+                column("subject_id", "character varying(256)", true, true),
+                column("idempotency_key", "character varying(128)", true, true),
+                column("source_id", "character varying(128)", true, true),
+                column("scope_type", "character varying(8)", true, false),
+                column("scope_id", "character varying(255)", true, true),
+                column("occurrence_id", "character varying(255)", true, true),
+                column("definition_sha256", "character(64)", true, true),
+                column("dispatch_not_after", "timestamp with time zone", true, false),
+                column("link_sha256", "character(64)", true, true),
+                column("request_sha256", "character(64)", false, true),
+                column("state", "character varying(8)", true, false),
+                column("run_id", "character varying(64)", false, false),
+                column("created_at", "timestamp with time zone", true, false),
+                column("closed_at", "timestamp with time zone", false, false));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull, co.collname
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum > 0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_process_dispatch' AND t.relkind IN ('r', 'p')
+                """, rs -> {
+            actual.put(rs.getString("attname"), new Column(rs.getString("type"), rs.getBoolean("attnotnull"),
+                    "C".equals(rs.getString("collname"))));
+        });
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+    }
+
+    private void verifyLinkedChecks() {
+        Set<String> checks = new HashSet<>();
+        jdbc.query("""
+                SELECT c.convalidated, pg_get_constraintdef(c.oid) AS definition
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_process_dispatch' AND c.contype='c'
+                """, rs -> {
+            if (!rs.getBoolean("convalidated")) throw invalid();
+            checks.add(rs.getString("definition"));
+        });
+        if (!checks.containsAll(Set.of(
+                "CHECK ((tenant_id > 0))",
+                "CHECK (((subject_issuer)::text ~ '^[0-9a-f]{64}$'::text))",
+                "CHECK ((definition_sha256 ~ '^[0-9a-f]{64}$'::text))",
+                "CHECK ((link_sha256 ~ '^[0-9a-f]{64}$'::text))",
+                "CHECK ((request_sha256 ~ '^[0-9a-f]{64}$'::text))",
+                "CHECK (((scope_type)::text = ANY ((ARRAY['BPMN'::character varying, 'CMMN'::character varying])::text[])))",
+                "CHECK (((state)::text = ANY ((ARRAY['OPEN'::character varying, 'CLOSED'::character varying])::text[])))",
+                "CHECK (((((state)::text = 'OPEN'::text) AND (closed_at IS NULL)) OR (((state)::text = 'CLOSED'::text) AND (closed_at IS NOT NULL))))",
+                "CHECK ((((run_id IS NULL) AND (request_sha256 IS NULL)) OR ((run_id IS NOT NULL) AND (request_sha256 IS NOT NULL))))"))) throw invalid();
+    }
+
     private void verifyHistory() {
         Map<String, Integer> expected = new HashMap<>();
         MIGRATIONS.forEach((version, file) -> expected.put(version, checksum(file)));
@@ -121,6 +204,10 @@ public final class AgentStorageVerifier {
     }
 
     private void verifyConstraints() {
+        if (!readConstraints().containsAll(requiredConstraints())) throw invalid();
+    }
+
+    private Set<Key> readConstraints() {
         Set<Key> actual = new HashSet<>();
         jdbc.query("""
                 SELECT t.relname, c.contype, c.convalidated, c.condeferrable, i.indisvalid, i.indisready,
@@ -143,7 +230,7 @@ public final class AgentStorageVerifier {
                     rs.getString("ref_table"), array(rs.getArray("ref_columns")),
                     "f".equals(type) ? rs.getString("confdeltype") : null));
         });
-        if (!actual.containsAll(requiredConstraints())) throw invalid();
+        return actual;
     }
 
     private static Set<Key> requiredConstraints() {
@@ -220,8 +307,12 @@ public final class AgentStorageVerifier {
     private static Key foreign(String table, List<String> columns, String target, List<String> targetColumns, String deletion) {
         return new Key(table, "f", columns, target, targetColumns, deletion);
     }
+    private static Map.Entry<String, Column> column(String name, String type, boolean required, boolean cCollation) {
+        return Map.entry(name, new Column(type, required, cCollation));
+    }
     private static AgentLedgerException invalid() {
         return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent storage verification failed");
     }
     private record Key(String table, String type, List<String> columns, String target, List<String> targetColumns, String deletion) { }
+    private record Column(String type, boolean required, boolean cCollation) { }
 }
