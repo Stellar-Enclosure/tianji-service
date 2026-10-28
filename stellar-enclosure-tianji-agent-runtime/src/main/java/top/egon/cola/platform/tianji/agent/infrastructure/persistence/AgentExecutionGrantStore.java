@@ -48,7 +48,7 @@ public final class AgentExecutionGrantStore {
         });
     }
 
-    /** Reserves a monotonically fenced attempt only while the exact owner's run is still queued. */
+    /** Returns empty when active evidence exists or the exact owner's run is no longer queued. */
     public Optional<AgentExecutionGrant.Reservation> reserve(TrustedAgentActor actor, String runId, URI resource) {
         Objects.requireNonNull(actor, "actor");
         return transact(status -> {
@@ -62,8 +62,17 @@ public final class AgentExecutionGrantStore {
                     ON CONFLICT (tenant_id, run_id) DO UPDATE
                     SET issue_epoch = stored.issue_epoch + 1, updated_at = clock_timestamp()
                     WHERE stored.binding_sha256 = EXCLUDED.binding_sha256
+                      AND (stored.expires_at IS NULL OR stored.expires_at <= clock_timestamp())
                     RETURNING issue_epoch
                     """, (rs, row) -> rs.getLong(1), actor.tenantId(), runId, binding);
+            if (epochs.isEmpty()) {
+                boolean existing = !jdbc.query("""
+                        SELECT 1 FROM tianji_agent.agent_run_execution_grant
+                        WHERE tenant_id = ? AND run_id = ? AND binding_sha256 = ? AND expires_at > clock_timestamp()
+                        """, (rs, row) -> 1, actor.tenantId(), runId, binding).isEmpty();
+                if (existing) return Optional.empty();
+                throw new IllegalStateException("EXECUTION_GRANT_BINDING_CONFLICT");
+            }
             if (epochs.size() != 1) throw new IllegalStateException("EXECUTION_GRANT_BINDING_CONFLICT");
             return Optional.of(new AgentExecutionGrant.Reservation(authorization, resource, epochs.getFirst(), binding));
         });
@@ -87,6 +96,7 @@ public final class AgentExecutionGrantStore {
                     SET grant_id = ?, ciphertext = ?, expires_at = ?, updated_at = clock_timestamp()
                     WHERE tenant_id = ? AND run_id = ? AND issue_epoch = ? AND binding_sha256 = ?
                       AND (grant_id IS NULL OR grant_id = ?)
+                      AND (expires_at IS NULL OR expires_at <= clock_timestamp())
                     """, ticket.grantId(), ticket.ciphertext(), Timestamp.from(expires), actor.tenantId(), runId,
                     reservation.epoch(), reservation.bindingSha256(), ticket.grantId()) == 1;
         });

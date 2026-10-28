@@ -55,6 +55,7 @@ class AgentExecutionGrantStorePostgresTest {
         var older = new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:older", expiry);
         var latest = new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:latest", expiry);
         assertFalse(store.complete(first, older)); assertTrue(store.complete(second, latest));
+        assertFalse(store.complete(second, older));
         var authorization = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId())).authorization();
         var stored = store.current(authorization, RESOURCE).orElseThrow();
         assertEquals(latest.ciphertext(), stored.ciphertext()); assertEquals(expiry.truncatedTo(ChronoUnit.MICROS), stored.expiresAt());
@@ -65,9 +66,12 @@ class AgentExecutionGrantStorePostgresTest {
         assertTrue(store.reserve(otherSubject, run.runId(), RESOURCE).isEmpty());
         assertTrue(store.current(authorization, URI.create("https://api.example/other")).isEmpty());
         assertThrows(IllegalStateException.class, () -> store.reserve(actor, run.runId(), URI.create("https://api.example/other")));
+        assertTrue(store.reserve(actor, run.runId(), RESOURCE).isEmpty());
+        jdbc.update("UPDATE tianji_agent.agent_run_execution_grant SET expires_at = clock_timestamp() - interval '1 second' WHERE tenant_id=? AND run_id=?",
+                actor.tenantId(), run.runId());
         var replacement = store.reserve(actor, run.runId(), RESOURCE).orElseThrow();
         assertFalse(store.complete(replacement, new AgentExecutionGrant.Ticket("9" + "2".repeat(62), "ENC:v1:key:nonce:other", expiry)));
-        assertEquals(latest.ciphertext(), store.current(authorization, RESOURCE).orElseThrow().ciphertext());
+        assertTrue(store.current(authorization, RESOURCE).isEmpty());
     }
 
     @Test void concurrent_attempts_have_unique_epochs_and_only_the_latest_can_publish() throws Exception {
@@ -95,11 +99,11 @@ class AgentExecutionGrantStorePostgresTest {
         assertFalse(store.complete(reservation, ticket)); assertTrue(store.current(reservation.authorization(), RESOURCE).isEmpty());
         assertTrue(store.reserve(cancelledActor, cancelled.runId(), RESOURCE).isEmpty());
         var runningActor = actor("running"); var running = start(runningActor);
+        var stale = store.reserve(runningActor, running.runId(), RESOURCE).orElseThrow();
         var pending = store.reserve(runningActor, running.runId(), RESOURCE).orElseThrow(); assertTrue(store.complete(pending, ticket));
-        var later = store.reserve(runningActor, running.runId(), RESOURCE).orElseThrow();
         var claimed = ledger.claim(runningActor, new GetAgentRunQuery(running.runId()), running.revision(), "worker", Duration.ofSeconds(30));
         assertEquals(AgentRunStatusEnum.RUNNING, claimed.run().status());
-        assertFalse(store.complete(later, ticket)); assertTrue(store.current(pending.authorization(), RESOURCE).isPresent());
+        assertFalse(store.complete(stale, ticket)); assertTrue(store.current(pending.authorization(), RESOURCE).isPresent());
         ledger.cancel(runningActor, new CancelAgentRunCommand(running.runId(), "cancel-running", claimed.run().revision(), "stop"));
         assertTrue(store.current(pending.authorization(), RESOURCE).isEmpty());
     }
