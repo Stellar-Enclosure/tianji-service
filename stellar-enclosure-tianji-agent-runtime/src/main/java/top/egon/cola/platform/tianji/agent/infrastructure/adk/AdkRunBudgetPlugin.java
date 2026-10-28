@@ -42,6 +42,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private final Scheduler retryScheduler;
     private final ScheduledExecutorService controlExecutor;
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
+    private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
     private final FlowableProcessor<Boolean> idleSignal = ReplayProcessor.<Boolean>createWithSize(1).toSerialized();
 
     AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
@@ -64,12 +65,31 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<LlmResponse> beforeModelCallback(CallbackContext context, LlmRequest.Builder request) {
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
-            AgentModelBudgetEstimator.Estimate estimate = estimate(request.build());
+            LlmRequest modelRequest = request.build();
+            AgentModelBudgetEstimator.Estimate estimate = estimate(modelRequest);
             GenerateContentConfig config = request.config().orElseGet(() -> GenerateContentConfig.builder().build());
             int outputLimit = config.maxOutputTokens().map(existing -> Math.min(existing, estimate.maxOutputTokens()))
                     .orElse(estimate.maxOutputTokens());
             if (outputLimit < 1) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_INVALID_COMMAND, "model output limit is invalid");
+            }
+            AgentModelBudgetEstimator.ContextWindow window = contextWindow(modelRequest);
+            var dependencies = snapshot.definition().dependencies();
+            if (!window.modelName().equals(modelRequest.model().orElse(null))
+                    || !window.modelRouteRef().equals(dependencies.modelRouteRef())
+                    || !window.policyVersionRef().equals(dependencies.policyVersionRef())) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                        "model context policy does not match the execution snapshot");
+            }
+            AgentModelBudgetEstimator.ContextWindow first = contextWindows.putIfAbsent(window.modelName(), window);
+            if (first != null && !first.equals(window)) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                        "model context policy changed during the run");
+            }
+            long available = window.windowTokens() - window.safetyMarginTokens();
+            if (outputLimit > available || estimate.inputTokens() > available - outputLimit) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED,
+                        "model context window is exhausted");
             }
             AgentBudgetReservation reservation = ledger.budgets().reserveBudget(actor, lease,
                     new AgentBudgetRequest(context.eventId(), AgentBudgetRequest.Kind.MODEL, null,
@@ -198,6 +218,14 @@ final class AdkRunBudgetPlugin implements Plugin {
     private AgentModelBudgetEstimator.Estimate estimate(LlmRequest request) {
         try {
             return Objects.requireNonNull(estimator.estimate(snapshot, request), "model budget estimate");
+        } catch (RuntimeException failure) {
+            throw safeFailure(failure);
+        }
+    }
+
+    private AgentModelBudgetEstimator.ContextWindow contextWindow(LlmRequest request) {
+        try {
+            return Objects.requireNonNull(estimator.contextWindow(snapshot, request), "model context window");
         } catch (RuntimeException failure) {
             throw safeFailure(failure);
         }

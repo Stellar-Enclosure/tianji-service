@@ -691,6 +691,129 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void model_context_window_reserves_output_and_margin_before_calling_the_provider() {
+        for (long window : List.of(60L, 59L)) {
+            FixtureModel model = new FixtureModel();
+            TrustedAgentActor actor = actor();
+            ledger.publish(actor, singleSpec("window"));
+            GetAgentRunQuery query = start(actor, "window", "key");
+            var estimate = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                    "fixture-model", "fixture-route", "policy-v1", window, 10), call -> 20);
+            var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                    Map.of(), controlExecutor, estimate);
+            AgentRunDTO result = worker.executeQueued(actor, query);
+            assertEquals(window == 60 ? COMPLETED : FAILED, result.status());
+            assertEquals(window == 60 ? 1 : 0, model.streams.get());
+            if (window == 59) {
+                assertEquals("TIANJI_BUDGET_EXCEEDED", ledger.getResult(actor, query).orElseThrow().errorCode());
+                assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                        SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                        """, Integer.class, actor.tenantId(), query.runId()));
+            }
+        }
+    }
+
+    @Test
+    void model_context_window_is_checked_again_for_each_agent_call() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, configSpec("SEQUENTIAL", policy(Duration.ofSeconds(10)), "window-sequential"));
+        GetAgentRunQuery query = start(actor, "window-sequential", "key");
+        var estimate = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "fixture-model", "fixture-route", "policy-v1", 60, 10), call -> call == 0 ? 20 : 21);
+        var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                Map.of(), controlExecutor, estimate);
+        assertEquals(FAILED, worker.executeQueued(actor, query).status());
+        assertEquals("TIANJI_BUDGET_EXCEEDED", ledger.getResult(actor, query).orElseThrow().errorCode());
+        assertEquals(1, model.streams.get());
+        assertEquals(1, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                """, Integer.class, actor.tenantId(), query.runId()));
+    }
+
+    @Test
+    void changing_the_resolved_window_during_a_run_is_rejected() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, configSpec("SEQUENTIAL", policy(Duration.ofSeconds(10)), "window-drift"));
+        GetAgentRunQuery query = start(actor, "window-drift", "key");
+        AtomicInteger lookups = new AtomicInteger();
+        AgentModelBudgetEstimator delegate = estimator();
+        AgentModelBudgetEstimator estimate = new AgentModelBudgetEstimator() {
+            @Override public Estimate estimate(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                               com.google.adk.models.LlmRequest request) {
+                return delegate.estimate(snapshot, request);
+            }
+            @Override public ContextWindow contextWindow(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                                         com.google.adk.models.LlmRequest request) {
+                return new ContextWindow("fixture-model", "fixture-route", "policy-v1",
+                        lookups.getAndIncrement() == 0 ? 60 : 61, 10);
+            }
+            @Override public AgentBudgetSettlement actualUsage(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                                               com.google.adk.models.LlmResponse response) {
+                return delegate.actualUsage(snapshot, response);
+            }
+        };
+        var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                Map.of(), controlExecutor, estimate);
+        assertEquals(FAILED, worker.executeQueued(actor, query).status());
+        assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", ledger.getResult(actor, query).orElseThrow().errorCode());
+        assertEquals(1, model.streams.get());
+    }
+
+    @Test
+    void missing_or_mismatched_context_policy_and_overflow_fail_closed() {
+        var missing = new AgentModelBudgetEstimator() {
+            private final AgentModelBudgetEstimator delegate = estimator();
+            @Override public Estimate estimate(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                               com.google.adk.models.LlmRequest request) {
+                return delegate.estimate(snapshot, request);
+            }
+            @Override public AgentBudgetSettlement actualUsage(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                                               com.google.adk.models.LlmResponse response) {
+                return delegate.actualUsage(snapshot, response);
+            }
+        };
+        var wrongModel = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "different-model", "fixture-route", "policy-v1", 60, 10), call -> 20);
+        var wrongRoute = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "fixture-model", "other-route", "policy-v1", 60, 10), call -> 20);
+        var wrongPolicy = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "fixture-model", "fixture-route", "other-policy", 60, 10), call -> 20);
+        var overflow = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "fixture-model", "fixture-route", "policy-v1", Long.MAX_VALUE, 1), call -> Long.MAX_VALUE - 10);
+        for (var estimate : List.of(missing, wrongModel, wrongRoute, wrongPolicy, overflow)) {
+            FixtureModel model = new FixtureModel();
+            TrustedAgentActor actor = actor();
+            ledger.publish(actor, singleSpec("window-denied"));
+            GetAgentRunQuery query = start(actor, "window-denied", "key");
+            var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                    Map.of(), controlExecutor, estimate);
+            assertEquals(FAILED, worker.executeQueued(actor, query).status());
+            assertEquals(estimate == overflow ? "TIANJI_BUDGET_EXCEEDED" : "TIANJI_DEPENDENCY_UNAVAILABLE",
+                    ledger.getResult(actor, query).orElseThrow().errorCode());
+            assertEquals(0, model.streams.get());
+        }
+    }
+
+    @Test
+    void model_context_window_uses_the_lower_explicit_output_limit() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, codeSpec("limited-output", "limited-output"));
+        GetAgentRunQuery query = start(actor, "limited-output", "key");
+        var estimate = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
+                "fixture-model", "fixture-route", "policy-v1", 40, 10), call -> 20);
+        var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                Map.of("limited-output", scheduler -> LlmAgent.builder().name("limited").instruction("write")
+                        .model(new SpringAiModelAdapterFactory().create(model, "fixture-model"))
+                        .generateContentConfig(com.google.genai.types.GenerateContentConfig.builder().maxOutputTokens(10).build())
+                        .build()), controlExecutor, estimate);
+        assertEquals(COMPLETED, worker.executeQueued(actor, query).status());
+        assertEquals(10, model.maxTokens.get());
+    }
+
+    @Test
     void provider_failure_is_recorded_without_leaking_its_message() {
         FixtureModel model = new FixtureModel();
         model.script = prompt -> Flux.error(new IllegalStateException("private-provider-sentinel"));
@@ -892,12 +1015,42 @@ class AdkAgentRunExecutorPostgresTest {
             }
 
             @Override
+            public ContextWindow contextWindow(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                               com.google.adk.models.LlmRequest request) {
+                return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
+                        snapshot.definition().dependencies().policyVersionRef(), 1_000_000, 10);
+            }
+
+            @Override
             public AgentBudgetSettlement actualUsage(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
                                                       com.google.adk.models.LlmResponse response) {
                 return response.usageMetadata().map(usage -> new AgentBudgetSettlement(
                         usage.promptTokenCount().map(Integer::longValue).orElse(null),
                         usage.candidatesTokenCount().map(Integer::longValue).orElse(null), new BigDecimal("0.05")))
                         .orElseGet(() -> new AgentBudgetSettlement(null, null, null));
+            }
+        };
+    }
+
+    private static AgentModelBudgetEstimator contextEstimator(AgentModelBudgetEstimator.ContextWindow window,
+                                                               java.util.function.IntToLongFunction inputs) {
+        AtomicInteger calls = new AtomicInteger();
+        AgentModelBudgetEstimator delegate = estimator();
+        return new AgentModelBudgetEstimator() {
+            @Override
+            public Estimate estimate(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                     com.google.adk.models.LlmRequest request) {
+                return new Estimate(inputs.applyAsLong(calls.getAndIncrement()), 30, new BigDecimal("0.10"));
+            }
+            @Override
+            public ContextWindow contextWindow(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                               com.google.adk.models.LlmRequest request) {
+                return window;
+            }
+            @Override
+            public AgentBudgetSettlement actualUsage(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot,
+                                                      com.google.adk.models.LlmResponse response) {
+                return delegate.actualUsage(snapshot, response);
             }
         };
     }

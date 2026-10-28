@@ -12,11 +12,35 @@ public interface AgentModelBudgetEstimator {
     Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request);
     AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response);
 
+    /**
+     * Resolves the selected model's immutable route and policy versions. The estimate must cover
+     * the complete provider request, including model-adapter additions, not just user text.
+     * Existing adapters fail closed until they supply a context window.
+     */
+    default ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {
+        throw new UnsupportedOperationException("model context window is unavailable");
+    }
+
     record Estimate(long inputTokens, int maxOutputTokens, BigDecimal maximumCost) {
         public Estimate {
             if (inputTokens < 0 || maxOutputTokens < 1) {
                 throw new IllegalArgumentException("model budget estimate is invalid");
             }
+        }
+    }
+
+    record ContextWindow(String modelName, String modelRouteRef, String policyVersionRef,
+                         long windowTokens, long safetyMarginTokens) {
+        public ContextWindow {
+            if (!valid(modelName, 512) || !valid(modelRouteRef, 256) || !valid(policyVersionRef, 256)
+                    || windowTokens < 2 || safetyMarginTokens < 1 || safetyMarginTokens >= windowTokens) {
+                throw new IllegalArgumentException("model context window is invalid");
+            }
+        }
+
+        private static boolean valid(String value, int maximum) {
+            return value != null && !value.isBlank() && value.length() <= maximum && value.equals(value.trim())
+                    && value.chars().noneMatch(Character::isISOControl);
         }
     }
 }
