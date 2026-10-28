@@ -251,6 +251,7 @@ class ProcessServerPostgresTest {
         String caseId;
         String timerId;
         RoutingCases routingCases;
+        NativeWorkerProbe workerProbe;
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser)) {
             var processConfig = app.getBean(SpringProcessEngineConfiguration.class);
             var caseConfig = app.getBean(SpringCmmnEngineConfiguration.class);
@@ -276,6 +277,7 @@ class ProcessServerPostgresTest {
             verifyProcessStarts(app, jdbc, validator);
             verifyDecisionApplications(app, jdbc, validator, dmn);
             routingCases = prepareRoutingCases(app, validator, dmn);
+            workerProbe = probeNativeExternalWorker(app, jdbc);
             verifyHttpAgainstDatabase(app, validator);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
@@ -541,9 +543,87 @@ class ProcessServerPostgresTest {
                     .until(() -> runtime.createProcessInstanceQuery().processInstanceId(processId).count() == 0);
             assertNotNull(app.getBean(HistoryService.class).createHistoricProcessInstanceQuery()
                     .processInstanceId(processId).finished().singleResult());
+            verifyNativeWorkerReset(app, workerProbe);
         }
         assertFalse(executor.isActive());
     }
+
+    private static NativeWorkerProbe probeNativeExternalWorker(ConfigurableApplicationContext app, JdbcTemplate bootstrap) {
+        String xml = """
+                <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                             xmlns:flowable="http://flowable.org/bpmn" targetNamespace="urn:test">
+                  <process id="nativeWorkerProbe" isExecutable="true">
+                    <startEvent id="start"/><sequenceFlow id="a" sourceRef="start" targetRef="worker"/>
+                    <serviceTask id="worker" flowable:type="external-worker" flowable:topic="native-probe"/>
+                    <sequenceFlow id="b" sourceRef="worker" targetRef="after"/>
+                    <userTask id="after"/><sequenceFlow id="c" sourceRef="after" targetRef="end"/><endEvent id="end"/>
+                  </process>
+                </definitions>
+                """;
+        RepositoryService repository = app.getBean(RepositoryService.class);
+        RuntimeService runtime = app.getBean(RuntimeService.class);
+        ManagementService management = app.getBean(ManagementService.class);
+        for (String tenant : List.of("20", "21")) {
+            repository.createDeployment().tenantId(tenant).addString("native-probe.bpmn20.xml", xml).deploy();
+        }
+        String first = runtime.createProcessInstanceBuilder().processDefinitionKey("nativeWorkerProbe").tenantId("20")
+                .variable("allowed", "value").variable("privateFixture", "not-for-worker").start().getId();
+        String second = runtime.createProcessInstanceBuilder().processDefinitionKey("nativeWorkerProbe").tenantId("21").start().getId();
+        assertTrue(management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("22").acquireAndLock(1, "other-worker").isEmpty());
+        var acquired = management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("20").acquireAndLock(1, "first-worker");
+        assertEquals(1, acquired.size());
+        var job = acquired.getFirst();
+        assertEquals(first, job.getProcessInstanceId());
+        assertEquals("20", job.getTenantId());
+        assertEquals("not-for-worker", job.getVariables().get("privateFixture"));
+        assertTrue(management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("20").acquireAndLock(1, "other-worker").isEmpty());
+        expireNativeWorker(bootstrap, job.getId(), first);
+        assertTrue(management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("20").acquireAndLock(1, "other-worker").isEmpty());
+
+        // Flowable 8 checks the owner but accepts this completion after the lock has expired.
+        management.createExternalWorkerCompletionBuilder(job.getId(), "first-worker").variable("workerResult", "done").complete();
+        assertNotNull(runtime.createProcessInstanceQuery().processInstanceId(first).singleResult());
+        assertNull(app.getBean(TaskService.class).createTaskQuery().processInstanceId(first).singleResult());
+        var completionJob = management.createJobQuery().processInstanceId(first).singleResult();
+        assertNotNull(completionJob);
+        management.executeJob(completionJob.getId());
+        assertEquals("after", app.getBean(TaskService.class).createTaskQuery().processInstanceId(first).singleResult().getTaskDefinitionKey());
+        assertEquals("done", runtime.getVariable(first, "workerResult"));
+
+        var secondJob = management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("21").acquireAndLock(1, "expired-worker");
+        assertEquals(1, secondJob.size());
+        assertEquals(second, secondJob.getFirst().getProcessInstanceId());
+        expireNativeWorker(bootstrap, secondJob.getFirst().getId(), second);
+        assertTrue(management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("21").acquireAndLock(1, "replacement-worker").isEmpty());
+        return new NativeWorkerProbe(second, secondJob.getFirst().getId());
+    }
+
+    private static void expireNativeWorker(JdbcTemplate bootstrap, String id, String processInstanceId) {
+        assertEquals(1, bootstrap.update("UPDATE tianji_process.act_ru_external_job SET lock_exp_time_=clock_timestamp() - interval '1 second' WHERE id_=?", id));
+        assertEquals(1, bootstrap.update("UPDATE tianji_process.act_ru_execution SET lock_time_=clock_timestamp() - interval '1 second' WHERE id_=?", processInstanceId));
+    }
+
+    private static void verifyNativeWorkerReset(ConfigurableApplicationContext app, NativeWorkerProbe probe) {
+        ManagementService management = app.getBean(ManagementService.class);
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                management.createExternalWorkerJobQuery().jobId(probe.jobId()).unlocked().count() == 1);
+        var replacement = management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("21").acquireAndLock(1, "replacement-worker");
+        assertEquals(1, replacement.size());
+        assertEquals(probe.jobId(), replacement.getFirst().getId());
+        assertThrows(RuntimeException.class, () -> management.createExternalWorkerCompletionBuilder(probe.jobId(), "expired-worker").complete());
+        management.createExternalWorkerCompletionBuilder(probe.jobId(), "replacement-worker").complete();
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                app.getBean(TaskService.class).createTaskQuery().processInstanceId(probe.instanceId()).count() == 1);
+    }
+
+    private record NativeWorkerProbe(String instanceId, String jobId) { }
 
     private static RoutingCases prepareRoutingCases(ConfigurableApplicationContext app, ProcessModelValidator validator,
                                                     byte[] dmnBytes) throws Exception {
