@@ -76,7 +76,7 @@ class AgentLinkedSubmissionPostgresTest {
         var oldRun = ledger.start(user, start("old-run", "old-trace", "old-input"));
         String oldHash = ledger.executionMaterial(user, new GetAgentRunQuery(oldRun.runId())).authorization().snapshotSha256();
         assertThrows(AgentLedgerException.class, () -> new AgentStorageVerifier(source).verifyLinked());
-        var current = flyway(null); assertEquals(1, current.migrate().migrationsExecuted); current.validate();
+        var current = flyway("7"); assertEquals(1, current.migrate().migrationsExecuted); current.validate();
         assertEquals(oldChecksums, checksums());
         assertNull(ledger.snapshot(user, new GetAgentRunQuery(oldRun.runId())).processLink());
         assertEquals(oldHash, ledger.executionMaterial(user, new GetAgentRunQuery(oldRun.runId())).authorization().snapshotSha256());

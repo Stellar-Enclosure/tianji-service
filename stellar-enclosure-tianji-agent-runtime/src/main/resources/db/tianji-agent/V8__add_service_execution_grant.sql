@@ -1,0 +1,23 @@
+CREATE TABLE tianji_agent.agent_run_service_execution_grant (
+    tenant_id bigint NOT NULL CONSTRAINT agent_service_grant_tenant_positive CHECK (tenant_id > 0),
+    run_id varchar(64) NOT NULL,
+    subject_client_id varchar(128) COLLATE "C" NOT NULL,
+    subject_app_id varchar(128) COLLATE "C" NOT NULL,
+    subject_business_code varchar(128) COLLATE "C" NOT NULL,
+    subject_application_code varchar(128) COLLATE "C" NOT NULL,
+    subject_environment varchar(128) COLLATE "C" NOT NULL,
+    subject_resource_uri varchar(2048) COLLATE "C" NOT NULL,
+    binding_sha256 char(64) COLLATE "C" NOT NULL CONSTRAINT agent_service_grant_binding_hash CHECK (binding_sha256 ~ '^[0-9a-f]{64}$'),
+    issue_epoch bigint NOT NULL CONSTRAINT agent_service_grant_epoch_positive CHECK (issue_epoch > 0),
+    grant_id varchar(63) COLLATE "C",
+    ciphertext text,
+    expires_at timestamptz,
+    updated_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, run_id),
+    FOREIGN KEY (tenant_id, run_id) REFERENCES tianji_agent.agent_process_dispatch (tenant_id, run_id) ON DELETE CASCADE,
+    CONSTRAINT agent_service_grant_id_format CHECK (grant_id IS NULL OR grant_id ~ '^8[0-9]{62}$'),
+    CONSTRAINT agent_service_grant_cipher_format CHECK (ciphertext IS NULL OR ciphertext LIKE 'ENC:v1:%'),
+    CONSTRAINT agent_service_grant_cipher_size CHECK (ciphertext IS NULL OR octet_length(ciphertext) <= 32768),
+    CONSTRAINT agent_service_grant_cipher_presence CHECK ((grant_id IS NULL) = (ciphertext IS NULL)),
+    CONSTRAINT agent_service_grant_expiry_presence CHECK ((grant_id IS NULL) = (expires_at IS NULL))
+);

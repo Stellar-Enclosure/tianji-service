@@ -101,6 +101,94 @@ public final class AgentStorageVerifier {
         }
     }
 
+    /** SERVICE execution additionally requires the separately provisioned V8 grant store. */
+    public void verifyServiceGrants() {
+        verifyLinked();
+        try {
+            transaction.executeWithoutResult(status -> {
+                int expected = checksum("V8__add_service_execution_grant.sql");
+                List<Boolean> history = jdbc.query("SELECT success,checksum FROM tianji_agent.flyway_schema_history "
+                                + "WHERE version='8' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
+                                && rs.getObject("checksum") != null && rs.getInt("checksum") == expected);
+                if (history.size() != 1 || !history.getFirst()) throw invalid();
+                verifyServiceGrantColumns();
+                Set<Key> constraints = Set.of(key("agent_run_service_execution_grant", "p", "tenant_id", "run_id"),
+                        foreign("agent_run_service_execution_grant", RUN_KEY, "agent_process_dispatch", RUN_KEY, "c"));
+                if (!readConstraints().containsAll(constraints)) throw invalid();
+                Map<String, String> checks = new HashMap<>();
+                jdbc.query("""
+                        SELECT c.conname, c.convalidated, pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c
+                        JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                        WHERE n.nspname='tianji_agent' AND t.relname='agent_run_service_execution_grant' AND c.contype='c'
+                        """, rs -> {
+                    if (!rs.getBoolean("convalidated")) throw invalid();
+                    checks.put(rs.getString("conname"), normalizedCheck(rs.getString("definition")));
+                });
+                Map<String, String> expectedChecks = Map.of(
+                        "agent_service_grant_tenant_positive", "CHECKtenant_id>0",
+                        "agent_service_grant_binding_hash", "CHECKbinding_sha256~'^[0-9a-f]{64}$'",
+                        "agent_service_grant_epoch_positive", "CHECKissue_epoch>0",
+                        "agent_service_grant_id_format", "CHECKgrant_idISNULLORgrant_id~'^8[0-9]{62}$'",
+                        "agent_service_grant_cipher_format", "CHECKciphertextISNULLORciphertext~~'ENC:v1:%'",
+                        "agent_service_grant_cipher_size", "CHECKciphertextISNULLORoctet_lengthciphertext<=32768",
+                        "agent_service_grant_cipher_presence", "CHECKgrant_idISNULL=ciphertextISNULL",
+                        "agent_service_grant_expiry_presence", "CHECKgrant_idISNULL=expires_atISNULL");
+                for (var entry : expectedChecks.entrySet()) if (!entry.getValue().equals(checks.get(entry.getKey()))) throw invalid();
+                String table = "tianji_agent.agent_run_service_execution_grant";
+                Boolean permitted = jdbc.queryForObject("SELECT has_table_privilege(current_user, ?, 'SELECT') "
+                        + "AND has_table_privilege(current_user, ?, 'INSERT') AND has_table_privilege(current_user, ?, 'UPDATE')",
+                        Boolean.class, table, table, table);
+                if (!Boolean.TRUE.equals(permitted)) throw invalid();
+            });
+        } catch (DataAccessException failure) {
+            throw invalid();
+        }
+    }
+
+    private void verifyServiceGrantColumns() {
+        Map<String, Column> expected = Map.ofEntries(
+                column("tenant_id", "bigint", true, false), column("run_id", "character varying(64)", true, false),
+                column("subject_client_id", "character varying(128)", true, true), column("subject_app_id", "character varying(128)", true, true),
+                column("subject_business_code", "character varying(128)", true, true),
+                column("subject_application_code", "character varying(128)", true, true),
+                column("subject_environment", "character varying(128)", true, true),
+                column("subject_resource_uri", "character varying(2048)", true, true),
+                column("binding_sha256", "character(64)", true, true), column("issue_epoch", "bigint", true, false),
+                column("grant_id", "character varying(63)", false, true), column("ciphertext", "text", false, false),
+                column("expires_at", "timestamp with time zone", false, false), column("updated_at", "timestamp with time zone", true, false));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull, co.collname
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum > 0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_run_service_execution_grant' AND t.relkind IN ('r', 'p')
+                """, rs -> {
+            actual.put(rs.getString("attname"), new Column(rs.getString("type"), rs.getBoolean("attnotnull"),
+                    "C".equals(rs.getString("collname"))));
+        });
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+    }
+
+    static String normalizedCheck(String definition) {
+        if (definition == null) throw invalid();
+        var result = new StringBuilder();
+        boolean quoted = false;
+        for (int i = 0; i < definition.length(); i++) {
+            char value = definition.charAt(i);
+            if (value == '\'') {
+                result.append(value);
+                if (quoted && i + 1 < definition.length() && definition.charAt(i + 1) == '\'') result.append(definition.charAt(++i));
+                else quoted = !quoted;
+            } else if (quoted) result.append(value);
+            else if (definition.startsWith("::character varying", i)) i += "::character varying".length() - 1;
+            else if (definition.startsWith("::text", i)) i += "::text".length() - 1;
+            else if (!Character.isWhitespace(value) && value != '(' && value != ')') result.append(value);
+        }
+        if (quoted) throw invalid();
+        return result.toString();
+    }
+
     private void verifyLinkedColumns() {
         Map<String, Column> expected = Map.ofEntries(
                 column("tenant_id", "bigint", true, false),
