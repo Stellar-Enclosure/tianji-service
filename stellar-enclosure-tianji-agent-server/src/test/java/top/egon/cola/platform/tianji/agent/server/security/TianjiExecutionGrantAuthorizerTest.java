@@ -131,6 +131,62 @@ class TianjiExecutionGrantAuthorizerTest {
         assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM));
     }
 
+    @Test void authorization_workers_do_not_inherit_request_thread_locals() {
+        var inherited = new InheritableThreadLocal<String>();
+        inherited.set("request-only-proof");
+        try {
+            doAnswer(inv -> { assertNull(inherited.get()); return decision(NOW.plusSeconds(30)); }).when(client).decide(any(), any());
+            assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM));
+            assertEquals("request-only-proof", inherited.get());
+        } finally { inherited.remove(); }
+    }
+
+    @Test void service_evaluation_is_optional_and_uses_the_same_bounded_executor() throws Exception {
+        var services = mock(TianjiServiceExecutionGrantAuthorizer.class);
+        when(services.usesLedger(ledger)).thenReturn(true); when(services.usesIssuerRegistry(issuers)).thenReturn(true);
+        var serviceActor = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "worker", ISSUER.toString());
+        var serviceRequest = new AgentRunAuthorization.Request(serviceActor, RUN, "review", 1, "a".repeat(64),
+                "b".repeat(64), "c".repeat(64), "policy-v1", true, NOW.plusSeconds(600));
+        when(services.evaluate(serviceRequest)).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+        authorizer.close();
+        authorizer = new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)),
+                Duration.ofSeconds(1), 2, Clock.fixed(NOW, ZoneOffset.UTC), services);
+        assertTrue(authorizer.supportsService());
+        assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(serviceRequest, AgentRunAuthorization.Boundary.CLAIM));
+        assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(serviceRequest, AgentRunAuthorization.Boundary.MODEL));
+        verify(services, times(2)).evaluate(serviceRequest);
+        assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM));
+        verify(services, never()).evaluate(request);
+
+        authorizer.close();
+        authorizer = new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)),
+                Duration.ofMillis(120), 1, Clock.fixed(NOW, ZoneOffset.UTC), services);
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+        doAnswer(inv -> {
+            entered.countDown();
+            while (release.getCount() != 0) { try { release.await(); } catch (InterruptedException ignored) { } }
+            return AgentRunAuthorization.Decision.ALLOW;
+        }).when(services).evaluate(serviceRequest);
+        try {
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(serviceRequest, AgentRunAuthorization.Boundary.CLAIM));
+            assertTrue(entered.await(1, TimeUnit.SECONDS));
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(serviceRequest, AgentRunAuthorization.Boundary.MODEL));
+        } finally { release.countDown(); }
+    }
+
+    @Test void a_service_authorizer_with_different_ledger_or_issuer_registry_is_rejected() {
+        var services = mock(TianjiServiceExecutionGrantAuthorizer.class);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)),
+                Duration.ofSeconds(1), 1, Clock.fixed(NOW, ZoneOffset.UTC), services));
+        when(services.usesLedger(ledger)).thenReturn(true);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)),
+                Duration.ofSeconds(1), 1, Clock.fixed(NOW, ZoneOffset.UTC), services));
+    }
+
     @Test void interrupted_caller_remains_interrupted_and_the_check_fails_closed() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         var result = new java.util.concurrent.atomic.AtomicReference<AgentRunAuthorization.Decision>();

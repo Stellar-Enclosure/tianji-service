@@ -31,7 +31,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRe
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.state.IdentityAuthorityProperties;
 
-/** Rechecks owner-sealed USER intents and current Jianshen policy at every execution boundary. */
+/** Rechecks owner-sealed intents and current Jianshen policy at every execution boundary. */
 public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorization, AutoCloseable {
     private final AgentLedgerService ledger;
     private final AgentExecutionGrantStore store;
@@ -42,17 +42,31 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     private final ThreadPoolExecutor executor;
     private final Duration timeout;
     private final Clock clock;
+    private final TianjiServiceExecutionGrantAuthorizer services;
 
     public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
             Duration timeout, int concurrency) {
+        this(ledger, store, starter, authority, issuers, oauth, mapper, rbac, timeout, concurrency, null);
+    }
+
+    public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
+            Duration timeout, int concurrency, TianjiServiceExecutionGrantAuthorizer services) {
         this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), systemCode(rbac), issuers,
-                clients(starter, authority, issuers, oauth, mapper, rbac), timeout, concurrency, Clock.systemUTC());
+                clients(starter, authority, issuers, oauth, mapper, rbac), timeout, concurrency, Clock.systemUTC(), services);
     }
 
     TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
             TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock) {
+        this(ledger, store, resource, systemCode, issuers, clients, timeout, concurrency, clock, null);
+    }
+
+    TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
+            TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock,
+            TianjiServiceExecutionGrantAuthorizer services) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.systemCode = systemCode(systemCode);
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clients = Map.copyOf(clients);
@@ -63,16 +77,25 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
         if (this.clients.entrySet().stream().anyMatch(entry -> !entry.getKey().equals(TrustedIssuerRegistry.issuerHash(entry.getValue().issuer())))) {
             throw new IllegalArgumentException("TIANJI_EXECUTION_AUTHORIZATION_ISSUER_INVALID");
         }
+        if (services != null && (!services.usesLedger(ledger) || !services.usesIssuerRegistry(issuers))) {
+            throw new IllegalArgumentException("TIANJI_SERVICE_AUTHORIZATION_MISMATCH");
+        }
+        this.services = services;
         this.timeout = timeout; this.clock = Objects.requireNonNull(clock, "clock");
         this.executor = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
-                Thread.ofVirtual().name("tianji-authorization-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
+                Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-authorization-", 0).factory(),
+                new ThreadPoolExecutor.AbortPolicy());
     }
 
-    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && store.usesLedger(candidate); }
+    public boolean usesLedger(AgentLedgerService candidate) {
+        return ledger == candidate && store.usesLedger(candidate) && (services == null || services.usesLedger(candidate));
+    }
+    public boolean supportsService() { return services != null; }
 
     @Override
     public Decision authorize(Request request, Boundary boundary) {
-        if (request == null || boundary == null || request.actor().subjectType() != TrustedAgentActor.SubjectType.USER
+        if (request == null || boundary == null || (request.actor().subjectType() != TrustedAgentActor.SubjectType.USER
+                && (request.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || services == null))
                 || "LEGACY".equals(request.actor().issuerFingerprint()) || executor.isShutdown()) return Decision.UNAVAILABLE;
         try {
             Duration remaining = Duration.between(clock.instant(), request.deadlineAt());
@@ -93,6 +116,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     }
 
     private Decision evaluate(Request request) {
+        if (request.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE) return services.evaluate(request);
         try {
             var bound = clients.get(request.actor().issuerFingerprint());
             if (bound == null || !bound.tenantId().equals(Long.toString(request.actor().tenantId()))) return Decision.UNAVAILABLE;
