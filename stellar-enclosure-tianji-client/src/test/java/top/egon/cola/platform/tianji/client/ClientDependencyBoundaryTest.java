@@ -2,6 +2,9 @@ package top.egon.cola.platform.tianji.client;
 
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient;
+import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 
 import java.lang.reflect.Method;
 
@@ -21,10 +24,12 @@ class ClientDependencyBoundaryTest {
 
     @Test
     void agent_client_signatures_do_not_expose_engine_types() {
-        for (Method method : AgentClient.class.getMethods()) {
-            assertFalse(method.toGenericString().contains("com.google.adk"));
-            assertFalse(method.toGenericString().contains("org.flowable"));
-            assertFalse(method.toGenericString().contains("org.springframework.ai"));
+        for (Class<?> contract : new Class<?>[] {AgentClient.class, ProcessClient.class, ProcessReleaseClient.class, DecisionClient.class}) {
+            for (Method method : contract.getMethods()) {
+                assertFalse(method.toGenericString().contains("com.google.adk"));
+                assertFalse(method.toGenericString().contains("org.flowable"));
+                assertFalse(method.toGenericString().contains("org.springframework.ai"));
+            }
         }
     }
 }

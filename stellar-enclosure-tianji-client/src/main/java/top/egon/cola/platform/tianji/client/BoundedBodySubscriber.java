@@ -61,4 +61,12 @@ final class BoundedBodySubscriber implements HttpResponse.BodySubscriber<byte[]>
     }
 
     static final class TooLarge extends RuntimeException { }
+
+    static boolean tooLarge(Throwable failure) {
+        Throwable current = failure;
+        for (int depth = 0; current != null && depth < 32; depth++, current = current.getCause()) {
+            if (current instanceof TooLarge) return true;
+        }
+        return false;
+    }
 }

@@ -1,0 +1,59 @@
+package top.egon.cola.platform.tianji.contract.orchestration;
+
+import org.junit.jupiter.api.Test;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class OrchestrationContractTest {
+    @Test
+    void copies_values_and_normalizes_only_supported_numeric_inputs() {
+        Map<String, Object> values = new HashMap<>(Map.of("amount", 10, "name", "中文😀"));
+        var command = new StartProcessCommand("invoice", "v1", "订单-1", "command-1", "trace-1", values);
+        values.put("amount", 20);
+        assertEquals(10L, command.variables().get("amount"));
+        assertThrows(UnsupportedOperationException.class, () -> command.variables().put("amount", 30));
+        assertThrows(IllegalArgumentException.class, () -> new EvaluateDecisionCommand("risk", "v1", "r", "c", Map.of("amount", 10.0)));
+        assertThrows(IllegalArgumentException.class, () -> new EvaluateDecisionCommand("risk", "v1", "r", "c", Map.of("amount", new BigDecimal("10"))));
+        assertThrows(IllegalArgumentException.class, () -> new EvaluateDecisionCommand("risk", "v1", "r", "c", Map.of("amount", 1_000_000_000_000_000L)));
+        assertThrows(IllegalArgumentException.class, () -> new StartProcessCommand("invoice", "v1", "bad" + (char) 0, "c", "t", Map.of()));
+        assertFalse(List.of(StartProcessCommand.class.getRecordComponents()).stream()
+                .anyMatch(component -> component.getName().equalsIgnoreCase("tenantId")));
+    }
+
+    @Test
+    void release_models_are_bounded_immutable_and_unique() {
+        var model = new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", "<xml/>", Map.of("amount", ProcessValueTypeEnum.INTEGER));
+        List<ProcessModelResource> source = new ArrayList<>(List.of(model));
+        var release = new PublishProcessReleaseCommand("v1", source);
+        source.clear();
+        assertEquals(1, release.models().size());
+        assertThrows(UnsupportedOperationException.class, () -> release.models().clear());
+        assertThrows(IllegalArgumentException.class, () -> new PublishProcessReleaseCommand("v1", List.of(model, model)));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", "x".repeat(524_289), Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", "bad" + (char) 0xd800, Map.of()));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", "<xml/>", Map.of("execution", ProcessValueTypeEnum.STRING)));
+    }
+
+    @Test
+    void validates_terminal_times_and_standalone_decision_results() {
+        Instant now = Instant.now();
+        assertThrows(IllegalArgumentException.class, () -> new ProcessInstanceDTO("instance", "invoice", "v1", "order",
+                "trace", ProcessInstanceStatusEnum.COMPLETED, now, null));
+        var result = new DecisionResultDTO("12345678-1234-1234-1234-123456789abc", "risk", "v1", "trace", now,
+                List.of(Map.of("route", "review", "score", 1)), List.of("row:1"));
+        assertEquals(1L, result.outputs().getFirst().get("score"));
+        assertThrows(UnsupportedOperationException.class, () -> result.outputs().getFirst().put("route", "changed"));
+        assertThrows(IllegalArgumentException.class, () -> new DecisionResultDTO("not-an-id", "risk", "v1", "trace", now, List.of(), List.of()));
+        assertThrows(IllegalArgumentException.class, () -> new DecisionResultDTO("12345678-1234-1234-1234-123456789abc", "risk", "v1", "trace", now,
+                List.of(), List.of("row:1")));
+        assertThrows(IllegalArgumentException.class, () -> new DecisionResultDTO("12345678-1234-1234-1234-123456789abc", "risk", "v1", "trace", now,
+                List.of(Map.of("route", "review")), List.of("row:1", "row:1")));
+    }
+}

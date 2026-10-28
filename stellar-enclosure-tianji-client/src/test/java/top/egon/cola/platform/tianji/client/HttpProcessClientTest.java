@@ -1,0 +1,182 @@
+package top.egon.cola.platform.tianji.client;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.contract.orchestration.*;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class HttpProcessClientTest {
+    private static final String TOKEN = "test-process-token";
+    private static final Instant NOW = Instant.parse("2026-10-28T00:00:00Z");
+    private final JsonMapper mapper = JsonMapper.builder().build();
+    private final AtomicReference<Handler> handler = new AtomicReference<>();
+    private HttpServer server;
+    private ExecutorService executor;
+    private URI base;
+
+    @BeforeEach
+    void startStub() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        executor = Executors.newVirtualThreadPerTaskExecutor();
+        server.setExecutor(executor);
+        server.createContext("/", exchange -> {
+            try (exchange) { handler.get().handle(exchange); }
+            catch (IOException ignored) { }
+        });
+        server.start();
+        base = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
+    }
+
+    @AfterEach
+    void stopStub() {
+        server.stop(0);
+        executor.shutdownNow();
+    }
+
+    @Test
+    void release_process_and_decision_calls_use_neutral_contracts_and_verified_responses() throws Exception {
+        String xml = "<definitions/>";
+        var model = new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", xml, Map.of("amount", ProcessValueTypeEnum.INTEGER));
+        var release = new ProcessReleaseDTO("v1", "a".repeat(64), NOW, List.of(new ProcessModelDTO(
+                ProcessModelTypeEnum.BPMN, "invoice", sha(xml), Map.of("amount", ProcessValueTypeEnum.INTEGER))));
+        var process = new ProcessInstanceDTO("instance-1", "invoice", "v1", "order-1", "trace-1",
+                ProcessInstanceStatusEnum.ACTIVE, NOW, null);
+        var decision = new DecisionResultDTO("12345678-1234-1234-1234-123456789abc", "risk", "v1", "trace-1", NOW,
+                List.of(Map.of("route", "review")), List.of("row:1"));
+        BlockingQueue<Seen> seen = new LinkedBlockingQueue<>();
+        handler.set(exchange -> {
+            String path = exchange.getRequestURI().getRawPath();
+            seen.add(new Seen(exchange.getRequestMethod(), path, exchange.getRequestHeaders().getFirst("Authorization"),
+                    exchange.getRequestBody().readAllBytes()));
+            Object body = path.contains("process-releases") ? release : path.contains("process-instances") ? process : decision;
+            respond(exchange, 200, "application/json", mapper.writeValueAsBytes(body));
+        });
+        HttpProcessClient client = client(Duration.ofSeconds(3));
+        var publish = new PublishProcessReleaseCommand("v1", List.of(model));
+        var start = new StartProcessCommand("invoice", "v1", "order-1", "command-1", "trace-1", Map.of("amount", 10));
+        var evaluate = new EvaluateDecisionCommand("risk", "v1", "request-1", "trace-1", Map.of("amount", 10));
+        assertEquals(release, client.publish(publish));
+        assertEquals(release, client.get(new GetProcessReleaseQuery("v1")));
+        assertEquals(process, client.start(start));
+        assertEquals(process, client.get(new GetProcessInstanceQuery("instance-1")));
+        assertEquals(decision, client.evaluate(evaluate));
+        List<Seen> requests = new ArrayList<>();
+        seen.drainTo(requests);
+        assertEquals(List.of("POST", "GET", "POST", "GET", "POST"), requests.stream().map(Seen::method).toList());
+        assertEquals(List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/v1",
+                "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/instance-1",
+                "/api/tianji/v1/decisions/evaluate"), requests.stream().map(Seen::path).toList());
+        assertTrue(requests.stream().allMatch(item -> ("Bearer " + TOKEN).equals(item.authorization())));
+        assertEquals(publish, mapper.readValue(requests.get(0).body(), PublishProcessReleaseCommand.class));
+        assertEquals(start, mapper.readValue(requests.get(2).body(), StartProcessCommand.class));
+        assertEquals(evaluate, mapper.readValue(requests.get(4).body(), EvaluateDecisionCommand.class));
+    }
+
+    @Test
+    void rejects_mismatched_release_content_and_mismatched_instance_identity() {
+        var model = new ProcessModelResource(ProcessModelTypeEnum.BPMN, "invoice", "<xml/>", Map.of());
+        var wrong = new ProcessReleaseDTO("v1", "a".repeat(64), NOW,
+                List.of(new ProcessModelDTO(ProcessModelTypeEnum.BPMN, "invoice", "b".repeat(64), Map.of())));
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(wrong)));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofSeconds(3)).publish(new PublishProcessReleaseCommand("v1", List.of(model)))).code());
+        var other = new ProcessInstanceDTO("other", "invoice", "v1", "order", "trace", ProcessInstanceStatusEnum.ACTIVE, NOW, null);
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(other)));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofSeconds(3)).get(new GetProcessInstanceQuery("expected"))).code());
+        handler.set(exchange -> respond(exchange, 200, "text/html", mapper.writeValueAsBytes(other)));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofSeconds(3)).get(new GetProcessInstanceQuery("other"))).code());
+    }
+
+    @Test
+    void sends_writes_once_and_keeps_credentials_and_error_bodies_out_of_exceptions() {
+        AtomicInteger calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet();
+            exchange.getResponseHeaders().set("Retry-After", "9");
+            respond(exchange, 409, "application/json", ("{\"code\":\"TIANJI_IDEMPOTENCY_CONFLICT\","
+                    + "\"correlationId\":\"trace-123\",\"message\":\"private " + TOKEN + "\"}").getBytes(StandardCharsets.UTF_8));
+        });
+        var command = new EvaluateDecisionCommand("risk", "v1", "request", "trace", Map.of("amount", 10));
+        ProcessClientException failure = assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).evaluate(command));
+        assertEquals(1, calls.get());
+        assertEquals(409, failure.httpStatus());
+        assertEquals("TIANJI_IDEMPOTENCY_CONFLICT", failure.code());
+        assertEquals("trace-123", failure.correlationId());
+        assertEquals(Duration.ofSeconds(9), failure.retryAfter());
+        assertFalse(failure.toString().contains(TOKEN));
+        assertNull(failure.getCause());
+        handler.set(exchange -> respond(exchange, 409, "application/json",
+                ("{\"code\":\"" + TOKEN + "\",\"correlationId\":\"prefix-" + TOKEN + "\"}").getBytes(StandardCharsets.UTF_8)));
+        ProcessClientException echoed = assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).evaluate(command));
+        assertEquals("TIANJI_IDEMPOTENCY_CONFLICT", echoed.code());
+        assertNull(echoed.correlationId());
+        assertFalse(echoed.toString().contains(TOKEN));
+    }
+
+    @Test
+    void bounds_responses_and_rejects_redirects_or_invalid_credentials() {
+        handler.set(exchange -> respond(exchange, 200, "application/json", new byte[2 * 1_048_576 + 1]));
+        ProcessClientException large = assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofSeconds(3)).get(new GetProcessReleaseQuery("v1")));
+        assertEquals("TIANJI_RESPONSE_TOO_LARGE", large.code());
+        assertThrows(IllegalArgumentException.class, () -> new HttpProcessClient(base,
+                HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build(), () -> TOKEN, Duration.ofSeconds(3)));
+        var badToken = new HttpProcessClient(base, HttpClient.newHttpClient(), () -> "bad\nsecret", Duration.ofSeconds(3));
+        assertThrows(IllegalArgumentException.class, () -> badToken.get(new GetProcessReleaseQuery("v1")));
+        var throwing = new HttpProcessClient(base, HttpClient.newHttpClient(), () -> { throw new IllegalStateException(TOKEN); }, Duration.ofSeconds(3));
+        ProcessClientException failure = assertThrows(ProcessClientException.class, () -> throwing.get(new GetProcessReleaseQuery("v1")));
+        assertFalse(failure.toString().contains(TOKEN));
+        assertNull(failure.getCause());
+    }
+
+    @Test
+    void bounds_the_entire_response_time() {
+        handler.set(exchange -> {
+            try { Thread.sleep(500); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            respond(exchange, 200, "application/json", "{}".getBytes(StandardCharsets.UTF_8));
+        });
+        long started = System.nanoTime();
+        assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofMillis(100)).get(new GetProcessReleaseQuery("v1"))).code());
+        assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(2)) < 0);
+    }
+
+    private HttpProcessClient client(Duration timeout) { return new HttpProcessClient(base, HttpClient.newHttpClient(), () -> TOKEN, timeout); }
+    private static String sha(String value) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+    }
+    private static void respond(HttpExchange exchange, int status, String contentType, byte[] bytes) throws IOException {
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.sendResponseHeaders(status, bytes.length);
+        exchange.getResponseBody().write(bytes);
+    }
+    private interface Handler { void handle(HttpExchange exchange) throws IOException; }
+    private record Seen(String method, String path, String authorization, byte[] body) { }
+}

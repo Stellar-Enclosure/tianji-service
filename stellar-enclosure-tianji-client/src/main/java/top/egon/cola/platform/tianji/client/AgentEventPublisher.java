@@ -181,7 +181,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                         pending = null;
                     }
                     if (isDone()) return;
-                    if (HttpAgentClient.tooLarge(failure)) {
+                    if (BoundedBodySubscriber.tooLarge(failure)) {
                         fail(new AgentClientException(0, "TIANJI_RESPONSE_TOO_LARGE", null, null));
                         return;
                     }

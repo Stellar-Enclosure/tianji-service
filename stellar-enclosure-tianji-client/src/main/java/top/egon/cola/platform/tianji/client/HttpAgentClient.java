@@ -179,7 +179,7 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
             call.cancel(true);
             throw new AgentClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
         } catch (ExecutionException failure) {
-            if (tooLarge(failure)) {
+            if (BoundedBodySubscriber.tooLarge(failure)) {
                 throw new AgentClientException(0, "TIANJI_RESPONSE_TOO_LARGE", null, null);
             }
             throw new AgentClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
@@ -217,14 +217,6 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     private static String segment(String value) {
         if (value.equals(".") || value.equals("..")) throw new IllegalArgumentException("Agent run id is invalid");
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
-    }
-
-    static boolean tooLarge(Throwable failure) {
-        Throwable current = failure;
-        for (int depth = 0; current != null && depth < 32; depth++, current = current.getCause()) {
-            if (current instanceof BoundedBodySubscriber.TooLarge) return true;
-        }
-        return false;
     }
 
     private AgentClientException error(HttpResponse<?> response, byte[] body) {
