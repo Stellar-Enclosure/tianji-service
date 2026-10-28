@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/CMMN/20151109/MODEL" targetNamespace="https://stellar-enclosure.example/test">
+    <case id="baselineCase" name="Baseline Case">
+        <casePlanModel id="plan">
+            <planItem id="investigation" name="Investigation" definitionRef="investigate"/>
+            <humanTask id="investigate" name="Investigate"/>
+        </casePlanModel>
+    </case>
+</definitions>

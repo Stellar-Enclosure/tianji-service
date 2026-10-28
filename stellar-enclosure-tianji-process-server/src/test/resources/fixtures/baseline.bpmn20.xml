@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="https://stellar-enclosure.example/test">
+    <process id="baseline" name="Baseline" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toReview" sourceRef="start" targetRef="review"/>
+        <userTask id="review" name="Review"/>
+        <sequenceFlow id="toTimer" sourceRef="review" targetRef="wait"/>
+        <intermediateCatchEvent id="wait"><timerEventDefinition><timeDuration>PT1H</timeDuration></timerEventDefinition></intermediateCatchEvent>
+        <sequenceFlow id="toEnd" sourceRef="wait" targetRef="end"/>
+        <endEvent id="end"/>
+    </process>
+</definitions>

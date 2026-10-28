@@ -22,6 +22,8 @@
         <spring-ai.version>2.0.2</spring-ai.version>
         <google-adk.version>1.13.0</google-adk.version>
         <agent-flow.version>0.0.2-SNAPSHOT</agent-flow.version>
+        <flowable.version>8.0.0</flowable.version>
+        <transactional-outbox.version>0.0.2-SNAPSHOT</transactional-outbox.version>
     </properties>
 
     <modules>
@@ -29,6 +31,7 @@
         <module>stellar-enclosure-tianji-client</module>
         <module>stellar-enclosure-tianji-agent-runtime</module>
         <module>stellar-enclosure-tianji-agent-server</module>
+        <module>stellar-enclosure-tianji-process-server</module>
     </modules>
 
     <dependencyManagement>

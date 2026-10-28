@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/DMN/20151101" id="baselineDefinitions" name="Baseline" namespace="https://stellar-enclosure.example/test">
+    <decision id="baselineDecision" name="Baseline Decision">
+        <decisionTable id="baselineTable" hitPolicy="FIRST">
+            <input><inputExpression id="amountExpression" typeRef="number"><text>amount</text></inputExpression></input>
+            <output id="routeOutput" name="route" typeRef="string"/>
+            <rule><inputEntry id="small"><text>&lt;= 10</text></inputEntry><outputEntry id="standard"><text>'standard'</text></outputEntry></rule>
+            <rule><inputEntry id="large"><text>&gt; 10</text></inputEntry><outputEntry id="review"><text>'review'</text></outputEntry></rule>
+        </decisionTable>
+    </decision>
+</definitions>
