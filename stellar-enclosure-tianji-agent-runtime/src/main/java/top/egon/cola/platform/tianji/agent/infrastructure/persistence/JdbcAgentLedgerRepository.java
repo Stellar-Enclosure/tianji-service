@@ -71,6 +71,14 @@ final class JdbcAgentLedgerRepository {
                 .stream().findFirst();
     }
 
+    boolean lockOwnedSession(TrustedAgentActor actor, String sessionId) {
+        return !jdbc.query("""
+                SELECT 1 FROM tianji_agent.agent_session
+                WHERE tenant_id=? AND subject_type=? AND subject_id=? AND app_name='tianji' AND session_id=?
+                FOR KEY SHARE
+                """, (rs, row) -> 1, actor.tenantId(), actor.subjectType().name(), actor.subjectId(), sessionId).isEmpty();
+    }
+
     Optional<StoredRun> run(TrustedAgentActor actor, String runId) {
         return jdbc.query("""
                 SELECT * FROM tianji_agent.agent_run

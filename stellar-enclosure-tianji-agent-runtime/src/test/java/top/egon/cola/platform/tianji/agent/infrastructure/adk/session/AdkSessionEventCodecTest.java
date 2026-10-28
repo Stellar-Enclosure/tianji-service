@@ -12,6 +12,7 @@ import com.google.genai.types.Part;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -66,6 +67,21 @@ class AdkSessionEventCodecTest {
         ((ObjectNode) unknownField.path("event")).put("unrecognizedField", true);
         assertThrows(IllegalArgumentException.class, () -> codec.decode(unknownField.toString()));
         assertThrows(IllegalArgumentException.class, () -> codec.decode(stored.replaceFirst("\\{", "{\"codecVersion\":1,")));
+    }
+
+    @Test
+    void serializes_equivalent_maps_in_the_same_order_for_event_idempotency() {
+        Map<String, Object> first = new LinkedHashMap<>();
+        first.put("z", 2);
+        first.put("a", 1);
+        Map<String, Object> second = new LinkedHashMap<>();
+        second.put("a", 1);
+        second.put("z", 2);
+        Event left = event(null, EventActions.builder().stateDelta(first).build());
+        Event right = event(null, EventActions.builder().stateDelta(second).build());
+        left.setOutput(first);
+        right.setOutput(second);
+        assertEquals(codec.encode(left), codec.encode(right));
     }
 
     @Test

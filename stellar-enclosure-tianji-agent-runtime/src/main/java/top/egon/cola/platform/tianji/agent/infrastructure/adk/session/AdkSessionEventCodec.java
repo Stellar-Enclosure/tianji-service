@@ -65,7 +65,7 @@ final class AdkSessionEventCodec {
             envelope.set("event", nativeEvent);
             ArrayNode keys = envelope.putArray("removedStateKeys");
             removed.forEach(keys::add);
-            String stored = MAPPER.writeValueAsString(envelope);
+            String stored = MAPPER.writeValueAsString(canonical(envelope));
             requireSize(stored);
             Event restored = decode(stored);
             if (!nativeEvent.equals(MAPPER.readTree(restored.toJson())) || !sameGenericValues(durableEvent, restored)) {
@@ -135,7 +135,23 @@ final class AdkSessionEventCodec {
                 part.partMetadata());
     }
 
-    private static void validateJsonValue(Object value, int depth, boolean allowRemoved) {
+    private static JsonNode canonical(JsonNode value) {
+        if (value instanceof ObjectNode object) {
+            ObjectNode result = MAPPER.createObjectNode();
+            Set<String> names = new TreeSet<>();
+            object.fieldNames().forEachRemaining(names::add);
+            names.forEach(name -> result.set(name, canonical(object.get(name))));
+            return result;
+        }
+        if (value instanceof ArrayNode array) {
+            ArrayNode result = MAPPER.createArrayNode();
+            array.forEach(item -> result.add(canonical(item)));
+            return result;
+        }
+        return value;
+    }
+
+    static void validateJsonValue(Object value, int depth, boolean allowRemoved) {
         if (depth > 64) throw invalid();
         if (value == null || value instanceof Boolean) return;
         if (value instanceof String text) {

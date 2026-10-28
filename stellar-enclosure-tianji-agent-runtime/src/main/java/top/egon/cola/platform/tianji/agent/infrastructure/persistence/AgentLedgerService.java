@@ -108,6 +108,9 @@ public final class AgentLedgerService {
             if (existing.isPresent()) {
                 return sameRequest(existing.get(), requestHash);
             }
+            if (command.sessionId() != null && !repository.lockOwnedSession(actor, command.sessionId())) {
+                throw notFound();
+            }
             JdbcAgentLedgerRepository.DefinitionRow definition = repository.definition(actor.tenantId(),
                     command.definitionKey(), command.definitionVersion()).orElseThrow(AgentLedgerService::notFound);
             ExecutionPolicyDTO policy = ExecutionPolicyReducer.reduce(definition.specification().policy(),

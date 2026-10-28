@@ -47,6 +47,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecuto
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentFlowImportOptions;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.LegacyAgentFlowImporter;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
@@ -406,6 +407,8 @@ class AdkAgentRunExecutorPostgresTest {
         FixtureModel model = new FixtureModel();
         TrustedAgentActor actor = actor();
         ledger.publish(actor, configSpec("SEQUENTIAL", policy(Duration.ofSeconds(10)), "session"));
+        PostgresAdkSessionService sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "saved-session").blockingGet();
         AgentRunDTO run = ledger.start(actor, new StartAgentRunCommand("session", 1, "saved-session", "key",
                 null, null, new AgentInputDTO("question", List.of(), Map.of()), null));
         GetAgentRunQuery query = new GetAgentRunQuery(run.runId());
