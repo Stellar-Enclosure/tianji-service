@@ -2,7 +2,6 @@ package top.egon.cola.platform.tianji.agent.server.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.net.URI;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
@@ -15,12 +14,9 @@ import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
-import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.contract.execution.ExecutionGrantContract;
-import top.egon.cola.platform.tianquan.shoubing.contract.state.IdentityAuthorityScopes;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
-import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRequest;
 import top.egon.cola.platform.tianquan.shoubing.starter.execution.HttpExecutionGrantClient;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedUserTokenCarrier;
@@ -37,14 +33,14 @@ public final class TianjiExecutionGrantIssuer {
     public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper) {
-        this(ledger, store, requireResource(starter.getResourceUri()), issuers,
+        this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), issuers,
                 clients(starter, authority, issuers, oauth, mapper));
     }
 
     TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
             TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
-        this.resource = requireResource(resource); this.issuers = Objects.requireNonNull(issuers, "issuers");
+        this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.issuers = Objects.requireNonNull(issuers, "issuers");
         this.clients = Map.copyOf(clients);
         if (this.clients.isEmpty()) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_REQUIRED");
     }
@@ -97,39 +93,10 @@ public final class TianjiExecutionGrantIssuer {
 
     private static Map<URI, HttpExecutionGrantClient> clients(IdpStarterProperties starter, IdentityAuthorityProperties authority,
             TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth, ObjectMapper mapper) {
-        if (starter == null || authority == null || authority.getBindings() == null || authority.getBindings().size() > 4096) {
-            throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_INVALID");
-        }
-        URI source = requireResource(starter.getResourceUri());
-        Map<URI, HttpExecutionGrantClient> result = new LinkedHashMap<>();
-        authority.getBindings().forEach((name, value) -> {
-            if (value == null || value.getScopes() == null || !value.getScopes().contains(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE)) return;
-            if (name == null || !name.matches("[A-Za-z0-9._-]{1,128}") || value.getIssuer() == null) {
-                throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDING_INVALID");
-            }
-            URI boundResource = value.getSourceResource() == null ? source : requireResource(value.getSourceResource());
-            if (!source.toASCIIString().equals(boundResource.toASCIIString())) return;
-            var trusted = issuers.findByIssuer(value.getIssuer().toASCIIString())
-                    .orElseThrow(() -> new IllegalStateException("TIANJI_EXECUTION_GRANT_ISSUER_UNTRUSTED"));
-            if (trusted.realmType() != TrustedIssuerRegistry.RealmType.TENANT || value.getContext() != ServiceTokenContext.TENANT
-                    || !Objects.equals(value.getTenantId(), trusted.tenantId())) {
-                throw new IllegalStateException("TIANJI_EXECUTION_GRANT_TENANT_INVALID");
-            }
-            var context = new IdpServiceTokenRequest(value.getRegistrationId(), starter.getServiceClient().getAppId(), value.getAudience(),
-                    value.getContext(), value.getTenantId(), java.util.Set.copyOf(value.getScopes()));
-            var client = new HttpExecutionGrantClient(authority.getBaseUri(), value.getIssuer(), context, oauth, mapper, authority.getTimeout());
-            if (result.putIfAbsent(value.getIssuer(), client) != null) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDING_DUPLICATE");
-        });
+        var result = new java.util.LinkedHashMap<URI, HttpExecutionGrantClient>();
+        TianjiExecutionAuthorityBindings.source(starter, authority, issuers).forEach((issuer, context) -> result.put(issuer,
+                new HttpExecutionGrantClient(authority.getBaseUri(), issuer, context, oauth, mapper, authority.getTimeout())));
         return Map.copyOf(result);
-    }
-
-    private static URI requireResource(URI value) {
-        if (value == null || !"https".equalsIgnoreCase(value.getScheme()) || value.getHost() == null
-                || value.getUserInfo() != null || value.getQuery() != null || value.getFragment() != null
-                || !value.normalize().equals(value) || value.toASCIIString().length() > 2048) {
-            throw new IllegalArgumentException("TIANJI_EXECUTION_GRANT_RESOURCE_INVALID");
-        }
-        return value;
     }
 
     private static AgentLedgerException unavailable() {

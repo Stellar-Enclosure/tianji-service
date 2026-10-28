@@ -88,6 +88,10 @@ class TianjiGrantSubmissionPostgresTest {
                 5, 0, 1000, 500, new BigDecimal("2.00"), "USD", 2, Set.of(), null, null);
         ledger.publish(ACTOR, new AgentDefinitionSpecDTO("review", 1, "SEQUENTIAL", null, "1", "1",
                 new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "model-route", "policy-v1"), policy, Map.of()));
+        ledger.publish(ACTOR, new AgentDefinitionSpecDTO("model", 1, "CONFIG", null, "1", "1",
+                new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "model-route", "policy-v1"), policy,
+                Map.of("chatModelBeanName", "fixtureModel", "modelName", "fixture-model", "rootAgentName", "writer",
+                        "agents", List.of(Map.of("name", "writer", "instruction", "write")))));
         new AgentSessionManager(ledger, source).create(ACTOR, new CreateAgentSessionCommand("session-1"));
     }
 
@@ -152,6 +156,88 @@ class TianjiGrantSubmissionPostgresTest {
                 && value.purpose().equals(AgentRunAuthorization.PURPOSE)));
     }
 
+    @Test void stored_user_intent_can_be_rechecked_without_the_original_bearer() throws Exception {
+        var run = submit("grant-authorize");
+        var authorization = ledger.executionMaterial(ACTOR, new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(run.runId())).authorization();
+        var rbac = mock(top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient.class);
+        when(rbac.decide(any(), any())).thenAnswer(invocation -> decision(invocation.getArgument(0), invocation.getArgument(1)));
+        try (var verifier = authorizer(rbac)) {
+            assertEquals(AgentRunAuthorization.Decision.ALLOW, verifier.authorize(authorization, AgentRunAuthorization.Boundary.CLAIM));
+            verify(rbac).decide(argThat(value -> value.ciphertext().startsWith("ENC:v1:") && !value.ciphertext().contains(TOKEN)),
+                    argThat(value -> value.subject().equals("alice") && value.intentId().equals(run.runId())));
+        }
+    }
+
+    @Test void cancellation_during_remote_authorization_returns_unavailable_without_holding_the_run_lock() throws Exception {
+        var run = submit("grant-auth-cancel");
+        var authorization = ledger.executionMaterial(ACTOR, new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(run.runId())).authorization();
+        var rbac = mock(top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient.class);
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+        when(rbac.decide(any(), any())).thenAnswer(invocation -> {
+            entered.countDown(); assertTrue(release.await(10, TimeUnit.SECONDS));
+            return decision(invocation.getArgument(0), invocation.getArgument(1));
+        });
+        try (var verifier = authorizer(rbac); var worker = Executors.newSingleThreadExecutor()) {
+            var result = worker.submit(() -> verifier.authorize(authorization, AgentRunAuthorization.Boundary.CLAIM));
+            assertTrue(entered.await(10, TimeUnit.SECONDS));
+            ledger.cancel(ACTOR, new CancelAgentRunCommand(run.runId(), "cancel-authorization", run.revision(), "test"));
+            release.countDown();
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, result.get(10, TimeUnit.SECONDS));
+        } finally { release.countDown(); }
+    }
+
+    @Test void actual_adk_executor_rechecks_the_grant_before_model_invocation() throws Exception {
+        var deniedRun = submitModel("grant-model-denied");
+        var rbac = mock(top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient.class);
+        when(rbac.decide(any(), any())).thenAnswer(invocation -> decision(invocation.getArgument(0), invocation.getArgument(1)))
+                .thenThrow(new top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient.ExecutionAuthorizationDeniedException());
+        var streams = new java.util.concurrent.atomic.AtomicInteger();
+        var model = mock(org.springframework.ai.chat.model.ChatModel.class);
+        when(model.getOptions()).thenReturn(org.springframework.ai.model.tool.ToolCallingChatOptions.builder().model("fixture-model").build());
+        when(model.stream(any(org.springframework.ai.chat.prompt.Prompt.class))).thenAnswer(invocation -> reactor.core.publisher.Flux.defer(() -> {
+            streams.incrementAndGet();
+            var generation = new org.springframework.ai.chat.model.Generation(new org.springframework.ai.chat.messages.AssistantMessage("done"),
+                    org.springframework.ai.chat.metadata.ChatGenerationMetadata.builder().finishReason("stop").build());
+            return reactor.core.publisher.Flux.just(new org.springframework.ai.chat.model.ChatResponse(List.of(generation),
+                    org.springframework.ai.chat.metadata.ChatResponseMetadata.builder().usage(new org.springframework.ai.chat.metadata.DefaultUsage(10, 5, 15)).build()));
+        }));
+        var validators = jakarta.validation.Validation.buildDefaultValidatorFactory();
+        var scheduler = Executors.newScheduledThreadPool(2, task -> Thread.ofPlatform().daemon().name("grant-test-control").unstarted(task));
+        try (var verifier = authorizer(rbac)) {
+            var flowFactory = new top.egon.cola.component.agentflow.runtime.AgentFlowFactory(
+                    new top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory(),
+                    new top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory(List.of(
+                            new top.egon.cola.component.agentflow.workflow.SequentialAgentWorkflowBuilderStrategy(),
+                            new top.egon.cola.component.agentflow.workflow.ParallelAgentWorkflowBuilderStrategy(),
+                            new top.egon.cola.component.agentflow.workflow.LoopAgentWorkflowBuilderStrategy())));
+            var validator = new top.egon.cola.component.agentflow.config.AgentFlowConfigValidator(
+                    new top.egon.cola.component.common.core.validation.ValidationUtils(validators.getValidator()));
+            var estimator = new top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator() {
+                @Override public Estimate estimate(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmRequest request) {
+                    return new Estimate(20, 30, new BigDecimal("0.10"));
+                }
+                @Override public ContextWindow contextWindow(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmRequest request) {
+                    return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
+                            snapshot.definition().dependencies().policyVersionRef(), 100_000, 10);
+                }
+                @Override public top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement actualUsage(
+                        top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmResponse response) {
+                    return new top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05"));
+                }
+            };
+            var executor = new top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor(ledger, flowFactory, validator,
+                    Map.of("fixtureModel", model), Map.of(), scheduler, estimator, null, false, verifier);
+            var denied = executor.executeQueued(ACTOR, new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(deniedRun.runId()));
+            assertEquals(AgentRunStatusEnum.SUSPENDED, denied.status()); assertEquals("AUTHORIZATION_DENIED", denied.waitReason());
+            assertEquals(0, streams.get()); verify(rbac, times(2)).decide(any(), any());
+            doAnswer(invocation -> decision(invocation.getArgument(0), invocation.getArgument(1))).when(rbac).decide(any(), any());
+            var allowedRun = submitModel("grant-model-allowed");
+            assertEquals(AgentRunStatusEnum.COMPLETED, executor.executeQueued(ACTOR,
+                    new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(allowedRun.runId())).status());
+            assertEquals(1, streams.get());
+        } finally { scheduler.shutdownNow(); validators.close(); }
+    }
+
     @Test void cancellation_during_remote_issue_cannot_publish_a_late_ticket() throws Exception {
         var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
         doAnswer(invocation -> { entered.countDown(); assertTrue(release.await(10, TimeUnit.SECONDS)); return issued(invocation.getArgument(0)); })
@@ -201,6 +287,22 @@ class TianjiGrantSubmissionPostgresTest {
                 .withBean("jacksonObjectMapper", com.fasterxml.jackson.databind.ObjectMapper.class, com.fasterxml.jackson.databind.ObjectMapper::new);
         runner.run(context -> { assertNull(context.getStartupFailure()); assertNotNull(context.getBean(TianjiExecutionGrantIssuer.class)); });
         verify(oauth, never()).authorize(any());
+        var rbac = new top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties();
+        rbac.setSystemCode("tianji"); rbac.getAuthorization().setEndpoint("https://rbac.example");
+        rbac.getAuthorization().getServiceToken().setResourceUri("https://api.example/rbac");
+        runner.withUserConfiguration(TianjiExecutionAuthorizationConfiguration.class)
+                .withPropertyValues("stellar.tianji.agent.execution-authorization.enabled=true")
+                .withBean(top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties.class, () -> rbac)
+                .run(context -> {
+                    assertNull(context.getStartupFailure());
+                    assertNotNull(context.getBean(top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.class));
+                });
+        verify(oauth, never()).authorize(any());
+        var contexts = org.mockito.ArgumentCaptor.forClass(top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRequest.class);
+        verify(oauth, atLeast(2)).authorizationKey(contexts.capture());
+        assertTrue(contexts.getAllValues().stream().anyMatch(value -> value.registrationId().equals("registration")
+                && value.tenantId().equals("50001") && value.audience().equals(URI.create("https://api.example/rbac"))
+                && value.scopes().equals(Set.of(top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract.SERVICE_SCOPE))));
         String missingUrl = System.getProperty("tianji.grant.missing.postgres.test.url");
         assertNotNull(missingUrl);
         assertTrue(missingUrl.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}"));
@@ -212,6 +314,38 @@ class TianjiGrantSubmissionPostgresTest {
 
     private static StartAgentRunCommand command(String key, String session) {
         return new StartAgentRunCommand("review", 1, session, key, null, null, new AgentInputDTO("input", List.of(), Map.of()), null);
+    }
+    private AgentRunDTO submit(String key) throws Exception {
+        String body = mvc.perform(post("/api/tianji/v1/agent-runs").contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsBytes(command(key, null)))).andExpect(status().isAccepted())
+                .andReturn().getResponse().getContentAsString();
+        return json.readValue(body, AgentRunDTO.class);
+    }
+
+    private AgentRunDTO submitModel(String key) throws Exception {
+        var command = new StartAgentRunCommand("model", 1, null, key, null, null, new AgentInputDTO("input", List.of(), Map.of()), null);
+        String body = mvc.perform(post("/api/tianji/v1/agent-runs").contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsBytes(command))).andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        return json.readValue(body, AgentRunDTO.class);
+    }
+
+    private static TianjiExecutionGrantAuthorizer authorizer(
+            top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient client) {
+        var registry = mock(TrustedIssuerRegistry.class);
+        var trust = new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER, URI.create("https://idp.example/jwks"), "tenant:50001",
+                TrustedIssuerRegistry.RealmType.TENANT, "50001", TrustedIssuerRegistry.Status.ACTIVE, 1);
+        when(registry.findByIssuer(ISSUER.toString())).thenReturn(Optional.of(trust));
+        return new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", registry,
+                Map.of(ACTOR.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "50001", client)),
+                Duration.ofSeconds(5), 2, java.time.Clock.systemUTC());
+    }
+
+    private static top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract.Decision decision(
+            top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract.Request request,
+            top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient.Expectation expected) {
+        return new top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract.Decision(request.grantId(),
+                expected.issuer().toString(), expected.tenantId(), expected.subject(), expected.resource().toString(), expected.purpose(),
+                expected.intentId(), expected.bindingSha256(), expected.sessionRequired(), expected.deadlineAt(), Instant.now().plusSeconds(20), 1, 1);
     }
     private static ExecutionGrantContract.Issued issued(ExecutionGrantContract.IssueRequest request) {
         String decimal = new BigInteger(request.intentId().replace("-", ""), 16).toString();
