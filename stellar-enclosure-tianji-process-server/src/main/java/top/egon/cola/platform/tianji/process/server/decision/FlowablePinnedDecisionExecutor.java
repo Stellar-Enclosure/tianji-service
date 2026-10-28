@@ -13,26 +13,21 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
-import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
 import javax.sql.DataSource;
 import java.io.IOException;
 import java.io.InputStream;
-import java.math.BigDecimal;
-import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /** Internal adapter; its binding must be loaded from an already authorized tenant-scoped release. */
 public final class FlowablePinnedDecisionExecutor {
-    private static final long MAX_INTEGER = 999_999_999_999_999L;
     private static final int MAX_XML_BYTES = 512 * 1024;
     private final SpringDmnEngineConfiguration engine;
     private final TransactionTemplate transaction;
@@ -51,7 +46,7 @@ public final class FlowablePinnedDecisionExecutor {
 
     public Result evaluate(Binding binding, Map<String, Object> inputs) {
         Objects.requireNonNull(binding, "binding");
-        Map<String, Object> checked = values(binding.model().inputs(), inputs, false);
+        Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
         return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked)));
     }
 
@@ -86,60 +81,11 @@ public final class FlowablePinnedDecisionExecutor {
         List<Map<String, Object>> rows = new ArrayList<>();
         if (audit.getDecisionResult() != null) {
             if (audit.getDecisionResult().size() > 256) throw new IllegalStateException("Decision evaluation failed");
-            for (Map<String, Object> result : audit.getDecisionResult()) rows.add(values(binding.model().outputs(), result, true));
+            for (Map<String, Object> result : audit.getDecisionResult()) rows.add(ProcessValues.outputs(binding.model().outputs(), result));
         }
         List<Integer> matchedRules = audit.getRuleExecutions().values().stream()
                 .filter(rule -> Boolean.TRUE.equals(rule.isValid())).map(rule -> rule.getRuleNumber()).sorted().toList();
         return new Result(binding.definitionId(), binding.definitionVersion(), rows, matchedRules);
-    }
-
-    private static Map<String, Object> values(Map<String, ValueType> schema, Map<String, Object> values, boolean output) {
-        if (values == null || !schema.keySet().equals(values.keySet())) throw invalidValues(output);
-        Map<String, Object> checked = new LinkedHashMap<>();
-        schema.forEach((key, type) -> {
-            Object value = values.get(key);
-            if (type == ValueType.STRING && value instanceof String text && safeText(text)) checked.put(key, text);
-            else if (type == ValueType.BOOLEAN && value instanceof Boolean flag) checked.put(key, flag);
-            else if (type == ValueType.INTEGER) checked.put(key, integer(value, output));
-            else throw invalidValues(output);
-        });
-        return Map.copyOf(checked);
-    }
-
-    private static Long integer(Object value, boolean output) {
-        try {
-            long number;
-            if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
-                number = ((Number) value).longValue();
-            } else if (value instanceof BigInteger integer) number = integer.longValueExact();
-            else if (output && value instanceof BigDecimal decimal) number = decimal.longValueExact();
-            else if (output && (value instanceof Float || value instanceof Double)) {
-                double decimal = ((Number) value).doubleValue();
-                if (!Double.isFinite(decimal) || decimal != Math.rint(decimal)
-                        || decimal < -MAX_INTEGER || decimal > MAX_INTEGER) throw invalidValues(true);
-                number = (long) decimal;
-            } else throw invalidValues(output);
-            if (number < -MAX_INTEGER || number > MAX_INTEGER) throw invalidValues(output);
-            return number;
-        } catch (ArithmeticException failure) {
-            throw invalidValues(output);
-        }
-    }
-
-    private static boolean safeText(String value) {
-        if (value.length() > 1_024 || value.getBytes(StandardCharsets.UTF_8).length > 4_096) return false;
-        for (int i = 0; i < value.length(); i++) {
-            char character = value.charAt(i);
-            if (character == '\0' || Character.isLowSurrogate(character)
-                    || Character.isHighSurrogate(character)
-                    && (i + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++i)))) return false;
-        }
-        return true;
-    }
-
-    private static RuntimeException invalidValues(boolean output) {
-        return output ? new IllegalStateException("Decision evaluation failed")
-                : new IllegalArgumentException("Decision inputs do not match the release schema");
     }
 
     private static IllegalArgumentException unavailable() {

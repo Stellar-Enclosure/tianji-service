@@ -52,6 +52,8 @@ The internal `ProcessReleaseService` atomically deploys validated BPMN/DMN resou
 
 The platform release/command tables have a separate migration at `db/tianji-process/V1__create_process_release_store.sql`; use the `tianji_process_schema_history` Flyway history for this location, distinct from Outbox's history and Flowable's own schema history. Because the shared schema already contains engine and Outbox tables, the isolated integration test explicitly creates the new history with a version-0 baseline before applying platform V1. Production provisioning requires an operator-controlled equivalent after checking the target history and platform tables; the application still performs no automatic migration.
 
+The internal `ProcessExecutionService` starts a process by the exact tenant-scoped release binding after rechecking its deployed model and input schema. The start receipt and Flowable instance commit together; the same actor and command ID replay the existing instance, while changed input conflicts. Its query is restricted to the initiating actor and tenant and uses synchronous Flowable instance history for completed or cancelled instances. Publishing, starting and querying still require authorization at a future external boundary; no process HTTP or SDK endpoint is enabled yet.
+
 For a JDK 25 environment with the Stellar-Enclosure platform parent and Components BOM available in Maven, run this from the repository root. It builds the sibling Components, Tianquan-Shoubing and Tianquan-Jianshen checkouts and Tianji in one reactor without installing or publishing artifacts:
 
 ```bash

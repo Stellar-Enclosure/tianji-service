@@ -45,6 +45,7 @@ import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
@@ -111,6 +112,15 @@ class ProcessServerPostgresTest {
                 """);
         jdbc.execute("CREATE TRIGGER test_release_failure BEFORE INSERT ON tianji_process.tianji_process_release_definition "
                 + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_release_failure()");
+        jdbc.execute("""
+                CREATE FUNCTION tianji_process.test_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.command_id = 'rollback-command' THEN RAISE EXCEPTION 'forced receipt failure'; END IF;
+                  RETURN NEW;
+                END $$
+                """);
+        jdbc.execute("CREATE TRIGGER test_receipt_failure BEFORE UPDATE ON tianji_process.tianji_process_command_receipt "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_receipt_failure()");
         String runtimeUser = System.getProperty("tianji.process.postgres.test.runtime-user", "");
         if (!runtimeUser.matches("tianji_it_runtime_[0-9a-f]{12}")) {
             throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
@@ -174,6 +184,7 @@ class ProcessServerPostgresTest {
             byte[] bpmn = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
             byte[] dmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
             verifyReleaseTransactions(app, jdbc, validator, bpmn, dmn);
+            verifyProcessStarts(app, jdbc, validator);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
             app.getBean(CmmnRepositoryService.class).createDeployment().tenantId(TENANT)
@@ -487,6 +498,102 @@ class ProcessServerPostgresTest {
 
     private static ProcessReleaseService.Definition definition(ProcessReleaseService.Release release, Type type) {
         return release.definitions().stream().filter(item -> item.type() == type).findFirst().orElseThrow();
+    }
+
+    private static void verifyProcessStarts(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
+                                            ProcessModelValidator validator) throws Exception {
+        var engine = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        var service = new ProcessExecutionService(engine, dmn, validator);
+        var actor = new ProcessActor(20, ProcessActor.SubjectType.USER, "alice");
+        var other = new ProcessActor(20, ProcessActor.SubjectType.USER, "bob");
+        var foreign = new ProcessActor(21, ProcessActor.SubjectType.USER, "alice");
+        var request = new ProcessExecutionService.StartCommand("release-one", "baseline", "order-1", "command-1",
+                "correlation-1", Map.of("amount", 10));
+        var started = service.start(actor, request);
+        assertEquals(ProcessExecutionService.State.ACTIVE, started.state());
+        assertEquals("order-1", started.businessKey());
+        assertEquals("correlation-1", started.correlationId());
+        assertEquals(started, service.get(actor, started.instanceId()));
+        var replay = new ProcessExecutionService.StartCommand("release-one", "baseline", "order-1", "command-1",
+                "correlation-1", Map.of("amount", 10L));
+        assertEquals(started, service.start(actor, replay));
+        assertEquals(10L, engine.getRuntimeService().getVariable(started.instanceId(), "amount"));
+        assertThrows(IllegalStateException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("release-one", "baseline", "order-1", "command-1",
+                        "correlation-1", Map.of("amount", 11))));
+        assertThrows(IllegalStateException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("release-one", "baseline", "order-1", "command-1",
+                        "another-correlation", Map.of("amount", 10))));
+        assertThrows(IllegalArgumentException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("release-one", "baseline", "order-1", "invalid-input",
+                        "correlation-1", Map.of("amount", 10.0))));
+        assertEquals(assertThrows(IllegalArgumentException.class, () -> service.get(other, started.instanceId())).getMessage(),
+                assertThrows(IllegalArgumentException.class, () -> service.get(foreign, started.instanceId())).getMessage());
+        var otherStarted = service.start(other, request);
+        assertNotEquals(started.instanceId(), otherStarted.instanceId());
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_id='invalid-input'", Integer.class));
+
+        long previous = engine.getRuntimeService().createProcessInstanceQuery().processInstanceBusinessKey("rollback-order").count();
+        assertThrows(RuntimeException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("release-one", "baseline", "rollback-order", "rollback-command",
+                        "correlation-rollback", Map.of("amount", 10))));
+        assertEquals(previous, engine.getRuntimeService().createProcessInstanceQuery().processInstanceBusinessKey("rollback-order").count());
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_id='rollback-command'", Integer.class));
+
+        var releases = new ProcessReleaseService(engine, dmn, validator);
+        byte[] baseline = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
+        var corruptRelease = releases.publish(actor, "corrupt-release", List.of(new ProcessReleaseService.ModelResource(
+                Type.BPMN, "baseline", baseline, Map.of("amount", ValueType.INTEGER))));
+        var bound = definition(corruptRelease, Type.BPMN);
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET model_sha256=? "
+                + "WHERE tenant_id=20 AND release_key='corrupt-release'", "0".repeat(64));
+        assertThrows(IllegalArgumentException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("corrupt-release", "baseline", "tamper-order", "tamper-hash",
+                        "tamper-correlation", Map.of("amount", 10))));
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET model_sha256=?, engine_version=? "
+                + "WHERE tenant_id=20 AND release_key='corrupt-release'", bound.modelSha256(), bound.engineVersion() + 100);
+        assertThrows(IllegalArgumentException.class, () -> service.start(actor,
+                new ProcessExecutionService.StartCommand("corrupt-release", "baseline", "tamper-order", "tamper-version",
+                        "tamper-correlation", Map.of("amount", 10))));
+        assertEquals(0, engine.getRuntimeService().createProcessInstanceQuery().processInstanceBusinessKey("tamper-order").count());
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_id IN ('tamper-hash','tamper-version')", Integer.class));
+
+        var concurrent = new ProcessExecutionService.StartCommand("release-one", "baseline", "order-concurrent", "command-concurrent",
+                "correlation-concurrent", Map.of("amount", 10));
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            CountDownLatch gate = new CountDownLatch(1);
+            List<Future<ProcessExecutionService.Snapshot>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < 8; i++) futures.add(pool.submit(() -> { gate.await(); return service.start(actor, concurrent); }));
+            gate.countDown();
+            var first = futures.getFirst().get(20, TimeUnit.SECONDS);
+            for (Future<ProcessExecutionService.Snapshot> future : futures) assertEquals(first, future.get(20, TimeUnit.SECONDS));
+            assertEquals(1, engine.getRuntimeService().createProcessInstanceQuery().processInstanceBusinessKey("order-concurrent").count());
+        }
+
+        String instant = """
+                <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:test">
+                  <process id="instant" isExecutable="true"><startEvent id="start"/>
+                    <sequenceFlow id="flow" sourceRef="start" targetRef="end"/><endEvent id="end"/>
+                  </process>
+                </definitions>
+                """;
+        releases.publish(actor, "instant-release", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "instant",
+                instant.getBytes(StandardCharsets.UTF_8), Map.of())));
+        var instantRequest = new ProcessExecutionService.StartCommand("instant-release", "instant", "instant-order",
+                "instant-command", "instant-correlation", Map.of());
+        var completed = service.start(actor, instantRequest);
+        assertEquals(ProcessExecutionService.State.COMPLETED, completed.state());
+        assertNotNull(completed.finishedAt());
+        assertEquals(completed, service.start(actor, instantRequest));
+
+        engine.getRuntimeService().deleteProcessInstance(started.instanceId(), "cancelled in test");
+        assertEquals(ProcessExecutionService.State.CANCELLED, service.get(actor, started.instanceId()).state());
+        assertEquals(started.instanceId(), service.start(actor, request).instanceId());
+        assertEquals(ProcessExecutionService.State.CANCELLED, service.start(actor, request).state());
     }
 
     private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {
