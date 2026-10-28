@@ -9,6 +9,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentExecutionGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
@@ -23,7 +24,7 @@ public class TianjiExecutionGrantConfiguration {
             throw new IllegalStateException("TIANJI_EXECUTION_GRANT_REQUIRES_AGENT_API");
         }
         var store = new AgentExecutionGrantStore(dataSource, ledger);
-        store.requireSchema();
+        new AgentStorageVerifier(dataSource).verify();
         return store;
     }
 
