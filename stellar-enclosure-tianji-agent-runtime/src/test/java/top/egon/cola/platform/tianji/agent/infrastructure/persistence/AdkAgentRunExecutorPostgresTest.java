@@ -29,6 +29,7 @@ import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import reactor.core.publisher.Flux;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
@@ -49,6 +50,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentFlowImportOpt
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.LegacyAgentFlowImporter;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -60,6 +62,7 @@ import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -75,6 +78,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 import static top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.SubjectType.USER;
@@ -418,6 +422,135 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void persistent_session_executor_restores_prior_turn_and_releases_its_lease() {
+        TrustedAgentActor actor = actor();
+        PostgresAdkSessionService sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "conversation").blockingGet();
+        ledger.publish(actor, singleSpec("conversation"));
+        FixtureModel model = new FixtureModel();
+        List<List<String>> prompts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        model.script = prompt -> {
+            prompts.add(prompt.getInstructions().stream().map(message -> message.getText()).filter(java.util.Objects::nonNull).toList());
+            return FixtureModel.textStream(prompts.size() == 1 ? "FIRST answer" : "SECOND answer");
+        };
+        AdkAgentRunExecutor worker = sessionExecutor(model);
+        AgentRunDTO first = ledger.start(actor, new StartAgentRunCommand("conversation", 1, "conversation", "turn-1",
+                null, null, new AgentInputDTO("first question", List.of(), Map.of()), null));
+        assertEquals(COMPLETED, worker.executeQueued(actor, new GetAgentRunQuery(first.runId())).status());
+        AgentRunDTO second = ledger.start(actor, new StartAgentRunCommand("conversation", 1, "conversation", "turn-2",
+                null, null, new AgentInputDTO("second question", List.of(), Map.of()), null));
+        assertEquals(COMPLETED, worker.executeQueued(actor, new GetAgentRunQuery(second.runId())).status());
+        assertEquals(2, prompts.size());
+        assertTrue(prompts.get(1).containsAll(List.of("first question", "FIRST answer", "second question")));
+        var saved = sessions.getSession("tianji", sessions.adkUserId(), "conversation", java.util.Optional.empty()).blockingGet();
+        assertTrue(saved.immutableEvents().size() >= 4);
+        assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_session_lease
+                WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji'
+                  AND session_id='conversation' AND lease_owner IS NOT NULL
+                """, Integer.class, actor.tenantId(), actor.subjectId()));
+    }
+
+    @Test
+    void a_busy_persistent_session_fails_the_second_run_before_another_model_call() throws Exception {
+        TrustedAgentActor actor = actor();
+        PostgresAdkSessionService sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "busy-session").blockingGet();
+        ledger.publish(actor, singleSpec("busy-session", policy(Duration.ofSeconds(20), Duration.ofSeconds(10))));
+        FixtureModel model = new FixtureModel();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelled = new CountDownLatch(1);
+        model.script = prompt -> Flux.<ChatResponse>never().doOnSubscribe(ignored -> started.countDown()).doOnCancel(cancelled::countDown);
+        AdkAgentRunExecutor worker = sessionExecutor(model);
+        AgentRunDTO first = ledger.start(actor, new StartAgentRunCommand("busy-session", 1, "busy-session", "first",
+                null, null, new AgentInputDTO("first", List.of(), Map.of()), null));
+        AgentRunDTO second = ledger.start(actor, new StartAgentRunCommand("busy-session", 1, "busy-session", "second",
+                null, null, new AgentInputDTO("second", List.of(), Map.of()), null));
+        try (var pool = Executors.newSingleThreadExecutor()) {
+            Future<AgentRunDTO> active = pool.submit(() -> worker.executeQueued(actor, new GetAgentRunQuery(first.runId())));
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            AgentRunDTO rejected = worker.executeQueued(actor, new GetAgentRunQuery(second.runId()));
+            assertEquals(FAILED, rejected.status());
+            assertEquals("TIANJI_SESSION_BUSY", ledger.getResult(actor, new GetAgentRunQuery(second.runId())).orElseThrow().errorCode());
+            assertEquals("NONE", ledger.getResult(actor, new GetAgentRunQuery(second.runId())).orElseThrow().sideEffectOutcome());
+            assertEquals(1, model.streams.get());
+            JdbcTemplate jdbc = new JdbcTemplate(PostgresTestDatabase.dataSource());
+            Timestamp initialExpiry = jdbc.queryForObject("""
+                    SELECT lease_expires_at FROM tianji_agent.agent_session_lease
+                    WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji' AND session_id='busy-session'
+                    """, Timestamp.class, actor.tenantId(), actor.subjectId());
+            assertNotNull(initialExpiry);
+            await().atMost(Duration.ofSeconds(5)).until(() -> Boolean.TRUE.equals(jdbc.queryForObject("""
+                    SELECT lease_expires_at > ? FROM tianji_agent.agent_session_lease
+                    WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji' AND session_id='busy-session'
+                    """, Boolean.class, initialExpiry, actor.tenantId(), actor.subjectId())));
+            AgentRunDTO current = ledger.get(actor, new GetAgentRunQuery(first.runId()));
+            ledger.cancel(actor, new CancelAgentRunCommand(first.runId(), "stop-busy", current.revision(), "test"));
+            assertEquals(CANCELLED, active.get(10, TimeUnit.SECONDS).status());
+            assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void session_lease_loss_stops_the_model_and_does_not_finish_the_run_as_success() throws Exception {
+        TrustedAgentActor actor = actor();
+        PostgresAdkSessionService sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "lost-lease").blockingGet();
+        ledger.publish(actor, singleSpec("lost-lease", policy(Duration.ofSeconds(20), Duration.ofSeconds(10))));
+        FixtureModel model = new FixtureModel();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelled = new CountDownLatch(1);
+        model.script = prompt -> Flux.<ChatResponse>never().doOnSubscribe(ignored -> started.countDown()).doOnCancel(cancelled::countDown);
+        AgentRunDTO queued = ledger.start(actor, new StartAgentRunCommand("lost-lease", 1, "lost-lease", "run",
+                null, null, new AgentInputDTO("question", List.of(), Map.of()), null));
+        try (var pool = Executors.newSingleThreadExecutor()) {
+            Future<AgentRunDTO> active = pool.submit(() -> sessionExecutor(model).executeQueued(actor, new GetAgentRunQuery(queued.runId())));
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+            new JdbcTemplate(PostgresTestDatabase.dataSource()).update("""
+                    UPDATE tianji_agent.agent_session_lease SET lease_expires_at=clock_timestamp()-interval '1 second'
+                    WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji' AND session_id='lost-lease'
+                    """, actor.tenantId(), actor.subjectId());
+            java.util.concurrent.ExecutionException failure = assertThrows(java.util.concurrent.ExecutionException.class,
+                    () -> active.get(10, TimeUnit.SECONDS));
+            assertInstanceOf(AgentLedgerException.class, failure.getCause());
+            assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, ((AgentLedgerException) failure.getCause()).code());
+            assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+            assertEquals(RUNNING, ledger.get(actor, new GetAgentRunQuery(queued.runId())).status());
+            assertTrue(ledger.getResult(actor, new GetAgentRunQuery(queued.runId())).isEmpty());
+        }
+    }
+
+    @Test
+    void persistent_session_is_released_after_the_run_deadline() throws Exception {
+        TrustedAgentActor actor = actor();
+        PostgresAdkSessionService sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "timeout-session").blockingGet();
+        ledger.publish(actor, singleSpec("timeout-session", policy(Duration.ofSeconds(3), Duration.ofSeconds(10))));
+        FixtureModel model = new FixtureModel();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch cancelled = new CountDownLatch(1);
+        model.script = prompt -> Flux.<ChatResponse>never().doOnSubscribe(ignored -> started.countDown()).doOnCancel(cancelled::countDown);
+        AgentRunDTO queued = ledger.start(actor, new StartAgentRunCommand("timeout-session", 1, "timeout-session", "run",
+                null, null, new AgentInputDTO("question", List.of(), Map.of()), null));
+        assertEquals(TIMED_OUT, sessionExecutor(model).executeQueued(actor, new GetAgentRunQuery(queued.runId())).status());
+        assertTrue(started.await(1, TimeUnit.SECONDS));
+        assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+        assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_session_lease
+                WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji'
+                  AND session_id='timeout-session' AND lease_owner IS NOT NULL
+                """, Integer.class, actor.tenantId(), actor.subjectId()));
+    }
+
+    @Test
+    void rejects_session_storage_bound_to_a_different_datasource() {
+        FixtureModel model = new FixtureModel();
+        DriverManagerDataSource other = new DriverManagerDataSource(PostgresTestDatabase.dataSource().getUrl());
+        assertThrows(IllegalArgumentException.class, () -> new AdkAgentRunExecutor(ledger, flowFactory, validator,
+                Map.of("fixtureModel", model), Map.of(), controlExecutor, estimator(), other));
+    }
+
+    @Test
     void keeps_a_large_multibyte_final_report_complete() {
         FixtureModel model = new FixtureModel();
         String report = "研".repeat(200_000);
@@ -646,6 +779,11 @@ class AdkAgentRunExecutorPostgresTest {
                     ? extends com.google.adk.agents.BaseAgent>> factories) {
         return new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model), factories,
                 controlExecutor, estimator());
+    }
+
+    private static AdkAgentRunExecutor sessionExecutor(FixtureModel model) {
+        return new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model), Map.of(),
+                controlExecutor, estimator(), PostgresTestDatabase.dataSource());
     }
 
     private static AgentDefinitionSpecDTO configSpec(String workflow, ExecutionPolicyDTO policy, String key) {

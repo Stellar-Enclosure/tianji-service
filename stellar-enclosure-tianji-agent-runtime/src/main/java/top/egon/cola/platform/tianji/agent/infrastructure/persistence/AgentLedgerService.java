@@ -49,12 +49,13 @@ import java.time.DateTimeException;
  * this service is not an HTTP entry point and is not automatically enabled.
  */
 public final class AgentLedgerService {
+    private final DataSource dataSource;
     private final JdbcAgentLedgerRepository repository;
     private final AgentJsonCodec json = new AgentJsonCodec();
     private final TransactionTemplate transaction;
     private final AgentBudgetService budgetService;
     public AgentLedgerService(DataSource dataSource) {
-        Objects.requireNonNull(dataSource, "dataSource");
+        this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.repository = new JdbcAgentLedgerRepository(new JdbcTemplate(dataSource), json);
         this.transaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         this.transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
@@ -70,6 +71,11 @@ public final class AgentLedgerService {
 
     public AgentBudgetService budgets() {
         return budgetService;
+    }
+
+    /** Session and run fencing must use the exact same transaction-bound DataSource. */
+    public boolean usesDataSource(DataSource candidate) {
+        return dataSource == candidate;
     }
 
     public Instant databaseNow() {
