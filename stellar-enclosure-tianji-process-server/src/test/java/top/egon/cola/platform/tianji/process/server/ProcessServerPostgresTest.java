@@ -174,11 +174,18 @@ class ProcessServerPostgresTest {
         Integer version2Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class);
         Flyway upgraded = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
                 .table("tianji_process_schema_history").baselineVersion("0")
-                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-process").target("3").cleanDisabled(true).load();
         assertEquals(1, upgraded.migrate().migrationsExecuted);
         upgraded.validate();
+        Integer version3Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class);
+        Flyway workerSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+        assertEquals(1, workerSchema.migrate().migrationsExecuted);
+        workerSchema.validate();
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
         assertEquals(version2Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class));
+        assertEquals(version3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class));
         assertEquals(legacyInstance, jdbc.queryForObject("SELECT resource_id FROM tianji_process.tianji_process_command_receipt "
                 + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
         assertNull(jdbc.queryForObject("SELECT decision_result::text FROM tianji_process.tianji_process_command_receipt "

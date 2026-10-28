@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.List;
 import java.util.Set;
 import java.util.zip.CRC32;
 
@@ -20,6 +21,7 @@ public final class ProcessApiSchemaVerifier {
     private static final String RELEASE = "tianji_process_release";
     private static final String DEFINITION = "tianji_process_release_definition";
     private static final String RECEIPT = "tianji_process_command_receipt";
+    private static final String WORKER = "tianji_worker_lease_receipt";
     private final JdbcTemplate jdbc;
     private final String schema;
 
@@ -37,6 +39,23 @@ public final class ProcessApiSchemaVerifier {
             verifyReceiptIndex();
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Process API schema verification failed", failure);
+        }
+    }
+
+    /** Worker activation also requires the separately deployed V4 lease schema. */
+    public void verifyWorker() {
+        verify();
+        try {
+            int expectedChecksum = checksum("V4__add_worker_lease_receipts.sql");
+            List<Boolean> versions = jdbc.query("SELECT success,checksum FROM \"" + schema + "\".tianji_process_schema_history "
+                            + "WHERE version='4' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
+                            && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+            if (versions.size() != 1 || !versions.getFirst()) throw invalid();
+            verifyWorkerColumns();
+            verifyWorkerConstraints();
+            verifyWorkerIndex();
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Worker lease schema verification failed", failure);
         }
     }
 
@@ -142,6 +161,93 @@ public final class ProcessApiSchemaVerifier {
                   AND pg_get_indexdef(i.indexrelid) LIKE '% (tenant_id, resource_id) WHERE %'
                   AND pg_get_expr(i.indpred, i.indrelid)=?
                 """, Integer.class, schema, "(((command_type)::text = 'START'::text) AND ((state)::text = 'APPLIED'::text))");
+        if (count == null || count != 1) throw invalid();
+    }
+
+    private void verifyWorkerColumns() {
+        Map<String, Column> expected = Map.ofEntries(
+                column(WORKER, "token_sha256", "character(64)", true, true),
+                column(WORKER, "tenant_id", "bigint", true, false),
+                column(WORKER, "subject_issuer", "character(64)", true, true),
+                column(WORKER, "subject_id", "character varying(256)", true, true),
+                column(WORKER, "topic", "character varying(128)", true, true),
+                column(WORKER, "schema_version", "character varying(128)", true, true),
+                column(WORKER, "job_id", "character varying(255)", true, true),
+                column(WORKER, "occurrence_id", "character varying(255)", true, true),
+                column(WORKER, "scope_type", "character varying(8)", true, false),
+                column(WORKER, "scope_id", "character varying(255)", true, true),
+                column(WORKER, "release_key", "character varying(128)", true, true),
+                column(WORKER, "definition_id", "character varying(255)", true, true),
+                column(WORKER, "element_id", "character varying(128)", true, true),
+                column(WORKER, "idempotency_key", "character varying(128)", true, true),
+                column(WORKER, "model_sha256", "character(64)", true, true),
+                column(WORKER, "input_sha256", "character(64)", true, true),
+                column(WORKER, "native_owner", "character varying(255)", true, true),
+                column(WORKER, "leased_at", "timestamp with time zone", true, false),
+                column(WORKER, "lease_expires_at", "timestamp with time zone", true, false),
+                column(WORKER, "state", "character varying(24)", true, false),
+                column(WORKER, "result_sha256", "character(64)", false, true),
+                column(WORKER, "decided_at", "timestamp with time zone", false, false),
+                column(WORKER, "business_receipt_id", "character varying(255)", false, true),
+                column(WORKER, "failure_kind", "character varying(24)", false, false),
+                column(WORKER, "failure_code", "character varying(64)", false, true));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT t.relname, a.attname, format_type(a.atttypid, a.atttypmod) AS type,
+                       a.attnotnull, co.collname
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum > 0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname=? AND t.relname='tianji_worker_lease_receipt' AND t.relkind IN ('r', 'p')
+                """, rs -> {
+            actual.put(rs.getString("relname") + "." + rs.getString("attname"),
+                    new Column(rs.getString("type"), rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname"))));
+        }, schema);
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+    }
+
+    private void verifyWorkerConstraints() {
+        Map<String, String> actual = new HashMap<>();
+        boolean[] releaseForeignKey = {false};
+        jdbc.query("""
+                SELECT c.conname, c.contype, c.convalidated, pg_get_constraintdef(c.oid) AS definition,
+                       c.confrelid = to_regclass(format('%I.%I', ?, 'tianji_process_release')) AS release_target
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname=? AND t.relname='tianji_worker_lease_receipt' AND c.contype IN ('p','u','c','f')
+                """, rs -> {
+            if (!rs.getBoolean("convalidated")) throw invalid();
+            String definition = rs.getString("definition");
+            actual.put(rs.getString("conname"), definition);
+            if ("f".equals(rs.getString("contype")) && rs.getBoolean("release_target")
+                    && definition.startsWith("FOREIGN KEY (tenant_id, release_key) REFERENCES ")
+                    && definition.endsWith("(tenant_id, release_key)")) releaseForeignKey[0] = true;
+        }, schema, schema);
+        Map<String, String> expected = Map.ofEntries(
+                Map.entry("tianji_worker_lease_receipt_pkey", "PRIMARY KEY (token_sha256)"),
+                Map.entry("tianji_worker_lease_receipt_tenant_id_job_id_native_owner_key", "UNIQUE (tenant_id, job_id, native_owner)"),
+                Map.entry("tianji_worker_lease_receipt_tenant_id_check", "CHECK ((tenant_id > 0))"),
+                Map.entry("tianji_worker_lease_receipt_token_sha256_check", "CHECK ((token_sha256 ~ '^[0-9a-f]{64}$'::text))"),
+                Map.entry("tianji_worker_lease_receipt_subject_issuer_check", "CHECK ((subject_issuer ~ '^[0-9a-f]{64}$'::text))"),
+                Map.entry("tianji_worker_lease_receipt_model_sha256_check", "CHECK ((model_sha256 ~ '^[0-9a-f]{64}$'::text))"),
+                Map.entry("tianji_worker_lease_receipt_input_sha256_check", "CHECK ((input_sha256 ~ '^[0-9a-f]{64}$'::text))"),
+                Map.entry("tianji_worker_lease_receipt_result_sha256_check", "CHECK ((result_sha256 ~ '^[0-9a-f]{64}$'::text))"),
+                Map.entry("tianji_worker_lease_receipt_scope_type_check", "CHECK (((scope_type)::text = ANY ((ARRAY['BPMN'::character varying, 'CMMN'::character varying])::text[])))"),
+                Map.entry("tianji_worker_lease_receipt_state_check", "CHECK (((state)::text = ANY ((ARRAY['LEASED'::character varying, 'EXPIRED'::character varying, 'COMPLETED'::character varying, 'RETRY_SCHEDULED'::character varying, 'BUSINESS_REJECTED'::character varying, 'NEEDS_MANUAL'::character varying])::text[])))"),
+                Map.entry("tianji_worker_lease_bounds_check", "CHECK (((lease_expires_at > leased_at) AND (lease_expires_at <= (leased_at + '00:15:00'::interval))))"),
+                Map.entry("tianji_worker_lease_state_fields_check", "CHECK (((((state)::text = 'LEASED'::text) AND (decided_at IS NULL) AND (result_sha256 IS NULL) AND (business_receipt_id IS NULL) AND (failure_kind IS NULL) AND (failure_code IS NULL)) OR (((state)::text = 'EXPIRED'::text) AND (decided_at IS NOT NULL) AND (result_sha256 IS NULL) AND (business_receipt_id IS NULL) AND (failure_kind IS NULL) AND (failure_code IS NULL)) OR (((state)::text = 'COMPLETED'::text) AND (decided_at IS NOT NULL) AND (result_sha256 IS NOT NULL) AND (business_receipt_id IS NOT NULL) AND (failure_kind IS NULL) AND (failure_code IS NULL)) OR (((state)::text = 'RETRY_SCHEDULED'::text) AND (decided_at IS NOT NULL) AND (result_sha256 IS NOT NULL) AND (business_receipt_id IS NULL) AND (failure_kind IS NOT NULL) AND ((failure_kind)::text = 'RETRYABLE'::text) AND (failure_code IS NOT NULL)) OR (((state)::text = 'BUSINESS_REJECTED'::text) AND (decided_at IS NOT NULL) AND (result_sha256 IS NOT NULL) AND (business_receipt_id IS NULL) AND (failure_kind IS NOT NULL) AND ((failure_kind)::text = 'BUSINESS_REJECTED'::text) AND (failure_code IS NOT NULL)) OR (((state)::text = 'NEEDS_MANUAL'::text) AND (decided_at IS NOT NULL) AND (result_sha256 IS NOT NULL) AND (business_receipt_id IS NULL) AND (failure_kind IS NOT NULL) AND ((failure_kind)::text = ANY ((ARRAY['RETRYABLE'::character varying, 'BUSINESS_REJECTED'::character varying, 'UNKNOWN'::character varying])::text[])) AND (failure_code IS NOT NULL))))"));
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+        if (!releaseForeignKey[0]) throw invalid();
+    }
+
+    private void verifyWorkerIndex() {
+        Integer count = jdbc.queryForObject("""
+                SELECT count(*) FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
+                JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class x ON x.oid=i.indexrelid
+                WHERE n.nspname=? AND t.relname='tianji_worker_lease_receipt'
+                  AND x.relname='tianji_worker_lease_active_job_idx' AND i.indisunique AND i.indisvalid AND i.indisready
+                  AND pg_get_indexdef(i.indexrelid) LIKE '% (tenant_id, job_id) WHERE %'
+                  AND pg_get_expr(i.indpred, i.indrelid)=?
+                """, Integer.class, schema, "((state)::text = 'LEASED'::text)");
         if (count == null || count != 1) throw invalid();
     }
 
