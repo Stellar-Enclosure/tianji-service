@@ -1,10 +1,8 @@
 package top.egon.cola.platform.tianji.process.server.execution;
 
 import org.flowable.common.engine.impl.history.HistoryLevel;
-import org.flowable.common.engine.api.FlowableObjectNotFoundException;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.history.HistoricProcessInstance;
-import org.flowable.engine.repository.ProcessDefinition;
 import org.flowable.engine.runtime.ProcessInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -18,14 +16,10 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidato
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Release;
+import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,9 +27,8 @@ import java.util.Objects;
 
 /** Internal process entry point; the caller must authenticate and authorize the supplied actor. */
 public final class ProcessExecutionService {
-    private static final int MAX_XML_BYTES = 512 * 1024;
     private final SpringProcessEngineConfiguration engine;
-    private final ProcessModelValidator validator;
+    private final VerifiedProcessModels models;
     private final ProcessReleaseService releases;
     private final ProcessCommandReceiptStore receipts;
     private final TransactionTemplate write;
@@ -44,7 +37,7 @@ public final class ProcessExecutionService {
     public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                    ProcessModelValidator validator) {
         this.engine = Objects.requireNonNull(engine, "engine");
-        this.validator = Objects.requireNonNull(validator, "validator");
+        this.models = new VerifiedProcessModels(engine, dmn, validator);
         this.releases = new ProcessReleaseService(engine, dmn, validator);
         if (!(engine.getTransactionManager() instanceof DataSourceTransactionManager manager)
                 || engine.getRuntimeService() == null || engine.getHistoryService() == null
@@ -87,7 +80,7 @@ public final class ProcessExecutionService {
                     || !command.correlationId().equals(existing.correlationId())) throw unavailable();
             return snapshot(actor, existing);
         }
-        validateDefinition(actor.tenantId(), binding);
+        models.process(actor.tenantId(), binding);
         ProcessInstance instance = engine.getRuntimeService().createProcessInstanceBuilder()
                 .processDefinitionId(binding.engineDefinitionId()).tenantId(Long.toString(actor.tenantId()))
                 .businessKey(command.businessKey()).variables(new HashMap<>(inputs)).start();
@@ -97,25 +90,6 @@ public final class ProcessExecutionService {
         }
         receipts.apply(actor, ProcessCommandReceiptStore.Kind.START, command.commandId(), instance.getId(), null);
         return snapshot(actor, receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, command.commandId()));
-    }
-
-    private void validateDefinition(long tenantId, Definition binding) {
-        var repository = engine.getRepositoryService();
-        ProcessDefinition definition = repository.createProcessDefinitionQuery().processDefinitionId(binding.engineDefinitionId())
-                .deploymentId(binding.engineDeploymentId()).processDefinitionTenantId(Long.toString(tenantId)).singleResult();
-        if (definition == null || definition.isSuspended() || definition.getVersion() != binding.engineVersion()
-                || !binding.definitionKey().equals(definition.getKey())) throw unavailable();
-        try (InputStream source = repository.getResourceAsStream(binding.engineDeploymentId(), definition.getResourceName())) {
-            if (source == null) throw unavailable();
-            byte[] xml = source.readNBytes(MAX_XML_BYTES + 1);
-            if (!hash(xml).equals(binding.modelSha256())) throw unavailable();
-            try { validator.validateBpmn(xml, binding.definitionKey()); }
-            catch (IllegalArgumentException invalid) { throw new IllegalStateException("Stored process model is invalid"); }
-        } catch (FlowableObjectNotFoundException missing) {
-            throw unavailable();
-        } catch (IOException failure) {
-            throw new IllegalStateException("Process model could not be read safely");
-        }
     }
 
     private Snapshot snapshot(ProcessActor actor, ProcessCommandReceiptStore.Receipt receipt) {
@@ -141,12 +115,6 @@ public final class ProcessExecutionService {
     private static Definition releaseDefinition(Release release, String definitionId) {
         return release.definitions().stream().filter(item -> item.type() == Type.BPMN
                 && item.engineDefinitionId().equals(definitionId)).findFirst().orElseThrow(ProcessExecutionService::unavailable);
-    }
-
-    private static String hash(byte[] value) { return HexFormat.of().formatHex(sha256().digest(value)); }
-    private static MessageDigest sha256() {
-        try { return MessageDigest.getInstance("SHA-256"); }
-        catch (NoSuchAlgorithmException failure) { throw new IllegalStateException("SHA-256 is unavailable"); }
     }
 
     private static boolean validId(String value, int max) {

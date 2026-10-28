@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <process id="approvalRouting" name="Approval routing" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toWait" sourceRef="start" targetRef="wait"/>
+        <userTask id="wait" name="Prepare"/>
+        <sequenceFlow id="toDecision" sourceRef="wait" targetRef="decide"/>
+        <serviceTask id="decide" flowable:type="dmn">
+            <extensionElements><flowable:field name="decisionTableReferenceKey"><flowable:string>baselineDecision</flowable:string></flowable:field></extensionElements>
+        </serviceTask>
+        <sequenceFlow id="toRoute" sourceRef="decide" targetRef="routing"/>
+        <exclusiveGateway id="routing" default="toStandard"/>
+        <sequenceFlow id="toReview" sourceRef="routing" targetRef="review"><conditionExpression xsi:type="tFormalExpression">${route == 'review'}</conditionExpression></sequenceFlow>
+        <sequenceFlow id="toStandard" sourceRef="routing" targetRef="standard"/>
+        <userTask id="review" name="Review"/>
+        <userTask id="standard" name="Standard"/>
+        <sequenceFlow id="reviewDone" sourceRef="review" targetRef="end"/>
+        <sequenceFlow id="standardDone" sourceRef="standard" targetRef="end"/>
+        <endEvent id="end"/>
+    </process>
+</definitions>

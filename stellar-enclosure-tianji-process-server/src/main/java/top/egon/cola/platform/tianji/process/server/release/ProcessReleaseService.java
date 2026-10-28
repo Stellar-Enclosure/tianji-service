@@ -13,6 +13,7 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -50,9 +51,15 @@ public final class ProcessReleaseService {
     private final TransactionTemplate write;
     private final TransactionTemplate read;
     private final String schema;
+    private final boolean decisionTasksEnabled;
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
+        this(process, dmn, validator, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, boolean decisionTasksEnabled) {
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -62,7 +69,10 @@ public final class ProcessReleaseService {
                 || process.getRepositoryService() == null || dmn.getDmnRepositoryService() == null
                 || process.getBeans() == null || !process.getBeans().isEmpty() || dmn.getBeans() == null || !dmn.getBeans().isEmpty()
                 || process.getDatabaseSchema() == null || !process.getDatabaseSchema().matches("[a-z_][a-z0-9_]{0,62}")
-                || !process.getDatabaseSchema().equals(dmn.getDatabaseSchema())) throw invalidConfiguration();
+                || !process.getDatabaseSchema().equals(dmn.getDatabaseSchema())
+                || decisionTasksEnabled && (!(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
+                || !dmn.isHistoryEnabled() || dmn.getDmnHistoryService() == null)) throw invalidConfiguration();
+        this.decisionTasksEnabled = decisionTasksEnabled;
         this.schema = process.getDatabaseSchema();
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
@@ -83,6 +93,19 @@ public final class ProcessReleaseService {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
         return Objects.requireNonNull(read.execute(status -> load(actor.tenantId(), releaseKey, false)));
+    }
+
+    /** Internal lookup for an already-running Flowable instance, not a caller authorization check. */
+    public Release getForProcessDefinition(long tenantId, String definitionId) {
+        if (tenantId <= 0 || definitionId == null || definitionId.isBlank() || definitionId.length() > 255) throw unavailable();
+        return Objects.requireNonNull(read.execute(status -> {
+            List<String> keys = jdbc.query("SELECT d.release_key FROM " + table("tianji_process_release_definition")
+                            + " d JOIN " + table("tianji_process_release") + " r ON r.tenant_id=d.tenant_id AND r.release_key=d.release_key "
+                            + "WHERE d.tenant_id=? AND d.model_type='BPMN' AND d.engine_definition_id=? AND r.state='ACTIVE'",
+                    (rs, row) -> rs.getString("release_key"), tenantId, definitionId);
+            if (keys.size() != 1) throw unavailable();
+            return load(tenantId, keys.getFirst(), false);
+        }));
     }
 
     private Release publishInTransaction(ProcessActor actor, String releaseKey, String manifestHash,
@@ -175,6 +198,14 @@ public final class ProcessReleaseService {
                 inputs = model.inputs();
             }
             prepared.add(new PreparedModel(model, hash(model.xml()), inputs));
+        }
+        for (PreparedModel processModel : prepared) {
+            if (processModel.model().type() != Type.BPMN || processModel.model().decisionTasks().isEmpty()) continue;
+            if (!decisionTasksEnabled) throw invalid();
+            String decisionKey = processModel.model().decisionTasks().values().iterator().next();
+            PreparedModel decision = prepared.stream().filter(item -> item.model().type() == Type.DMN
+                    && item.model().definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
+            validator.validateDecisionBinding(processModel.model(), processModel.inputs(), decision.model());
         }
         prepared.sort(Comparator.comparing((PreparedModel item) -> item.model().type().name())
                 .thenComparing(item -> item.model().definitionKey()));

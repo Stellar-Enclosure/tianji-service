@@ -58,10 +58,19 @@ public final class FlowablePinnedDecisionExecutor {
             throw new IllegalArgumentException("Decision execution reference is invalid");
         }
         Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
-        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, executionReference)));
+        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, executionReference, null)));
     }
 
-    private Result evaluateInTransaction(Binding binding, Map<String, Object> inputs, String executionReference) {
+    /** Associates a decision with its Flowable process execution in the same local transaction. */
+    public Result evaluateForProcess(Binding binding, Map<String, Object> inputs, ProcessReference reference) {
+        Objects.requireNonNull(binding, "binding");
+        Objects.requireNonNull(reference, "reference");
+        Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
+        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, null, reference)));
+    }
+
+    private Result evaluateInTransaction(Binding binding, Map<String, Object> inputs, String executionReference,
+                                         ProcessReference processReference) {
         var repository = engine.getDmnRepositoryService();
         DmnDecision definition = repository.createDecisionQuery().decisionId(binding.definitionId())
                 .deploymentId(binding.deploymentId()).decisionVersion(binding.definitionVersion())
@@ -82,6 +91,10 @@ public final class FlowablePinnedDecisionExecutor {
         if (executionReference != null) {
             context.setInstanceId(executionReference);
             context.setScopeType("tianji-decision");
+        } else if (processReference != null) {
+            context.setInstanceId(processReference.instanceId());
+            context.setExecutionId(processReference.executionId());
+            context.setActivityId(processReference.activityId());
         }
         engine.getCommandExecutor().execute(new PinnedCommand(context, binding, engine));
         DecisionExecutionAuditContainer audit = context.getDecisionExecution();
@@ -127,6 +140,14 @@ public final class FlowablePinnedDecisionExecutor {
         public Result {
             outputs = outputs.stream().map(Map::copyOf).toList();
             matchedRuleNumbers = List.copyOf(matchedRuleNumbers);
+        }
+    }
+
+    public record ProcessReference(String instanceId, String executionId, String activityId) {
+        public ProcessReference {
+            if (!Binding.validId(instanceId) || !Binding.validId(executionId) || !Binding.validId(activityId)) {
+                throw new IllegalArgumentException("Process decision reference is invalid");
+            }
         }
     }
 

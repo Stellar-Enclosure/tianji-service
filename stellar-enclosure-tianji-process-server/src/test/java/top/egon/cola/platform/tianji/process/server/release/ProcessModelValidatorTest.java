@@ -78,6 +78,29 @@ class ProcessModelValidatorTest {
     }
 
     @Test
+    void validates_release_bound_decision_and_rejects_unsafe_routing_expressions() throws Exception {
+        String xml = new String(fixture("approval-routing.bpmn20.xml"), StandardCharsets.UTF_8);
+        var process = validator.validateBpmn(bytes(xml), "approvalRouting");
+        var decision = validator.validateDmn(fixture("baseline.dmn"), "baselineDecision");
+        assertEquals(Map.of("decide", "baselineDecision"), process.decisionTasks());
+        validator.validateDecisionBinding(process, Map.of("amount", INTEGER), decision);
+        assertThrows(IllegalArgumentException.class, () -> validator.validateDecisionBinding(process, Map.of("amount", STRING), decision));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateDecisionBinding(process, Map.of("amount", INTEGER, "route", STRING), decision));
+        var wrongRoute = validator.validateBpmn(bytes(xml.replace("route == 'review'", "amount == 10")), "approvalRouting");
+        assertThrows(IllegalArgumentException.class, () -> validator.validateDecisionBinding(wrongRoute, Map.of("amount", INTEGER), decision));
+
+        for (String unsafe : new String[] {"route.class == 'review'", "route == 'review' || true", "execution.getVariable('route') == 'review'",
+                "route == 'review' ? true : false"}) {
+            assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("route == 'review'", unsafe)), "approvalRouting"));
+        }
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("default=\"toStandard\"", "default=\"missing\"")), "approvalRouting"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("flowable:type=\"dmn\"", "flowable:type=\"http\"")), "approvalRouting"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("decisionTableReferenceKey", "fallbackToDefaultTenant")), "approvalRouting"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("baselineDecision", "${tenant}")), "approvalRouting"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("targetRef=\"decide\"", "targetRef=\"routing\"")), "approvalRouting"));
+    }
+
+    @Test
     void rejects_dmn_expression_injection_and_rule_shape_mismatches() throws Exception {
         String xml = new String(fixture("baseline.dmn"), StandardCharsets.UTF_8);
         assertThrows(IllegalArgumentException.class, () -> validator.validateDmn(bytes(xml.replace(

@@ -5,8 +5,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.flowable.dmn.api.DmnDecision;
-import org.flowable.common.engine.api.FlowableObjectNotFoundException;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -24,16 +22,12 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
+import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -42,12 +36,11 @@ import java.util.UUID;
 
 /** Standalone decision application service; the caller must authorize the trusted actor and release. */
 public final class ProcessDecisionService {
-    private static final int MAX_XML_BYTES = 512 * 1024;
     private static final int MAX_RESULT_BYTES = 1_048_576;
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
     private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() { };
     private final SpringDmnEngineConfiguration engine;
-    private final ProcessModelValidator validator;
+    private final VerifiedProcessModels models;
     private final ProcessReleaseService releases;
     private final FlowablePinnedDecisionExecutor executor;
     private final ProcessCommandReceiptStore receipts;
@@ -56,7 +49,7 @@ public final class ProcessDecisionService {
     public ProcessDecisionService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration engine,
                                   ProcessModelValidator validator) {
         this.engine = Objects.requireNonNull(engine, "engine");
-        this.validator = Objects.requireNonNull(validator, "validator");
+        this.models = new VerifiedProcessModels(process, engine, validator);
         this.releases = new ProcessReleaseService(process, engine, validator);
         this.executor = new FlowablePinnedDecisionExecutor(engine);
         if (!(engine.getTransactionManager() instanceof DataSourceTransactionManager manager)
@@ -77,7 +70,7 @@ public final class ProcessDecisionService {
         var release = releases.get(actor, command.releaseKey());
         Definition binding = release.definitions().stream().filter(item -> item.type() == Type.DMN
                 && item.definitionKey().equals(command.decisionKey())).findFirst().orElseThrow(ProcessDecisionService::unavailable);
-        ValidatedProcessModel model = loadModel(actor.tenantId(), binding);
+        ValidatedProcessModel model = models.decision(actor.tenantId(), binding);
         Map<String, Object> inputs = ProcessValues.inputs(model.inputs(), command.inputs());
         String hash = ProcessRequestDigest.hash(List.of(command.releaseKey(), command.decisionKey(), command.correlationId()), inputs);
         if (!receipts.insert(actor, ProcessCommandReceiptStore.Kind.DECISION, command.requestId(), hash,
@@ -107,28 +100,6 @@ public final class ProcessDecisionService {
         String result = encode(execution.outputs(), matched);
         receipts.apply(actor, ProcessCommandReceiptStore.Kind.DECISION, command.requestId(), executionId, result);
         return decode(receipts.lock(actor, ProcessCommandReceiptStore.Kind.DECISION, command.requestId()), binding, model);
-    }
-
-    private ValidatedProcessModel loadModel(long tenantId, Definition binding) {
-        var repository = engine.getDmnRepositoryService();
-        DmnDecision definition = repository.createDecisionQuery().decisionId(binding.engineDefinitionId())
-                .decisionTenantId(Long.toString(tenantId)).deploymentId(binding.engineDeploymentId())
-                .decisionKey(binding.definitionKey()).decisionVersion(binding.engineVersion()).singleResult();
-        if (definition == null) throw unavailable();
-        try (InputStream source = repository.getDmnResource(binding.engineDefinitionId())) {
-            if (source == null) throw unavailable();
-            byte[] xml = source.readNBytes(MAX_XML_BYTES + 1);
-            if (!hash(xml).equals(binding.modelSha256())) throw unavailable();
-            ValidatedProcessModel model;
-            try { model = validator.validateDmn(xml, binding.definitionKey()); }
-            catch (IllegalArgumentException invalid) { throw new IllegalStateException("Stored decision model is invalid"); }
-            if (!model.inputs().equals(binding.inputs())) throw unavailable();
-            return model;
-        } catch (FlowableObjectNotFoundException missing) {
-            throw unavailable();
-        } catch (IOException failure) {
-            throw new IllegalStateException("Decision model could not be read safely");
-        }
     }
 
     private static String encode(List<Map<String, Object>> rows, List<String> rules) {
@@ -179,10 +150,6 @@ public final class ProcessDecisionService {
         if (value == null || value.length() > MAX_RESULT_BYTES || value.getBytes(StandardCharsets.UTF_8).length > MAX_RESULT_BYTES) {
             throw evaluationFailed();
         }
-    }
-    private static String hash(byte[] bytes) {
-        try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)); }
-        catch (NoSuchAlgorithmException failure) { throw new IllegalStateException("SHA-256 is unavailable"); }
     }
     private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }

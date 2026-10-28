@@ -1,12 +1,14 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
 import org.flowable.dmn.api.DmnRepositoryService;
+import org.flowable.dmn.api.DmnHistoryService;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.RepositoryService;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
@@ -70,6 +72,37 @@ class ProcessReleaseServiceTest {
                 new byte[] {1}, Map.of("execution", ValueType.STRING)));
         assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(
                 new ProcessReleaseService.ModelResource(Type.DMN, "wrong-key", expected, Map.of()))));
+        verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
+    }
+
+    @Test
+    void decision_tasks_require_opt_in_pinned_behavior_and_a_compatible_decision_in_the_same_release() throws Exception {
+        DataSource source = mock(DataSource.class);
+        var process = process(source);
+        var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        assertThrows(IllegalArgumentException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), true));
+        when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());
+        assertThrows(IllegalArgumentException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), true));
+        when(decision.isHistoryEnabled()).thenReturn(true);
+        when(decision.getDmnHistoryService()).thenReturn(mock(DmnHistoryService.class));
+        var disabled = new ProcessReleaseService(process, decision, new ProcessModelValidator());
+        var enabled = new ProcessReleaseService(process, decision, new ProcessModelValidator(), true);
+        var actor = new ProcessActor(20, ProcessActor.SubjectType.USER, "alice");
+        byte[] bpmn;
+        byte[] dmn;
+        try (var bpmnInput = getClass().getResourceAsStream("/fixtures/approval-routing.bpmn20.xml");
+             var dmnInput = getClass().getResourceAsStream("/fixtures/baseline.dmn")) {
+            assertNotNull(bpmnInput);
+            assertNotNull(dmnInput);
+            bpmn = bpmnInput.readAllBytes();
+            dmn = dmnInput.readAllBytes();
+        }
+        var routing = new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", bpmn, Map.of("amount", ValueType.INTEGER));
+        var rules = new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", dmn, Map.of());
+        assertThrows(IllegalArgumentException.class, () -> disabled.publish(actor, "release", List.of(routing, rules)));
+        assertThrows(IllegalArgumentException.class, () -> enabled.publish(actor, "release", List.of(routing)));
+        var wrongInputs = new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", bpmn, Map.of("amount", ValueType.STRING));
+        assertThrows(IllegalArgumentException.class, () -> enabled.publish(actor, "release", List.of(wrongInputs, rules)));
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
     }
 

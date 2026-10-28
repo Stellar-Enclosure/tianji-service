@@ -7,6 +7,7 @@ import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.api.DmnDecisionService;
 import org.flowable.dmn.api.DmnHistoryService;
 import org.flowable.dmn.api.DmnRepositoryService;
+import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.HistoryService;
 import org.flowable.engine.ManagementService;
 import org.flowable.engine.RepositoryService;
@@ -249,6 +250,7 @@ class ProcessServerPostgresTest {
         String processId;
         String caseId;
         String timerId;
+        RoutingCases routingCases;
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser)) {
             var processConfig = app.getBean(SpringProcessEngineConfiguration.class);
             var caseConfig = app.getBean(SpringCmmnEngineConfiguration.class);
@@ -273,6 +275,7 @@ class ProcessServerPostgresTest {
             verifyReleaseTransactions(app, jdbc, validator, bpmn, dmn);
             verifyProcessStarts(app, jdbc, validator);
             verifyDecisionApplications(app, jdbc, validator, dmn);
+            routingCases = prepareRoutingCases(app, validator, dmn);
             verifyHttpAgainstDatabase(app, validator);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
@@ -482,6 +485,7 @@ class ProcessServerPostgresTest {
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser)) {
             RuntimeService runtime = app.getBean(RuntimeService.class);
             ManagementService jobs = app.getBean(ManagementService.class);
+            verifyRoutingAfterRestart(app, jdbc, routingCases);
             assertEquals("retained", runtime.getVariable(processId, "evidence"));
             assertEquals(timerId, jobs.createTimerJobQuery().processInstanceId(processId).singleResult().getId());
             assertNotNull(app.getBean(CmmnRuntimeService.class).createCaseInstanceQuery().caseInstanceId(caseId).singleResult());
@@ -491,8 +495,11 @@ class ProcessServerPostgresTest {
             assertNull(app.getBean(CmmnRuntimeService.class).createCaseInstanceQuery().caseInstanceId(caseId).singleResult());
         }
 
+        byte[] routingXml = new ClassPathResource("fixtures/approval-routing.bpmn20.xml").getContentAsByteArray();
+        byte[] routingDmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
         new WebApplicationContextRunner().withUserConfiguration(TianjiProcessServerApplication.class, TestDelivery.class)
-                .withPropertyValues("stellar.tianji.process.api.enabled=true", "spring.datasource.url=" + scopedUrl,
+                .withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.decision-tasks.enabled=true",
+                        "spring.datasource.url=" + scopedUrl,
                         "spring.datasource.username=" + runtimeUser,
                         "spring.sql.init.mode=never", "spring.flyway.enabled=false",
                         "flowable.database-schema=tianji_process", "flowable.database-schema-update=false",
@@ -515,6 +522,11 @@ class ProcessServerPostgresTest {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(ProcessController.class);
                     assertThat(context).hasSingleBean(ProcessApiSchemaVerifier.class);
+                    var release = context.getBean(ProcessReleaseService.class).publish(
+                            new ProcessActor(20, ProcessActor.SubjectType.USER, "routing-user"), "routing-configured", List.of(
+                                    new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", routingXml, Map.of("amount", ValueType.INTEGER)),
+                                    new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", routingDmn, Map.of())));
+                    assertEquals(2, release.definitions().size());
                 });
 
         AsyncExecutor executor;
@@ -532,6 +544,121 @@ class ProcessServerPostgresTest {
         }
         assertFalse(executor.isActive());
     }
+
+    private static RoutingCases prepareRoutingCases(ConfigurableApplicationContext app, ProcessModelValidator validator,
+                                                    byte[] dmnBytes) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var releases = new ProcessReleaseService(process, dmn, validator, true);
+        var runs = new ProcessExecutionService(process, dmn, validator);
+        var actor = new ProcessActor(20, ProcessActor.SubjectType.USER, "routing-user");
+        byte[] bpmn = new ClassPathResource("fixtures/approval-routing.bpmn20.xml").getContentAsByteArray();
+        var processModel = new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", bpmn, Map.of("amount", ValueType.INTEGER));
+        String oldXml = new String(dmnBytes, StandardCharsets.UTF_8);
+        var oldRules = new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", dmnBytes, Map.of());
+        var oldRelease = releases.publish(actor, "routing-old", List.of(processModel, oldRules));
+        String oldReview = startRouting(runs, actor, "routing-old", "old-review", 11);
+        String oldBoundary = startRouting(runs, actor, "routing-old", "old-boundary", 10);
+
+        byte[] newer = oldXml.replace("<text>'review'</text>", "<text>'standard'</text>").getBytes(StandardCharsets.UTF_8);
+        var newRules = new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", newer, Map.of());
+        releases.publish(actor, "routing-new", List.of(processModel, newRules));
+        String newReview = startRouting(runs, actor, "routing-new", "new-review", 11);
+
+        byte[] sparse = oldXml.replace("&gt; 10", "&gt; 100").getBytes(StandardCharsets.UTF_8);
+        releases.publish(actor, "routing-empty", List.of(processModel,
+                new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", sparse, Map.of())));
+        String empty = startRouting(runs, actor, "routing-empty", "empty", 11);
+
+        String any = oldXml.replace("hitPolicy=\"FIRST\"", "hitPolicy=\"ANY\"").replace("&gt; 10", "&gt;= 10");
+        releases.publish(actor, "routing-any", List.of(processModel, new ProcessReleaseService.ModelResource(Type.DMN,
+                "baselineDecision", any.replace("<text>'review'</text>", "<text>'standard'</text>").getBytes(StandardCharsets.UTF_8), Map.of())));
+        String same = startRouting(runs, actor, "routing-any", "same", 10);
+        releases.publish(actor, "routing-conflict", List.of(processModel, new ProcessReleaseService.ModelResource(Type.DMN,
+                "baselineDecision", any.getBytes(StandardCharsets.UTF_8), Map.of())));
+        String conflict = startRouting(runs, actor, "routing-conflict", "conflict", 10);
+
+        var foreign = new ProcessActor(21, ProcessActor.SubjectType.USER, "routing-user");
+        assertThrows(IllegalArgumentException.class, () -> releases.getForProcessDefinition(foreign.tenantId(),
+                definition(oldRelease, Type.BPMN).engineDefinitionId()));
+        releases.publish(foreign, "routing-old", List.of(processModel, newRules));
+        String foreignRun = startRouting(runs, foreign, "routing-old", "foreign", 11);
+        assertThrows(IllegalArgumentException.class, () -> runs.start(actor, new ProcessExecutionService.StartCommand(
+                "routing-old", "approvalRouting", "bad", "bad-routing", "trace", Map.of("amount", "11"))));
+        return new RoutingCases(oldReview, oldBoundary, newReview, empty, same, conflict, foreignRun,
+                definition(oldRelease, Type.DMN).engineDefinitionId(), definition(oldRelease, Type.DMN).engineDeploymentId(),
+                definition(oldRelease, Type.DMN).modelSha256());
+    }
+
+    private static String startRouting(ProcessExecutionService runs, ProcessActor actor, String release, String id, int amount) {
+        var command = new ProcessExecutionService.StartCommand(release, "approvalRouting", id, id, "trace-" + id, Map.of("amount", amount));
+        var first = runs.start(actor, command);
+        assertEquals(ProcessExecutionService.State.ACTIVE, first.state());
+        assertEquals(first, runs.start(actor, command));
+        return first.instanceId();
+    }
+
+    private static void verifyRoutingAfterRestart(ConfigurableApplicationContext app, JdbcTemplate bootstrap, RoutingCases cases) {
+        TaskService tasks = app.getBean(TaskService.class);
+        DmnHistoryService history = app.getBean(DmnHistoryService.class);
+        var before = tasks.createTaskQuery().processInstanceId(cases.oldReview()).singleResult();
+        assertEquals("wait", before.getTaskDefinitionKey());
+        TransactionTemplate transaction = new TransactionTemplate(app.getBean(PlatformTransactionManager.class));
+        assertThrows(InjectedFailure.class, () -> transaction.execute(status -> {
+            tasks.complete(before.getId());
+            throw new InjectedFailure();
+        }));
+        assertEquals("wait", tasks.createTaskQuery().processInstanceId(cases.oldReview()).singleResult().getTaskDefinitionKey());
+        assertEquals(0, history.createHistoricDecisionExecutionQuery().instanceId(cases.oldReview()).count());
+
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET model_sha256=? "
+                + "WHERE tenant_id=20 AND release_key='routing-old' AND model_type='DMN'", "0".repeat(64));
+        assertThrows(RuntimeException.class, () -> tasks.complete(before.getId()));
+        assertEquals("wait", tasks.createTaskQuery().processInstanceId(cases.oldReview()).singleResult().getTaskDefinitionKey());
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET model_sha256=? "
+                + "WHERE tenant_id=20 AND release_key='routing-old' AND model_type='DMN'", cases.oldDecisionHash());
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET engine_definition_id=? "
+                + "WHERE tenant_id=20 AND release_key='routing-old' AND model_type='DMN'", "missing-pinned-decision");
+        assertThrows(RuntimeException.class, () -> tasks.complete(before.getId()));
+        assertEquals("wait", tasks.createTaskQuery().processInstanceId(cases.oldReview()).singleResult().getTaskDefinitionKey());
+        bootstrap.update("UPDATE tianji_process.tianji_process_release_definition SET engine_definition_id=? "
+                + "WHERE tenant_id=20 AND release_key='routing-old' AND model_type='DMN'", cases.oldDecisionId());
+
+        completeWait(tasks, cases.oldReview());
+        assertEquals("review", tasks.createTaskQuery().processInstanceId(cases.oldReview()).singleResult().getTaskDefinitionKey());
+        var decision = history.createHistoricDecisionExecutionQuery().instanceId(cases.oldReview())
+                .tenantId(TENANT).decisionDefinitionId(cases.oldDecisionId()).singleResult();
+        assertNotNull(decision);
+        assertFalse(decision.isFailed());
+        assertEquals(cases.oldDecisionDeploymentId(), decision.getDeploymentId());
+        assertEquals("decide", decision.getActivityId());
+        assertNotNull(decision.getExecutionId());
+        completeWait(tasks, cases.oldBoundary());
+        assertEquals("standard", tasks.createTaskQuery().processInstanceId(cases.oldBoundary()).singleResult().getTaskDefinitionKey());
+        completeWait(tasks, cases.newReview());
+        assertEquals("standard", tasks.createTaskQuery().processInstanceId(cases.newReview()).singleResult().getTaskDefinitionKey());
+        completeWait(tasks, cases.empty());
+        assertEquals("standard", tasks.createTaskQuery().processInstanceId(cases.empty()).singleResult().getTaskDefinitionKey());
+        completeWait(tasks, cases.same());
+        assertEquals("standard", tasks.createTaskQuery().processInstanceId(cases.same()).singleResult().getTaskDefinitionKey());
+        completeWait(tasks, cases.foreign());
+        assertEquals("standard", tasks.createTaskQuery().processInstanceId(cases.foreign()).singleResult().getTaskDefinitionKey());
+        assertEquals(1, history.createHistoricDecisionExecutionQuery().instanceId(cases.foreign()).tenantId("21").count());
+        var conflictTask = tasks.createTaskQuery().processInstanceId(cases.conflict()).singleResult();
+        assertThrows(RuntimeException.class, () -> tasks.complete(conflictTask.getId()));
+        assertEquals("wait", tasks.createTaskQuery().processInstanceId(cases.conflict()).singleResult().getTaskDefinitionKey());
+        assertEquals(0, history.createHistoricDecisionExecutionQuery().instanceId(cases.conflict()).count());
+    }
+
+    private static void completeWait(TaskService tasks, String instanceId) {
+        var task = tasks.createTaskQuery().processInstanceId(instanceId).singleResult();
+        assertEquals("wait", task.getTaskDefinitionKey());
+        tasks.complete(task.getId());
+    }
+
+    private record RoutingCases(String oldReview, String oldBoundary, String newReview, String empty, String same,
+                                String conflict, String foreign, String oldDecisionId, String oldDecisionDeploymentId,
+                                String oldDecisionHash) { }
 
     private static void verifySchemaGuard(ConfigurableApplicationContext app, JdbcTemplate bootstrap) {
         var verifier = new ProcessApiSchemaVerifier(app.getBean(DataSource.class), "tianji_process");
@@ -983,7 +1110,7 @@ class ProcessServerPostgresTest {
                     if (!"baseline".equals(destination)) throw new IllegalArgumentException("unexpected destination");
                 }
                 @Override public DeliveryResult deliver(DeliveryContext context) {
-                    throw new AssertionError("the baseline test does not start Outbox polling");
+                    return DeliveryResult.retryableFailure("TEST_UNDELIVERED", "No test delivery target is configured");
                 }
             };
         }

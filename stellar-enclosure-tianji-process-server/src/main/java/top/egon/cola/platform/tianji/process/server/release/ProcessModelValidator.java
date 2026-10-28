@@ -5,6 +5,7 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.RouteCondition;
 
 import javax.xml.XMLConstants;
 import java.time.Duration;
@@ -21,22 +22,30 @@ import java.util.regex.Pattern;
 public final class ProcessModelValidator {
     private static final String BPMN = "http://www.omg.org/spec/BPMN/20100524/MODEL";
     private static final String DMN = "http://www.omg.org/spec/DMN/20151101";
+    private static final String FLOWABLE = "http://flowable.org/bpmn";
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_.-]{0,127}");
     private static final Pattern VARIABLE = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
     private static final Set<String> RESERVED = Set.of("true", "false", "null", "empty", "and", "or", "not", "div", "mod",
             "eq", "ne", "lt", "gt", "le", "ge", "instanceof", "execution", "task", "authenticatedUserId");
     private static final String INTEGER = "-?(?:0|[1-9][0-9]{0,14})";
     private static final String STRING = "'[\\p{L}\\p{N} _.,:;!?/\\-]{0,128}'";
+    private static final Pattern ROUTE = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]{0,63}) == (" + STRING
+            + "|" + INTEGER + "|true|false)\\}");
     private static final Map<String, Set<String>> BPMN_CHILDREN = Map.ofEntries(
             Map.entry("definitions", Set.of("process")),
-            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "intermediateCatchEvent", "parallelGateway", "sequenceFlow")),
+            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "parallelGateway", "exclusiveGateway", "sequenceFlow")),
             Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition")),
-            Map.entry("timerEventDefinition", Set.of("timeDuration")));
+            Map.entry("timerEventDefinition", Set.of("timeDuration")),
+            Map.entry("serviceTask", Set.of("extensionElements")), Map.entry("extensionElements", Set.of("field")),
+            Map.entry("field", Set.of("string")), Map.entry("sequenceFlow", Set.of("conditionExpression")));
     private static final Map<String, Set<String>> BPMN_ATTRIBUTES = Map.ofEntries(
             Map.entry("definitions", Set.of("id", "name", "targetNamespace")),
             Map.entry("process", Set.of("id", "name", "isExecutable")),
             Map.entry("startEvent", Set.of("id", "name")), Map.entry("endEvent", Set.of("id", "name")),
             Map.entry("userTask", Set.of("id", "name")), Map.entry("parallelGateway", Set.of("id", "name")),
+            Map.entry("serviceTask", Set.of("id", "name")), Map.entry("extensionElements", Set.of()),
+            Map.entry("field", Set.of("name")), Map.entry("string", Set.of()),
+            Map.entry("exclusiveGateway", Set.of("id", "name", "default")), Map.entry("conditionExpression", Set.of()),
             Map.entry("intermediateCatchEvent", Set.of("id", "name")),
             Map.entry("timerEventDefinition", Set.of("id")), Map.entry("timeDuration", Set.of("id")),
             Map.entry("sequenceFlow", Set.of("id", "name", "sourceRef", "targetRef")));
@@ -65,6 +74,7 @@ public final class ProcessModelValidator {
 
         Map<String, FlowNode> nodes = new LinkedHashMap<>();
         List<Element> flows = new ArrayList<>();
+        Map<String, String> decisions = new LinkedHashMap<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
             if ("sequenceFlow".equals(kind)) {
@@ -72,7 +82,15 @@ public final class ProcessModelValidator {
                 flows.add(element);
             } else {
                 String id = required(element, "id");
-                nodes.put(id, new FlowNode(kind));
+                nodes.put(id, new FlowNode(kind, element));
+                if ("serviceTask".equals(kind)) {
+                    if (!"dmn".equals(element.getAttributeNS(FLOWABLE, "type"))) throw invalid();
+                    Element field = only(only(element, "extensionElements"), "field");
+                    if (!"decisionTableReferenceKey".equals(required(field, "name"))) throw invalid();
+                    String decisionKey = only(field, "string").getTextContent();
+                    if (!IDENTIFIER.matcher(decisionKey).matches()) throw invalid();
+                    decisions.put(id, decisionKey);
+                }
                 if ("intermediateCatchEvent".equals(kind)) {
                     Element timer = only(element, "timerEventDefinition");
                     Element duration = only(timer, "timeDuration");
@@ -93,9 +111,16 @@ public final class ProcessModelValidator {
             FlowNode to = nodes.get(required(flow, "targetRef"));
             if (from == null || to == null) throw invalid();
             from.next.add(to);
+            from.flows.add(flow);
+            to.previous.add(from);
             to.incoming++;
         }
+        if (decisions.size() > 1
+                || !decisions.isEmpty() && nodes.values().stream().anyMatch(n -> "parallelGateway".equals(n.kind))
+                || decisions.isEmpty() && nodes.values().stream().anyMatch(n -> "exclusiveGateway".equals(n.kind))) throw invalid();
         FlowNode start = null;
+        List<RouteCondition> routes = new ArrayList<>();
+        int splits = 0;
         for (FlowNode node : nodes.values()) {
             int outgoing = node.next.size();
             switch (node.kind) {
@@ -104,9 +129,18 @@ public final class ProcessModelValidator {
                     start = node;
                 }
                 case "endEvent" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing != 0) throw invalid(); }
-                case "userTask", "intermediateCatchEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
+                case "userTask", "serviceTask", "intermediateCatchEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
                 case "parallelGateway" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing < 1 || outgoing > 4) throw invalid(); }
+                case "exclusiveGateway" -> {
+                    if (node.incoming == 1 && outgoing >= 2 && outgoing <= 4) {
+                        if (++splits > 1 || !"serviceTask".equals(node.previous.getFirst().kind)) throw invalid();
+                        routes.addAll(validateRoutes(node));
+                    } else if (node.incoming < 2 || node.incoming > 4 || outgoing != 1 || node.element.hasAttribute("default")) throw invalid();
+                }
                 default -> throw invalid();
+            }
+            if (!"exclusiveGateway".equals(node.kind) || outgoing == 1) {
+                for (Element flow : node.flows) if (!children(flow, "conditionExpression").isEmpty()) throw invalid();
             }
         }
         if (start == null) throw invalid();
@@ -128,7 +162,52 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of());
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes);
+    }
+
+    private static List<RouteCondition> validateRoutes(FlowNode gateway) {
+        String defaultFlow = required(gateway.element, "default");
+        List<RouteCondition> routes = new ArrayList<>();
+        Set<String> literals = new HashSet<>();
+        String variable = null;
+        boolean foundDefault = false;
+        for (Element flow : gateway.flows) {
+            List<Element> conditions = children(flow, "conditionExpression");
+            if (defaultFlow.equals(required(flow, "id"))) {
+                if (!conditions.isEmpty()) throw invalid();
+                foundDefault = true;
+                continue;
+            }
+            if (conditions.size() != 1) throw invalid();
+            String expression = conditions.getFirst().getTextContent();
+            var match = ROUTE.matcher(expression);
+            if (!match.matches()) throw invalid();
+            String name = match.group(1);
+            validateVariable(name);
+            String literal = match.group(2);
+            ValueType type = literal.startsWith("'") ? ValueType.STRING
+                    : "true".equals(literal) || "false".equals(literal) ? ValueType.BOOLEAN : ValueType.INTEGER;
+            if (variable != null && !variable.equals(name) || !literals.add(literal)) throw invalid();
+            variable = name;
+            routes.add(new RouteCondition(name, type, literal));
+        }
+        if (!foundDefault || routes.isEmpty()) throw invalid();
+        return routes;
+    }
+
+    /** Checks that a BPMN task and its routes use only values declared by the same release. */
+    public void validateDecisionBinding(ValidatedProcessModel bpmn, Map<String, ValueType> processInputs,
+                                        ValidatedProcessModel decision) {
+        if (bpmn == null || bpmn.type() != Type.BPMN || decision == null || decision.type() != Type.DMN
+                || processInputs == null || bpmn.decisionTasks().size() != 1
+                || !bpmn.decisionTasks().containsValue(decision.definitionKey())) throw invalid();
+        for (var input : decision.inputs().entrySet()) {
+            if (processInputs.get(input.getKey()) != input.getValue()) throw invalid();
+        }
+        if (decision.outputs().keySet().stream().anyMatch(processInputs::containsKey)) throw invalid();
+        for (RouteCondition route : bpmn.routeConditions()) {
+            if (decision.outputs().get(route.variable()) != route.type()) throw invalid();
+        }
     }
 
     public ValidatedProcessModel validateDmn(byte[] source, String expectedKey) {
@@ -207,12 +286,19 @@ public final class ProcessModelValidator {
     private static void walk(Element element, String namespace, Map<String, Set<String>> children,
                              Map<String, Set<String>> attributes, Set<String> ids) {
         String kind = element.getLocalName();
-        if (!namespace.equals(element.getNamespaceURI()) || !attributes.containsKey(kind)) throw invalid();
+        String elementNamespace = BPMN.equals(namespace) && Set.of("field", "string").contains(kind) ? FLOWABLE : namespace;
+        if (!elementNamespace.equals(element.getNamespaceURI()) || !attributes.containsKey(kind)) throw invalid();
         var attrs = element.getAttributes();
         for (int i = 0; i < attrs.getLength(); i++) {
             Node attribute = attrs.item(i);
             if (XMLConstants.XMLNS_ATTRIBUTE_NS_URI.equals(attribute.getNamespaceURI())) continue;
-            if (attribute.getNamespaceURI() != null || !attributes.get(kind).contains(attribute.getNodeName())) throw invalid();
+            boolean flowableType = BPMN.equals(namespace) && "serviceTask".equals(kind)
+                    && FLOWABLE.equals(attribute.getNamespaceURI()) && "type".equals(attribute.getLocalName());
+            boolean expressionType = BPMN.equals(namespace) && "conditionExpression".equals(kind)
+                    && XMLConstants.W3C_XML_SCHEMA_INSTANCE_NS_URI.equals(attribute.getNamespaceURI())
+                    && "type".equals(attribute.getLocalName()) && "tFormalExpression".equals(attribute.getNodeValue());
+            if (!flowableType && !expressionType
+                    && (attribute.getNamespaceURI() != null || !attributes.get(kind).contains(attribute.getNodeName()))) throw invalid();
             String value = attribute.getNodeValue();
             if (value.length() > 512 || value.contains("${") || value.contains("#{")) throw invalid();
             if ("id".equals(attribute.getNodeName()) && (!IDENTIFIER.matcher(value).matches() || !ids.add(value))) throw invalid();
@@ -222,8 +308,8 @@ public final class ProcessModelValidator {
                 if (!children.getOrDefault(kind, Set.of()).contains(child.getLocalName())) throw invalid();
                 walk(child, namespace, children, attributes, ids);
             } else if (node.getNodeType() == Node.TEXT_NODE || node.getNodeType() == Node.CDATA_SECTION_NODE) {
-                if (!"text".equals(kind) && !"timeDuration".equals(kind) && !node.getNodeValue().isBlank()) throw invalid();
-            } else if (node.getNodeType() != Node.COMMENT_NODE || "text".equals(kind) || "timeDuration".equals(kind)) throw invalid();
+                if (!Set.of("text", "timeDuration", "string", "conditionExpression").contains(kind) && !node.getNodeValue().isBlank()) throw invalid();
+            } else if (node.getNodeType() != Node.COMMENT_NODE || Set.of("text", "timeDuration", "string", "conditionExpression").contains(kind)) throw invalid();
         }
     }
 
@@ -257,11 +343,14 @@ public final class ProcessModelValidator {
 
     private static final class FlowNode {
         private final String kind;
+        private final Element element;
         private final List<FlowNode> next = new ArrayList<>();
+        private final List<FlowNode> previous = new ArrayList<>();
+        private final List<Element> flows = new ArrayList<>();
         private int incoming;
         private int visitedInputs;
         private int paths;
 
-        private FlowNode(String kind) { this.kind = kind; }
+        private FlowNode(String kind, Element element) { this.kind = kind; this.element = element; }
     }
 }

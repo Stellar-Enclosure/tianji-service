@@ -119,8 +119,9 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnMissingBean(ProcessReleaseService.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessReleaseService processReleaseService(ProcessEngine process, DmnEngine dmn,
-                                                 ProcessModelValidator validator) {
-        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator);
+                                                 ProcessModelValidator validator, Environment environment) {
+        boolean decisionTasksEnabled = environment.getProperty("stellar.tianji.process.decision-tasks.enabled", Boolean.class, false);
+        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled);
     }
 
     @Bean

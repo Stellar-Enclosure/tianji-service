@@ -19,6 +19,7 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
+import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 
 import javax.sql.DataSource;
 import java.util.Collections;
@@ -55,7 +56,13 @@ public class ProcessStorageConfiguration {
     @Order(Ordered.LOWEST_PRECEDENCE)
     EngineConfigurationConfigurer<SpringProcessEngineConfiguration> processStorageGuard(
             OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
-        return config -> verify(config, config, outbox, properties);
+        return config -> {
+            verify(config, config, outbox, properties);
+            if (config.getActivityBehaviorFactory() != null) {
+                throw new IllegalStateException("Process Server requires its pinned decision task behavior");
+            }
+            config.setActivityBehaviorFactory(new PinnedDecisionActivityBehaviorFactory());
+        };
     }
 
     @Bean
