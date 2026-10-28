@@ -118,6 +118,15 @@ class TianjiGrantDispatchPostgresTest {
             var worker = new top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor(ledger, flow, validator,
                     Map.of("fixtureModel", model), Map.of(), control, estimator, null, false, authorizer);
             var dispatcherA = new AgentRunDispatcher(hostA, worker, ledger); var dispatcherB = new AgentRunDispatcher(hostB, worker, ledger);
+            var otherLedger = new AgentLedgerService(source);
+            assertTrue(dispatcherA.usesLedger(ledger)); assertFalse(dispatcherA.usesLedger(otherLedger));
+            assertTrue(authorizer.usesLedger(ledger)); assertFalse(authorizer.usesLedger(otherLedger));
+            try (var wrongStoreAuthorizer = new TianjiExecutionGrantAuthorizer(ledger, new AgentExecutionGrantStore(source, otherLedger),
+                    resource, "tianji", registry,
+                    Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(issuer, "88", rbac)),
+                    Duration.ofSeconds(5), 4, Clock.systemUTC())) {
+                assertFalse(wrongStoreAuthorizer.usesLedger(ledger));
+            }
             var schedulerA = mock(TaskScheduler.class); var schedulerB = mock(TaskScheduler.class);
             var callbackA = new AtomicReference<Runnable>(); var callbackB = new AtomicReference<Runnable>();
             ScheduledFuture<?> scheduled = mock(ScheduledFuture.class);
@@ -141,16 +150,21 @@ class TianjiGrantDispatchPostgresTest {
             var autoDispatch = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
                     new java.util.concurrent.ArrayBlockingQueue<>(2));
             var autoScheduler = mock(TaskScheduler.class); var autoCallback = new AtomicReference<Runnable>();
-            doAnswer(inv -> { autoCallback.set(inv.getArgument(0)); return scheduled; })
+            var reconcileScheduler = mock(TaskScheduler.class); var lifecycle = new java.util.ArrayList<String>();
+            doAnswer(inv -> { lifecycle.add("reconcile"); return mock(ScheduledFuture.class); })
+                    .when(reconcileScheduler).scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+            doAnswer(inv -> { lifecycle.add("dispatch"); autoCallback.set(inv.getArgument(0)); return scheduled; })
                     .when(autoScheduler).scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
             try {
                 new org.springframework.boot.test.context.runner.ApplicationContextRunner()
                         .withConfiguration(org.springframework.boot.autoconfigure.AutoConfigurations.of(
                                 top.egon.cola.component.agentflow.autoconfigure.AgentFlowAutoConfiguration.class,
-                                top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration.class))
+                                top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration.class,
+                                top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentReconciliationAutoConfiguration.class))
                         .withUserConfiguration(TianjiGrantDispatchConfiguration.class)
                         .withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "stellar.tianji.agent.dispatch.enabled=true",
-                                "stellar.tianji.agent.execution-authorization.enabled=true", "egon.cola.component.agent-flow.enabled=true",
+                                "stellar.tianji.agent.execution-authorization.enabled=true", "stellar.tianji.agent.reconciliation.enabled=true",
+                                "egon.cola.component.agent-flow.enabled=true",
                                 "egon.cola.component.agent-flow-registry.enabled=false")
                         .withBean(javax.sql.DataSource.class, () -> source)
                         .withBean(AgentLedgerService.class, () -> ledger)
@@ -160,8 +174,10 @@ class TianjiGrantDispatchPostgresTest {
                         .withBean("tianjiAgentControlExecutor", java.util.concurrent.ScheduledThreadPoolExecutor.class, () -> autoControl)
                         .withBean("tianjiAgentDispatchExecutor", java.util.concurrent.ThreadPoolExecutor.class, () -> autoDispatch)
                         .withBean("tianjiAgentDispatchScheduler", TaskScheduler.class, () -> autoScheduler)
+                        .withBean("tianjiAgentReconciliationScheduler", TaskScheduler.class, () -> reconcileScheduler)
                         .run(context -> {
                             assertNull(context.getStartupFailure());
+                            assertEquals(List.of("reconcile", "dispatch"), lifecycle);
                             assertTrue(context.getBean(AgentRunDispatcher.class).usesAuthorization(authorizer));
                             assertNotNull(autoCallback.get());
                             autoCallback.get().run();

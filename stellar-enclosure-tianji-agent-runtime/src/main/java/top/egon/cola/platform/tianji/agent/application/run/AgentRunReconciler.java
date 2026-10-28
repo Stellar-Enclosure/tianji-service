@@ -109,6 +109,12 @@ public final class AgentRunReconciler implements SmartLifecycle {
         synchronized (monitor) { return running; }
     }
 
+    /** The dispatcher and reconciler must operate on the same ledger instance. */
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
+
+    @Override
+    public int getPhase() { return Integer.MAX_VALUE - 200; }
+
     private void poll(long expectedGeneration) {
         synchronized (monitor) {
             if (!running || generation != expectedGeneration || active != null) return;

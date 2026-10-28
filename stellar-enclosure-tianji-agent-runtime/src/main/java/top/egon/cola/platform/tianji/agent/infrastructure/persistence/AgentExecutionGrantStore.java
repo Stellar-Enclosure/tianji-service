@@ -37,6 +37,8 @@ public final class AgentExecutionGrantStore {
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
     }
 
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
+
     /** Read-only startup probe; Flyway validation remains the deployment owner's responsibility. */
     public void requireSchema() {
         transact(status -> {

@@ -38,6 +38,8 @@ public final class AgentRunDispatcher implements AutoCloseable {
 
     public boolean usesAuthorization(AgentRunAuthorization candidate) { return worker.usesAuthorization(candidate); }
 
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && worker.usesLedger(candidate); }
+
     /** Discovers a bounded batch; rejected runs remain queued for a later poll. */
     public List<CompletionStage<AgentRunDTO>> dispatchQueued(int limit) {
         return ledger.pendingRuns(limit).stream().map(run -> dispatch(run.actor(), run.query())).toList();

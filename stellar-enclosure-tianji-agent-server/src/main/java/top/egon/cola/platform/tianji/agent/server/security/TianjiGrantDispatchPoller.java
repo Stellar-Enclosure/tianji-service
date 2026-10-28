@@ -43,6 +43,9 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
         if (authorizer == null || !dispatcher.usesAuthorization(authorizer)) {
             throw new IllegalArgumentException("TIANJI_DISPATCH_AUTHORIZER_MISMATCH");
         }
+        if (!dispatcher.usesLedger(ledger) || !authorizer.usesLedger(ledger)) {
+            throw new IllegalArgumentException("TIANJI_DISPATCH_LEDGER_MISMATCH");
+        }
         if (batchSize < 1 || batchSize > 1000 || maxInFlight < 1 || maxInFlight > 128
                 || interval == null || interval.compareTo(Duration.ofMillis(250)) < 0
                 || interval.compareTo(Duration.ofHours(1)) > 0 || shutdownTimeout == null || shutdownTimeout.isNegative()

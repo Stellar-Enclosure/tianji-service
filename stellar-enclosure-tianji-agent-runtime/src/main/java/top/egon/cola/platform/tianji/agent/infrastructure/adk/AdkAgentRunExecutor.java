@@ -129,6 +129,9 @@ public final class AdkAgentRunExecutor {
     /** Lets a host verify that its dispatcher uses the intended authorization boundary. */
     public boolean usesAuthorization(AgentRunAuthorization candidate) { return authorizer == candidate; }
 
+    /** Lets a host verify that discovery and execution use the same ledger. */
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
+
     /** Uses one CAS to claim the run and one subscription to the ADK root invocation. */
     public AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
         Objects.requireNonNull(actor, "actor");

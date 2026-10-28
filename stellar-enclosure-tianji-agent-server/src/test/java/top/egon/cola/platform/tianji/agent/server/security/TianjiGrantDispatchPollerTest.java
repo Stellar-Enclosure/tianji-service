@@ -13,6 +13,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.scheduling.TaskScheduler;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.application.run.AgentRunReconciler;
+import top.egon.cola.platform.tianji.agent.autoconfigure.AgentReconciliationProperties;
+import top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentReconciliationAutoConfiguration;
 import top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
@@ -33,6 +36,8 @@ class TianjiGrantDispatchPollerTest {
 
     @BeforeEach void setup() {
         when(dispatcher.usesAuthorization(authorizer)).thenReturn(true);
+        when(dispatcher.usesLedger(ledger)).thenReturn(true);
+        when(authorizer.usesLedger(ledger)).thenReturn(true);
         when(dispatcher.awaitQuiescence(any())).thenReturn(true);
         doAnswer(invocation -> { callback.set(invocation.getArgument(0)); return scheduled; })
                 .when(scheduler).scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
@@ -105,11 +110,53 @@ class TianjiGrantDispatchPollerTest {
         when(dispatcher.usesAuthorization(authorizer)).thenReturn(false);
         assertThrows(IllegalArgumentException.class, () -> new TianjiGrantDispatchPoller(ledger, dispatcher, authorizer,
                 scheduler, 2, 2, Duration.ofSeconds(1), Duration.ofSeconds(1)));
+        when(dispatcher.usesAuthorization(authorizer)).thenReturn(true);
+        when(dispatcher.usesLedger(ledger)).thenReturn(false);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGrantDispatchPoller(ledger, dispatcher, authorizer,
+                scheduler, 2, 2, Duration.ofSeconds(1), Duration.ofSeconds(1)));
+        when(dispatcher.usesLedger(ledger)).thenReturn(true);
+        when(authorizer.usesLedger(ledger)).thenReturn(false);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGrantDispatchPoller(ledger, dispatcher, authorizer,
+                scheduler, 2, 2, Duration.ofSeconds(1), Duration.ofSeconds(1)));
         new org.springframework.boot.test.context.runner.ApplicationContextRunner().withUserConfiguration(TianjiGrantDispatchConfiguration.class)
                 .run(context -> assertTrue(context.getBeansOfType(TianjiGrantDispatchPoller.class).isEmpty()));
         new org.springframework.boot.test.context.runner.ApplicationContextRunner().withUserConfiguration(TianjiGrantDispatchConfiguration.class)
                 .withPropertyValues("stellar.tianji.agent.dispatch.enabled=true")
                 .run(context -> assertNotNull(context.getStartupFailure()));
+    }
+
+    @Test void automatic_dispatch_requires_reconciliation_for_the_same_ledger() {
+        var configuration = new TianjiGrantDispatchConfiguration();
+        var matching = new AgentRunReconciler(ledger, mock(TaskScheduler.class), new AgentReconciliationProperties());
+        var other = new AgentRunReconciler(mock(AgentLedgerService.class), mock(TaskScheduler.class), new AgentReconciliationProperties());
+        var environment = new org.springframework.mock.env.MockEnvironment()
+                .withProperty("stellar.tianji.agent.execution-authorization.enabled", "true");
+        assertThrows(IllegalStateException.class,
+                () -> configuration.tianjiGrantDispatchPoller(ledger, dispatcher, authorizer, matching, scheduler, environment));
+        environment.setProperty("stellar.tianji.agent.reconciliation.enabled", "true");
+        assertThrows(IllegalStateException.class,
+                () -> configuration.tianjiGrantDispatchPoller(ledger, dispatcher, authorizer, other, scheduler, environment));
+        var configured = configuration.tianjiGrantDispatchPoller(ledger, dispatcher, authorizer, matching, scheduler, environment);
+        assertTrue(matching.getPhase() < configured.getPhase());
+        configured.close();
+    }
+
+    @Test void a_reconciliation_start_failure_prevents_dispatch_from_starting() {
+        var reconcileScheduler = mock(TaskScheduler.class);
+        doThrow(new IllegalStateException("unavailable")).when(reconcileScheduler)
+                .scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+        new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                .withConfiguration(org.springframework.boot.autoconfigure.AutoConfigurations.of(TianjiAgentReconciliationAutoConfiguration.class))
+                .withUserConfiguration(TianjiGrantDispatchConfiguration.class)
+                .withPropertyValues("stellar.tianji.agent.dispatch.enabled=true", "stellar.tianji.agent.execution-authorization.enabled=true",
+                        "stellar.tianji.agent.reconciliation.enabled=true")
+                .withBean(AgentLedgerService.class, () -> ledger)
+                .withBean(AgentRunDispatcher.class, () -> dispatcher)
+                .withBean(TianjiExecutionGrantAuthorizer.class, () -> authorizer)
+                .withBean("tianjiAgentDispatchScheduler", TaskScheduler.class, () -> scheduler)
+                .withBean("tianjiAgentReconciliationScheduler", TaskScheduler.class, () -> reconcileScheduler)
+                .run(context -> assertNotNull(context.getStartupFailure()));
+        verify(scheduler, never()).scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
     }
 
     private static GrantReadyAgentRun candidate(long tenant, String runId) {

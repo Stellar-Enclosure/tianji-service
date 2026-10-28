@@ -66,6 +66,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
                 Thread.ofVirtual().name("tianji-authorization-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
     }
 
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && store.usesLedger(candidate); }
+
     @Override
     public Decision authorize(Request request, Boundary boundary) {
         if (request == null || boundary == null || request.actor().subjectType() != TrustedAgentActor.SubjectType.USER

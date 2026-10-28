@@ -8,6 +8,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.scheduling.TaskScheduler;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.application.run.AgentRunReconciler;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 
 @Configuration(proxyBeanMethods = false)
@@ -15,10 +16,14 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 public class TianjiGrantDispatchConfiguration {
     @Bean(destroyMethod = "close")
     TianjiGrantDispatchPoller tianjiGrantDispatchPoller(AgentLedgerService ledger, AgentRunDispatcher dispatcher,
-            TianjiExecutionGrantAuthorizer authorizer, @Qualifier("tianjiAgentDispatchScheduler") TaskScheduler scheduler,
-            Environment environment) {
+            TianjiExecutionGrantAuthorizer authorizer, AgentRunReconciler reconciler,
+            @Qualifier("tianjiAgentDispatchScheduler") TaskScheduler scheduler, Environment environment) {
         if (!environment.getProperty("stellar.tianji.agent.execution-authorization.enabled", Boolean.class, false)) {
             throw new IllegalStateException("TIANJI_DISPATCH_REQUIRES_EXECUTION_AUTHORIZATION");
+        }
+        if (!environment.getProperty("stellar.tianji.agent.reconciliation.enabled", Boolean.class, false)
+                || !reconciler.usesLedger(ledger)) {
+            throw new IllegalStateException("TIANJI_DISPATCH_REQUIRES_MATCHING_RECONCILIATION");
         }
         int batchSize = environment.getProperty("stellar.tianji.agent.dispatch.batch-size", Integer.class, 64);
         int maxInFlight = environment.getProperty("stellar.tianji.agent.dispatch.max-in-flight", Integer.class, 4);
