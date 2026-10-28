@@ -38,19 +38,23 @@ class TianjiAgentStoragePostgresTest {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasStackTraceContaining("TIANJI_AGENT_STORAGE_DATA_SOURCE_MISMATCH");
         });
+        runtimeRunner(url).run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).hasSingleBean(AgentLedgerService.class)
+                    .hasSingleBean(top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher.class);
+            var ledger = context.getBean(AgentLedgerService.class);
+            assertThat(ledger.usesDataSource(context.getBean(DataSource.class))).isTrue();
+            assertThat(context.getBean(top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher.class)
+                    .usesLedger(ledger)).isTrue();
+            assertThat(context.getBean("tianjiAgentDispatchExecutor", java.util.concurrent.ThreadPoolExecutor.class)
+                    .getTaskCount()).isZero();
+        });
         var dispatch = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, java.util.concurrent.TimeUnit.SECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(2));
         var control = new java.util.concurrent.ScheduledThreadPoolExecutor(1);
         control.setRemoveOnCancelPolicy(true);
         try {
-            runner(url).withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "egon.cola.component.agent-flow.enabled=true",
-                            "egon.cola.component.agent-flow-registry.enabled=false")
-                    .withBean("fixtureModel", org.springframework.ai.chat.model.ChatModel.class,
-                            () -> org.mockito.Mockito.mock(org.springframework.ai.chat.model.ChatModel.class))
-                    .withBean(top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.class,
-                            () -> (request, boundary) -> top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Decision.ALLOW)
-                    .withBean(top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator.class,
-                            () -> org.mockito.Mockito.mock(top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator.class))
+            runtimeRunner(url)
                     .withBean("tianjiAgentDispatchExecutor", java.util.concurrent.ThreadPoolExecutor.class, () -> dispatch)
                     .withBean("tianjiAgentControlExecutor", java.util.concurrent.ScheduledThreadPoolExecutor.class, () -> control)
                     .run(context -> {
@@ -87,6 +91,17 @@ class TianjiAgentStoragePostgresTest {
                         "spring.flyway.enabled=false", "spring.sql.init.mode=never",
                         "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4",
                         "egon.cola.component.id.enabled=false");
+    }
+
+    private static ApplicationContextRunner runtimeRunner(String url) {
+        return runner(url).withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "egon.cola.component.agent-flow.enabled=true",
+                        "egon.cola.component.agent-flow-registry.enabled=false")
+                .withBean("fixtureModel", org.springframework.ai.chat.model.ChatModel.class,
+                        () -> org.mockito.Mockito.mock(org.springframework.ai.chat.model.ChatModel.class))
+                .withBean(top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.class,
+                        () -> (request, boundary) -> top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Decision.ALLOW)
+                .withBean(top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator.class,
+                        () -> org.mockito.Mockito.mock(top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator.class));
     }
 
     private static String testUrl(String property) {
