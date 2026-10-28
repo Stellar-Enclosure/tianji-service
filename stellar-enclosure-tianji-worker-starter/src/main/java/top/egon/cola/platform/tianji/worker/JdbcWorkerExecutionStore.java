@@ -57,6 +57,9 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
         new WorkerExecutionSchemaVerifier(source, schema).verify();
     }
 
+    @Override public long tenantId() { return tenantId; }
+    @Override public Duration deadlineSafetyMargin() { return deadlineSafetyMargin; }
+
     @Override
     public WorkerExecutionReceipt execute(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor, TransactionalWorkerHandler handler) {
         Objects.requireNonNull(task, "task");

@@ -39,6 +39,8 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.http.MediaType;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.scheduling.TaskScheduler;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.outbox.api.OutboxMessage;
@@ -86,6 +88,16 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnu
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerClient;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerContractDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerBusinessResultDTO;
+import top.egon.cola.platform.tianji.client.ProcessClientException;
+import top.egon.cola.platform.tianji.worker.JdbcWorkerExecutionStore;
+import top.egon.cola.platform.tianji.worker.WorkerHandlerDescriptor;
+import top.egon.cola.platform.tianji.worker.WorkerHandlerRegistration;
+import top.egon.cola.platform.tianji.worker.WorkerPollingProperties;
+import top.egon.cola.platform.tianji.worker.RemoteWorkerPoller;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
@@ -107,6 +119,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
@@ -115,6 +128,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -759,7 +773,159 @@ class ProcessServerPostgresTest {
 
         verifyWorkerConcurrency(app, bootstrap, runs, service, owner20, worker20, worker20b);
         verifyWorkerHttpAgainstDatabase(runs, service, owner20, worker20, worker21);
+        if (System.getProperty("tianji.worker.business.postgres.test.url") != null) {
+            verifyWorkerLostAcknowledgement(app, bootstrap, runs, service, owner20, worker20);
+        }
         verifyWorkerExpiry(app, bootstrap, runs, service, owner20, worker20);
+    }
+
+    private static void verifyWorkerLostAcknowledgement(ConfigurableApplicationContext app, JdbcTemplate processDatabase,
+                                                         ProcessExecutionService runs, FlowableWorkerService service,
+                                                         ProcessActor owner, ProcessActor worker) throws Exception {
+        String url = System.getProperty("tianji.worker.business.postgres.test.url", "");
+        String user = System.getProperty("tianji.worker.business.postgres.test.runtime-user", "");
+        if (!url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")
+                || !user.matches("tianji_it_worker_[0-9a-f]{12}")) throw new IllegalArgumentException("fresh loopback business database and temporary role required");
+        var bootstrapSource = new DriverManagerDataSource(url);
+        var business = new JdbcTemplate(bootstrapSource);
+        if (business.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='cross_worker'", Integer.class) != 0) {
+            throw new IllegalStateException("cross-worker test schema already exists");
+        }
+        business.execute("CREATE SCHEMA cross_worker");
+        business.execute("CREATE TABLE cross_worker.business_counter (tenant_id bigint PRIMARY KEY, value bigint NOT NULL)");
+        business.update("INSERT INTO cross_worker.business_counter (tenant_id,value) VALUES (20,0)");
+        Flyway flyway = Flyway.configure().dataSource(bootstrapSource).schemas("cross_worker").defaultSchema("cross_worker")
+                .table("tianji_worker_schema_history").baselineVersion("0").baselineOnMigrate(true)
+                .locations("classpath:db/tianji-worker").cleanDisabled(true).load();
+        assertEquals(1, flyway.migrate().migrationsExecuted);
+        business.execute("GRANT USAGE ON SCHEMA cross_worker TO \"" + user + "\"");
+        business.execute("GRANT SELECT,INSERT,UPDATE ON cross_worker.tianji_worker_execution_receipt TO \"" + user + "\"");
+        business.execute("GRANT SELECT,UPDATE ON cross_worker.business_counter TO \"" + user + "\"");
+        business.execute("GRANT SELECT ON cross_worker.tianji_worker_schema_history TO \"" + user + "\"");
+        assertEquals(Boolean.FALSE, business.queryForObject("SELECT has_schema_privilege(?, 'cross_worker', 'CREATE')", Boolean.class, user));
+        var runtime = new DriverManagerDataSource(url + "?currentSchema=cross_worker");
+        runtime.setUsername(user);
+        var businessStore = new JdbcWorkerExecutionStore(runtime, new DataSourceTransactionManager(runtime), "cross_worker",
+                "integration-process", 20, Duration.ofSeconds(20), Duration.ofSeconds(6));
+        var contract = new WorkerContractDTO("riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT,
+                Map.of("requestedAmount", ProcessValueTypeEnum.INTEGER), Map.of("approved", ProcessValueTypeEnum.BOOLEAN));
+        AtomicInteger executions = new AtomicInteger();
+        var registration = new WorkerHandlerRegistration(new WorkerHandlerDescriptor(contract, "v1"), (context, jdbc) -> {
+            executions.incrementAndGet();
+            jdbc.update("UPDATE cross_worker.business_counter SET value=value+? WHERE tenant_id=?",
+                    context.input().get("requestedAmount"), context.tenantId());
+            return new WorkerBusinessResultDTO("cross-business-receipt", Map.of("approved", true));
+        });
+        var access = mock(TianjiProcessAccess.class);
+        when(access.require(anyString())).thenReturn(worker);
+        var mvc = MockMvcBuilders.standaloneSetup(new WorkerController(service, access))
+                .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
+        var client = new LostAcknowledgementClient(mvc, false);
+        var scheduler = mock(TaskScheduler.class);
+        var tick = new java.util.concurrent.atomic.AtomicReference<Runnable>();
+        when(scheduler.scheduleWithFixedDelay(any(Runnable.class), any(Duration.class))).thenAnswer(invocation -> {
+            tick.set(invocation.getArgument(0));
+            return mock(ScheduledFuture.class);
+        });
+        var properties = new WorkerPollingProperties(true, 20, 1, Duration.ofSeconds(1), Duration.ofSeconds(3),
+                Duration.ofSeconds(2), Duration.ZERO, 1, Duration.ZERO);
+        var poller = new RemoteWorkerPoller(client, businessStore, List.of(registration), scheduler, Runnable::run, properties, Clock.systemUTC());
+        var instance = startWorkerRun(runs, owner, "worker-v1", "worker-lost-ack");
+        poller.start();
+        try {
+            tick.get().run();
+            WorkerTaskDTO first = client.latestTask;
+            assertNotNull(first);
+            assertEquals(instance.instanceId(), first.processInstanceId());
+            assertEquals(1, executions.get());
+            assertEquals(10L, business.queryForObject("SELECT value FROM cross_worker.business_counter WHERE tenant_id=20", Long.class));
+            assertEquals(1, app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(first.taskId()).count());
+            expireNativeWorker(processDatabase, first.taskId(), first.processInstanceId());
+            expireWorkerLease(processDatabase, first);
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                    app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(first.taskId()).unlocked().count() == 1);
+            tick.get().run();
+            WorkerTaskDTO second = client.latestTask;
+            assertEquals(first.taskId(), second.taskId());
+            assertEquals(first.idempotencyKey(), second.idempotencyKey());
+            assertFalse(first.leaseToken().equals(second.leaseToken()));
+            assertEquals(1, executions.get());
+            assertEquals(10L, business.queryForObject("SELECT value FROM cross_worker.business_counter WHERE tenant_id=20", Long.class));
+            assertEquals(1, business.queryForObject("SELECT count(*) FROM cross_worker.tianji_worker_execution_receipt", Integer.class));
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                    app.getBean(TaskService.class).createTaskQuery().processInstanceId(instance.instanceId()).count() == 1);
+            var review = app.getBean(TaskService.class).createTaskQuery().processInstanceId(instance.instanceId()).singleResult();
+            app.getBean(TaskService.class).complete(review.getId());
+            assertEquals(ProcessExecutionService.State.COMPLETED, runs.get(owner, instance.instanceId()).state());
+        } finally {
+            poller.stop();
+        }
+        var responseLostClient = new LostAcknowledgementClient(mvc, true);
+        var retryProperties = new WorkerPollingProperties(true, 20, 1, Duration.ofSeconds(1), Duration.ofSeconds(3),
+                Duration.ofSeconds(2), Duration.ZERO, 2, Duration.ZERO);
+        var retryPoller = new RemoteWorkerPoller(responseLostClient, businessStore, List.of(registration), scheduler,
+                Runnable::run, retryProperties, Clock.systemUTC());
+        var secondInstance = startWorkerRun(runs, owner, "worker-v1", "worker-lost-response");
+        retryPoller.start();
+        try {
+            tick.get().run();
+            assertEquals(2, responseLostClient.completionCalls);
+            assertEquals(2, executions.get());
+            assertEquals(20L, business.queryForObject("SELECT value FROM cross_worker.business_counter WHERE tenant_id=20", Long.class));
+            assertEquals(2, business.queryForObject("SELECT count(*) FROM cross_worker.tianji_worker_execution_receipt", Integer.class));
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                    app.getBean(TaskService.class).createTaskQuery().processInstanceId(secondInstance.instanceId()).count() == 1);
+            var review = app.getBean(TaskService.class).createTaskQuery().processInstanceId(secondInstance.instanceId()).singleResult();
+            app.getBean(TaskService.class).complete(review.getId());
+            assertEquals(ProcessExecutionService.State.COMPLETED, runs.get(owner, secondInstance.instanceId()).state());
+        } finally {
+            retryPoller.stop();
+        }
+    }
+
+    private static final class LostAcknowledgementClient implements WorkerClient {
+        private final MockMvc mvc;
+        private final JsonMapper mapper = JsonMapper.builder().build();
+        private final boolean dropAfterCommit;
+        private boolean dropFirstCompletion = true;
+        private int completionCalls;
+        private WorkerTaskDTO latestTask;
+
+        private LostAcknowledgementClient(MockMvc mvc, boolean dropAfterCommit) { this.mvc = mvc; this.dropAfterCommit = dropAfterCommit; }
+
+        @Override public AcquireWorkerTaskResult acquire(AcquireWorkerTaskCommand command) {
+            var result = post("acquire", command, AcquireWorkerTaskResult.class);
+            if (result.task() != null) latestTask = result.task();
+            return result;
+        }
+
+        @Override public WorkerReceiptDTO complete(CompleteWorkerTaskCommand command) {
+            completionCalls++;
+            if (dropFirstCompletion && !dropAfterCommit) {
+                dropFirstCompletion = false;
+                throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            }
+            WorkerReceiptDTO receipt = post("complete", command, WorkerReceiptDTO.class);
+            if (dropFirstCompletion) {
+                dropFirstCompletion = false;
+                throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            }
+            return receipt;
+        }
+
+        @Override public WorkerReceiptDTO fail(FailWorkerTaskCommand command) { return post("fail", command, WorkerReceiptDTO.class); }
+
+        private <T> T post(String action, Object command, Class<T> type) {
+            try {
+                var response = mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/api/tianji/v1/worker-tasks/" + action)
+                                .contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(command)))
+                        .andReturn().getResponse();
+                if (response.getStatus() != 200) throw new IllegalStateException("Worker test request failed");
+                return mapper.readValue(response.getContentAsByteArray(), type);
+            } catch (Exception failure) {
+                throw new IllegalStateException("Worker test transport failed");
+            }
+        }
     }
 
     private static void verifyWorkerHttpAgainstDatabase(ProcessExecutionService runs, FlowableWorkerService service,
