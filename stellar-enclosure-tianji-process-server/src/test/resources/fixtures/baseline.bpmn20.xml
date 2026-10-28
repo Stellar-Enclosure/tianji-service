@@ -5,7 +5,7 @@
         <sequenceFlow id="toReview" sourceRef="start" targetRef="review"/>
         <userTask id="review" name="Review"/>
         <sequenceFlow id="toTimer" sourceRef="review" targetRef="wait"/>
-        <intermediateCatchEvent id="wait"><timerEventDefinition><timeDuration>PT1H</timeDuration></timerEventDefinition></intermediateCatchEvent>
+        <intermediateCatchEvent id="wait"><timerEventDefinition><timeDuration>PT1S</timeDuration></timerEventDefinition></intermediateCatchEvent>
         <sequenceFlow id="toEnd" sourceRef="wait" targetRef="end"/>
         <endEvent id="end"/>
     </process>

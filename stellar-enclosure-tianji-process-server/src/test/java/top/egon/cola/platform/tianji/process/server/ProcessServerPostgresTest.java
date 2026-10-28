@@ -12,6 +12,7 @@ import org.flowable.engine.ManagementService;
 import org.flowable.engine.RepositoryService;
 import org.flowable.engine.RuntimeService;
 import org.flowable.engine.TaskService;
+import org.flowable.job.service.impl.asyncexecutor.AsyncExecutor;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
@@ -40,8 +41,10 @@ import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 
 import javax.sql.DataSource;
+import java.time.Duration;
 import java.util.Map;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 /** Runs only in a fresh, explicitly supplied loopback database. */
@@ -196,12 +199,22 @@ class ProcessServerPostgresTest {
             assertNotNull(caseTask);
             app.getBean(CmmnTaskService.class).complete(caseTask.getId());
             assertNull(app.getBean(CmmnRuntimeService.class).createCaseInstanceQuery().caseInstanceId(caseId).singleResult());
-            jobs.moveTimerToExecutableJob(timerId);
-            jobs.executeJob(timerId);
-            assertNull(runtime.createProcessInstanceQuery().processInstanceId(processId).singleResult());
+        }
+
+        AsyncExecutor executor;
+        try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser,
+                "--flowable.async-executor-activate=true",
+                "--flowable.process.async.executor.default-timer-job-acquire-wait-time=PT0.2S",
+                "--flowable.process.async.executor.default-async-job-acquire-wait-time=PT0.2S")) {
+            RuntimeService runtime = app.getBean(RuntimeService.class);
+            executor = app.getBean(SpringProcessEngineConfiguration.class).getAsyncExecutor();
+            assertTrue(executor.isActive());
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100))
+                    .until(() -> runtime.createProcessInstanceQuery().processInstanceId(processId).count() == 0);
             assertNotNull(app.getBean(HistoryService.class).createHistoricProcessInstanceQuery()
                     .processInstanceId(processId).finished().singleResult());
         }
+        assertFalse(executor.isActive());
     }
 
     private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {
