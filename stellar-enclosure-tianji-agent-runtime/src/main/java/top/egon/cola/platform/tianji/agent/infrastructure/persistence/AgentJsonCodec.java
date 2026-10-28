@@ -70,6 +70,19 @@ final class AgentJsonCodec {
         return hash(write(content, MAX_EVENT_BYTES));
     }
 
+    /** Stable V1 binding for the immutable inputs actually used by an execution. */
+    String executionSnapshotHash(AgentExecutionSnapshot snapshot) {
+        Map<String, Object> content = new TreeMap<>();
+        content.put("bindingVersion", 1);
+        content.put("definitionKey", snapshot.definition().definitionKey());
+        content.put("definitionVersion", snapshot.definition().version());
+        content.put("definitionContentSha256", snapshot.definitionContentSha256());
+        content.put("effectivePolicy", policy(snapshot.effectivePolicy()));
+        content.put("input", snapshot.input());
+        content.put("businessKey", snapshot.businessKey());
+        return hash(write(content, MAX_SNAPSHOT_BYTES));
+    }
+
     String snapshot(AgentDefinitionSpecDTO spec, String definitionHash,
                     ExecutionPolicyDTO effective, StartAgentRunCommand command) {
         Map<String, Object> snapshot = new TreeMap<>();

@@ -7,6 +7,9 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -113,6 +116,34 @@ class AgentRunGovernancePostgresTest {
     }
 
     @Test
+    void authorization_suspension_requires_the_live_owner_and_marks_outstanding_usage_unknown() {
+        TrustedAgentActor owner = actor();
+        GetAgentRunQuery query = queued(owner);
+        ClaimedAgentRun claim = ledger.claim(owner, query, 0, "worker-1", Duration.ofSeconds(10));
+        ledger.budgets().reserveBudget(owner, claim.lease(), new AgentBudgetRequest("model-call",
+                AgentBudgetRequest.Kind.MODEL, null, 10, 10, new java.math.BigDecimal("0.10")));
+        var stale = new AgentRunLease(query.runId(), claim.lease().owner(), claim.lease().epoch() + 1,
+                claim.lease().expiresAt());
+        assertThrows(AgentLedgerException.class, () -> ledger.suspendForAuthorization(owner, stale,
+                AgentRunAuthorization.Decision.UNAVAILABLE));
+        assertThrows(AgentLedgerException.class, () -> ledger.suspendForAuthorization(owner, claim.lease(),
+                AgentRunAuthorization.Decision.ALLOW));
+        assertEquals(RUNNING, ledger.get(owner, query).status());
+        AgentRunDTO suspended = ledger.suspendForAuthorization(owner, claim.lease(), AgentRunAuthorization.Decision.UNAVAILABLE);
+        assertEquals(SUSPENDED, suspended.status());
+        assertEquals("AUTHORIZATION_UNAVAILABLE", suspended.waitReason());
+        assertEquals("UNKNOWN", jdbc.queryForObject("""
+                SELECT state FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                """, String.class, owner.tenantId(), query.runId()));
+        assertEquals(LeaseHeartbeat.LEASE_LOST, ledger.heartbeat(owner, claim.lease(), Duration.ofSeconds(10)));
+        assertThrows(AgentLedgerException.class, () -> ledger.suspendForAuthorization(owner, claim.lease(),
+                AgentRunAuthorization.Decision.DENY));
+        assertThrows(AgentLedgerException.class, () -> ledger.finish(owner, claim.lease(), suspended.revision(),
+                result(query.runId(), COMPLETED)));
+        assertEquals(3, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 20)).size());
+    }
+
+    @Test
     void database_deadline_expires_and_fences_a_running_owner() {
         TrustedAgentActor owner = actor();
         GetAgentRunQuery query = queued(owner);
@@ -202,6 +233,32 @@ class AgentRunGovernancePostgresTest {
                 .filter(event -> event.payload().get("status") != null
                         && Set.of("COMPLETED", "CANCELLED").contains(event.payload().get("status"))).count();
         assertEquals(1, terminalEvents);
+    }
+
+    @RepeatedTest(10)
+    void queued_authorization_denial_and_cancellation_preserve_one_consistent_state() throws Exception {
+        TrustedAgentActor owner = actor();
+        GetAgentRunQuery query = queued(owner);
+        CountDownLatch gate = new CountDownLatch(1);
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
+            var denied = pool.submit(() -> attempt(gate, () -> ledger.suspendQueuedForAuthorization(owner, query, 0)));
+            var cancelled = pool.submit(() -> attempt(gate, () -> ledger.cancel(owner,
+                    new CancelAgentRunCommand(query.runId(), "cancel-denied", 0, "stop"))));
+            gate.countDown();
+            denied.get(20, TimeUnit.SECONDS);
+            cancelled.get(20, TimeUnit.SECONDS);
+        }
+        AgentRunDTO current = ledger.get(owner, query);
+        assertTrue(current.status() == SUSPENDED || current.status() == CANCELLED);
+        if (current.status() == SUSPENDED) {
+            assertEquals("AUTHORIZATION_DENIED", current.waitReason());
+            ledger.cancel(owner, new CancelAgentRunCommand(query.runId(), "cancel-denied", current.revision(), "stop"));
+        }
+        assertEquals(CANCELLED, ledger.get(owner, query).status());
+        assertEquals(0, ledger.get(owner, query).attempt());
+        var events = ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 20));
+        assertEquals(1, events.stream().filter(event -> "CANCELLED".equals(event.payload().get("status"))).count());
+        assertTrue(events.stream().filter(event -> "SUSPENDED".equals(event.payload().get("status"))).count() <= 1);
     }
 
     private static Object attempt(CountDownLatch gate, java.util.concurrent.Callable<?> action) throws Exception {

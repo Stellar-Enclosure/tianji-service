@@ -10,6 +10,7 @@ class AgentRunTransitionsTest {
     @Test
     void lifecycle_allows_expected_paths_and_never_reopens_a_terminal_run() {
         assertTrue(AgentRunTransitions.allows(QUEUED, RUNNING));
+        assertTrue(AgentRunTransitions.allows(QUEUED, SUSPENDED));
         assertTrue(AgentRunTransitions.allows(RUNNING, WAITING));
         assertTrue(AgentRunTransitions.allows(WAITING, QUEUED));
         assertTrue(AgentRunTransitions.allows(RUNNING, COMPLETED));

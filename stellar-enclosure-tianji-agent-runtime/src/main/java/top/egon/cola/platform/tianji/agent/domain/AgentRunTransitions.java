@@ -28,7 +28,7 @@ public final class AgentRunTransitions {
     private static Map<AgentRunStatusEnum, Set<AgentRunStatusEnum>> transitions() {
         Map<AgentRunStatusEnum, Set<AgentRunStatusEnum>> result = new EnumMap<>(AgentRunStatusEnum.class);
         result.put(CREATED, EnumSet.of(QUEUED, CANCELLED));
-        result.put(QUEUED, EnumSet.of(RUNNING, CANCELLED, TIMED_OUT));
+        result.put(QUEUED, EnumSet.of(RUNNING, SUSPENDED, CANCELLED, TIMED_OUT));
         result.put(RUNNING, EnumSet.of(WAITING, COMPLETED, FAILED, SUSPENDED, CANCELLED, TIMED_OUT));
         result.put(WAITING, EnumSet.of(QUEUED, CANCELLED, TIMED_OUT));
         result.put(SUSPENDED, EnumSet.of(QUEUED, FAILED, CANCELLED, TIMED_OUT));

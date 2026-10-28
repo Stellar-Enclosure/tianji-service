@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.junit.jupiter.api.Test;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
@@ -46,6 +47,26 @@ class AgentJsonCodecTest {
         assertEquals(codec.requestHash(a), codec.requestHash(b));
         assertNotEquals(codec.requestHash(a), codec.requestHash(different));
         assertNotEquals(codec.requestHash(a), codec.requestHash(limited));
+    }
+
+    @Test
+    void execution_authorization_fingerprint_is_canonical_and_binds_the_effective_input() {
+        AgentDefinitionSpecDTO definition = spec(1, Map.of("mode", "safe"), Set.of("search@1", "read@1"));
+        Map<String, Object> first = new LinkedHashMap<>();
+        first.put("z", 2);
+        first.put("a", 1);
+        Map<String, Object> second = new LinkedHashMap<>();
+        second.put("a", 1);
+        second.put("z", 2);
+        String definitionHash = codec.definitionHash(definition);
+        var a = new AgentExecutionSnapshot(definition, definitionHash, definition.policy(),
+                new AgentInputDTO("question", List.of(), first), "business");
+        var b = new AgentExecutionSnapshot(definition, definitionHash, definition.policy(),
+                new AgentInputDTO("question", List.of(), second), "business");
+        var altered = new AgentExecutionSnapshot(definition, definitionHash, definition.policy(),
+                new AgentInputDTO("other", List.of(), second), "business");
+        assertEquals(codec.executionSnapshotHash(a), codec.executionSnapshotHash(b));
+        assertNotEquals(codec.executionSnapshotHash(a), codec.executionSnapshotHash(altered));
     }
 
     @Test

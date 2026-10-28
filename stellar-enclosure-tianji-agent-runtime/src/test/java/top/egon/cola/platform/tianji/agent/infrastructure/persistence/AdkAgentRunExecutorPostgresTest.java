@@ -11,6 +11,7 @@ import jakarta.validation.ValidatorFactory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.RepeatedTest;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.slf4j.LoggerFactory;
@@ -43,6 +44,7 @@ import top.egon.cola.component.dtp.executor.virtual.BoundedVirtualThreadExecutor
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
@@ -109,6 +111,204 @@ class AdkAgentRunExecutorPostgresTest {
     static void tearDown() {
         validators.close();
         controlExecutor.shutdownNow();
+    }
+
+    @Test
+    void queued_execution_requires_a_current_authorization_and_a_verified_issuer() {
+        List<AgentRunAuthorization> rejected = List.of(
+                (request, boundary) -> AgentRunAuthorization.Decision.DENY,
+                (request, boundary) -> AgentRunAuthorization.Decision.UNAVAILABLE,
+                (request, boundary) -> null,
+                (request, boundary) -> { throw new IllegalStateException("private-authorization-sentinel"); });
+        for (int index = 0; index <= rejected.size(); index++) {
+            FixtureModel model = new FixtureModel();
+            TrustedAgentActor actor = actor();
+            ledger.publish(actor, singleSpec("auth-before-claim"));
+            GetAgentRunQuery query = start(actor, "auth-before-claim", "key");
+            AdkAgentRunExecutor worker = index == rejected.size()
+                    ? new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                            Map.of(), controlExecutor, estimator())
+                    : authorizingExecutor(model, rejected.get(index));
+            if (index == 0) {
+                AgentRunDTO denied = worker.executeQueued(actor, query);
+                assertEquals(SUSPENDED, denied.status());
+                assertEquals("AUTHORIZATION_DENIED", denied.waitReason());
+            } else {
+                AgentLedgerException failure = assertThrows(AgentLedgerException.class, () -> worker.executeQueued(actor, query));
+                assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
+                assertFalse(failure.toString().contains("private-authorization-sentinel"));
+                assertEquals(QUEUED, ledger.get(actor, query).status());
+            }
+            assertEquals(0, ledger.get(actor, query).attempt());
+            assertEquals(0, model.streams.get());
+        }
+        AtomicInteger checks = new AtomicInteger();
+        TrustedAgentActor legacy = new TrustedAgentActor(PostgresTestDatabase.nextTenant(), USER, "legacy-user");
+        ledger.publish(legacy, singleSpec("legacy-authorization"));
+        GetAgentRunQuery legacyRun = start(legacy, "legacy-authorization", "key");
+        var worker = authorizingExecutor(new FixtureModel(), (request, boundary) -> {
+            checks.incrementAndGet();
+            return AgentRunAuthorization.Decision.ALLOW;
+        });
+        assertEquals(SUSPENDED, worker.executeQueued(legacy, legacyRun).status());
+        assertEquals(0, checks.get());
+        assertEquals(SUSPENDED, ledger.get(legacy, legacyRun).status());
+    }
+
+    @Test
+    void revoked_authorization_fences_a_running_attempt_before_the_next_model_call() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, configSpec("SEQUENTIAL", policy(Duration.ofSeconds(10)), "auth-sequential"));
+        GetAgentRunQuery query = start(actor, "auth-sequential", "key");
+        List<AgentRunAuthorization.Boundary> boundaries = new java.util.concurrent.CopyOnWriteArrayList<>();
+        List<AgentRunAuthorization.Request> requests = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AtomicInteger modelChecks = new AtomicInteger();
+        var worker = authorizingExecutor(model, (request, boundary) -> {
+            requests.add(request);
+            boundaries.add(boundary);
+            return boundary == AgentRunAuthorization.Boundary.MODEL && modelChecks.incrementAndGet() == 2
+                    ? AgentRunAuthorization.Decision.DENY : AgentRunAuthorization.Decision.ALLOW;
+        });
+        AgentRunDTO result = worker.executeQueued(actor, query);
+        assertEquals(SUSPENDED, result.status());
+        assertEquals("AUTHORIZATION_DENIED", result.waitReason());
+        assertEquals(List.of(AgentRunAuthorization.Boundary.CLAIM, AgentRunAuthorization.Boundary.MODEL,
+                AgentRunAuthorization.Boundary.MODEL), boundaries);
+        assertEquals(1, model.streams.get());
+        assertTrue(requests.stream().allMatch(requests.getFirst()::equals));
+        var binding = requests.getFirst();
+        assertEquals(actor, binding.actor());
+        assertEquals(query.runId(), binding.runId());
+        assertEquals("auth-sequential", binding.definitionKey());
+        assertEquals(1, binding.definitionVersion());
+        assertFalse(binding.sessionRequired());
+        assertEquals(ledger.executionMaterial(actor, query).authorization(), binding);
+        assertFalse(binding.toString().contains(actor.subjectId()));
+        assertFalse(binding.toString().contains("question"));
+        assertTrue(ledger.getResult(actor, query).isEmpty());
+        var events = ledger.events(actor, new AgentEventsQuery(query.runId(), 0, 100));
+        assertEquals("AUTHORIZATION_DENIED", events.getLast().payload().get("reason"));
+        assertEquals(1, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                """, Integer.class, actor.tenantId(), query.runId()));
+    }
+
+    @Test
+    void unavailable_authorization_after_claim_suspends_without_calling_the_model() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, singleSpec("auth-unavailable"));
+        GetAgentRunQuery query = start(actor, "auth-unavailable", "key");
+        var worker = authorizingExecutor(model, (request, boundary) -> boundary == AgentRunAuthorization.Boundary.CLAIM
+                ? AgentRunAuthorization.Decision.ALLOW : AgentRunAuthorization.Decision.UNAVAILABLE);
+        AgentRunDTO result = worker.executeQueued(actor, query);
+        assertEquals(SUSPENDED, result.status());
+        assertEquals("AUTHORIZATION_UNAVAILABLE", result.waitReason());
+        assertEquals(0, model.streams.get());
+        assertTrue(ledger.getResult(actor, query).isEmpty());
+    }
+
+    @Test
+    void session_access_requirement_is_part_of_the_authorization_binding() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        var sessions = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), actor, "tianji");
+        sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "auth-session").blockingGet();
+        ledger.publish(actor, singleSpec("auth-session"));
+        AgentRunDTO run = ledger.start(actor, new StartAgentRunCommand("auth-session", 1, "auth-session", "key",
+                null, null, new AgentInputDTO("question", List.of(), Map.of()), null));
+        GetAgentRunQuery query = new GetAgentRunQuery(run.runId());
+        var worker = authorizingExecutor(model, (request, boundary) -> request.sessionRequired()
+                ? AgentRunAuthorization.Decision.DENY : AgentRunAuthorization.Decision.ALLOW);
+        AgentRunDTO denied = worker.executeQueued(actor, query);
+        assertEquals(SUSPENDED, denied.status());
+        assertEquals("AUTHORIZATION_DENIED", denied.waitReason());
+        assertEquals(0, model.streams.get());
+    }
+
+    @Test
+    void authorization_binding_changes_if_persisted_execution_input_changes() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, singleSpec("bound-input"));
+        GetAgentRunQuery query = start(actor, "bound-input", "key");
+        var original = ledger.executionMaterial(actor, query).authorization();
+        assertEquals(original, new AgentLedgerService(PostgresTestDatabase.dataSource())
+                .executionMaterial(actor, query).authorization());
+        new JdbcTemplate(PostgresTestDatabase.dataSource()).update("""
+                UPDATE tianji_agent.agent_run SET execution_snapshot = jsonb_set(execution_snapshot,
+                    '{input,text}', '"different question"'::jsonb)
+                WHERE tenant_id = ? AND run_id = ?
+                """, actor.tenantId(), query.runId());
+        var changed = ledger.executionMaterial(actor, query).authorization();
+        assertNotEquals(original.snapshotSha256(), changed.snapshotSha256());
+        var worker = authorizingExecutor(model, (request, boundary) -> original.equals(request)
+                ? AgentRunAuthorization.Decision.ALLOW : AgentRunAuthorization.Decision.DENY);
+        assertEquals(SUSPENDED, worker.executeQueued(actor, query).status());
+        assertEquals(SUSPENDED, ledger.get(actor, query).status());
+        assertEquals(0, model.streams.get());
+    }
+
+    @Test
+    void authorization_provider_failure_does_not_leak_details_into_logs() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, singleSpec("auth-error"));
+        GetAgentRunQuery query = start(actor, "auth-error", "key");
+        var worker = authorizingExecutor(model, (request, boundary) -> {
+            throw new IllegalStateException("private-authorization-sentinel");
+        });
+        Logger root = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
+        ListAppender<ILoggingEvent> captured = new ListAppender<>();
+        captured.start();
+        root.addAppender(captured);
+        try {
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class, () -> worker.executeQueued(actor, query)).code());
+        } finally {
+            root.detachAppender(captured);
+            captured.stop();
+        }
+        String logText = captured.list.stream().map(event -> event.getFormattedMessage()
+                        + (event.getThrowableProxy() == null ? "" : ThrowableProxyUtil.asString(event.getThrowableProxy())))
+                .reduce("", String::concat);
+        assertFalse(logText.contains("private-authorization-sentinel"));
+        assertEquals(0, model.streams.get());
+    }
+
+    @RepeatedTest(10)
+    void cancellation_wins_when_authorization_and_cancellation_race() throws Exception {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, singleSpec("auth-cancel"));
+        GetAgentRunQuery query = start(actor, "auth-cancel", "key");
+        CountDownLatch checking = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        var worker = authorizingExecutor(model, (request, boundary) -> {
+            if (boundary == AgentRunAuthorization.Boundary.CLAIM) return AgentRunAuthorization.Decision.ALLOW;
+            checking.countDown();
+            try {
+                if (!release.await(5, TimeUnit.SECONDS)) return AgentRunAuthorization.Decision.UNAVAILABLE;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return AgentRunAuthorization.Decision.UNAVAILABLE;
+            }
+            return AgentRunAuthorization.Decision.DENY;
+        });
+        try (ExecutorService pool = Executors.newSingleThreadExecutor()) {
+            Future<AgentRunDTO> running = pool.submit(() -> worker.executeQueued(actor, query));
+            try {
+                assertTrue(checking.await(5, TimeUnit.SECONDS));
+                AgentRunDTO active = ledger.get(actor, query);
+                assertTrue(ledger.cancel(actor, new CancelAgentRunCommand(query.runId(), "auth-cancel",
+                        active.revision(), "stop")).accepted());
+            } finally {
+                release.countDown();
+            }
+            assertEquals(CANCELLED, running.get(10, TimeUnit.SECONDS).status());
+        }
+        assertEquals(0, model.streams.get());
     }
 
     @Test
@@ -377,6 +577,22 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void terminal_run_status_remains_readable_even_if_its_old_snapshot_is_unreadable() {
+        FixtureModel model = new FixtureModel();
+        TrustedAgentActor actor = actor();
+        ledger.publish(actor, singleSpec("cancel-corrupt-snapshot"));
+        GetAgentRunQuery query = start(actor, "cancel-corrupt-snapshot", "key");
+        ledger.cancel(actor, new CancelAgentRunCommand(query.runId(), "cancel", 0, "stop"));
+        new JdbcTemplate(PostgresTestDatabase.dataSource()).update("""
+                UPDATE tianji_agent.agent_run SET execution_snapshot = '{}'::jsonb WHERE tenant_id = ? AND run_id = ?
+                """, actor.tenantId(), query.runId());
+        var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                Map.of(), controlExecutor, estimator());
+        assertEquals(CANCELLED, worker.executeQueued(actor, query).status());
+        assertEquals(0, model.streams.get());
+    }
+
+    @Test
     void a_run_that_expires_in_the_queue_never_starts_the_model() {
         FixtureModel model = new FixtureModel();
         TrustedAgentActor actor = actor();
@@ -434,7 +650,7 @@ class AdkAgentRunExecutorPostgresTest {
             return FixtureModel.textStream(prompts.size() == 1 ? "FIRST answer" : "SECOND answer");
         };
         AdkAgentRunExecutor worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                Map.of(), controlExecutor, estimator(), PostgresTestDatabase.dataSource(), true);
+                Map.of(), controlExecutor, estimator(), PostgresTestDatabase.dataSource(), true, authorized());
         AgentRunDTO first = ledger.start(actor, new StartAgentRunCommand("conversation", 1, "conversation", "turn-1",
                 null, null, new AgentInputDTO("first question", List.of(), Map.of()), null));
         assertEquals(COMPLETED, worker.executeQueued(actor, new GetAgentRunQuery(first.runId())).status());
@@ -628,7 +844,7 @@ class AdkAgentRunExecutorPostgresTest {
         root.addAppender(captured);
         try {
             var executor = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                    Map.of(), controlExecutor, badEstimator);
+                    Map.of(), controlExecutor, badEstimator, null, false, authorized());
             assertEquals(FAILED, executor.executeQueued(actor, query).status());
             assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", ledger.getResult(actor, query).orElseThrow().errorCode());
         } finally {
@@ -728,7 +944,7 @@ class AdkAgentRunExecutorPostgresTest {
             var estimate = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
                     "fixture-model", "fixture-route", "policy-v1", window, 10), call -> 20);
             var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                    Map.of(), controlExecutor, estimate);
+                    Map.of(), controlExecutor, estimate, null, false, authorized());
             AgentRunDTO result = worker.executeQueued(actor, query);
             assertEquals(window == 60 ? COMPLETED : FAILED, result.status());
             assertEquals(window == 60 ? 1 : 0, model.streams.get());
@@ -750,7 +966,7 @@ class AdkAgentRunExecutorPostgresTest {
         var estimate = contextEstimator(new AgentModelBudgetEstimator.ContextWindow(
                 "fixture-model", "fixture-route", "policy-v1", 60, 10), call -> call == 0 ? 20 : 21);
         var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                Map.of(), controlExecutor, estimate);
+                Map.of(), controlExecutor, estimate, null, false, authorized());
         assertEquals(FAILED, worker.executeQueued(actor, query).status());
         assertEquals("TIANJI_BUDGET_EXCEEDED", ledger.getResult(actor, query).orElseThrow().errorCode());
         assertEquals(1, model.streams.get());
@@ -783,7 +999,7 @@ class AdkAgentRunExecutorPostgresTest {
             }
         };
         var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                Map.of(), controlExecutor, estimate);
+                Map.of(), controlExecutor, estimate, null, false, authorized());
         assertEquals(FAILED, worker.executeQueued(actor, query).status());
         assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", ledger.getResult(actor, query).orElseThrow().errorCode());
         assertEquals(1, model.streams.get());
@@ -816,7 +1032,7 @@ class AdkAgentRunExecutorPostgresTest {
             ledger.publish(actor, singleSpec("window-denied"));
             GetAgentRunQuery query = start(actor, "window-denied", "key");
             var worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
-                    Map.of(), controlExecutor, estimate);
+                    Map.of(), controlExecutor, estimate, null, false, authorized());
             assertEquals(FAILED, worker.executeQueued(actor, query).status());
             assertEquals(estimate == overflow ? "TIANJI_BUDGET_EXCEEDED" : "TIANJI_DEPENDENCY_UNAVAILABLE",
                     ledger.getResult(actor, query).orElseThrow().errorCode());
@@ -836,7 +1052,7 @@ class AdkAgentRunExecutorPostgresTest {
                 Map.of("limited-output", scheduler -> LlmAgent.builder().name("limited").instruction("write")
                         .model(new SpringAiModelAdapterFactory().create(model, "fixture-model"))
                         .generateContentConfig(com.google.genai.types.GenerateContentConfig.builder().maxOutputTokens(10).build())
-                        .build()), controlExecutor, estimate);
+                        .build()), controlExecutor, estimate, null, false, authorized());
         assertEquals(COMPLETED, worker.executeQueued(actor, query).status());
         assertEquals(10, model.maxTokens.get());
     }
@@ -952,8 +1168,8 @@ class AdkAgentRunExecutorPostgresTest {
             return FixtureModel.textStream("WRITE done");
         });
         TrustedAgentActor user = actor();
-        TrustedAgentActor service = new TrustedAgentActor(PostgresTestDatabase.nextTenant(),
-                TrustedAgentActor.SubjectType.SERVICE, "service-client");
+        TrustedAgentActor service = TrustedAgentActor.verified(PostgresTestDatabase.nextTenant(),
+                TrustedAgentActor.SubjectType.SERVICE, "service-client", "https://issuer.example");
         ledger.publish(user, singleSpec("user-flow"));
         ledger.publish(service, singleSpec("service-flow"));
         GetAgentRunQuery userRun = startWithText(user, "user-flow", "question-user");
@@ -982,12 +1198,17 @@ class AdkAgentRunExecutorPostgresTest {
             Map<String, java.util.function.Function<io.reactivex.rxjava3.core.Scheduler,
                     ? extends com.google.adk.agents.BaseAgent>> factories) {
         return new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model), factories,
-                controlExecutor, estimator());
+                controlExecutor, estimator(), null, false, authorized());
+    }
+
+    private static AdkAgentRunExecutor authorizingExecutor(FixtureModel model, AgentRunAuthorization authorizer) {
+        return new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model), Map.of(),
+                controlExecutor, estimator(), null, false, authorizer);
     }
 
     private static AdkAgentRunExecutor sessionExecutor(FixtureModel model) {
         return new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model), Map.of(),
-                controlExecutor, estimator(), PostgresTestDatabase.dataSource());
+                controlExecutor, estimator(), PostgresTestDatabase.dataSource(), false, authorized());
     }
 
     private static AgentDefinitionSpecDTO configSpec(String workflow, ExecutionPolicyDTO policy, String key) {
@@ -1084,7 +1305,11 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     private static TrustedAgentActor actor() {
-        return new TrustedAgentActor(PostgresTestDatabase.nextTenant(), USER, "fixture-user");
+        return TrustedAgentActor.verified(PostgresTestDatabase.nextTenant(), USER, "fixture-user", "https://issuer.example");
+    }
+
+    private static AgentRunAuthorization authorized() {
+        return (request, boundary) -> AgentRunAuthorization.Decision.ALLOW;
     }
 
     private static GetAgentRunQuery start(TrustedAgentActor actor, String definitionKey, String key) {

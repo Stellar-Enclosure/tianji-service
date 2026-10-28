@@ -204,6 +204,35 @@ final class JdbcAgentLedgerRepository {
                 runId, expectedRevision).stream().findFirst();
     }
 
+    Optional<StoredRun> suspendAuthorization(TrustedAgentActor actor, AgentRunLease lease, String reason) {
+        return jdbc.query("""
+                UPDATE tianji_agent.agent_run
+                SET status = 'SUSPENDED', wait_reason = ?, revision = revision + 1,
+                    last_event_sequence = last_event_sequence + 1, lease_epoch = lease_epoch + 1,
+                    lease_owner = NULL, lease_expires_at = NULL, active_model_calls = 0, active_tool_calls = 0
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
+                  AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
+                  AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
+                  AND cancel_requested_at IS NULL
+                RETURNING *
+                """, runMapper(), reason, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(),
+                actor.subjectId(), lease.runId(), lease.owner(), lease.epoch()).stream().findFirst();
+    }
+
+    Optional<StoredRun> suspendQueuedAuthorization(TrustedAgentActor actor, String runId, long expectedRevision) {
+        return jdbc.query("""
+                UPDATE tianji_agent.agent_run
+                SET status = 'SUSPENDED', wait_reason = 'AUTHORIZATION_DENIED', revision = revision + 1,
+                    last_event_sequence = last_event_sequence + 1, lease_epoch = lease_epoch + 1,
+                    lease_owner = NULL, lease_expires_at = NULL, active_model_calls = 0, active_tool_calls = 0
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
+                  AND status = 'QUEUED' AND revision = ? AND cancel_requested_at IS NULL
+                  AND deadline_at > clock_timestamp()
+                RETURNING *
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                runId, expectedRevision).stream().findFirst();
+    }
+
     List<ReconciliationCandidate> dueRuns(int limit) {
         return jdbc.query("""
                 SELECT tenant_id, subject_type, subject_issuer, subject_id, run_id, revision,

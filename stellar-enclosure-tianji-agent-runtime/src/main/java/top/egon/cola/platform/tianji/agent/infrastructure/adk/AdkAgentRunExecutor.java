@@ -29,6 +29,7 @@ import top.egon.cola.component.agentflow.runtime.AgentFlowSessionRunner;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
 import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
@@ -72,6 +73,7 @@ public final class AdkAgentRunExecutor {
     private final String workerId = UUID.randomUUID().toString();
     private final ScheduledExecutorService controlExecutor;
     private final AgentModelBudgetEstimator budgetEstimator;
+    private final AgentRunAuthorization authorizer;
     private final DataSource sessionDataSource;
     private final boolean typedSessionWrites;
     private final ObjectMapper mapper = new ObjectMapper();
@@ -99,6 +101,16 @@ public final class AdkAgentRunExecutor {
                                Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
                                ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
                                DataSource sessionDataSource, boolean typedSessionWrites) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, typedSessionWrites, (request, boundary) -> AgentRunAuthorization.Decision.UNAVAILABLE);
+    }
+
+    /** The host must provide a current, run-bound authorization verifier. */
+    public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -106,6 +118,7 @@ public final class AdkAgentRunExecutor {
         this.codeFirstFactories = Map.copyOf(codeFirstFactories);
         this.controlExecutor = Objects.requireNonNull(controlExecutor, "controlExecutor");
         this.budgetEstimator = Objects.requireNonNull(budgetEstimator, "budgetEstimator");
+        this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
         if (sessionDataSource != null && !ledger.usesDataSource(sessionDataSource)) {
             throw new IllegalArgumentException("Agent sessions and runs require the same DataSource");
         }
@@ -143,6 +156,32 @@ public final class AdkAgentRunExecutor {
         if (!queued.deadlineAt().isAfter(ledger.databaseNow())) {
             return ledger.expireDeadline(actor, query, queued.revision());
         }
+        AgentLedgerService.ExecutionMaterial material = ledger.executionMaterial(actor, query);
+        if (material.run().revision() != queued.revision()) {
+            AgentRunDTO latest = material.run();
+            if (AgentRunTransitions.terminal(latest.status())) return latest;
+            if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                return ledger.expireDeadline(actor, query, latest.revision());
+            }
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent run changed before authorization");
+        }
+        AgentExecutionAuthorization authorization = new AgentExecutionAuthorization(authorizer, material.authorization());
+        try {
+            authorization.require(AgentRunAuthorization.Boundary.CLAIM);
+        } catch (AgentExecutionAuthorization.Failure failure) {
+            if (failure.decision() != AgentRunAuthorization.Decision.DENY) throw failure;
+            try {
+                return ledger.suspendQueuedForAuthorization(actor, query, queued.revision());
+            } catch (AgentLedgerException race) {
+                if (race.code() != AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT) throw race;
+                AgentRunDTO latest = ledger.get(actor, query);
+                if (AgentRunTransitions.terminal(latest.status())) return latest;
+                if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                    return ledger.expireDeadline(actor, query, latest.revision());
+                }
+                throw race;
+            }
+        }
         ClaimedAgentRun claimed;
         try {
             claimed = ledger.claim(actor, query, queued.revision(), workerId, LEASE_DURATION);
@@ -163,12 +202,12 @@ public final class AdkAgentRunExecutor {
         SessionLease sessionLease = null;
         boolean invocationStarted = false;
         try {
-            AgentExecutionSnapshot snapshot = ledger.snapshot(actor, query);
+            AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
             BaseAgent root = buildRoot(snapshot.definition());
             requireNoTools(root);
             AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
-                    Schedulers.from(controlExecutor), controlExecutor);
+                    authorization, Schedulers.from(controlExecutor), controlExecutor);
             String userId;
             String sessionId;
             if (running.sessionId() == null) {
@@ -236,6 +275,10 @@ public final class AdkAgentRunExecutor {
                     output, null, snapshot.definition().outputSchemaVersion(), null, null, "UNKNOWN");
             return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } catch (RuntimeException failure) {
+            AgentExecutionAuthorization.Failure authorizationFailure = findCause(failure, AgentExecutionAuthorization.Failure.class);
+            if (authorizationFailure != null) {
+                return suspendForAuthorizationOrResolve(actor, lease, authorizationFailure.decision());
+            }
             if (failure instanceof AgentLedgerException conflict
                     && (conflict.code() == AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT
                     || conflict.code() == AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED)) {
@@ -288,6 +331,25 @@ public final class AdkAgentRunExecutor {
                             releaseFailure.getClass().getSimpleName());
                 }
             }
+        }
+    }
+
+    private AgentRunDTO suspendForAuthorizationOrResolve(TrustedAgentActor actor, AgentRunLease lease,
+                                                          AgentRunAuthorization.Decision decision) {
+        GetAgentRunQuery query = new GetAgentRunQuery(lease.runId());
+        try {
+            return ledger.suspendForAuthorization(actor, lease, decision);
+        } catch (AgentLedgerException race) {
+            if (race.code() != AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED) throw race;
+            AgentRunDTO latest = ledger.get(actor, query);
+            if (AgentRunTransitions.terminal(latest.status())) return latest;
+            if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()) {
+                return finishCancellation(actor, lease, latest);
+            }
+            if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                return ledger.expireDeadline(actor, query, latest.revision());
+            }
+            throw race;
         }
     }
 
@@ -408,11 +470,15 @@ public final class AdkAgentRunExecutor {
     }
 
     private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {
+        return findCause(failure, type) != null;
+    }
+
+    private static <T extends Throwable> T findCause(Throwable failure, Class<T> type) {
         Throwable current = failure;
         for (int depth = 0; current != null && depth < 64; depth++, current = current.getCause()) {
-            if (type.isInstance(current)) return true;
+            if (type.isInstance(current)) return type.cast(current);
         }
-        return false;
+        return null;
     }
 
     private static final class CancellationSignal extends RuntimeException { }

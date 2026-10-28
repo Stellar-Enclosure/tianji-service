@@ -20,6 +20,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -39,6 +40,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private final AgentRunLease lease;
     private final AgentExecutionSnapshot snapshot;
     private final AgentModelBudgetEstimator estimator;
+    private final AgentExecutionAuthorization authorization;
     private final Scheduler retryScheduler;
     private final ScheduledExecutorService controlExecutor;
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
@@ -47,12 +49,14 @@ final class AdkRunBudgetPlugin implements Plugin {
 
     AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
                        AgentExecutionSnapshot snapshot, AgentModelBudgetEstimator estimator,
-                       Scheduler retryScheduler, ScheduledExecutorService controlExecutor) {
+                       AgentExecutionAuthorization authorization, Scheduler retryScheduler,
+                       ScheduledExecutorService controlExecutor) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
         this.snapshot = snapshot;
         this.estimator = estimator;
+        this.authorization = Objects.requireNonNull(authorization, "authorization");
         this.retryScheduler = retryScheduler;
         this.controlExecutor = controlExecutor;
     }
@@ -65,6 +69,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<LlmResponse> beforeModelCallback(CallbackContext context, LlmRequest.Builder request) {
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
+            authorization.require(AgentRunAuthorization.Boundary.MODEL);
             LlmRequest modelRequest = request.build();
             AgentModelBudgetEstimator.Estimate estimate = estimate(modelRequest);
             GenerateContentConfig config = request.config().orElseGet(() -> GenerateContentConfig.builder().build());

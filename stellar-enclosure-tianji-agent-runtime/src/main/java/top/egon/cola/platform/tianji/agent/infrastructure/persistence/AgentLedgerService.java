@@ -7,6 +7,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
 import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.ExecutionPolicyReducer;
@@ -186,7 +187,27 @@ public final class AgentLedgerService {
     }
 
     public AgentExecutionSnapshot snapshot(TrustedAgentActor actor, GetAgentRunQuery query) {
-        JdbcAgentLedgerRepository.StoredRun run = requireRun(actor, query);
+        return verifiedSnapshot(actor, requireRun(actor, query));
+    }
+
+    /** Reads the run, execution input and its authorization binding from the same stored row. */
+    public ExecutionMaterial executionMaterial(TrustedAgentActor actor, GetAgentRunQuery query) {
+        JdbcAgentLedgerRepository.StoredRun stored = requireRun(actor, query);
+        AgentExecutionSnapshot snapshot = verifiedSnapshot(actor, stored);
+        var run = stored.run();
+        var authorization = new AgentRunAuthorization.Request(actor, run.runId(), run.definitionKey(),
+                run.definitionVersion(), snapshot.definitionContentSha256(), stored.requestHash(),
+                json.executionSnapshotHash(snapshot), snapshot.definition().dependencies().policyVersionRef(),
+                run.sessionId() != null, run.deadlineAt());
+        return new ExecutionMaterial(run, snapshot, authorization);
+    }
+
+    public record ExecutionMaterial(AgentRunDTO run, AgentExecutionSnapshot snapshot,
+                                    AgentRunAuthorization.Request authorization) {
+        @Override public String toString() { return "AgentLedgerService.ExecutionMaterial[redacted]"; }
+    }
+
+    private AgentExecutionSnapshot verifiedSnapshot(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun run) {
         AgentExecutionSnapshot snapshot = json.readSnapshot(run.snapshotJson());
         JdbcAgentLedgerRepository.DefinitionRow definition = repository.definition(actor.tenantId(),
                 run.run().definitionKey(), run.run().definitionVersion()).orElseThrow(AgentLedgerService::notFound);
@@ -326,6 +347,43 @@ public final class AgentLedgerService {
             repository.markOutstandingBudgetUnknown(actor.tenantId(), query.runId());
             appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING,
                     AgentRunStatusEnum.SUSPENDED, "LEASE_EXPIRED");
+            return updated.run();
+        });
+    }
+
+    /** Fences the active worker when current authorization cannot be established. */
+    public AgentRunDTO suspendForAuthorization(TrustedAgentActor actor, AgentRunLease lease,
+                                               AgentRunAuthorization.Decision decision) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(lease, "lease");
+        if (decision == null || decision == AgentRunAuthorization.Decision.ALLOW) {
+            throw invalid("invalid Agent authorization suspension reason");
+        }
+        String reason = decision == AgentRunAuthorization.Decision.DENY
+                ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_UNAVAILABLE";
+        return transaction.execute(status -> {
+            JdbcAgentLedgerRepository.StoredRun previous = requireRun(actor, new GetAgentRunQuery(lease.runId()));
+            JdbcAgentLedgerRepository.StoredRun updated = repository.suspendAuthorization(actor, lease, reason)
+                    .orElseThrow(() -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED,
+                            "Agent run lease or state is no longer valid"));
+            repository.markOutstandingBudgetUnknown(actor.tenantId(), lease.runId());
+            appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING, AgentRunStatusEnum.SUSPENDED, reason);
+            return updated.run();
+        });
+    }
+
+    /** A confirmed denial removes a queued run from automatic discovery without discarding it. */
+    public AgentRunDTO suspendQueuedForAuthorization(TrustedAgentActor actor, GetAgentRunQuery query, long expectedRevision) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(query, "query");
+        if (expectedRevision < 0) throw invalid("invalid Agent authorization revision");
+        return transaction.execute(status -> {
+            JdbcAgentLedgerRepository.StoredRun previous = requireRun(actor, query);
+            JdbcAgentLedgerRepository.StoredRun updated = repository.suspendQueuedAuthorization(actor, query.runId(), expectedRevision)
+                    .orElseThrow(() -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                            "Agent run changed before authorization suspension"));
+            appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.QUEUED, AgentRunStatusEnum.SUSPENDED,
+                    "AUTHORIZATION_DENIED");
             return updated.run();
         });
     }
