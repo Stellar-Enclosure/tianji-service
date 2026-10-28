@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.health.actuate.endpoint.HealthEndpoint;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
+import javax.sql.DataSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -20,6 +21,7 @@ class TianjiAgentServerApplicationTest {
             assertThat(context).hasNotFailed();
             assertThat(context).hasSingleBean(HealthEndpoint.class);
             assertThat(context).doesNotHaveBean(AgentClient.class);
+            assertThat(context).doesNotHaveBean(DataSource.class);
             assertThat(context).doesNotHaveBean("webServerFactory");
         });
     }
