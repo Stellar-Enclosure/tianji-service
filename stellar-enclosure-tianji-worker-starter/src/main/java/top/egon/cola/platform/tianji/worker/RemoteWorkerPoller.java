@@ -18,6 +18,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -31,12 +32,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
-/** Bounded polling over host-managed executors; business work stays in the supplied receipt store. */
+/** Bounded polling over host-managed executors; the store owns intent and receipt handling. */
 public final class RemoteWorkerPoller implements SmartLifecycle {
     private static final Logger log = LoggerFactory.getLogger(RemoteWorkerPoller.class);
     private final WorkerClient client;
     private final WorkerExecutionStore store;
-    private final List<WorkerHandlerRegistration> handlers;
+    private final List<Handler> handlers;
     private final TaskScheduler scheduler;
     private final Executor executor;
     private final WorkerPollingProperties properties;
@@ -52,21 +53,39 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
 
     public RemoteWorkerPoller(WorkerClient client, WorkerExecutionStore store, List<WorkerHandlerRegistration> handlers,
                               TaskScheduler scheduler, Executor executor, WorkerPollingProperties properties, Clock clock) {
+        this(client, store, handlers, List.of(), scheduler, executor, properties, clock);
+    }
+
+    public RemoteWorkerPoller(WorkerClient client, WorkerExecutionStore store, List<WorkerHandlerRegistration> handlers,
+                              List<NonTransactionalWorkerRegistration> nonTransactionalHandlers,
+                              TaskScheduler scheduler, Executor executor, WorkerPollingProperties properties, Clock clock) {
         this.client = Objects.requireNonNull(client, "client");
         this.store = Objects.requireNonNull(store, "store");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         this.executor = Objects.requireNonNull(executor, "executor");
         this.properties = Objects.requireNonNull(properties, "properties");
         this.clock = Objects.requireNonNull(clock, "clock");
-        if (!properties.enabled() || handlers == null || handlers.isEmpty() || handlers.size() > 1_000
+        if (!properties.enabled() || handlers == null || nonTransactionalHandlers == null
+                || (long) handlers.size() + nonTransactionalHandlers.size() < 1
+                || (long) handlers.size() + nonTransactionalHandlers.size() > 1_000
                 || store.tenantId() != properties.tenantId() || store.deadlineSafetyMargin() == null
                 || store.deadlineSafetyMargin().compareTo(properties.acknowledgementReserve().plus(properties.maxClockSkew())) < 0) throw invalid();
         Set<String> keys = new HashSet<>();
+        List<Handler> registered = new ArrayList<>();
         for (WorkerHandlerRegistration registration : handlers) {
             if (registration == null || !keys.add(registration.descriptor().contract().topic() + ":"
                     + registration.descriptor().contract().schemaVersion())) throw invalid();
+            registered.add(new Handler(registration.descriptor(), registration.handler(), null, null));
         }
-        this.handlers = List.copyOf(handlers);
+        for (NonTransactionalWorkerRegistration registration : nonTransactionalHandlers) {
+            if (registration == null || !keys.add(registration.descriptor().contract().topic() + ":"
+                    + registration.descriptor().contract().schemaVersion())) throw invalid();
+            registered.add(new Handler(registration.descriptor(), null, registration.targetId(), registration.handler()));
+        }
+        if (!nonTransactionalHandlers.isEmpty()) {
+            store.requireNonTransactional();
+        }
+        this.handlers = List.copyOf(registered);
         this.slots = new Semaphore(properties.concurrency());
     }
 
@@ -118,7 +137,7 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
                 inFlight++;
             }
             int index = Math.floorMod(nextHandler.getAndIncrement(), handlers.size());
-            WorkerHandlerRegistration handler = handlers.get(index);
+            Handler handler = handlers.get(index);
             var started = new AtomicBoolean();
             try {
                 executor.execute(() -> {
@@ -145,7 +164,7 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
         }
     }
 
-    private void process(WorkerHandlerRegistration registration, long current) {
+    private void process(Handler registration, long current) {
         var contract = registration.descriptor().contract();
         AcquireWorkerTaskResult acquired;
         try { acquired = client.acquire(new AcquireWorkerTaskCommand(contract.topic(), contract.schemaVersion())); }
@@ -171,7 +190,11 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
             return;
         }
         WorkerExecutionReceipt receipt;
-        try { receipt = store.execute(task, registration.descriptor(), registration.handler()); }
+        try {
+            receipt = registration.nonTransactionalHandler() == null
+                    ? store.execute(task, registration.descriptor(), registration.handler())
+                    : store.executeNonTransactional(task, registration.descriptor(), registration.targetId(), registration.nonTransactionalHandler());
+        }
         catch (WorkerHandlerFailureException reported) {
             reportFailure(task, reported.kind(), reported.code());
             return;
@@ -258,4 +281,7 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
     }
 
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Worker poller configuration is invalid"); }
+
+    private record Handler(WorkerHandlerDescriptor descriptor, TransactionalWorkerHandler handler, String targetId,
+                           NonTransactionalWorkerHandler nonTransactionalHandler) { }
 }

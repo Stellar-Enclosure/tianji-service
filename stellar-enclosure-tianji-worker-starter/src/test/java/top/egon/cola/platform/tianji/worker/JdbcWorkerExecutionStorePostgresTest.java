@@ -52,7 +52,7 @@ class JdbcWorkerExecutionStorePostgresTest {
         assertThrows(IllegalStateException.class, absent::verify);
         Flyway migrations = Flyway.configure().dataSource(bootstrapSource).schemas("business").defaultSchema("business")
                 .table("tianji_worker_schema_history").baselineVersion("0").baselineOnMigrate(true)
-                .locations("classpath:db/tianji-worker").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-worker").target("1").cleanDisabled(true).load();
         assertEquals(1, migrations.migrate().migrationsExecuted);
         migrations.validate();
         assertEquals(0L, counter(bootstrap, 20));
@@ -66,6 +66,7 @@ class JdbcWorkerExecutionStorePostgresTest {
         var manager = new DataSourceTransactionManager(runtime);
         var verifier = new WorkerExecutionSchemaVerifier(runtime, "business");
         verifier.verify();
+        assertThrows(IllegalStateException.class, verifier::verifyNonTransactional);
         assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM information_schema.columns WHERE table_schema='business' "
                 + "AND table_name='tianji_worker_execution_receipt' AND column_name LIKE '%token%'", Integer.class));
         verifySchemaDrift(bootstrap, verifier);

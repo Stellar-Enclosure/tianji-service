@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.worker;
 
+import org.jspecify.annotations.Nullable;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -20,10 +22,12 @@ public class TianjiWorkerAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(RemoteWorkerPoller.class)
     RemoteWorkerPoller remoteWorkerPoller(WorkerClient client, WorkerExecutionStore store,
-                                          List<WorkerHandlerRegistration> handlers,
+                                          @Nullable List<WorkerHandlerRegistration> handlers,
+                                          ObjectProvider<NonTransactionalWorkerRegistration> nonTransactionalHandlers,
                                           @Qualifier("tianjiWorkerScheduler") TaskScheduler scheduler,
                                           @Qualifier("tianjiWorkerExecutor") Executor executor,
                                           WorkerPollingProperties properties) {
-        return new RemoteWorkerPoller(client, store, handlers, scheduler, executor, properties, Clock.systemUTC());
+        return new RemoteWorkerPoller(client, store, handlers == null ? List.of() : handlers, nonTransactionalHandlers.orderedStream().toList(),
+                scheduler, executor, properties, Clock.systemUTC());
     }
 }

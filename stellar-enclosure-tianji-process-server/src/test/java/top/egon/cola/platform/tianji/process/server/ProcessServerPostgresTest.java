@@ -634,8 +634,12 @@ class ProcessServerPostgresTest {
                 Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
                 Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
                 Duration.ofSeconds(3), Duration.ofMillis(200), WorkerEffect.TRANSACTIONAL_RECEIPT);
+        var external = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-service", "riskCheck", "4",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
+                Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.EXTERNAL_IDEMPOTENT);
         var foreign = workerRegistration(21, "https://idp.example/21", "worker-service", "1");
-        var registry = new WorkerTopicRegistry(List.of(one, two, competitor, shortLease, foreign));
+        var registry = new WorkerTopicRegistry(List.of(one, two, competitor, shortLease, external, foreign));
         var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
         var runs = new ProcessExecutionService(process, dmn, validator);
         var service = new FlowableWorkerService(process, dmn, validator, registry);
@@ -649,10 +653,15 @@ class ProcessServerPostgresTest {
                 .replace("tianji:schemaVersion=\"1\"", "tianji:schemaVersion=\"2\"").getBytes(StandardCharsets.UTF_8);
         byte[] v3 = new String(v1, StandardCharsets.UTF_8).replace("riskCheck:1", "riskCheck:3")
                 .replace("tianji:schemaVersion=\"1\"", "tianji:schemaVersion=\"3\"").getBytes(StandardCharsets.UTF_8);
+        byte[] v4 = new String(v1, StandardCharsets.UTF_8).replace("riskCheck:1", "riskCheck:4")
+                .replace("tianji:schemaVersion=\"1\"", "tianji:schemaVersion=\"4\"")
+                .replace("tianji:effectSafety=\"TRANSACTIONAL_RECEIPT\"", "tianji:effectSafety=\"EXTERNAL_IDEMPOTENT\"")
+                .getBytes(StandardCharsets.UTF_8);
         var inputs = Map.of("amount", ValueType.INTEGER, "privateFixture", ValueType.STRING);
         var model1 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v1, inputs);
         var model2 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v2, inputs);
         var model3 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v3, inputs);
+        var model4 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v4, inputs);
         byte[] unauthorizedSource = new String(v1, StandardCharsets.UTF_8).replace("source=\"amount\"", "source=\"privateAmount\"")
                 .getBytes(StandardCharsets.UTF_8);
         var unsafeModel = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", unauthorizedSource,
@@ -661,6 +670,7 @@ class ProcessServerPostgresTest {
         releases.publish(owner20, "worker-v1", List.of(model1));
         releases.publish(owner20, "worker-v2", List.of(model2));
         releases.publish(owner20, "worker-v3", List.of(model3));
+        releases.publish(owner20, "worker-v4", List.of(model4));
         releases.publish(owner21, "worker-v1", List.of(model1));
         var first = startWorkerRun(runs, owner20, "worker-v1", "worker-first");
         var second = startWorkerRun(runs, owner20, "worker-v1", "worker-second");
@@ -796,7 +806,7 @@ class ProcessServerPostgresTest {
         business.update("INSERT INTO cross_worker.business_counter (tenant_id,value) VALUES (20,0)");
         Flyway flyway = Flyway.configure().dataSource(bootstrapSource).schemas("cross_worker").defaultSchema("cross_worker")
                 .table("tianji_worker_schema_history").baselineVersion("0").baselineOnMigrate(true)
-                .locations("classpath:db/tianji-worker").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-worker").target("1").cleanDisabled(true).load();
         assertEquals(1, flyway.migrate().migrationsExecuted);
         business.execute("GRANT USAGE ON SCHEMA cross_worker TO \"" + user + "\"");
         business.execute("GRANT SELECT,INSERT,UPDATE ON cross_worker.tianji_worker_execution_receipt TO \"" + user + "\"");
@@ -881,6 +891,52 @@ class ProcessServerPostgresTest {
         } finally {
             retryPoller.stop();
         }
+
+        Flyway externalSchema = Flyway.configure().dataSource(bootstrapSource).schemas("cross_worker").defaultSchema("cross_worker")
+                .table("tianji_worker_schema_history").baselineVersion("0").baselineOnMigrate(true)
+                .locations("classpath:db/tianji-worker").target("2").cleanDisabled(true).load();
+        assertEquals(1, externalSchema.migrate().migrationsExecuted);
+        externalSchema.validate();
+        business.execute("GRANT SELECT,INSERT ON cross_worker.tianji_worker_nontransactional_intent TO \"" + user + "\"");
+        var externalContract = new WorkerContractDTO("riskCheck", "4", WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT,
+                Map.of("requestedAmount", ProcessValueTypeEnum.INTEGER), Map.of("approved", ProcessValueTypeEnum.BOOLEAN));
+        var remote = new java.util.concurrent.ConcurrentHashMap<String, WorkerBusinessResultDTO>();
+        var externalEffects = new AtomicInteger(); var externalCalls = new AtomicInteger();
+        var externalRegistration = new top.egon.cola.platform.tianji.worker.NonTransactionalWorkerRegistration(new WorkerHandlerDescriptor(externalContract, "external-v1"),
+                "idempotent-service-v1", (context, externalKey) -> {
+                    assertFalse(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive());
+                    var result = remote.computeIfAbsent(externalKey, ignored -> {
+                        externalEffects.incrementAndGet();
+                        return new WorkerBusinessResultDTO("external-receipt", Map.of("approved", true));
+                    });
+                    if (externalCalls.incrementAndGet() == 1) {
+                        throw new top.egon.cola.platform.tianji.worker.WorkerHandlerFailureException(WorkerFailureKindEnum.RETRYABLE, "REMOTE_RESPONSE_LOST");
+                    }
+                    return result;
+                });
+        var externalClient = new LostAcknowledgementClient(mvc, true);
+        var externalPoller = new RemoteWorkerPoller(externalClient, businessStore, List.of(), List.of(externalRegistration), scheduler,
+                Runnable::run, retryProperties, Clock.systemUTC());
+        var externalInstance = startWorkerRun(runs, owner, "worker-v4", "worker-external-response-lost");
+        externalPoller.start();
+        try {
+            tick.get().run();
+            assertEquals(1, externalEffects.get()); assertEquals(1, externalCalls.get());
+            assertEquals(WorkerFailureKindEnum.RETRYABLE, externalClient.lastFailure.kind());
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
+                tick.get().run();
+                assertEquals(1, app.getBean(TaskService.class).createTaskQuery().processInstanceId(externalInstance.instanceId()).count());
+            });
+            assertEquals(1, externalEffects.get()); assertEquals(2, externalCalls.get());
+            assertEquals(2, externalClient.completionCalls);
+            assertEquals(1, business.queryForObject("SELECT count(*) FROM cross_worker.tianji_worker_nontransactional_intent", Integer.class));
+            assertEquals(3, business.queryForObject("SELECT count(*) FROM cross_worker.tianji_worker_execution_receipt", Integer.class));
+            var review = app.getBean(TaskService.class).createTaskQuery().processInstanceId(externalInstance.instanceId()).singleResult();
+            app.getBean(TaskService.class).complete(review.getId());
+            assertEquals(ProcessExecutionService.State.COMPLETED, runs.get(owner, externalInstance.instanceId()).state());
+        } finally {
+            externalPoller.stop();
+        }
     }
 
     private static final class LostAcknowledgementClient implements WorkerClient {
@@ -890,6 +946,7 @@ class ProcessServerPostgresTest {
         private boolean dropFirstCompletion = true;
         private int completionCalls;
         private WorkerTaskDTO latestTask;
+        private FailWorkerTaskCommand lastFailure;
 
         private LostAcknowledgementClient(MockMvc mvc, boolean dropAfterCommit) { this.mvc = mvc; this.dropAfterCommit = dropAfterCommit; }
 
@@ -913,7 +970,7 @@ class ProcessServerPostgresTest {
             return receipt;
         }
 
-        @Override public WorkerReceiptDTO fail(FailWorkerTaskCommand command) { return post("fail", command, WorkerReceiptDTO.class); }
+        @Override public WorkerReceiptDTO fail(FailWorkerTaskCommand command) { lastFailure = command; return post("fail", command, WorkerReceiptDTO.class); }
 
         private <T> T post(String action, Object command, Class<T> type) {
             try {

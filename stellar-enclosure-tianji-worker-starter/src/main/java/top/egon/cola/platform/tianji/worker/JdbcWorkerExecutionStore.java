@@ -31,11 +31,16 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
     private final DataSourceTransactionManager manager;
     private final JdbcTemplate jdbc;
     private final String table;
+    private final String intentTable;
+    private final String schemaHistory;
+    private final WorkerExecutionSchemaVerifier schemaVerifier;
     private final String sourceId;
     private final long tenantId;
     private final Duration maximumWorkTime;
     private final Duration deadlineSafetyMargin;
     private final JsonMapper mapper = JsonMapper.builder().build();
+    private volatile boolean intentReadableVerified;
+    private volatile boolean nonTransactionalVerified;
 
     public JdbcWorkerExecutionStore(DataSource source, DataSourceTransactionManager manager, String schema, String sourceId,
                                     long tenantId, Duration maximumWorkTime, Duration deadlineSafetyMargin) {
@@ -50,11 +55,14 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
         this.manager = manager;
         this.jdbc = new JdbcTemplate(source);
         this.table = '"' + schema + "\".tianji_worker_execution_receipt";
+        this.intentTable = '"' + schema + "\".tianji_worker_nontransactional_intent";
+        this.schemaHistory = '"' + schema + "\".tianji_worker_schema_history";
         this.sourceId = sourceId;
         this.tenantId = tenantId;
         this.maximumWorkTime = maximumWorkTime;
         this.deadlineSafetyMargin = deadlineSafetyMargin;
-        new WorkerExecutionSchemaVerifier(source, schema).verify();
+        this.schemaVerifier = new WorkerExecutionSchemaVerifier(source, schema);
+        schemaVerifier.verify();
     }
 
     @Override public long tenantId() { return tenantId; }
@@ -78,18 +86,11 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
             Instant workDeadline = now.plus(maximumWorkTime);
             Instant deadline = leaseDeadline.isBefore(workDeadline) ? leaseDeadline : workDeadline;
             requireTime(now, deadline);
-            long lockMillis = Math.max(1, Duration.between(now, deadline).toMillis());
-            jdbc.queryForObject("SELECT set_config('lock_timeout', ?, true)", String.class, lockMillis + "ms");
-            String lockKey = WorkerDigests.hash(List.of("worker-business-lock-v1", sourceId,
-                    Long.toString(tenantId), task.idempotencyKey()), Map.of());
-            jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { }, "tianji:business-worker:" + lockKey);
-            requireTime(now(), deadline);
+            lockBusinessKey(task, deadline);
             String inputHash = inputHash(task);
-            List<StoredReceipt> existing = jdbc.query("SELECT task_id,occurrence_id,topic,schema_version,effect_safety,handler_version, "
-                            + "input_sha256,result_sha256,business_receipt_id,output_json::text AS output_json,committed_at FROM " + table
-                            + " WHERE source_id=? AND tenant_id=? AND idempotency_key=?",
-                    (rs, row) -> read(rs), sourceId, tenantId, task.idempotencyKey());
+            List<StoredReceipt> existing = receipts(task);
             if (existing.size() > 1) throw conflict();
+            rejectConflictingIntent(task);
             if (!existing.isEmpty()) return replay(task, descriptor, inputHash, existing.getFirst());
 
             if (!TransactionSynchronizationManager.hasResource(source)) throw new IllegalStateException("Worker business transaction is not bound to its DataSource");
@@ -98,21 +99,149 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
             if (!TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)
                     || status.isRollbackOnly()) throw new IllegalStateException("Worker business transaction is not active");
             requireTime(now(), deadline);
-            byte[] output;
-            try { output = mapper.writeValueAsBytes(result.output()); }
-            catch (RuntimeException invalidResult) { throw invalid(); }
-            if (output.length > MAX_RESULT_BYTES) throw invalid();
-            String resultHash = resultHash(result);
-            List<Instant> committed = jdbc.query("INSERT INTO " + table + " (source_id,tenant_id,idempotency_key,task_id,occurrence_id, "
-                            + "topic,schema_version,effect_safety,handler_version,input_sha256,result_sha256,business_receipt_id,output_json,committed_at) "
-                            + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CAST(? AS jsonb),clock_timestamp()) RETURNING committed_at",
-                    (rs, row) -> rs.getTimestamp("committed_at").toInstant(), sourceId, tenantId, task.idempotencyKey(), task.taskId(),
-                    task.activityOccurrenceId(), task.topic(), task.schemaVersion(), task.effectSafety().name(), descriptor.handlerVersion(), inputHash,
-                    resultHash, result.businessReceiptId(), new String(output, StandardCharsets.UTF_8));
-            if (committed.size() != 1) throw new IllegalStateException("Worker business receipt could not be recorded");
-            requireTime(now(), deadline);
-            return new WorkerExecutionReceipt(descriptor.handlerVersion(), committed.getFirst(), result, false);
+            return insertReceipt(task, descriptor, inputHash, result, deadline);
         }));
+    }
+
+    @Override
+    public void requireNonTransactional() {
+        if (!nonTransactionalVerified) {
+            schemaVerifier.verifyNonTransactional();
+            intentReadableVerified = true;
+            nonTransactionalVerified = true;
+        }
+    }
+
+    private void requireIntentReadable() {
+        if (!intentReadableVerified) {
+            schemaVerifier.verifyIntentReadable();
+            intentReadableVerified = true;
+        }
+    }
+
+    private void rejectConflictingIntent(WorkerTaskDTO task) {
+        Boolean installed = jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + schemaHistory + " WHERE version='2' AND type='SQL')", Boolean.class);
+        Boolean exists = jdbc.queryForObject("SELECT to_regclass(?) IS NOT NULL", Boolean.class, intentTable);
+        if (!Objects.equals(installed, exists)) throw new IllegalStateException("Worker intent schema is inconsistent");
+        if (Boolean.TRUE.equals(installed)) {
+            requireIntentReadable();
+            if (!intents(task).isEmpty()) throw conflict();
+        }
+    }
+
+    @Override
+    public WorkerExecutionReceipt executeNonTransactional(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor,
+                                                           String targetId, NonTransactionalWorkerHandler handler) {
+        Objects.requireNonNull(task, "task"); Objects.requireNonNull(descriptor, "descriptor"); Objects.requireNonNull(handler, "handler");
+        if (task.tenantId() != tenantId || task.effectSafety() == WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT
+                || !task.contract().equals(descriptor.contract()) || targetId == null
+                || !targetId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) throw invalid();
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Worker external execution must not inherit a transaction");
+        }
+        requireNonTransactional();
+        var transaction = new TransactionTemplate(manager);
+        transaction.setTimeout(Math.max(1, (int) maximumWorkTime.toSeconds()));
+        Prepared prepared = Objects.requireNonNull(transaction.execute(status -> prepare(task, descriptor, targetId)));
+        if (prepared.receipt() != null) return prepared.receipt();
+
+        String externalKey = "twex-" + WorkerDigests.hash(List.of("worker-external-key-v1", sourceId,
+                Long.toString(tenantId), targetId, task.idempotencyKey()), Map.of());
+        requireTime(now(), prepared.deadline());
+        WorkerBusinessResultDTO result = Objects.requireNonNull(handler.execute(
+                WorkerExecutionContext.from(task, sourceId, prepared.deadline()), externalKey), "worker result");
+        descriptor.contract().validateOutput(result.output());
+        return Objects.requireNonNull(transaction.execute(status -> finishNonTransactional(task, descriptor, targetId, prepared, result)));
+    }
+
+    private Prepared prepare(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor, String targetId) {
+        Instant current = now();
+        Instant leaseDeadline = task.leaseExpiresAt().minus(deadlineSafetyMargin);
+        Instant workDeadline = current.plus(maximumWorkTime);
+        Instant deadline = leaseDeadline.isBefore(workDeadline) ? leaseDeadline : workDeadline;
+        lockBusinessKey(task, deadline);
+        String inputHash = inputHash(task);
+        List<StoredIntent> intents = intents(task);
+        List<StoredReceipt> existing = receipts(task);
+        if (intents.size() > 1 || existing.size() > 1) throw conflict();
+        if (intents.isEmpty()) {
+            if (!existing.isEmpty()) throw conflict();
+            jdbc.update("INSERT INTO " + intentTable + " (source_id,tenant_id,idempotency_key,effect_safety,target_id,handler_version,input_sha256,created_at) "
+                            + "VALUES (?,?,?,?,?,?,?,clock_timestamp())", sourceId, tenantId, task.idempotencyKey(),
+                    task.effectSafety().name(), targetId, descriptor.handlerVersion(), inputHash);
+            intents = intents(task);
+        }
+        if (intents.size() != 1) throw conflict();
+        requireIntent(intents.getFirst(), task, descriptor, targetId, inputHash, existing.isEmpty());
+        requireTime(now(), deadline);
+        return new Prepared(deadline, inputHash, existing.isEmpty() ? null : replay(task, descriptor, inputHash, existing.getFirst()));
+    }
+
+    private WorkerExecutionReceipt finishNonTransactional(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor, String targetId,
+                                                            Prepared prepared, WorkerBusinessResultDTO result) {
+        lockBusinessKey(task, prepared.deadline());
+        List<StoredIntent> intents = intents(task);
+        if (intents.size() != 1) throw conflict();
+        requireIntent(intents.getFirst(), task, descriptor, targetId, prepared.inputHash(), true);
+        List<StoredReceipt> existing = receipts(task);
+        if (existing.size() > 1) throw conflict();
+        if (!existing.isEmpty()) {
+            var replay = replay(task, descriptor, prepared.inputHash(), existing.getFirst());
+            if (task.effectSafety() == WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT
+                    && !resultHash(result).equals(resultHash(replay.result()))) throw conflict();
+            return replay;
+        }
+        return insertReceipt(task, descriptor, prepared.inputHash(), result, prepared.deadline());
+    }
+
+    private void requireIntent(StoredIntent intent, WorkerTaskDTO task, WorkerHandlerDescriptor descriptor,
+                               String targetId, String inputHash, boolean pending) {
+        if (!task.effectSafety().name().equals(intent.effectSafety()) || !targetId.equals(intent.targetId())
+                || !inputHash.equals(intent.inputSha256()) || pending && !descriptor.handlerVersion().equals(intent.handlerVersion())) {
+            throw conflict();
+        }
+    }
+
+    private void lockBusinessKey(WorkerTaskDTO task, Instant deadline) {
+        Instant current = now();
+        requireTime(current, deadline);
+        long lockMillis = Math.max(1, Duration.between(current, deadline).toMillis());
+        jdbc.queryForObject("SELECT set_config('lock_timeout', ?, true)", String.class, lockMillis + "ms");
+        String lockKey = WorkerDigests.hash(List.of("worker-business-lock-v1", sourceId,
+                Long.toString(tenantId), task.idempotencyKey()), Map.of());
+        jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { }, "tianji:business-worker:" + lockKey);
+        requireTime(now(), deadline);
+    }
+
+    private List<StoredReceipt> receipts(WorkerTaskDTO task) {
+        return jdbc.query("SELECT task_id,occurrence_id,topic,schema_version,effect_safety,handler_version, "
+                        + "input_sha256,result_sha256,business_receipt_id,output_json::text AS output_json,committed_at FROM " + table
+                        + " WHERE source_id=? AND tenant_id=? AND idempotency_key=?",
+                (rs, row) -> read(rs), sourceId, tenantId, task.idempotencyKey());
+    }
+
+    private List<StoredIntent> intents(WorkerTaskDTO task) {
+        return jdbc.query("SELECT effect_safety,target_id,handler_version,input_sha256 FROM " + intentTable
+                        + " WHERE source_id=? AND tenant_id=? AND idempotency_key=?",
+                (rs, row) -> new StoredIntent(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)),
+                sourceId, tenantId, task.idempotencyKey());
+    }
+
+    private WorkerExecutionReceipt insertReceipt(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor, String inputHash,
+                                                   WorkerBusinessResultDTO result, Instant deadline) {
+        byte[] output;
+        try { output = mapper.writeValueAsBytes(result.output()); }
+        catch (RuntimeException invalidResult) { throw invalid(); }
+        if (output.length > MAX_RESULT_BYTES) throw invalid();
+        List<Instant> committed = jdbc.query("INSERT INTO " + table + " (source_id,tenant_id,idempotency_key,task_id,occurrence_id, "
+                        + "topic,schema_version,effect_safety,handler_version,input_sha256,result_sha256,business_receipt_id,output_json,committed_at) "
+                        + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,CAST(? AS jsonb),clock_timestamp()) RETURNING committed_at",
+                (rs, row) -> rs.getTimestamp("committed_at").toInstant(), sourceId, tenantId, task.idempotencyKey(), task.taskId(),
+                task.activityOccurrenceId(), task.topic(), task.schemaVersion(), task.effectSafety().name(), descriptor.handlerVersion(), inputHash,
+                resultHash(result), result.businessReceiptId(), new String(output, StandardCharsets.UTF_8));
+        if (committed.size() != 1) throw new IllegalStateException("Worker business receipt could not be recorded");
+        requireTime(now(), deadline);
+        return new WorkerExecutionReceipt(descriptor.handlerVersion(), committed.getFirst(), result, false);
     }
 
     private WorkerExecutionReceipt replay(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor, String inputHash, StoredReceipt stored) {
@@ -174,4 +303,6 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
     private record StoredReceipt(String taskId, String occurrenceId, String topic, String schemaVersion, String effectSafety,
                                  String handlerVersion, String inputSha256, String resultSha256, String businessReceiptId,
                                  String outputJson, Instant committedAt) { }
+    private record StoredIntent(String effectSafety, String targetId, String handlerVersion, String inputSha256) { }
+    private record Prepared(Instant deadline, String inputHash, WorkerExecutionReceipt receipt) { }
 }

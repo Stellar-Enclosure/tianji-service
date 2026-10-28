@@ -212,6 +212,76 @@ class RemoteWorkerPollerTest {
         poller.stop();
     }
 
+    @Test
+    void non_transactional_registration_requires_store_support_and_uses_its_durable_path() {
+        var contract = new WorkerContractDTO("remote", "1", WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT,
+                Map.of("amount", ProcessValueTypeEnum.INTEGER), Map.of("approved", ProcessValueTypeEnum.BOOLEAN));
+        var descriptor = new WorkerHandlerDescriptor(contract, "v1");
+        assertThrows(IllegalArgumentException.class, () -> new WorkerHandlerRegistration(descriptor,
+                (context, jdbc) -> new WorkerBusinessResultDTO("receipt", Map.of("approved", true))));
+        var registration = new NonTransactionalWorkerRegistration(descriptor, "orders-v1",
+                (context, externalKey) -> new WorkerBusinessResultDTO("receipt", Map.of("approved", true)));
+        var client = mock(WorkerClient.class); var store = store(); var scheduler = mock(TaskScheduler.class);
+        var duplicateContract = new WorkerContractDTO("remote", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT,
+                contract.inputs(), contract.outputs());
+        assertThrows(IllegalArgumentException.class, () -> new RemoteWorkerPoller(client, store,
+                List.of(registration(duplicateContract)), List.of(registration), scheduler, Runnable::run, properties(1, Duration.ZERO), CLOCK));
+        doThrow(new IllegalStateException("missing schema")).when(store).requireNonTransactional();
+        assertThrows(IllegalStateException.class,
+                () -> new RemoteWorkerPoller(client, store, List.of(), List.of(registration), scheduler, Runnable::run, properties(1, Duration.ZERO), CLOCK));
+        reset(store); configureStore(store);
+        var callback = captureScheduler(scheduler); var task = task(20, contract);
+        when(client.acquire(any())).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task));
+        when(store.executeNonTransactional(eq(task), eq(descriptor), eq("orders-v1"), same(registration.handler())))
+                .thenReturn(new WorkerExecutionReceipt("v1", NOW, new WorkerBusinessResultDTO("receipt", Map.of("approved", true)), false));
+        when(client.complete(any())).thenReturn(new WorkerReceiptDTO("job", "occurrence", WorkerReceiptOutcomeEnum.COMPLETED, NOW));
+        var poller = new RemoteWorkerPoller(client, store, List.of(), List.of(registration), scheduler, Runnable::run, properties(1, Duration.ZERO), CLOCK);
+        verify(store).requireNonTransactional();
+        poller.start(); callback.get().run(); poller.stop();
+        verify(store).executeNonTransactional(eq(task), eq(descriptor), eq("orders-v1"), same(registration.handler()));
+        verify(store, never()).execute(any(), any(), any());
+        verify(client).complete(any());
+    }
+
+    @Test
+    void auto_configuration_accepts_a_non_transactional_handler_without_a_transactional_one() {
+        var contract = new WorkerContractDTO("remote", "1", WorkerEffectSafetyEnum.READ_ONLY,
+                Map.of("amount", ProcessValueTypeEnum.INTEGER), Map.of("approved", ProcessValueTypeEnum.BOOLEAN));
+        var registration = new NonTransactionalWorkerRegistration(new WorkerHandlerDescriptor(contract, "v1"), "catalog-v1",
+                (context, externalKey) -> new WorkerBusinessResultDTO("receipt", Map.of("approved", true)));
+        var store = store(); var scheduler = mock(TaskScheduler.class);
+        when(scheduler.scheduleWithFixedDelay(any(Runnable.class), any(Duration.class))).thenReturn(mock(ScheduledFuture.class));
+        new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(TianjiWorkerAutoConfiguration.class))
+                .withPropertyValues("stellar.tianji.worker.enabled=true", "stellar.tianji.worker.tenant-id=20")
+                .withBean(WorkerClient.class, () -> mock(WorkerClient.class))
+                .withBean(WorkerExecutionStore.class, () -> store)
+                .withBean(NonTransactionalWorkerRegistration.class, () -> registration)
+                .withBean("tianjiWorkerScheduler", TaskScheduler.class, () -> scheduler)
+                .withBean("tianjiWorkerExecutor", Executor.class, () -> Runnable::run)
+                .run(context -> assertThat(context).hasNotFailed().hasSingleBean(RemoteWorkerPoller.class));
+        verify(store).requireNonTransactional();
+    }
+
+    @Test
+    void auto_configuration_retains_a_host_supplied_transactional_registration_list() {
+        var scheduler = mock(TaskScheduler.class);
+        when(scheduler.scheduleWithFixedDelay(any(Runnable.class), any(Duration.class))).thenReturn(mock(ScheduledFuture.class));
+        new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(TianjiWorkerAutoConfiguration.class))
+                .withUserConfiguration(RegistrationListConfiguration.class)
+                .withPropertyValues("stellar.tianji.worker.enabled=true", "stellar.tianji.worker.tenant-id=20")
+                .withBean(WorkerClient.class, () -> mock(WorkerClient.class))
+                .withBean(WorkerExecutionStore.class, RemoteWorkerPollerTest::store)
+                .withBean("tianjiWorkerScheduler", TaskScheduler.class, () -> scheduler)
+                .withBean("tianjiWorkerExecutor", Executor.class, () -> Runnable::run)
+                .run(context -> assertThat(context).hasNotFailed().hasSingleBean(RemoteWorkerPoller.class));
+    }
+
+    @org.springframework.context.annotation.Configuration(proxyBeanMethods = false)
+    static class RegistrationListConfiguration {
+        @org.springframework.context.annotation.Bean
+        List<WorkerHandlerRegistration> workerHandlers() { return List.of(registration(contract())); }
+    }
+
     private static AtomicReference<Runnable> captureScheduler(TaskScheduler scheduler) {
         var callback = new AtomicReference<Runnable>();
         when(scheduler.scheduleWithFixedDelay(any(Runnable.class), any(Duration.class))).thenAnswer(invocation -> {

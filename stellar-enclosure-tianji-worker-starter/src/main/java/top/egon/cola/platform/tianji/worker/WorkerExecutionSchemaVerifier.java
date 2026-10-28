@@ -27,7 +27,7 @@ public final class WorkerExecutionSchemaVerifier {
 
     public void verify() {
         try {
-            int expected = checksum();
+            int expected = checksum("V1__create_worker_execution_receipt.sql");
             List<Boolean> history = jdbc.query("SELECT success,checksum FROM \"" + schema + "\".tianji_worker_schema_history "
                             + "WHERE version='1' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
                             && rs.getObject("checksum") != null && rs.getInt("checksum") == expected);
@@ -37,6 +37,79 @@ public final class WorkerExecutionSchemaVerifier {
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Worker execution schema verification failed", failure);
         }
+    }
+
+    /** The optional external/read-only path needs its separately provisioned V2 intent table. */
+    public void verifyNonTransactional() {
+        verifyIntentReadable();
+        try {
+            String table = '"' + schema + "\".tianji_worker_nontransactional_intent";
+            Boolean permitted = jdbc.queryForObject("SELECT has_table_privilege(current_user, ?, 'INSERT')", Boolean.class, table);
+            if (!Boolean.TRUE.equals(permitted)) throw invalid();
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Worker non-transactional schema verification failed", failure);
+        }
+    }
+
+    /** Transactional handlers must see any conflicting intent after V2 is installed. */
+    public void verifyIntentReadable() {
+        verify();
+        try {
+            int expected = checksum("V2__add_nontransactional_worker_intent.sql");
+            List<Boolean> history = jdbc.query("SELECT success,checksum FROM \"" + schema + "\".tianji_worker_schema_history "
+                            + "WHERE version='2' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
+                            && rs.getObject("checksum") != null && rs.getInt("checksum") == expected);
+            if (history.size() != 1 || !history.getFirst()) throw invalid();
+            verifyIntentColumns();
+            verifyIntentConstraints();
+            String table = '"' + schema + "\".tianji_worker_nontransactional_intent";
+            Boolean permitted = jdbc.queryForObject("SELECT has_table_privilege(current_user, ?, 'SELECT')", Boolean.class, table);
+            if (!Boolean.TRUE.equals(permitted)) throw invalid();
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Worker non-transactional schema verification failed", failure);
+        }
+    }
+
+    private void verifyIntentColumns() {
+        Map<String, Column> expected = Map.ofEntries(
+                column("source_id", "character varying(128)", true, true),
+                column("tenant_id", "bigint", true, false),
+                column("idempotency_key", "character varying(128)", true, true),
+                column("effect_safety", "character varying(32)", true, false),
+                column("target_id", "character varying(128)", true, true),
+                column("handler_version", "character varying(128)", true, true),
+                column("input_sha256", "character(64)", true, true),
+                column("created_at", "timestamp with time zone", true, false));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull, co.collname
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum > 0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname=? AND t.relname='tianji_worker_nontransactional_intent' AND t.relkind IN ('r', 'p')
+                """, rs -> {
+            actual.put(rs.getString("attname"), new Column(rs.getString("type"),
+                    rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname"))));
+        }, schema);
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+    }
+
+    private void verifyIntentConstraints() {
+        Map<String, String> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT c.conname, c.convalidated, pg_get_constraintdef(c.oid) AS definition
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname=? AND t.relname='tianji_worker_nontransactional_intent' AND c.contype IN ('p','u','c')
+                """, rs -> {
+            if (!rs.getBoolean("convalidated")) throw invalid();
+            actual.put(rs.getString("conname"), rs.getString("definition"));
+        }, schema);
+        Map<String, String> expected = Map.of(
+                "tianji_worker_nontransactional_intent_pkey", "PRIMARY KEY (source_id, tenant_id, idempotency_key)",
+                "tianji_worker_nontransactional_intent_tenant_id_check", "CHECK ((tenant_id > 0))",
+                "tianji_worker_nontransactional_intent_input_sha256_check", "CHECK ((input_sha256 ~ '^[0-9a-f]{64}$'::text))",
+                "tianji_worker_nontransactional_intent_effect_safety_check", "CHECK (((effect_safety)::text = ANY ((ARRAY['READ_ONLY'::character varying, 'EXTERNAL_IDEMPOTENT'::character varying])::text[])))");
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
     }
 
     private void verifyColumns() {
@@ -89,9 +162,9 @@ public final class WorkerExecutionSchemaVerifier {
         for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
     }
 
-    private static int checksum() {
+    private static int checksum(String file) {
         try (InputStream stream = WorkerExecutionSchemaVerifier.class.getClassLoader()
-                .getResourceAsStream("db/tianji-worker/V1__create_worker_execution_receipt.sql")) {
+                .getResourceAsStream("db/tianji-worker/" + file)) {
             if (stream == null) throw invalid();
             CRC32 crc = new CRC32();
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
