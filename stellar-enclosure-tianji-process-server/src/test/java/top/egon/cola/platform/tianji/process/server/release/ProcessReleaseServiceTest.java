@@ -72,6 +72,11 @@ class ProcessReleaseServiceTest {
                 new byte[] {1}, Map.of("execution", ValueType.STRING)));
         assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(
                 new ProcessReleaseService.ModelResource(Type.DMN, "wrong-key", expected, Map.of()))));
+        try (var worker = getClass().getResourceAsStream("/fixtures/worker-mapping.bpmn20.xml")) {
+            assertNotNull(worker);
+            var workerModel = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", worker.readAllBytes(), Map.of("amount", ValueType.INTEGER));
+            assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(workerModel)));
+        }
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
     }
 

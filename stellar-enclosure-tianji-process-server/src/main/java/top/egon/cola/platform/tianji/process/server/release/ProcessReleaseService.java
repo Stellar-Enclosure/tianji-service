@@ -200,6 +200,8 @@ public final class ProcessReleaseService {
             prepared.add(new PreparedModel(model, hash(model.xml()), inputs));
         }
         for (PreparedModel processModel : prepared) {
+            // Publishing these tasks stays closed until the secured Worker adapter is available.
+            if (!processModel.model().workerTasks().isEmpty()) throw invalid();
             if (processModel.model().type() != Type.BPMN || processModel.model().decisionTasks().isEmpty()) continue;
             if (!decisionTasksEnabled) throw invalid();
             String decisionKey = processModel.model().decisionTasks().values().iterator().next();

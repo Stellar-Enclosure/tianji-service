@@ -8,6 +8,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.*;
 import static top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType.INTEGER;
 import static top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType.STRING;
+import static top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType.BOOLEAN;
 
 class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
@@ -98,6 +99,35 @@ class ProcessModelValidatorTest {
         assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("decisionTableReferenceKey", "fallbackToDefaultTenant")), "approvalRouting"));
         assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("baselineDecision", "${tenant}")), "approvalRouting"));
         assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(xml.replace("targetRef=\"decide\"", "targetRef=\"routing\"")), "approvalRouting"));
+    }
+
+    @Test
+    void validates_explicit_worker_mappings_and_rejects_implicit_or_dynamic_access() throws Exception {
+        String xml = new String(fixture("worker-mapping.bpmn20.xml"), StandardCharsets.UTF_8);
+        var process = validator.validateBpmn(bytes(xml), "workerMapping");
+        var worker = process.workerTasks().get("worker");
+        assertEquals("riskCheck", worker.topic());
+        assertEquals("1", worker.schemaVersion());
+        assertEquals(java.util.List.of(new ValidatedProcessModel.WorkerParameter("amount", "requestedAmount", INTEGER)), worker.inputs());
+        assertEquals(java.util.List.of(new ValidatedProcessModel.WorkerParameter("approved", "approved", BOOLEAN)), worker.outputs());
+        validator.validateWorkerBindings(process, Map.of("amount", INTEGER), null);
+        assertThrows(IllegalArgumentException.class, () -> validator.validateWorkerBindings(process, Map.of("amount", STRING), null));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateWorkerBindings(process, Map.of("amount", INTEGER, "approved", BOOLEAN), null));
+        assertThrows(UnsupportedOperationException.class, () -> worker.inputs().clear());
+
+        for (String invalid : new String[] {
+                xml.replace("flowable:doNotIncludeVariables=\"true\"", ""),
+                xml.replace("flowable:topic=\"riskCheck\"", "flowable:topic=\"${execution.tenantId}\""),
+                xml.replace("tianji:schemaVersion=\"1\"", ""),
+                xml.replace("source=\"amount\"", "sourceExpression=\"${amount}\""),
+                xml.replace("target=\"requestedAmount\"", "target=\"execution\""),
+                xml.replace("tianji:type=\"INTEGER\"", "tianji:type=\"OBJECT\""),
+                xml.replace("tianji:type=\"BOOLEAN\"", ""),
+                xml.replace("flowable:type=\"external-worker\"", "flowable:type=\"external\""),
+                xml.replace("<flowable:externalWorkerOutParameter", "<flowable:field name=\"unknown\"/><flowable:externalWorkerOutParameter")
+        }) {
+            assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(invalid), "workerMapping"));
+        }
     }
 
     @Test

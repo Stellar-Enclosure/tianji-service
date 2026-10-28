@@ -548,7 +548,7 @@ class ProcessServerPostgresTest {
         assertFalse(executor.isActive());
     }
 
-    private static NativeWorkerProbe probeNativeExternalWorker(ConfigurableApplicationContext app, JdbcTemplate bootstrap) {
+    private static NativeWorkerProbe probeNativeExternalWorker(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
         String xml = """
                 <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
                              xmlns:flowable="http://flowable.org/bpmn" targetNamespace="urn:test">
@@ -593,6 +593,34 @@ class ProcessServerPostgresTest {
         management.executeJob(completionJob.getId());
         assertEquals("after", app.getBean(TaskService.class).createTaskQuery().processInstanceId(first).singleResult().getTaskDefinitionKey());
         assertEquals("done", runtime.getVariable(first, "workerResult"));
+
+        byte[] mappedXml = new ClassPathResource("fixtures/worker-mapping.bpmn20.xml").getContentAsByteArray();
+        var validator = new ProcessModelValidator();
+        var mapped = validator.validateBpmn(mappedXml, "workerMapping");
+        validator.validateWorkerBindings(mapped, Map.of("amount", ValueType.INTEGER, "privateFixture", ValueType.STRING), null);
+        repository.createDeployment().tenantId("20").addBytes("worker-mapping.bpmn20.xml", mapped.xml()).deploy();
+        String mappedInstance = runtime.createProcessInstanceBuilder().processDefinitionKey("workerMapping").tenantId("20")
+                .variable("amount", 10L).variable("privateFixture", "not-for-worker").start().getId();
+        var mappedJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskCheck", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("20").acquireAndLock(1, "mapped-worker");
+        assertEquals(1, mappedJobs.size());
+        assertEquals(Map.of("requestedAmount", 10L), mappedJobs.getFirst().getVariables());
+        management.createExternalWorkerCompletionBuilder(mappedJobs.getFirst().getId(), "mapped-worker").variable("approved", true).complete();
+        management.executeJob(management.createJobQuery().processInstanceId(mappedInstance).singleResult().getId());
+        assertEquals(Boolean.TRUE, runtime.getVariable(mappedInstance, "approved"));
+
+        String emptyMapping = new String(mappedXml, StandardCharsets.UTF_8).replace("workerMapping", "workerEmpty")
+                .replace("riskCheck", "riskEmpty")
+                .replace("<flowable:externalWorkerInParameter source=\"amount\" target=\"requestedAmount\" tianji:type=\"INTEGER\"/>", "");
+        var emptyModel = validator.validateBpmn(emptyMapping.getBytes(StandardCharsets.UTF_8), "workerEmpty");
+        validator.validateWorkerBindings(emptyModel, Map.of("privateFixture", ValueType.STRING), null);
+        repository.createDeployment().tenantId("20").addBytes("worker-empty.bpmn20.xml", emptyModel.xml()).deploy();
+        runtime.createProcessInstanceBuilder().processDefinitionKey("workerEmpty").tenantId("20")
+                .variable("privateFixture", "not-for-worker").start();
+        var emptyJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskEmpty", Duration.ofMinutes(1))
+                .onlyBpmn().tenantId("20").acquireAndLock(1, "empty-worker");
+        assertEquals(1, emptyJobs.size());
+        assertTrue(emptyJobs.getFirst().getVariables().isEmpty());
 
         var secondJob = management.createExternalWorkerJobAcquireBuilder().topic("native-probe", Duration.ofMinutes(1))
                 .onlyBpmn().tenantId("21").acquireAndLock(1, "expired-worker");

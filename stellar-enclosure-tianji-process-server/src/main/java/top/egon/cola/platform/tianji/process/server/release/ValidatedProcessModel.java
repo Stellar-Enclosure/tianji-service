@@ -16,15 +16,17 @@ public final class ValidatedProcessModel {
     private final List<String> ruleIds;
     private final Map<String, String> decisionTasks;
     private final List<RouteCondition> routeConditions;
+    private final Map<String, WorkerTask> workerTasks;
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds) {
-        this(type, definitionKey, xml, inputs, outputs, ruleIds, Map.of(), List.of());
+        this(type, definitionKey, xml, inputs, outputs, ruleIds, Map.of(), List.of(), Map.of());
     }
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds,
-                          Map<String, String> decisionTasks, List<RouteCondition> routeConditions) {
+                          Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
+                          Map<String, WorkerTask> workerTasks) {
         this.type = type;
         this.definitionKey = definitionKey;
         this.xml = xml.clone();
@@ -33,6 +35,7 @@ public final class ValidatedProcessModel {
         this.ruleIds = List.copyOf(ruleIds);
         this.decisionTasks = Map.copyOf(decisionTasks);
         this.routeConditions = List.copyOf(routeConditions);
+        this.workerTasks = Map.copyOf(workerTasks);
     }
 
     public Type type() { return type; }
@@ -43,6 +46,14 @@ public final class ValidatedProcessModel {
     public List<String> ruleIds() { return ruleIds; }
     public Map<String, String> decisionTasks() { return decisionTasks; }
     public List<RouteCondition> routeConditions() { return routeConditions; }
+    public Map<String, WorkerTask> workerTasks() { return workerTasks; }
 
     public record RouteCondition(String variable, ValueType type, String literal) { }
+    public record WorkerParameter(String source, String target, ValueType type) { }
+    public record WorkerTask(String topic, String schemaVersion, List<WorkerParameter> inputs, List<WorkerParameter> outputs) {
+        public WorkerTask {
+            inputs = List.copyOf(inputs);
+            outputs = List.copyOf(outputs);
+        }
+    }
 }
