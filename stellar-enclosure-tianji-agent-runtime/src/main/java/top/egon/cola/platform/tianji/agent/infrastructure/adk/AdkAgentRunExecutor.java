@@ -330,7 +330,12 @@ public final class AdkAgentRunExecutor {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "this runtime currently supports text input without artifacts or task data");
         }
-        if (!snapshot.effectivePolicy().allowedToolVersions().isEmpty()) {
+        var dependencies = snapshot.definition().dependencies();
+        if (!dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+                    "versioned prompt and skill resolution is not available");
+        }
+        if (!dependencies.tools().isEmpty() || !snapshot.effectivePolicy().allowedToolVersions().isEmpty()) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "governed tool execution is not available");
         }

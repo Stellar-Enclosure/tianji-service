@@ -691,6 +691,34 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void unresolved_versioned_dependencies_are_not_silently_ignored() {
+        var reference = new top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef(
+                "published-resource", 1, "a".repeat(64));
+        for (String kind : List.of("prompt", "skill", "tool")) {
+            FixtureModel model = new FixtureModel();
+            TrustedAgentActor actor = actor();
+            AgentDefinitionSpecDTO base = singleSpec("requires-" + kind);
+            var dependencies = new DefinitionDependenciesDTO(
+                    kind.equals("prompt") ? List.of(reference) : List.of(),
+                    kind.equals("skill") ? List.of(reference) : List.of(),
+                    kind.equals("tool") ? List.of(reference) : List.of(),
+                    "fixture-route", "policy-v1");
+            ledger.publish(actor, new AgentDefinitionSpecDTO(base.definitionKey(), base.version(), base.executionMode(),
+                    base.codeRef(), base.inputSchemaVersion(), base.outputSchemaVersion(), dependencies,
+                    base.policy(), base.configuration()));
+            GetAgentRunQuery query = start(actor, base.definitionKey(), "key");
+            assertEquals(FAILED, executor(model, Map.of()).executeQueued(actor, query).status());
+            var result = ledger.getResult(actor, query).orElseThrow();
+            assertEquals("TIANJI_FEATURE_NOT_AVAILABLE", result.errorCode());
+            assertEquals("NONE", result.sideEffectOutcome());
+            assertEquals(0, model.streams.get());
+            assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                    SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                    """, Integer.class, actor.tenantId(), query.runId()));
+        }
+    }
+
+    @Test
     void model_context_window_reserves_output_and_margin_before_calling_the_provider() {
         for (long window : List.of(60L, 59L)) {
             FixtureModel model = new FixtureModel();
