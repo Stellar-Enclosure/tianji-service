@@ -29,4 +29,10 @@ class TianjiAgentServerApplicationTest {
         runner.withPropertyValues("stellar.tianji.agent.runtime.enabled=true")
                 .run(context -> assertThat(context).hasFailed());
     }
+
+    @Test
+    void server_classpath_contains_the_agent_flow_runtime_used_by_the_executor() throws Exception {
+        assertThat(Class.forName("top.egon.cola.component.agentflow.runtime.AgentFlowInMemoryRunner")).isNotNull();
+        assertThat(Class.forName("top.egon.cola.component.agentflow.runtime.AgentFlowSessionRunner")).isNotNull();
+    }
 }
