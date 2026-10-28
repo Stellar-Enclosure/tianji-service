@@ -22,11 +22,10 @@ class TianjiAgentRuntimeAutoConfigurationTest {
     }
 
     @Test
-    void enabling_an_unavailable_runtime_fails_closed() {
+    void enabling_runtime_without_host_dependencies_fails_closed() {
         runner.withPropertyValues("stellar.tianji.agent.runtime.enabled=true").run(context -> {
             assertThat(context).hasFailed();
-            assertThat(context.getStartupFailure()).hasRootCauseInstanceOf(IllegalStateException.class)
-                    .hasStackTraceContaining("persistence and trusted identity integration are required");
+            assertThat(context.getStartupFailure()).hasStackTraceContaining("DataSource");
         });
     }
 

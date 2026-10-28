@@ -131,6 +131,45 @@ class TianjiGrantDispatchPostgresTest {
                         assertEquals(AgentRunStatusEnum.COMPLETED, ledger.get(actor, new GetAgentRunQuery(run.runId())).status()));
                 assertEquals(1, streams.get()); assertEquals(1, ledger.get(actor, new GetAgentRunQuery(run.runId())).attempt());
             }
+            var next = ledger.start(actor, new StartAgentRunCommand("model", 1, null, "automatic", null, null,
+                    new AgentInputDTO("input", List.of(), Map.of()), null));
+            var nextReservation = store.reserve(actor, next.runId(), resource).orElseThrow();
+            assertTrue(store.complete(nextReservation, new AgentExecutionGrant.Ticket("9" + "2".repeat(62),
+                    "ENC:v1:key:nonce:automatic", ledger.databaseNow().plusSeconds(45))));
+            var autoControl = new java.util.concurrent.ScheduledThreadPoolExecutor(2);
+            autoControl.setRemoveOnCancelPolicy(true);
+            var autoDispatch = new java.util.concurrent.ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(2));
+            var autoScheduler = mock(TaskScheduler.class); var autoCallback = new AtomicReference<Runnable>();
+            doAnswer(inv -> { autoCallback.set(inv.getArgument(0)); return scheduled; })
+                    .when(autoScheduler).scheduleWithFixedDelay(any(Runnable.class), any(Duration.class));
+            try {
+                new org.springframework.boot.test.context.runner.ApplicationContextRunner()
+                        .withConfiguration(org.springframework.boot.autoconfigure.AutoConfigurations.of(
+                                top.egon.cola.component.agentflow.autoconfigure.AgentFlowAutoConfiguration.class,
+                                top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration.class))
+                        .withUserConfiguration(TianjiGrantDispatchConfiguration.class)
+                        .withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "stellar.tianji.agent.dispatch.enabled=true",
+                                "stellar.tianji.agent.execution-authorization.enabled=true", "egon.cola.component.agent-flow.enabled=true",
+                                "egon.cola.component.agent-flow-registry.enabled=false")
+                        .withBean(javax.sql.DataSource.class, () -> source)
+                        .withBean(AgentLedgerService.class, () -> ledger)
+                        .withBean(TianjiExecutionGrantAuthorizer.class, () -> authorizer)
+                        .withBean(top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator.class, () -> estimator)
+                        .withBean("fixtureModel", org.springframework.ai.chat.model.ChatModel.class, () -> model)
+                        .withBean("tianjiAgentControlExecutor", java.util.concurrent.ScheduledThreadPoolExecutor.class, () -> autoControl)
+                        .withBean("tianjiAgentDispatchExecutor", java.util.concurrent.ThreadPoolExecutor.class, () -> autoDispatch)
+                        .withBean("tianjiAgentDispatchScheduler", TaskScheduler.class, () -> autoScheduler)
+                        .run(context -> {
+                            assertNull(context.getStartupFailure());
+                            assertTrue(context.getBean(AgentRunDispatcher.class).usesAuthorization(authorizer));
+                            assertNotNull(autoCallback.get());
+                            autoCallback.get().run();
+                            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+                                    assertEquals(AgentRunStatusEnum.COMPLETED, ledger.get(actor, new GetAgentRunQuery(next.runId())).status()));
+                            assertEquals(2, streams.get());
+                        });
+            } finally { autoDispatch.shutdownNow(); autoControl.shutdownNow(); }
         } finally {
             release.countDown(); hostA.shutdownNow(); hostB.shutdownNow(); control.shutdownNow(); validators.close();
         }
