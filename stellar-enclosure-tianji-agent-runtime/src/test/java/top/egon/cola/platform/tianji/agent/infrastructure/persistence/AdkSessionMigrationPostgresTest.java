@@ -105,6 +105,10 @@ class AdkSessionMigrationPostgresTest {
                 .locations("classpath:db/tianji-agent").target("4").cleanDisabled(true).load();
         assertEquals(1, version4.migrate().migrationsExecuted);
         Integer v4Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='4'", Integer.class);
+        Flyway version5 = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
+                .locations("classpath:db/tianji-agent").target("5").cleanDisabled(true).load();
+        assertEquals(1, version5.migrate().migrationsExecuted);
+        Integer v5Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='5'", Integer.class);
         Flyway current = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
                 .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
         assertEquals(1, current.migrate().migrationsExecuted);
@@ -118,6 +122,7 @@ class AdkSessionMigrationPostgresTest {
         assertEquals(before, after);
         assertEquals(v3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='3'", Integer.class));
         assertEquals(v4Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='4'", Integer.class));
+        assertEquals(v5Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='5'", Integer.class));
         assertEquals("legacy-session", jdbc.queryForObject("SELECT session_id FROM tianji_agent.agent_run "
                 + "WHERE tenant_id=91 AND run_id='legacy-run'", String.class));
         assertEquals("QUEUED", jdbc.queryForObject("SELECT status FROM tianji_agent.agent_run "
