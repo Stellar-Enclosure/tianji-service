@@ -43,6 +43,7 @@ import top.egon.cola.component.outbox.delivery.DeliveryContext;
 import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
+import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor;
 
 import javax.sql.DataSource;
 import java.time.Duration;
@@ -231,6 +232,50 @@ class ProcessServerPostgresTest {
             assertNull(missingVersion.getDmnDeploymentId());
             assertEquals(secondDefinition.getVersion(), missingVersion.getDecisionVersion());
             assertEquals("second", missingVersion.getDecisionResult().getFirst().get("route"));
+            var pinned = new FlowablePinnedDecisionExecutor(decisionConfig);
+            var firstBinding = new FlowablePinnedDecisionExecutor.Binding(20, firstDefinition.getId(), firstDeployment.getId(),
+                    firstDefinition.getVersion(), validator.validateDmn(firstVersion.getBytes(StandardCharsets.UTF_8), "baselineDecision"));
+            var firstResult = pinned.evaluate(firstBinding, Map.of("amount", 10));
+            assertEquals("first", firstResult.outputs().getFirst().get("route"));
+            assertEquals(firstDefinition.getId(), firstResult.definitionId());
+            assertFalse(firstResult.matchedRuleNumbers().isEmpty());
+            assertThrows(UnsupportedOperationException.class, () -> firstResult.outputs().getFirst().put("route", "changed"));
+            assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of("amount", 10.0)));
+            assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of("amount", new Object())));
+            assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of()));
+            assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of("amount", 1_000_000_000_000_000L)));
+            var foreignBinding = new FlowablePinnedDecisionExecutor.Binding(21, firstDefinition.getId(), firstDeployment.getId(),
+                    firstDefinition.getVersion(), firstBinding.model());
+            var missingBinding = new FlowablePinnedDecisionExecutor.Binding(20, "missing", firstDeployment.getId(),
+                    firstDefinition.getVersion(), firstBinding.model());
+            assertEquals(assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(foreignBinding, Map.of("amount", 10))).getMessage(),
+                    assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(missingBinding, Map.of("amount", 10))).getMessage());
+            var mismatchedModel = new FlowablePinnedDecisionExecutor.Binding(20, firstDefinition.getId(), firstDeployment.getId(),
+                    firstDefinition.getVersion(), validator.validateDmn(secondVersion.getBytes(StandardCharsets.UTF_8), "baselineDecision"));
+            assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(mismatchedModel, Map.of("amount", 10)));
+            var uniqueDefinition = app.getBean(DmnRepositoryService.class).createDecisionQuery().decisionKey("uniqueDecision")
+                    .decisionTenantId(TENANT).singleResult();
+            var uniqueBinding = new FlowablePinnedDecisionExecutor.Binding(20, uniqueDefinition.getId(), uniqueDefinition.getDeploymentId(),
+                    uniqueDefinition.getVersion(), validator.validateDmn(uniqueDmn.getBytes(StandardCharsets.UTF_8), "uniqueDecision"));
+            long beforeFailure = app.getBean(DmnHistoryService.class).createHistoricDecisionExecutionQuery().decisionKey("uniqueDecision").count();
+            assertThrows(IllegalStateException.class, () -> pinned.evaluate(uniqueBinding, Map.of("amount", 10)));
+            assertEquals(beforeFailure, app.getBean(DmnHistoryService.class).createHistoricDecisionExecutionQuery().decisionKey("uniqueDecision").count());
+            var emptyDefinition = app.getBean(DmnRepositoryService.class).createDecisionQuery().decisionKey("noMatch")
+                    .decisionTenantId(TENANT).singleResult();
+            var emptyBinding = new FlowablePinnedDecisionExecutor.Binding(20, emptyDefinition.getId(), emptyDefinition.getDeploymentId(),
+                    emptyDefinition.getVersion(), validator.validateDmn(noMatch.getBytes(StandardCharsets.UTF_8), "noMatch"));
+            assertTrue(pinned.evaluate(emptyBinding, Map.of("amount", 15)).outputs().isEmpty());
+            String numericDmn = new String(dmn, StandardCharsets.UTF_8).replace("baselineDecision", "numericDecision")
+                    .replace("name=\"route\" typeRef=\"string\"", "name=\"route\" typeRef=\"number\"")
+                    .replace("'standard'", "42").replace("'review'", "-1");
+            var numericModel = validator.validateDmn(numericDmn.getBytes(StandardCharsets.UTF_8), "numericDecision");
+            var numericDeployment = app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
+                    .addDmnBytes("numeric.dmn", numericModel.xml()).deploy();
+            var numericDefinition = app.getBean(DmnRepositoryService.class).createDecisionQuery()
+                    .deploymentId(numericDeployment.getId()).singleResult();
+            var numericBinding = new FlowablePinnedDecisionExecutor.Binding(20, numericDefinition.getId(), numericDeployment.getId(),
+                    numericDefinition.getVersion(), numericModel);
+            assertEquals(42L, pinned.evaluate(numericBinding, Map.of("amount", 10)).outputs().getFirst().get("route"));
 
             // Bypass the release validator only here to verify the engine-level bean isolation independently.
             String unsafeDmn = new String(dmn, StandardCharsets.UTF_8).replace("baselineDecision", "blockedDecision")
