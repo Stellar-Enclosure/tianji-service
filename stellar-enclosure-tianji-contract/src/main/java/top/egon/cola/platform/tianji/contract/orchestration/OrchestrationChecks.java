@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.Base64;
 
 final class OrchestrationChecks {
     private static final long MAX_INTEGER = 999_999_999_999_999L;
@@ -42,6 +43,22 @@ final class OrchestrationChecks {
 
     static String hash(String value) {
         if (value == null || !value.matches("[0-9a-f]{64}")) throw invalid();
+        return value;
+    }
+
+    static String leaseToken(String value) {
+        if (value == null || !value.matches("[A-Za-z0-9_-]{43}")) throw invalid();
+        try {
+            byte[] bytes = Base64.getUrlDecoder().decode(value);
+            if (bytes.length != 32 || !Base64.getUrlEncoder().withoutPadding().encodeToString(bytes).equals(value)) throw invalid();
+            return value;
+        } catch (IllegalArgumentException malformed) {
+            throw invalid();
+        }
+    }
+
+    static String errorCode(String value) {
+        if (value == null || !value.matches("[A-Z][A-Z0-9_]{0,63}")) throw invalid();
         return value;
     }
 

@@ -17,6 +17,7 @@ import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -166,6 +167,68 @@ class HttpProcessClientTest {
         assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", assertThrows(ProcessClientException.class,
                 () -> client(Duration.ofMillis(100)).get(new GetProcessReleaseQuery("v1"))).code());
         assertTrue(Duration.ofNanos(System.nanoTime() - started).compareTo(Duration.ofSeconds(2)) < 0);
+    }
+
+    @Test
+    void worker_calls_send_once_and_validate_topic_occurrence_and_outcome() throws Exception {
+        String lease = Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+        var task = new WorkerTaskDTO("task-1", "occurrence-1", WorkerScopeTypeEnum.BPMN, "process-1", null, 20,
+                "riskCheck", "1", "order-1", "trace-1", "intent-1", NOW, NOW.plusSeconds(30), Map.of("amount", 10), lease);
+        var success = new WorkerReceiptDTO("task-1", "occurrence-1", WorkerReceiptOutcomeEnum.COMPLETED, NOW);
+        var manual = new WorkerReceiptDTO("task-1", "occurrence-1", WorkerReceiptOutcomeEnum.NEEDS_MANUAL, NOW);
+        BlockingQueue<Seen> seen = new LinkedBlockingQueue<>();
+        handler.set(exchange -> {
+            String path = exchange.getRequestURI().getRawPath();
+            seen.add(new Seen(exchange.getRequestMethod(), path, exchange.getRequestHeaders().getFirst("Authorization"),
+                    exchange.getRequestBody().readAllBytes()));
+            Object result = path.endsWith("acquire") ? new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task)
+                    : path.endsWith("complete") ? success : manual;
+            respond(exchange, 200, "application/json", mapper.writeValueAsBytes(result));
+        });
+        var client = client(Duration.ofSeconds(3));
+        var acquire = new AcquireWorkerTaskCommand("riskCheck", "1");
+        var complete = new CompleteWorkerTaskCommand("task-1", "occurrence-1", lease, "receipt-1", Map.of("route", "review"));
+        var fail = new FailWorkerTaskCommand("task-1", "occurrence-1", lease, WorkerFailureKindEnum.UNKNOWN, "OUTCOME_UNKNOWN");
+        assertEquals(task, client.acquire(acquire).task());
+        assertEquals(success, client.complete(complete));
+        assertEquals(manual, client.fail(fail));
+        List<Seen> requests = new ArrayList<>();
+        seen.drainTo(requests);
+        assertEquals(List.of("/api/tianji/v1/worker-tasks/acquire", "/api/tianji/v1/worker-tasks/complete",
+                "/api/tianji/v1/worker-tasks/fail"), requests.stream().map(Seen::path).toList());
+        assertEquals(complete, mapper.readValue(requests.get(1).body(), CompleteWorkerTaskCommand.class));
+        assertEquals(fail, mapper.readValue(requests.get(2).body(), FailWorkerTaskCommand.class));
+
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(
+                new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task))));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class,
+                () -> client.acquire(new AcquireWorkerTaskCommand("otherTopic", "1"))).code());
+        handler.set(exchange -> respond(exchange, 200, "application/json", "{}".getBytes(StandardCharsets.UTF_8)));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.acquire(acquire)).code());
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(
+                new WorkerReceiptDTO("task-1", "wrong-occurrence", WorkerReceiptOutcomeEnum.COMPLETED, NOW))));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.complete(complete)).code());
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(
+                new WorkerReceiptDTO("task-1", "occurrence-1", WorkerReceiptOutcomeEnum.RETRY_SCHEDULED, NOW))));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.fail(fail)).code());
+    }
+
+    @Test
+    void worker_errors_do_not_retry_or_expose_the_lease_capability() {
+        String lease = Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+        AtomicInteger calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet();
+            respond(exchange, 409, "application/json", ("{\"code\":\"" + lease + "\",\"correlationId\":\"" + lease + "\"}")
+                    .getBytes(StandardCharsets.UTF_8));
+        });
+        var command = new CompleteWorkerTaskCommand("task-1", "occurrence-1", lease, "receipt-1", Map.of());
+        var failure = assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).complete(command));
+        assertEquals(1, calls.get());
+        assertEquals("TIANJI_IDEMPOTENCY_CONFLICT", failure.code());
+        assertNull(failure.correlationId());
+        assertFalse(failure.toString().contains(lease));
+        assertNull(failure.getCause());
     }
 
     private HttpProcessClient client(Duration timeout) { return new HttpProcessClient(base, HttpClient.newHttpClient(), () -> TOKEN, timeout); }

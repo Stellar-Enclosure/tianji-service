@@ -13,6 +13,14 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskResult;
+import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerClient;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 
 import java.net.URI;
 import java.net.URLEncoder;
@@ -36,7 +44,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
-public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient {
+public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
     private final URI baseUri;
@@ -112,7 +120,42 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         return result;
     }
 
+    @Override
+    public AcquireWorkerTaskResult acquire(AcquireWorkerTaskCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", "worker-tasks/acquire", command, AcquireWorkerTaskResult.class);
+        if (result.task() != null && (!command.topic().equals(result.task().topic())
+                || !command.schemaVersion().equals(result.task().schemaVersion()))) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public WorkerReceiptDTO complete(CompleteWorkerTaskCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", "worker-tasks/complete", command, WorkerReceiptDTO.class, command.leaseToken());
+        if (!command.taskId().equals(result.taskId()) || !command.activityOccurrenceId().equals(result.activityOccurrenceId())
+                || result.outcome() != WorkerReceiptOutcomeEnum.COMPLETED) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public WorkerReceiptDTO fail(FailWorkerTaskCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", "worker-tasks/fail", command, WorkerReceiptDTO.class, command.leaseToken());
+        if (!command.taskId().equals(result.taskId()) || !command.activityOccurrenceId().equals(result.activityOccurrenceId())
+                || command.kind() == WorkerFailureKindEnum.UNKNOWN && result.outcome() != WorkerReceiptOutcomeEnum.NEEDS_MANUAL
+                || command.kind() == WorkerFailureKindEnum.RETRYABLE && result.outcome() != WorkerReceiptOutcomeEnum.RETRY_SCHEDULED
+                    && result.outcome() != WorkerReceiptOutcomeEnum.NEEDS_MANUAL
+                || command.kind() == WorkerFailureKindEnum.BUSINESS_REJECTED && result.outcome() != WorkerReceiptOutcomeEnum.BUSINESS_REJECTED
+                    && result.outcome() != WorkerReceiptOutcomeEnum.NEEDS_MANUAL) throw invalidResponse();
+        return result;
+    }
+
     private <T> T call(String method, String path, Object body, Class<T> type) {
+        return call(method, path, body, type, null);
+    }
+
+    private <T> T call(String method, String path, Object body, Class<T> type, String leaseToken) {
         byte[] bytes;
         try { bytes = body == null ? null : mapper.writeValueAsBytes(body); }
         catch (RuntimeException invalid) { throw new IllegalArgumentException("Process request cannot be encoded"); }
@@ -128,7 +171,7 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         var call = http.sendAsync(request, info -> new BoundedBodySubscriber(MAX_RESPONSE_BYTES));
         try {
             HttpResponse<byte[]> response = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-            if (response.statusCode() < 200 || response.statusCode() >= 300) throw error(response, token);
+            if (response.statusCode() < 200 || response.statusCode() >= 300) throw error(response, token, leaseToken);
             String contentType = response.headers().firstValue("Content-Type").orElse("");
             String mediaType = contentType.split(";", 2)[0].trim();
             if (!mediaType.equalsIgnoreCase("application/json") && !mediaType.toLowerCase(java.util.Locale.ROOT).endsWith("+json")) {
@@ -154,13 +197,13 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         }
     }
 
-    private ProcessClientException error(HttpResponse<byte[]> response, String token) {
+    private ProcessClientException error(HttpResponse<byte[]> response, String token, String leaseToken) {
         String code = null;
         String correlation = null;
         try {
             Map<?, ?> body = mapper.readValue(response.body(), Map.class);
-            if (body.get("code") instanceof String value && !value.contains(token)) code = value;
-            if (body.get("correlationId") instanceof String value && !value.contains(token)) correlation = value;
+            if (body.get("code") instanceof String value && !containsCredential(value, token, leaseToken)) code = value;
+            if (body.get("correlationId") instanceof String value && !containsCredential(value, token, leaseToken)) correlation = value;
         } catch (RuntimeException ignored) {
             // A non-JSON error body is not safe to expose to callers.
         }
@@ -176,6 +219,10 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         }
         return new ProcessClientException(response.statusCode(), code, correlation,
                 response.headers().firstValue("Retry-After").map(HttpProcessClient::retryAfter).orElse(null));
+    }
+
+    private static boolean containsCredential(String value, String token, String leaseToken) {
+        return value.contains(token) || leaseToken != null && value.contains(leaseToken);
     }
 
     private static String segment(String value) {
