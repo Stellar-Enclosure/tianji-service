@@ -44,11 +44,21 @@ import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
 import javax.sql.DataSource;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
@@ -85,6 +95,22 @@ class ProcessServerPostgresTest {
             assertNotNull(ignored.getBean(CmmnRepositoryService.class));
             assertNotNull(ignored.getBean(DmnRepositoryService.class));
         }
+        Flyway platform = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+        platform.baseline();
+        platform.migrate();
+        platform.validate();
+        jdbc.execute("""
+                CREATE FUNCTION tianji_process.test_release_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.release_key = 'rollback-release' THEN RAISE EXCEPTION 'forced release failure'; END IF;
+                  IF NEW.release_key = 'delayed-release' THEN PERFORM pg_advisory_xact_lock(72360422027); END IF;
+                  RETURN NEW;
+                END $$
+                """);
+        jdbc.execute("CREATE TRIGGER test_release_failure BEFORE INSERT ON tianji_process.tianji_process_release_definition "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_release_failure()");
         String runtimeUser = System.getProperty("tianji.process.postgres.test.runtime-user", "");
         if (!runtimeUser.matches("tianji_it_runtime_[0-9a-f]{12}")) {
             throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
@@ -102,6 +128,7 @@ class ProcessServerPostgresTest {
         jdbc.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA tianji_process TO \"" + runtimeUser + "\"");
         jdbc.execute("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA tianji_process TO \"" + runtimeUser + "\"");
         jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.flyway_schema_history FROM \"" + runtimeUser + "\"");
+        jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.tianji_process_schema_history FROM \"" + runtimeUser + "\"");
         assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_schema_privilege(?, ?, 'CREATE')",
                 Boolean.class, runtimeUser, SCHEMA));
 
@@ -146,6 +173,7 @@ class ProcessServerPostgresTest {
             ProcessModelValidator validator = new ProcessModelValidator();
             byte[] bpmn = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
             byte[] dmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
+            verifyReleaseTransactions(app, jdbc, validator, bpmn, dmn);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
             app.getBean(CmmnRepositoryService.class).createDeployment().tenantId(TENANT)
@@ -371,6 +399,94 @@ class ProcessServerPostgresTest {
                     .processInstanceId(processId).finished().singleResult());
         }
         assertFalse(executor.isActive());
+    }
+
+    private static void verifyReleaseTransactions(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
+                                                  ProcessModelValidator validator, byte[] bpmn, byte[] dmn) throws Exception {
+        var processEngine = app.getBean(SpringProcessEngineConfiguration.class);
+        var decisionEngine = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        var service = new ProcessReleaseService(processEngine, decisionEngine, validator);
+        var actor = new ProcessActor(20, ProcessActor.SubjectType.USER, "alice");
+        var foreign = new ProcessActor(21, ProcessActor.SubjectType.USER, "alice");
+        var processModel = new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", bpmn, Map.of("amount", ValueType.INTEGER));
+        var decisionModel = new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", dmn, Map.of());
+        List<ProcessReleaseService.ModelResource> resources = List.of(processModel, decisionModel);
+        var release = service.publish(actor, "release-one", resources);
+        assertEquals(2, release.definitions().size());
+        assertEquals(64, release.manifestSha256().length());
+        assertEquals(release, service.publish(actor, "release-one", List.of(decisionModel, processModel)));
+        assertEquals(release, service.get(actor, "release-one"));
+        assertEquals(Map.of("amount", ValueType.INTEGER), definition(release, Type.DMN).inputs());
+        assertEquals(assertThrows(IllegalArgumentException.class, () -> service.get(foreign, "release-one")).getMessage(),
+                assertThrows(IllegalArgumentException.class, () -> service.get(actor, "missing")).getMessage());
+        byte[] changed = new String(bpmn, StandardCharsets.UTF_8).replace("name=\"Baseline\"", "name=\"Changed\"")
+                .getBytes(StandardCharsets.UTF_8);
+        var changedModel = new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", changed, Map.of("amount", ValueType.INTEGER));
+        assertThrows(IllegalStateException.class, () -> service.publish(actor, "release-one", List.of(changedModel, decisionModel)));
+        var changedSchema = new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", bpmn, Map.of("amount", ValueType.STRING));
+        assertThrows(IllegalStateException.class, () -> service.publish(actor, "release-one", List.of(changedSchema, decisionModel)));
+        var foreignRelease = service.publish(foreign, "release-one", resources);
+        assertNotEquals(definition(release, Type.BPMN).engineDefinitionId(), definition(foreignRelease, Type.BPMN).engineDefinitionId());
+        assertEquals(release, service.get(actor, "release-one"));
+
+        var bound = definition(release, Type.DMN);
+        var pinned = new FlowablePinnedDecisionExecutor(decisionEngine);
+        var model = validator.validateDmn(dmn, "baselineDecision");
+        var binding = new FlowablePinnedDecisionExecutor.Binding(actor.tenantId(), bound.engineDefinitionId(),
+                bound.engineDeploymentId(), bound.engineVersion(), model);
+        assertEquals("standard", pinned.evaluate(binding, Map.of("amount", 10)).outputs().getFirst().get("route"));
+
+        long beforeProcess = processEngine.getRepositoryService().createDeploymentQuery().deploymentTenantId(TENANT).count();
+        long beforeDmn = decisionEngine.getDmnRepositoryService().createDeploymentQuery().deploymentTenantId(TENANT).count();
+        assertThrows(RuntimeException.class, () -> service.publish(actor, "rollback-release", resources));
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_release "
+                + "WHERE tenant_id=20 AND release_key='rollback-release'", Integer.class));
+        assertEquals(beforeProcess, processEngine.getRepositoryService().createDeploymentQuery().deploymentTenantId(TENANT).count());
+        assertEquals(beforeDmn, decisionEngine.getDmnRepositoryService().createDeploymentQuery().deploymentTenantId(TENANT).count());
+
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<ProcessReleaseService.Release>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < 8; i++) futures.add(pool.submit(() -> {
+                start.await();
+                return service.publish(actor, "concurrent-release", resources);
+            }));
+            start.countDown();
+            var first = futures.getFirst().get(20, TimeUnit.SECONDS);
+            for (Future<ProcessReleaseService.Release> future : futures) assertEquals(first, future.get(20, TimeUnit.SECONDS));
+            assertEquals(2, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_release_definition "
+                    + "WHERE tenant_id=20 AND release_key='concurrent-release'", Integer.class));
+
+            CountDownLatch versionsStart = new CountDownLatch(1);
+            Future<ProcessReleaseService.Release> one = pool.submit(() -> {
+                versionsStart.await(); return service.publish(actor, "version-one", resources);
+            });
+            Future<ProcessReleaseService.Release> two = pool.submit(() -> {
+                versionsStart.await(); return service.publish(actor, "version-two", resources);
+            });
+            versionsStart.countDown();
+            var firstVersion = one.get(20, TimeUnit.SECONDS);
+            var secondVersion = two.get(20, TimeUnit.SECONDS);
+            assertNotEquals(definition(firstVersion, Type.BPMN).engineVersion(), definition(secondVersion, Type.BPMN).engineVersion());
+            assertNotEquals(definition(firstVersion, Type.DMN).engineVersion(), definition(secondVersion, Type.DMN).engineVersion());
+
+            try (var connection = Objects.requireNonNull(bootstrap.getDataSource()).getConnection()) {
+                connection.setAutoCommit(false);
+                try (var statement = connection.createStatement()) { statement.execute("SELECT pg_advisory_xact_lock(72360422027)"); }
+                Future<ProcessReleaseService.Release> pending = pool.submit(() -> service.publish(actor, "delayed-release", resources));
+                await().atMost(Duration.ofSeconds(10)).until(() -> bootstrap.queryForObject(
+                        "SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND NOT granted", Integer.class) > 0);
+                assertThrows(IllegalArgumentException.class, () -> service.get(actor, "delayed-release"));
+                assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_release "
+                        + "WHERE tenant_id=20 AND release_key='delayed-release'", Integer.class));
+                connection.commit();
+                assertEquals("delayed-release", pending.get(20, TimeUnit.SECONDS).releaseKey());
+            }
+        }
+    }
+
+    private static ProcessReleaseService.Definition definition(ProcessReleaseService.Release release, Type type) {
+        return release.definitions().stream().filter(item -> item.type() == type).findFirst().orElseThrow();
     }
 
     private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {

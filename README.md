@@ -48,6 +48,10 @@ The engines do not expose Spring beans to model expressions. An internal `Proces
 
 The internal `FlowablePinnedDecisionExecutor` replaces that fallback with an exact definition-ID lookup inside Flowable's command, checks the bound tenant, key, deployment, version and validated XML, then checks the decision audit inside the same JDBC transaction. It accepts only the validated input names and primitive types, returns immutable values and rolls back a failed decision. Its binding must come from a separately authorized tenant-scoped release; the adapter does not grant access, manage releases or expose an HTTP/SDK endpoint.
 
+The internal `ProcessReleaseService` atomically deploys validated BPMN/DMN resources and records immutable, tenant-scoped definition IDs, versions, model hashes and input schemas. An identical release key and manifest is idempotent; a different manifest conflicts. It serializes concurrent deployments of the same tenant/model key so Flowable versions remain distinct. This service assumes its actor and publishing permission have already been verified and is not yet exposed through an endpoint.
+
+The platform release/command tables have a separate migration at `db/tianji-process/V1__create_process_release_store.sql`; use the `tianji_process_schema_history` Flyway history for this location, distinct from Outbox's history and Flowable's own schema history. Because the shared schema already contains engine and Outbox tables, the isolated integration test explicitly creates the new history with a version-0 baseline before applying platform V1. Production provisioning requires an operator-controlled equivalent after checking the target history and platform tables; the application still performs no automatic migration.
+
 For a JDK 25 environment with the Stellar-Enclosure platform parent and Components BOM available in Maven, run this from the repository root. It builds the sibling Components, Tianquan-Shoubing and Tianquan-Jianshen checkouts and Tianji in one reactor without installing or publishing artifacts:
 
 ```bash

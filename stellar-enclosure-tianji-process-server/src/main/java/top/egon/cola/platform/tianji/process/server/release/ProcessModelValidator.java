@@ -181,8 +181,8 @@ public final class ProcessModelValidator {
                 || text.contains("fn_addDate") || text.contains("fn_subtractDate"))) throw invalid();
     }
 
-    private static void validateVariable(String variable) {
-        if (!VARIABLE.matcher(variable).matches() || RESERVED.contains(variable)) throw invalid();
+    static void validateVariable(String variable) {
+        if (variable == null || !VARIABLE.matcher(variable).matches() || RESERVED.contains(variable)) throw invalid();
     }
 
     private static ValueType type(String value) {
