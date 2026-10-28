@@ -18,6 +18,11 @@
             <artifactId>stellar-enclosure-tianji-contract</artifactId>
         </dependency>
         <dependency>
+            <groupId>top.egon</groupId>
+            <artifactId>stellar-enclosure-component-agent-flow-starter</artifactId>
+            <version>${agent-flow.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
         </dependency>
@@ -32,6 +37,10 @@
         <dependency>
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.yaml</groupId>
+            <artifactId>snakeyaml</artifactId>
         </dependency>
         <dependency>
             <groupId>org.flywaydb</groupId>

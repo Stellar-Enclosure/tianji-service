@@ -97,6 +97,17 @@ final class JdbcAgentLedgerRepository {
                 .stream().findFirst();
     }
 
+    Optional<StoredRun> appendRunningEvent(TrustedAgentActor actor, String runId, long expectedRevision) {
+        return jdbc.query("""
+                UPDATE tianji_agent.agent_run
+                SET revision = revision + 1, last_event_sequence = last_event_sequence + 1
+                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                  AND revision = ? AND status = 'RUNNING'
+                RETURNING *
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                runId, expectedRevision).stream().findFirst();
+    }
+
     void insertEvent(long tenantId, AgentEventDTO event) {
         jdbc.update("""
                 INSERT INTO tianji_agent.agent_event
@@ -125,7 +136,7 @@ final class JdbcAgentLedgerRepository {
 
     private RowMapper<StoredRun> runMapper() {
         return (rs, row) -> new StoredRun(mapRun(rs), rs.getString("request_hash"),
-                rs.getString("result"), rs.getString("correlation_id"));
+                rs.getString("result"), rs.getString("correlation_id"), rs.getString("execution_snapshot"));
     }
 
     private static AgentRunDTO mapRun(ResultSet rs) throws SQLException {
@@ -139,5 +150,5 @@ final class JdbcAgentLedgerRepository {
     }
 
     record DefinitionRow(String hash, top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO specification) { }
-    record StoredRun(AgentRunDTO run, String requestHash, String resultJson, String correlationId) { }
+    record StoredRun(AgentRunDTO run, String requestHash, String resultJson, String correlationId, String snapshotJson) { }
 }

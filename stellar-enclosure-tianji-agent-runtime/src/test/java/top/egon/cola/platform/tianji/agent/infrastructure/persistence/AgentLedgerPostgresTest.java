@@ -1,6 +1,5 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
-import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -34,7 +33,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.SubjectType.*;
@@ -45,28 +43,14 @@ import static top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.*;
 @Timeout(90)
 class AgentLedgerPostgresTest {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-28T00:00:00Z"), ZoneOffset.UTC);
-    private static final AtomicLong TENANT = new AtomicLong(10_000);
     private static DriverManagerDataSource dataSource;
     private static JdbcTemplate jdbc;
     private static AgentLedgerService ledger;
 
     @BeforeAll
     static void migrateIsolatedDatabase() {
-        String url = System.getProperty("tianji.postgres.test.url");
-        if (!url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) {
-            throw new IllegalArgumentException("integration tests require an explicit loopback tianji_it_ database");
-        }
-        dataSource = new DriverManagerDataSource();
-        dataSource.setUrl(url);
+        dataSource = PostgresTestDatabase.dataSource();
         jdbc = new JdbcTemplate(dataSource);
-        if (jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname = 'tianji_agent'", Integer.class) != 0) {
-            throw new IllegalStateException("integration tests require a fresh database without a Tianji schema");
-        }
-        Flyway flyway = Flyway.configure().dataSource(dataSource).schemas("tianji_agent")
-                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent")
-                .cleanDisabled(true).load();
-        flyway.migrate();
-        flyway.validate();
         ledger = new AgentLedgerService(dataSource, CLOCK);
     }
 
@@ -206,6 +190,33 @@ class AgentLedgerPostgresTest {
     }
 
     @Test
+    void snapshot_is_bound_to_definition_and_event_append_uses_revision_cas() {
+        TrustedAgentActor owner = actor(USER, "alice");
+        AgentDefinitionDTO definition = ledger.publish(owner, spec(Map.of("topic", "original")));
+        AgentRunDTO queued = ledger.start(owner, command("key", "question", "trace"));
+        GetAgentRunQuery query = new GetAgentRunQuery(queued.runId());
+        assertEquals(definition.contentSha256(), ledger.snapshot(owner, query).definitionContentSha256());
+        assertEquals("question", ledger.snapshot(owner, query).input().text());
+        assertThrows(AgentLedgerException.class,
+                () -> ledger.appendEvent(owner, query, 0, "TEXT_DELTA", "planner", Map.of("text", "a")));
+        ledger.transition(owner, query, 0, QUEUED, RUNNING, null, null);
+        AgentRunDTO appended = ledger.appendEvent(owner, query, 1, "TEXT_DELTA", "planner", Map.of("text", "a"));
+        assertEquals(2, appended.revision());
+        assertEquals(3, appended.lastEventSequence());
+        assertThrows(AgentLedgerException.class,
+                () -> ledger.appendEvent(owner, query, 1, "TEXT_DELTA", "planner", Map.of("text", "duplicate")));
+        assertEquals(3, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 10)).size());
+
+        jdbc.update("""
+                UPDATE tianji_agent.agent_run
+                SET execution_snapshot = jsonb_set(execution_snapshot, '{definition,configuration,topic}', '"changed"'::jsonb)
+                WHERE tenant_id = ? AND run_id = ?
+                """, owner.tenantId(), query.runId());
+        AgentLedgerException invalid = assertThrows(AgentLedgerException.class, () -> ledger.snapshot(owner, query));
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, invalid.code());
+    }
+
+    @Test
     void event_failure_rolls_back_both_start_and_status_update() {
         TrustedAgentActor owner = actor(USER, "alice");
         ledger.publish(owner, spec(Map.of()));
@@ -245,7 +256,7 @@ class AgentLedgerPostgresTest {
     }
 
     private static TrustedAgentActor actor(TrustedAgentActor.SubjectType type, String subject) {
-        return new TrustedAgentActor(TENANT.incrementAndGet(), type, subject);
+        return new TrustedAgentActor(PostgresTestDatabase.nextTenant(), type, subject);
     }
 
     private static AgentDefinitionSpecDTO spec(Map<String, Object> configuration) {

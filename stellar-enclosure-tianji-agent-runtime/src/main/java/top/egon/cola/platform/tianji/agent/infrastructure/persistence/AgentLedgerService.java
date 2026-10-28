@@ -5,6 +5,7 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
 import top.egon.cola.platform.tianji.agent.domain.ExecutionPolicyReducer;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -111,10 +112,49 @@ public final class AgentLedgerService {
         return result == null ? Optional.empty() : Optional.of(json.readResult(result));
     }
 
+    public AgentExecutionSnapshot snapshot(TrustedAgentActor actor, GetAgentRunQuery query) {
+        JdbcAgentLedgerRepository.StoredRun run = requireRun(actor, query);
+        AgentExecutionSnapshot snapshot = json.readSnapshot(run.snapshotJson());
+        JdbcAgentLedgerRepository.DefinitionRow definition = repository.definition(actor.tenantId(),
+                run.run().definitionKey(), run.run().definitionVersion()).orElseThrow(AgentLedgerService::notFound);
+        if (!snapshot.definition().definitionKey().equals(run.run().definitionKey())
+                || snapshot.definition().version() != run.run().definitionVersion()
+                || !definition.hash().equals(snapshot.definitionContentSha256())
+                || !definition.hash().equals(json.definitionHash(snapshot.definition()))) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "Agent execution snapshot does not match its definition");
+        }
+        return snapshot;
+    }
+
     public List<AgentEventDTO> events(TrustedAgentActor actor, AgentEventsQuery query) {
         Objects.requireNonNull(query, "query");
         requireRun(actor, new GetAgentRunQuery(query.runId()));
         return List.copyOf(repository.events(actor.tenantId(), query.runId(), query.afterSequence(), query.limit()));
+    }
+
+    /** Appends one projected event only while the expected run revision remains active. */
+    public AgentRunDTO appendEvent(TrustedAgentActor actor, GetAgentRunQuery query, long expectedRevision,
+                                   String type, String author, Map<String, Object> payload) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(query, "query");
+        if (expectedRevision < 0) {
+            throw invalid("invalid Agent run revision");
+        }
+        Instant now = now();
+        AgentEventDTO validated = new AgentEventDTO(UUID.randomUUID().toString(), query.runId(), 1,
+                type, author, null, null, now, null, "1", payload);
+        json.write(validated.payload(), AgentJsonCodec.MAX_EVENT_BYTES);
+        return transaction.execute(status -> {
+            JdbcAgentLedgerRepository.StoredRun previous = requireRun(actor, query);
+            JdbcAgentLedgerRepository.StoredRun updated = repository.appendRunningEvent(actor, query.runId(),
+                    expectedRevision).orElseThrow(() -> new AgentLedgerException(
+                            AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent run revision or state changed"));
+            repository.insertEvent(actor.tenantId(), new AgentEventDTO(validated.eventId(), query.runId(),
+                    updated.run().lastEventSequence(), validated.type(), validated.author(), null, null, now,
+                    previous.correlationId(), "1", validated.payload()));
+            return updated.run();
+        });
     }
 
     /** A status CAS and its event/result commit in one local transaction. */
@@ -139,7 +179,7 @@ public final class AgentLedgerService {
                 || (result != null && (!query.runId().equals(result.runId()) || to != result.status()))) {
             throw invalid("terminal result must match the run and status");
         }
-        String resultJson = result == null ? null : json.write(result, AgentJsonCodec.MAX_SNAPSHOT_BYTES);
+        String resultJson = result == null ? null : json.write(result, AgentJsonCodec.MAX_RESULT_BYTES);
         return transaction.execute(status -> {
             JdbcAgentLedgerRepository.StoredRun previous = requireRun(actor, query);
             Instant now = now();

@@ -21,6 +21,7 @@
     <properties>
         <spring-ai.version>2.0.2</spring-ai.version>
         <google-adk.version>1.13.0</google-adk.version>
+        <agent-flow.version>0.0.2-SNAPSHOT</agent-flow.version>
     </properties>
 
     <modules>

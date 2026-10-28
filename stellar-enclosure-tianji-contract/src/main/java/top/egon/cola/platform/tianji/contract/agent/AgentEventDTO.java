@@ -11,6 +11,10 @@ public record AgentEventDTO(String eventId, String runId, long sequence, String 
         eventId = ContractChecks.required(eventId, "eventId", 128);
         runId = ContractChecks.required(runId, "runId", 128);
         type = ContractChecks.required(type, "type", 128);
+        author = ContractChecks.optional(author, "author", 128);
+        branch = ContractChecks.optional(branch, "branch", 128);
+        toolCallId = ContractChecks.optional(toolCallId, "toolCallId", 128);
+        correlationId = ContractChecks.optional(correlationId, "correlationId", 128);
         payloadSchemaVersion = ContractChecks.required(payloadSchemaVersion, "payloadSchemaVersion", 64);
         if (sequence <= 0) {
             throw new IllegalArgumentException("sequence must be positive");

@@ -1,6 +1,6 @@
 # Tianji Service
 
-Tianji is the business process and intelligent orchestration platform for Stellar Enclosure. The current delivery contains engine-neutral Agent contracts and a PostgreSQL Agent ledger. It does not yet dispatch agents or expose HTTP APIs.
+Tianji is the business process and intelligent orchestration platform for Stellar Enclosure. The current delivery contains engine-neutral Agent contracts, a PostgreSQL Agent ledger and a manually invoked single-run executor. It does not yet provide a background dispatcher or expose HTTP APIs.
 
 ## Modules
 
@@ -9,18 +9,22 @@ Tianji is the business process and intelligent orchestration platform for Stella
 - `stellar-enclosure-tianji-agent-runtime`: the embedded runtime boundary and transactional Agent ledger; disabled by default.
 - `stellar-enclosure-tianji-agent-server`: non-web Spring Boot shell with an in-process health endpoint.
 
-The selected dependency line is Java 25, Spring Boot 4.1.2, Spring AI 2.0.2 and Google ADK 1.13.0. The runtime does not yet depend on the Agent Flow starter: the updated Components artifact must first be consumed through a verified source reactor or a separately versioned publication. Contract and client modules do not depend on either engine or an AI framework.
+The selected dependency line is Java 25, Spring Boot 4.1.2, Spring AI 2.0.2 and Google ADK 1.13.0. The runtime uses Agent Flow `0.0.2-SNAPSHOT`; until that artifact is published, build it together with the Components source repository. Contract and client modules do not depend on either engine or an AI framework.
 
 `stellar.tianji.agent.runtime.enabled` is false by default. Setting it to true currently fails startup because dispatch and trusted identity integration are not implemented. No Agent or process endpoint is enabled in this delivery. The ledger accepts an internal `TrustedAgentActor`; a caller must authenticate and authorize before creating it. Input artifact references and policy overrides are requests, not authorization; the ledger only permits policy limits to be reduced.
 
-The ledger stores immutable definition versions, scoped idempotent starts, run status and ordered events. Its additive migration is in `classpath:db/tianji-agent`; it is not run automatically. A deployment must use a dedicated Flyway configuration and schema owner for `tianji_agent`, separate from any other application's migration history. The ledger does not yet claim queued runs, implement cancellation or reconcile interrupted execution.
+The ledger stores immutable definition versions, scoped idempotent starts, run status and ordered events. Its additive migration is in `classpath:db/tianji-agent`; it is not run automatically. A deployment must use a dedicated Flyway configuration and schema owner for `tianji_agent`, separate from any other application's migration history. The executor can claim a specifically selected queued run, but background dispatch, externally requested cancellation and interrupted-run reconciliation are not implemented. Until tool governance and persistent sessions are ready, it accepts one-shot text only and rejects tools; code-first factories must be registered by trusted application code.
 
-For a JDK 25 environment with the Stellar-Enclosure platform parent and Components BOM available in Maven, run:
+`TEXT_DELTA` events are increments, while `AGENT_OUTPUT` events are complete snapshots for individual Agents; neither is the root completion signal. The projector accepts only authors from the compiled Agent tree and excludes native parts marked as thoughts and tool arguments. Provider-specific text may still contain sensitive content and requires the later authorization and redaction controls. The final run status is written after the root stream finishes. A single execution snapshot or event is limited to 1 MiB of UTF-8 JSON, and a final result to 2 MiB; oversized values fail rather than being silently truncated.
+
+For a JDK 25 environment with the Stellar-Enclosure platform parent and Components BOM available in Maven, run this from the repository root. It builds the sibling Components checkout and Tianji in one reactor without installing or publishing artifacts:
 
 ```bash
-./mvnw -B -ntp test
+./scripts/verify-source-reactor.sh -B -ntp
 ```
 
-The default tests use in-memory Spring contexts without opening a listening port and skip the PostgreSQL integration class. To run the ledger integration tests, supply an explicitly created empty loopback database named `tianji_it_*` through `-Dtianji.postgres.test.url=jdbc:postgresql://127.0.0.1:<port>/tianji_it_<name>`. The tests reject any other URL and refuse a database that already contains the `tianji_agent` schema. They apply the migration and include concurrent starts, scope isolation and transaction rollback. Use a disposable test database, never a shared or production database.
+Set `STELLAR_COMPONENTS_DIR` if Components is not a sibling checkout. The script requires Python 3 only to create a temporary reactor POM. After a separately versioned Agent Flow artifact is available in the configured Maven repository, `./mvnw -B -ntp test` can also build Tianji on its own.
+
+The default tests use in-memory Spring contexts without opening a listening port and skip the PostgreSQL integration classes. To run them, supply an explicitly created empty loopback database named `tianji_it_*` through `-Dtianji.postgres.test.url=jdbc:postgresql://127.0.0.1:<port>/tianji_it_<name>`. The tests reject any other URL and refuse a database that already contains the `tianji_agent` schema. They apply the migration and include concurrent starts, scope isolation, transaction rollback and real ADK Runner execution with a fake model. Use a disposable test database, never a shared or production database.
 
 Real model providers, MCP, full service execution and process engines require separate integration and acceptance work.

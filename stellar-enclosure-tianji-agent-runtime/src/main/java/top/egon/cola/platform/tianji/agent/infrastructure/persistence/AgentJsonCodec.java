@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -24,7 +25,8 @@ import java.util.TreeSet;
 
 final class AgentJsonCodec {
     static final int MAX_SNAPSHOT_BYTES = 1_048_576;
-    static final int MAX_EVENT_BYTES = 65_536;
+    static final int MAX_EVENT_BYTES = 1_048_576;
+    static final int MAX_RESULT_BYTES = 2_097_152;
     private static final TypeReference<Map<String, Object>> JSON_OBJECT = new TypeReference<>() { };
 
     private final ObjectMapper mapper = JsonMapper.builder()
@@ -87,6 +89,10 @@ final class AgentJsonCodec {
 
     AgentExecutionResult readResult(String json) {
         return read(json, AgentExecutionResult.class);
+    }
+
+    AgentExecutionSnapshot readSnapshot(String json) {
+        return read(json, AgentExecutionSnapshot.class);
     }
 
     Map<String, Object> readObject(String json) {
