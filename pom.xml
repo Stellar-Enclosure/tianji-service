@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project child.project.url.inherit.append.path="false" xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>top.egon</groupId>
+        <artifactId>stellar-enclosure-platform-parent</artifactId>
+        <version>0.0.1</version>
+        <relativePath/>
+    </parent>
+
+    <artifactId>stellar-enclosure-tianji</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>stellar-enclosure-tianji</name>
+    <description>Tianji business process and intelligent orchestration platform.</description>
+    <url>https://github.com/Stellar-Enclosure/tianji-service</url>
+
+    <properties>
+        <spring-ai.version>2.0.2</spring-ai.version>
+        <google-adk.version>1.13.0</google-adk.version>
+    </properties>
+
+    <modules>
+        <module>stellar-enclosure-tianji-contract</module>
+        <module>stellar-enclosure-tianji-client</module>
+        <module>stellar-enclosure-tianji-agent-runtime</module>
+        <module>stellar-enclosure-tianji-agent-server</module>
+    </modules>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.google.adk</groupId>
+                <artifactId>google-adk</artifactId>
+                <version>${google-adk.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.google.adk</groupId>
+                <artifactId>google-adk-spring-ai</artifactId>
+                <version>${google-adk.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>top.egon</groupId>
+                <artifactId>stellar-enclosure-tianji-contract</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>top.egon</groupId>
+                <artifactId>stellar-enclosure-tianji-client</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>top.egon</groupId>
+                <artifactId>stellar-enclosure-tianji-agent-runtime</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <scm child.scm.connection.inherit.append.path="false" child.scm.developerConnection.inherit.append.path="false" child.scm.url.inherit.append.path="false">
+        <connection>scm:git:https://github.com/Stellar-Enclosure/tianji-service.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/Stellar-Enclosure/tianji-service.git</developerConnection>
+        <url>https://github.com/Stellar-Enclosure/tianji-service</url>
+        <tag>HEAD</tag>
+    </scm>
+</project>

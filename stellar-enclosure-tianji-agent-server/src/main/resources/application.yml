@@ -1,0 +1,5 @@
+spring:
+  application:
+    name: tianji-agent-server
+  main:
+    web-application-type: none
