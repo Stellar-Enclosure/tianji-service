@@ -36,6 +36,8 @@ class TianjiServiceExecutionBindingsTest {
     }
 
     @Test void reconstructs_only_the_configured_process_service_tuple() {
+        assertTrue(bindings.usesIssuerRegistry(issuers));
+        assertFalse(bindings.usesIssuerRegistry(mock(TrustedIssuerRegistry.class)));
         var subject = bindings.require(request(actor, "review", 1, HASH), link("process-east", WorkerScopeTypeEnum.BPMN, HASH));
         assertEquals("worker", subject.clientId()); assertEquals("process-app", subject.appId());
         assertEquals("platform", subject.businessCode()); assertEquals("process", subject.applicationCode());

@@ -18,13 +18,20 @@ final class TianjiExecutionAuthorityBindings {
 
     static Map<URI, IdpServiceTokenRequest> source(IdpStarterProperties starter, IdentityAuthorityProperties authority,
                                                    TrustedIssuerRegistry issuers) {
+        return source(starter, authority, issuers, IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE);
+    }
+
+    static Map<URI, IdpServiceTokenRequest> source(IdpStarterProperties starter, IdentityAuthorityProperties authority,
+                                                   TrustedIssuerRegistry issuers, String requiredScope) {
+        if (!Set.of(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE, IdentityAuthorityScopes.SERVICE_EXECUTION_GRANT_ISSUE)
+                .contains(requiredScope)) throw new IllegalArgumentException("TIANJI_EXECUTION_GRANT_SCOPE_INVALID");
         if (starter == null || authority == null || authority.getBindings() == null || authority.getBindings().size() > 4096) {
             throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_INVALID");
         }
         URI source = resource(starter.getResourceUri());
         Map<URI, IdpServiceTokenRequest> result = new LinkedHashMap<>();
         authority.getBindings().forEach((name, value) -> {
-            if (value == null || value.getScopes() == null || !value.getScopes().contains(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE)) return;
+            if (value == null || value.getScopes() == null || !value.getScopes().contains(requiredScope)) return;
             if (name == null || !name.matches("[A-Za-z0-9._-]{1,128}") || value.getIssuer() == null) {
                 throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDING_INVALID");
             }

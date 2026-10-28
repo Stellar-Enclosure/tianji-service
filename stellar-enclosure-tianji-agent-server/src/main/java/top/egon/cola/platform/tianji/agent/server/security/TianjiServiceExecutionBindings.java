@@ -47,6 +47,8 @@ public final class TianjiServiceExecutionBindings {
                 binding.applicationCode(), binding.environment(), source.resourceUri());
     }
 
+    boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return issuers == candidate; }
+
     private static boolean sameSource(TianjiServiceExecutionProperties.Source source, TianjiLinkedDispatchProperties.Binding binding) {
         return source.issuer().toASCIIString().equals(binding.issuer().toASCIIString())
                 && source.tenantId() == binding.tenantId() && source.clientId().equals(binding.clientId());
