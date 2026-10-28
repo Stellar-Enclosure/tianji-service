@@ -369,6 +369,12 @@ public final class AdkAgentRunExecutor {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                         "governed tool execution is not available");
             }
+            // ADK invokes agent-level before-model callbacks after the runtime budget plugin.
+            // They could change the already-metered request or output limit.
+            if (!llm.canonicalBeforeModelCallbacks().isEmpty()) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+                        "Agent model callbacks require final-request governance");
+            }
         } else if (!(agent instanceof SequentialAgent || agent instanceof ParallelAgent || agent instanceof LoopAgent)) {
             throw new IllegalArgumentException("this Agent type requires additional execution governance");
         }

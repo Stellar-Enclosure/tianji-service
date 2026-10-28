@@ -643,6 +643,54 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void agent_model_callbacks_cannot_modify_a_request_after_budget_reservation() {
+        AtomicInteger callbacks = new AtomicInteger();
+        AtomicInteger calls = new AtomicInteger();
+        var nativeModel = new com.google.adk.models.BaseLlm("fixture-model") {
+            @Override
+            public io.reactivex.rxjava3.core.Flowable<com.google.adk.models.LlmResponse> generateContent(
+                    com.google.adk.models.LlmRequest request, boolean stream) {
+                calls.incrementAndGet();
+                return io.reactivex.rxjava3.core.Flowable.error(new IllegalStateException("unexpected model call"));
+            }
+            @Override
+            public com.google.adk.models.BaseLlmConnection connect(com.google.adk.models.LlmRequest request) {
+                throw new UnsupportedOperationException();
+            }
+        };
+        var async = LlmAgent.builder().name("async").instruction("write").model(nativeModel)
+                .beforeModelCallback((context, request) -> {
+                    callbacks.incrementAndGet();
+                    request.config(com.google.genai.types.GenerateContentConfig.builder().maxOutputTokens(999_999).build());
+                    return io.reactivex.rxjava3.core.Maybe.empty();
+                }).build();
+        var sync = LlmAgent.builder().name("sync").instruction("write").model(nativeModel)
+                .beforeModelCallbackSync((context, request) -> {
+                    callbacks.incrementAndGet();
+                    request.config(com.google.genai.types.GenerateContentConfig.builder().maxOutputTokens(999_999).build());
+                    return java.util.Optional.empty();
+                }).build();
+        var executor = executor(new FixtureModel(), Map.of(
+                "async", scheduler -> async,
+                "nested-sync", scheduler -> com.google.adk.agents.SequentialAgent.builder()
+                        .name("root").subAgents(sync).build()));
+        for (String code : List.of("async", "nested-sync")) {
+            TrustedAgentActor actor = actor();
+            ledger.publish(actor, codeSpec(code, code));
+            GetAgentRunQuery query = start(actor, code, "key");
+            assertEquals(FAILED, executor.executeQueued(actor, query).status());
+            var result = ledger.getResult(actor, query).orElseThrow();
+            assertEquals("TIANJI_FEATURE_NOT_AVAILABLE", result.errorCode());
+            assertEquals("NONE", result.sideEffectOutcome());
+            assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                    SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ?
+                    """, Integer.class, actor.tenantId(), query.runId()));
+        }
+        assertEquals(0, callbacks.get());
+        assertEquals(0, calls.get());
+    }
+
+    @Test
     void provider_failure_is_recorded_without_leaking_its_message() {
         FixtureModel model = new FixtureModel();
         model.script = prompt -> Flux.error(new IllegalStateException("private-provider-sentinel"));
