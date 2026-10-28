@@ -5,11 +5,13 @@ Tianji is the business process and intelligent orchestration platform for Stella
 ## Modules
 
 - `stellar-enclosure-tianji-contract`: JDK-only Agent client contract, commands, results and events.
-- `stellar-enclosure-tianji-client`: reserved for the HTTP client implementation; no transport is exposed yet.
+- `stellar-enclosure-tianji-client`: engine-neutral HTTP client and resumable Agent event stream.
 - `stellar-enclosure-tianji-agent-runtime`: the embedded runtime boundary and transactional Agent ledger; disabled by default.
 - `stellar-enclosure-tianji-agent-server`: non-web Spring Boot shell with an in-process health endpoint.
 
 The selected dependency line is Java 25, Spring Boot 4.1.2, Spring AI 2.0.2 and Google ADK 1.13.0. The runtime uses Agent Flow `0.0.2-SNAPSHOT`; until that artifact is published, build it together with the Components source repository. Contract and client modules do not depend on either engine or an AI framework.
+
+The client uses JDK `HttpClient` and Jackson 3. Construct `HttpAgentClient` with a service URI, a client configured with `Redirect.NEVER`, a supplier of the current access token, a request timeout and a bounded event-stream reconnect policy. It sends writes once, limits JSON responses and resumes SSE using the last delivered persisted sequence. A subscriber controls demand and may cancel its subscription without cancelling the Agent run. A `stream.complete` frame closes a terminal stream; an expired cursor is reported as `TIANJI_EVENT_CURSOR_EXPIRED`. Error bodies and access tokens are not retained in client exceptions. These are client-side contracts tested against a local HTTP stub; the corresponding secured service endpoints are not available yet.
 
 `stellar.tianji.agent.runtime.enabled` is false by default. Setting it to true currently fails startup because scheduling and trusted identity are not yet wired into the service. No Agent or process endpoint is enabled in this delivery. The ledger accepts an internal `TrustedAgentActor`; a caller must authenticate and authorize before creating it. Input artifact references and policy overrides are requests, not authorization; the ledger only permits policy limits to be reduced.
 
