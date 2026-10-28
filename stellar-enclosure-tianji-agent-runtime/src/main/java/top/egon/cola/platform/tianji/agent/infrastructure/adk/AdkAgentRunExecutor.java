@@ -126,6 +126,9 @@ public final class AdkAgentRunExecutor {
         this.typedSessionWrites = typedSessionWrites;
     }
 
+    /** Lets a host verify that its dispatcher uses the intended authorization boundary. */
+    public boolean usesAuthorization(AgentRunAuthorization candidate) { return authorizer == candidate; }
+
     /** Uses one CAS to claim the run and one subscription to the ADK root invocation. */
     public AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
         Objects.requireNonNull(actor, "actor");

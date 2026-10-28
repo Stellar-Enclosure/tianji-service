@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.application.run;
 
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -34,6 +35,8 @@ public final class AgentRunDispatcher implements AutoCloseable {
         this.worker = Objects.requireNonNull(worker, "worker");
         this.ledger = Objects.requireNonNull(ledger, "ledger");
     }
+
+    public boolean usesAuthorization(AgentRunAuthorization candidate) { return worker.usesAuthorization(candidate); }
 
     /** Discovers a bounded batch; rejected runs remain queued for a later poll. */
     public List<CompletionStage<AgentRunDTO>> dispatchQueued(int limit) {
