@@ -83,6 +83,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCo
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerAcquireStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
@@ -671,6 +672,9 @@ class ProcessServerPostgresTest {
         WorkerTaskDTO task = acquired.stream().filter(item -> item.task() != null).findFirst().orElseThrow().task();
         assertTrue(Set.of(first.instanceId(), second.instanceId()).contains(task.processInstanceId()));
         assertEquals(Map.of("requestedAmount", 10L), task.input());
+        assertEquals(Map.of("requestedAmount", ProcessValueTypeEnum.INTEGER), task.inputSchema());
+        assertEquals(Map.of("approved", ProcessValueTypeEnum.BOOLEAN), task.outputSchema());
+        assertEquals(WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, task.effectSafety());
         assertEquals(20, task.tenantId());
         assertEquals(WorkerAcquireStatusEnum.EMPTY, service.acquire(worker20, v1Request).status());
 

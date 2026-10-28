@@ -29,6 +29,7 @@
     <modules>
         <module>stellar-enclosure-tianji-contract</module>
         <module>stellar-enclosure-tianji-client</module>
+        <module>stellar-enclosure-tianji-worker-starter</module>
         <module>stellar-enclosure-tianji-agent-runtime</module>
         <module>stellar-enclosure-tianji-agent-server</module>
         <module>stellar-enclosure-tianji-process-server</module>
@@ -61,6 +62,11 @@
             <dependency>
                 <groupId>top.egon</groupId>
                 <artifactId>stellar-enclosure-tianji-client</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>top.egon</groupId>
+                <artifactId>stellar-enclosure-tianji-worker-starter</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>

@@ -65,10 +65,18 @@ class OrchestrationContractTest {
         Instant start = Instant.parse("2026-01-01T00:00:00Z");
         Map<String, Object> input = new HashMap<>(Map.of("amount", 10, "description", "private-fixture"));
         var task = new WorkerTaskDTO("task-1", "occurrence-1", WorkerScopeTypeEnum.BPMN, "process-1", null, 20,
-                "riskCheck", "1", "order-1", "trace-1", "intent-1", start, start.plusSeconds(30), input, lease);
+                "riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT,
+                Map.of("amount", ProcessValueTypeEnum.INTEGER, "description", ProcessValueTypeEnum.STRING), Map.of("route", ProcessValueTypeEnum.STRING),
+                "order-1", "trace-1", "intent-1", start, start.plusSeconds(30), input, lease);
         input.put("amount", 99);
         assertEquals(10L, task.input().get("amount"));
         assertThrows(UnsupportedOperationException.class, () -> task.input().clear());
+        assertEquals(Map.of("route", ProcessValueTypeEnum.STRING), task.contract().outputs());
+        assertThrows(IllegalArgumentException.class, () -> task.contract().validateInput(Map.of("amount", 10)));
+        assertThrows(IllegalArgumentException.class, () -> task.contract().validateOutput(Map.of("route", true)));
+        assertThrows(IllegalArgumentException.class, () -> new AcquireWorkerTaskCommand("A".repeat(128), "1".repeat(128)));
+        var businessResult = new WorkerBusinessResultDTO("receipt", Map.of("route", "private-result"));
+        assertFalse(businessResult.toString().contains("private-result"));
         assertFalse(task.toString().contains(lease));
         assertFalse(task.toString().contains("private-fixture"));
         var complete = new CompleteWorkerTaskCommand("task-1", "occurrence-1", lease, "receipt-1", Map.of("route", "private-result"));
@@ -79,14 +87,14 @@ class OrchestrationContractTest {
         assertThrows(IllegalArgumentException.class, () -> new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, null));
         assertThrows(IllegalArgumentException.class, () -> new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, task));
         var caseTask = new WorkerTaskDTO("task", "occurrence", WorkerScopeTypeEnum.CMMN, null, "case", 20,
-                "riskCheck", "1", "order", "trace", "intent", start, start.plusSeconds(30), Map.of(), lease);
+                "riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, Map.of(), Map.of(), "order", "trace", "intent", start, start.plusSeconds(30), Map.of(), lease);
         assertEquals("case", caseTask.caseInstanceId());
         assertThrows(IllegalArgumentException.class, () -> new CompleteWorkerTaskCommand("task-1", "occurrence-1", lease + "=", "receipt-1", Map.of()));
         assertThrows(IllegalArgumentException.class, () -> new FailWorkerTaskCommand("task-1", "occurrence-1", lease, WorkerFailureKindEnum.RETRYABLE, "stack trace"));
         assertThrows(IllegalArgumentException.class, () -> new WorkerTaskDTO("task", "occurrence", WorkerScopeTypeEnum.BPMN,
-                "process", "case", 20, "riskCheck", "1", "order", "trace", "intent", start, start.plusSeconds(30), Map.of(), lease));
+                "process", "case", 20, "riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, Map.of(), Map.of(), "order", "trace", "intent", start, start.plusSeconds(30), Map.of(), lease));
         assertThrows(IllegalArgumentException.class, () -> new WorkerTaskDTO("task", "occurrence", WorkerScopeTypeEnum.CMMN,
-                null, "case", 20, "riskCheck", "1", "order", "trace", "intent", start, start.plus(Duration.ofMinutes(16)), Map.of(), lease));
+                null, "case", 20, "riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, Map.of(), Map.of(), "order", "trace", "intent", start, start.plus(Duration.ofMinutes(16)), Map.of(), lease));
         assertFalse(List.of(AcquireWorkerTaskCommand.class.getRecordComponents()).stream()
                 .anyMatch(component -> component.getName().equalsIgnoreCase("tenantId")));
     }

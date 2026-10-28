@@ -173,7 +173,8 @@ class HttpProcessClientTest {
     void worker_calls_send_once_and_validate_topic_occurrence_and_outcome() throws Exception {
         String lease = Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
         var task = new WorkerTaskDTO("task-1", "occurrence-1", WorkerScopeTypeEnum.BPMN, "process-1", null, 20,
-                "riskCheck", "1", "order-1", "trace-1", "intent-1", NOW, NOW.plusSeconds(30), Map.of("amount", 10), lease);
+                "riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, Map.of("amount", ProcessValueTypeEnum.INTEGER),
+                Map.of("approved", ProcessValueTypeEnum.BOOLEAN), "order-1", "trace-1", "intent-1", NOW, NOW.plusSeconds(30), Map.of("amount", 10), lease);
         var success = new WorkerReceiptDTO("task-1", "occurrence-1", WorkerReceiptOutcomeEnum.COMPLETED, NOW);
         var manual = new WorkerReceiptDTO("task-1", "occurrence-1", WorkerReceiptOutcomeEnum.NEEDS_MANUAL, NOW);
         BlockingQueue<Seen> seen = new LinkedBlockingQueue<>();

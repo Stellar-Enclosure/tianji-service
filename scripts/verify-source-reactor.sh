@@ -10,7 +10,7 @@ case "$task_goal" in
     test|verify) ;;
     *) printf 'STELLAR_VERIFY_GOAL must be test or verify\n' >&2; exit 1 ;;
 esac
-task_projects=:stellar-enclosure-tianji-client,:stellar-enclosure-tianji-agent-server,:stellar-enclosure-tianji-process-server
+task_projects=:stellar-enclosure-tianji-client,:stellar-enclosure-tianji-worker-starter,:stellar-enclosure-tianji-agent-server,:stellar-enclosure-tianji-process-server
 if [ "$task_goal" = verify ]; then
     task_projects=$task_projects,:stellar-enclosure-tianquan-jianshen-processor,:stellar-enclosure-tianquan-jianshen-manifest-cli
 fi

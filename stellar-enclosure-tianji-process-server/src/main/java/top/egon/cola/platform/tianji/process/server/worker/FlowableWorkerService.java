@@ -12,10 +12,12 @@ import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCo
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerAcquireStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -43,6 +45,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.stream.Collectors;
 
 /** Secured callers provide a verified SERVICE actor; all native job changes share the lease transaction. */
 public final class FlowableWorkerService {
@@ -106,7 +109,9 @@ public final class FlowableWorkerService {
             if (rechecked == null || !nativeOwner.equals(rechecked.owner()) || !rechecked.live()
                     || !leases.isLive(actor, nativeJob.id(), tokenHash)) throw conflict();
             var task = new WorkerTaskDTO(lease.jobId(), lease.occurrenceId(), WorkerScopeTypeEnum.BPMN,
-                    lease.scopeId(), null, actor.tenantId(), lease.topic(), lease.schemaVersion(), verified.businessKey(),
+                    lease.scopeId(), null, actor.tenantId(), lease.topic(), lease.schemaVersion(),
+                    WorkerEffectSafetyEnum.valueOf(registration.effectSafety().name()), contractSchema(registration.inputs()),
+                    contractSchema(registration.outputs()), verified.businessKey(),
                     verified.correlationId(), lease.idempotencyKey(), lease.leasedAt(), lease.leaseExpiresAt(), inputs, token);
             return new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task);
         }));
@@ -239,6 +244,11 @@ public final class FlowableWorkerService {
         addPolicy(fields, registration.inputs(), registration.inputSources());
         addPolicy(fields, registration.outputs(), registration.outputTargets());
         return ProcessRequestDigest.hash(fields, inputs);
+    }
+
+    private static Map<String, ProcessValueTypeEnum> contractSchema(Map<String, ValidatedProcessModel.ValueType> schema) {
+        return schema.entrySet().stream().collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
+                entry -> ProcessValueTypeEnum.valueOf(entry.getValue().name())));
     }
 
     private static void addPolicy(List<String> fields, Map<String, ValidatedProcessModel.ValueType> types, Map<String, Set<String>> mappings) {
