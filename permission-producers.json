@@ -5,6 +5,11 @@
       "producerId": "tianji-agent-java",
       "module": "stellar-enclosure-tianji-agent-server",
       "artifactFile": "stellar-enclosure-tianji-agent-server-exec.jar"
+    },
+    {
+      "producerId": "tianji-process-java",
+      "module": "stellar-enclosure-tianji-process-server",
+      "artifactFile": "stellar-enclosure-tianji-process-server-exec.jar"
     }
   ]
 }

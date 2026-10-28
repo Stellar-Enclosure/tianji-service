@@ -1,6 +1,9 @@
 spring:
   application:
     name: tianji-process-server
+  autoconfigure:
+    exclude:
+      - org.redisson.spring.starter.RedissonAutoConfigurationV4
   main:
     web-application-type: none
   sql:
@@ -27,6 +30,8 @@ flowable:
 egon:
   cola:
     component:
+      id:
+        enabled: false
       transactional-outbox:
         storage:
           type: JDBC
@@ -35,3 +40,17 @@ egon:
           validate-schema: true
         polling:
           enabled: false
+    platform:
+      tianquan:
+        shoubing:
+          register-filter: false
+        jianshen:
+          register-filter: false
+          user-scope-policy:
+            enabled: true
+            permission-scopes:
+              TIANJI_PROCESS_RELEASE_PUBLISH: ["tianji:process:publish"]
+              TIANJI_PROCESS_RELEASE_READ: ["tianji:process:release:read"]
+              TIANJI_PROCESS_START: ["tianji:process:start"]
+              TIANJI_PROCESS_READ: ["tianji:process:read"]
+              TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]

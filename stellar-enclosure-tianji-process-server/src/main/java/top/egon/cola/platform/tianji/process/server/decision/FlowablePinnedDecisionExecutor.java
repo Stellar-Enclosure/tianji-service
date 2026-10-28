@@ -15,6 +15,8 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
+import top.egon.cola.platform.tianji.process.server.error.ProcessDecisionFailedException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 
 import javax.sql.DataSource;
@@ -89,7 +91,7 @@ public final class FlowablePinnedDecisionExecutor {
                 || binding.definitionVersion() != context.getDecisionVersion()
                 || binding.definitionVersion() != audit.getDecisionVersion()
                 || !binding.model().definitionKey().equals(audit.getDecisionKey())) {
-            throw new IllegalStateException("Decision evaluation failed");
+            throw new ProcessDecisionFailedException();
         }
         // Flowable's public decision service persists history in a second command after execution.
         if (engine.isHistoryEnabled()) engine.getCommandExecutor().execute(new PersistHistoricDecisionExecutionCmd(context));
@@ -103,9 +105,7 @@ public final class FlowablePinnedDecisionExecutor {
         return new Result(binding.definitionId(), binding.definitionVersion(), rows, matchedRules);
     }
 
-    private static IllegalArgumentException unavailable() {
-        return new IllegalArgumentException("Decision is unavailable for this release");
-    }
+    private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
 
     private static IllegalArgumentException invalidConfiguration() {
         return new IllegalArgumentException("Decision engine requires isolated beans and a shared JDBC transaction manager");

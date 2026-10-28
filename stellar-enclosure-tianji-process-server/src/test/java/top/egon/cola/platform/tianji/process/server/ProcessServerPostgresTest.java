@@ -23,6 +23,7 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -34,6 +35,9 @@ import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.http.MediaType;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.outbox.api.OutboxMessage;
@@ -47,13 +51,38 @@ import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecis
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
+import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
+import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
+import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
+import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
+import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelResource;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
+import tools.jackson.databind.json.JsonMapper;
 
 import javax.sql.DataSource;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
+import java.net.URI;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.Set;
 import java.util.Map;
 import java.util.List;
 import java.util.Objects;
@@ -65,6 +94,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 /** Runs only in a fresh, explicitly supplied loopback database. */
 @EnabledIfSystemProperty(named = "tianji.process.postgres.test.url", matches = ".+")
@@ -109,23 +142,47 @@ class ProcessServerPostgresTest {
                 "legacy-correlation", Map.of("amount", 10));
         String legacyInstance;
         try (ConfigurableApplicationContext oldApp = context(TianjiProcessServerApplication.class, scopedUrl, System.getProperty("user.name"))) {
-            var oldProcess = oldApp.getBean(SpringProcessEngineConfiguration.class);
-            var oldDmn = oldApp.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
-            var oldValidator = new ProcessModelValidator();
-            var oldRelease = new ProcessReleaseService(oldProcess, oldDmn, oldValidator);
-            oldRelease.publish(legacyActor, "legacy", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "baseline",
-                    new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray(), Map.of("amount", ValueType.INTEGER))));
-            legacyInstance = new ProcessExecutionService(oldProcess, oldDmn, oldValidator).start(legacyActor, legacyCommand).instanceId();
+            byte[] oldXml = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
+            var oldRepository = oldApp.getBean(RepositoryService.class);
+            var deployment = oldRepository.createDeployment().tenantId("991").addBytes("legacy.bpmn20.xml", oldXml).deploy();
+            var definition = oldRepository.createProcessDefinitionQuery().deploymentId(deployment.getId()).singleResult();
+            legacyInstance = oldApp.getBean(RuntimeService.class).createProcessInstanceBuilder().processDefinitionId(definition.getId())
+                    .tenantId("991").businessKey("legacy-order").variable("amount", 10L).start().getId();
+            String modelHash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(oldXml));
+            String requestHash = ProcessRequestDigest.hash(List.of("legacy", "baseline", "legacy-order", "legacy-correlation"), Map.of("amount", 10L));
+            jdbc.update("INSERT INTO tianji_process.tianji_process_release "
+                    + "(tenant_id,release_key,state,manifest_sha256,publisher_type,publisher_id,created_at) "
+                    + "VALUES (991,'legacy','ACTIVE',?,'USER','alice',clock_timestamp())", "a".repeat(64));
+            jdbc.update("""
+                    INSERT INTO tianji_process.tianji_process_release_definition
+                        (tenant_id,release_key,model_type,definition_key,engine_definition_id,engine_deployment_id,
+                         engine_version,model_sha256,input_schema)
+                    VALUES (991,'legacy','BPMN','baseline',?,?,?,?,'{"amount":"INTEGER"}'::jsonb)
+                    """, definition.getId(), deployment.getId(), definition.getVersion(), modelHash);
+            jdbc.update("""
+                    INSERT INTO tianji_process.tianji_process_command_receipt
+                        (tenant_id,subject_type,subject_id,command_type,command_id,request_sha256,release_key,
+                         correlation_id,state,resource_id,created_at)
+                    VALUES (991,'USER','alice','START','legacy-command',?,'legacy','legacy-correlation','APPLIED',?,clock_timestamp())
+                    """, requestHash, legacyInstance);
         }
+        Flyway version2 = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").target("2").cleanDisabled(true).load();
+        assertEquals(1, version2.migrate().migrationsExecuted);
+        Integer version2Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class);
         Flyway upgraded = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
                 .table("tianji_process_schema_history").baselineVersion("0")
                 .locations("classpath:db/tianji-process").cleanDisabled(true).load();
         assertEquals(1, upgraded.migrate().migrationsExecuted);
         upgraded.validate();
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
+        assertEquals(version2Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class));
         assertEquals(legacyInstance, jdbc.queryForObject("SELECT resource_id FROM tianji_process.tianji_process_command_receipt "
                 + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
         assertNull(jdbc.queryForObject("SELECT decision_result::text FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
+        assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_process.tianji_process_command_receipt "
                 + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
         jdbc.execute("""
                 CREATE FUNCTION tianji_process.test_release_failure() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -196,6 +253,7 @@ class ProcessServerPostgresTest {
             var processConfig = app.getBean(SpringProcessEngineConfiguration.class);
             var caseConfig = app.getBean(SpringCmmnEngineConfiguration.class);
             var decisionConfig = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+            verifySchemaGuard(app, jdbc);
             assertFalse(processConfig.isAsyncExecutorActivate());
             assertFalse(caseConfig.isAsyncExecutorActivate());
             assertTrue(processConfig.getBeans().isEmpty());
@@ -206,13 +264,16 @@ class ProcessServerPostgresTest {
             TaskService tasks = app.getBean(TaskService.class);
             ManagementService jobs = app.getBean(ManagementService.class);
             ProcessModelValidator validator = new ProcessModelValidator();
-            assertEquals(legacyInstance, new ProcessExecutionService(processConfig, decisionConfig, validator)
-                    .start(legacyActor, legacyCommand).instanceId());
+            var legacyService = new ProcessExecutionService(processConfig, decisionConfig, validator);
+            assertEquals(legacyInstance, legacyService.start(legacyActor, legacyCommand).instanceId());
+            var verifiedLegacyName = ProcessActor.verified(991, ProcessActor.SubjectType.USER, "alice", "https://idp.example/tenants/991");
+            assertThrows(IllegalArgumentException.class, () -> legacyService.get(verifiedLegacyName, legacyInstance));
             byte[] bpmn = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
             byte[] dmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
             verifyReleaseTransactions(app, jdbc, validator, bpmn, dmn);
             verifyProcessStarts(app, jdbc, validator);
             verifyDecisionApplications(app, jdbc, validator, dmn);
+            verifyHttpAgainstDatabase(app, validator);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
             app.getBean(CmmnRepositoryService.class).createDeployment().tenantId(TENANT)
@@ -430,6 +491,32 @@ class ProcessServerPostgresTest {
             assertNull(app.getBean(CmmnRuntimeService.class).createCaseInstanceQuery().caseInstanceId(caseId).singleResult());
         }
 
+        new WebApplicationContextRunner().withUserConfiguration(TianjiProcessServerApplication.class, TestDelivery.class)
+                .withPropertyValues("stellar.tianji.process.api.enabled=true", "spring.datasource.url=" + scopedUrl,
+                        "spring.datasource.username=" + runtimeUser,
+                        "spring.sql.init.mode=never", "spring.flyway.enabled=false",
+                        "flowable.database-schema=tianji_process", "flowable.database-schema-update=false",
+                        "flowable.async-executor-activate=false", "flowable.async-history-executor-activate=false",
+                        "flowable.check-process-definitions=false", "flowable.cmmn.deploy-resources=false",
+                        "flowable.dmn.deploy-resources=false", "flowable.idm.enabled=false", "flowable.eventregistry.enabled=false",
+                        "egon.cola.component.transactional-outbox.enabled=true",
+                        "egon.cola.component.transactional-outbox.storage.type=JDBC",
+                        "egon.cola.component.transactional-outbox.storage.validate-schema=true",
+                        "egon.cola.component.transactional-outbox.storage.jdbc.schema=tianji_process",
+                        "egon.cola.component.transactional-outbox.polling.enabled=false",
+                        "egon.cola.platform.tianquan.shoubing.register-filter=false",
+                        "egon.cola.platform.tianquan.jianshen.register-filter=false",
+                        "egon.cola.component.id.enabled=false",
+                        "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4")
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(ProcessController.class);
+                    assertThat(context).hasSingleBean(ProcessApiSchemaVerifier.class);
+                });
+
         AsyncExecutor executor;
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser,
                 "--flowable.async-executor-activate=true",
@@ -444,6 +531,35 @@ class ProcessServerPostgresTest {
                     .processInstanceId(processId).finished().singleResult());
         }
         assertFalse(executor.isActive());
+    }
+
+    private static void verifySchemaGuard(ConfigurableApplicationContext app, JdbcTemplate bootstrap) {
+        var verifier = new ProcessApiSchemaVerifier(app.getBean(DataSource.class), "tianji_process");
+        verifier.verify();
+        Integer checksum = bootstrap.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class);
+        bootstrap.update("UPDATE tianji_process.tianji_process_schema_history SET checksum=0 WHERE version='2'");
+        assertThrows(IllegalStateException.class, verifier::verify);
+        bootstrap.update("UPDATE tianji_process.tianji_process_schema_history SET checksum=? WHERE version='2'", checksum);
+        bootstrap.execute("ALTER TABLE tianji_process.tianji_process_command_receipt ALTER COLUMN correlation_id DROP NOT NULL");
+        assertThrows(IllegalStateException.class, verifier::verify);
+        bootstrap.execute("ALTER TABLE tianji_process.tianji_process_command_receipt ALTER COLUMN correlation_id SET NOT NULL");
+        bootstrap.execute("DROP INDEX tianji_process.tianji_process_start_receipt_instance_idx");
+        assertThrows(IllegalStateException.class, verifier::verify);
+        bootstrap.execute("CREATE UNIQUE INDEX tianji_process_start_receipt_instance_idx "
+                + "ON tianji_process.tianji_process_command_receipt (tenant_id, resource_id) "
+                + "WHERE command_type='START' AND state='APPLIED'");
+        bootstrap.execute("ALTER TABLE tianji_process.tianji_process_command_receipt DROP CONSTRAINT tianji_process_decision_receipt_result_check");
+        assertThrows(IllegalStateException.class, verifier::verify);
+        bootstrap.execute("""
+                ALTER TABLE tianji_process.tianji_process_command_receipt
+                ADD CONSTRAINT tianji_process_decision_receipt_result_check CHECK (
+                    (command_type='DECISION' AND state='PENDING' AND decision_result IS NULL)
+                    OR (command_type='DECISION' AND state='APPLIED' AND decision_result IS NOT NULL
+                        AND jsonb_typeof(decision_result)='object')
+                    OR (command_type<>'DECISION' AND decision_result IS NULL)
+                )
+                """);
+        verifier.verify();
     }
 
     private static void verifyReleaseTransactions(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
@@ -473,6 +589,10 @@ class ProcessServerPostgresTest {
         var foreignRelease = service.publish(foreign, "release-one", resources);
         assertNotEquals(definition(release, Type.BPMN).engineDefinitionId(), definition(foreignRelease, Type.BPMN).engineDefinitionId());
         assertEquals(release, service.get(actor, "release-one"));
+        var publisher = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp-a.example/tenant/20");
+        service.publish(publisher, "issuer-release", resources);
+        assertEquals(publisher.issuerFingerprint(), bootstrap.queryForObject("SELECT publisher_issuer "
+                + "FROM tianji_process.tianji_process_release WHERE tenant_id=20 AND release_key='issuer-release'", String.class));
 
         var bound = definition(release, Type.DMN);
         var pinned = new FlowablePinnedDecisionExecutor(decisionEngine);
@@ -566,6 +686,16 @@ class ProcessServerPostgresTest {
                 assertThrows(IllegalArgumentException.class, () -> service.get(foreign, started.instanceId())).getMessage());
         var otherStarted = service.start(other, request);
         assertNotEquals(started.instanceId(), otherStarted.instanceId());
+        var issuerA = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "same-subject", "https://idp-a.example/tenant/20");
+        var issuerB = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "same-subject", "https://idp-b.example/tenant/20");
+        var issuerRequest = new ProcessExecutionService.StartCommand("release-one", "baseline", "issuer-order", "issuer-command",
+                "issuer-correlation", Map.of("amount", 10));
+        var issuerInstance = service.start(issuerA, issuerRequest);
+        assertThrows(IllegalArgumentException.class, () -> service.get(issuerB, issuerInstance.instanceId()));
+        assertThrows(IllegalArgumentException.class, () -> service.get(new ProcessActor(20, ProcessActor.SubjectType.USER, "same-subject"),
+                issuerInstance.instanceId()));
+        assertNotEquals(issuerInstance.instanceId(), service.start(issuerB, issuerRequest).instanceId());
+        assertEquals(issuerInstance, service.start(issuerA, issuerRequest));
         assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
                 + "WHERE tenant_id=20 AND command_id='invalid-input'", Integer.class));
 
@@ -660,6 +790,13 @@ class ProcessServerPostgresTest {
         bootstrap.update("UPDATE tianji_process.tianji_process_command_receipt SET decision_result=CAST(? AS jsonb) "
                         + "WHERE tenant_id=20 AND subject_type='USER' AND subject_id='alice' AND command_type='DECISION' AND command_id='decision-1'", saved);
         assertNotEquals(result.executionId(), service.evaluate(other, command).executionId());
+        var issuerA = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "same-subject", "https://idp-a.example/tenant/20");
+        var issuerB = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "same-subject", "https://idp-b.example/tenant/20");
+        var issuerCommand = new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "issuer-decision",
+                "issuer-correlation", Map.of("amount", 10));
+        var issuerResult = service.evaluate(issuerA, issuerCommand);
+        assertEquals(issuerResult, service.evaluate(issuerA, issuerCommand));
+        assertNotEquals(issuerResult.executionId(), service.evaluate(issuerB, issuerCommand).executionId());
         assertThrows(IllegalStateException.class, () -> service.evaluate(actor,
                 new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-1",
                         "decision-correlation", Map.of("amount", 11))));
@@ -733,16 +870,81 @@ class ProcessServerPostgresTest {
                 """, "a".repeat(64)));
     }
 
+    private static void verifyHttpAgainstDatabase(ConfigurableApplicationContext app, ProcessModelValidator validator) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        var guard = mock(PermissionExecutionGuard.class);
+        var mvc = MockMvcBuilders.standaloneSetup(new ProcessController(new ProcessReleaseService(process, dmn, validator),
+                        new ProcessExecutionService(process, dmn, validator), new ProcessDecisionService(process, dmn, validator),
+                        new TianjiProcessAccess(guard, Clock.systemUTC())))
+                .addFilters(new VerifiedProcessIssuerFilter())
+                .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
+        var mapper = JsonMapper.builder().build();
+        Instant now = Instant.now();
+        try {
+            authenticateService("worker", "20", now);
+            String bpmnXml = new String(new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray(), StandardCharsets.UTF_8);
+            String dmnXml = new String(new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray(), StandardCharsets.UTF_8);
+            var publish = new PublishProcessReleaseCommand("http-release", List.of(
+                    new ProcessModelResource(ProcessModelTypeEnum.BPMN, "baseline", bpmnXml, Map.of("amount", ProcessValueTypeEnum.INTEGER)),
+                    new ProcessModelResource(ProcessModelTypeEnum.DMN, "baselineDecision", dmnXml, Map.of())));
+            var release = mapper.readValue(mvc.perform(post("/api/tianji/v1/process-releases").contentType(MediaType.APPLICATION_JSON)
+                    .content(mapper.writeValueAsBytes(publish))).andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray(), ProcessReleaseDTO.class);
+            assertEquals(2, release.models().size());
+            mvc.perform(get("/api/tianji/v1/process-releases/http-release")).andExpect(status().isOk())
+                    .andExpect(jsonPath("$.releaseVersion").value("http-release"));
+            var start = new StartProcessCommand("baseline", "http-release", "http-order", "http-command", "http-trace", Map.of("amount", 10));
+            byte[] startBody = mapper.writeValueAsBytes(start);
+            var response = mvc.perform(post("/api/tianji/v1/process-instances").contentType(MediaType.APPLICATION_JSON).content(startBody))
+                    .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store")).andReturn().getResponse();
+            var created = mapper.readValue(response.getContentAsByteArray(), ProcessInstanceDTO.class);
+            var repeated = mapper.readValue(mvc.perform(post("/api/tianji/v1/process-instances").contentType(MediaType.APPLICATION_JSON)
+                    .content(startBody)).andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray(), ProcessInstanceDTO.class);
+            assertEquals(created, repeated);
+            assertEquals(1, process.getRuntimeService().createProcessInstanceQuery().processInstanceBusinessKey("http-order").count());
+            mvc.perform(get("/api/tianji/v1/process-instances/" + created.instanceId())
+                    .header("X-Egon-Tianji-Tenant", "21")).andExpect(status().isConflict());
+            var decision = new EvaluateDecisionCommand("baselineDecision", "http-release", "http-decision", "http-trace", Map.of("amount", 10));
+            byte[] decisionBody = mapper.writeValueAsBytes(decision);
+            var evaluated = mapper.readValue(mvc.perform(post("/api/tianji/v1/decisions/evaluate").contentType(MediaType.APPLICATION_JSON)
+                    .content(decisionBody)).andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray(), DecisionResultDTO.class);
+            assertEquals("standard", evaluated.outputs().getFirst().get("route"));
+            assertEquals(evaluated, mapper.readValue(mvc.perform(post("/api/tianji/v1/decisions/evaluate").contentType(MediaType.APPLICATION_JSON)
+                    .content(decisionBody)).andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray(), DecisionResultDTO.class));
+            authenticateService("other-worker", "20", now);
+            mvc.perform(get("/api/tianji/v1/process-instances/" + created.instanceId())).andExpect(status().isNotFound());
+            authenticateService("worker", "20", now, "https://another-idp.example/issuer");
+            mvc.perform(get("/api/tianji/v1/process-instances/" + created.instanceId())).andExpect(status().isNotFound());
+            authenticateService("worker", "21", now);
+            mvc.perform(get("/api/tianji/v1/process-instances/" + created.instanceId())).andExpect(status().isNotFound());
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+    }
+
+    private static void authenticateService(String subject, String tenant, Instant now) {
+        authenticateService(subject, tenant, now, "https://idp.example/issuer");
+    }
+
+    private static void authenticateService(String subject, String tenant, Instant now, String issuer) {
+        var principal = new ServiceIdentityPrincipal(subject, tenant, subject, "token-id", URI.create("https://api.example/tianji"),
+                1, Set.of("tianji:process:read"), "xingyuan", subject, "test", "credential", now.minusSeconds(30), now.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(), URI.create(issuer)));
+    }
+
     private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {
         return context(new Class<?>[] {source, TestDelivery.class}, url, user, extra);
     }
 
     private static ConfigurableApplicationContext context(Class<?>[] sources, String url, String user, String... extra) {
-        String[] args = new String[extra.length + 3];
+        String[] args = new String[extra.length + 5];
         args[0] = "--spring.datasource.url=" + url;
         args[1] = "--spring.datasource.username=" + user;
         args[2] = "--spring.main.banner-mode=off";
-        System.arraycopy(extra, 0, args, 3, extra.length);
+        // This integration test checks atomicity, not the component's 100 ms performance budget.
+        args[3] = "--egon.cola.component.transactional-outbox.state-machine.execution-timeout=PT1S";
+        args[4] = "--egon.cola.component.transactional-outbox.state-machine.claim-evaluation-timeout=PT2S";
+        System.arraycopy(extra, 0, args, 5, extra.length);
         return new SpringApplicationBuilder(sources).web(WebApplicationType.NONE).run(args);
     }
 

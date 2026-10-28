@@ -24,6 +24,11 @@ class ProcessReleaseServiceTest {
         assertThrows(IllegalArgumentException.class, () -> new ProcessActor(20, ProcessActor.SubjectType.USER, " alice"));
         assertThrows(IllegalArgumentException.class, () -> new ProcessActor(20, ProcessActor.SubjectType.USER, "alice" + (char) 0));
         assertThrows(IllegalArgumentException.class, () -> new ProcessActor(20, ProcessActor.SubjectType.USER, "alice" + (char) 0xd800));
+        var first = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp-a.example/20");
+        var second = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp-b.example/20");
+        assertNotEquals(first, second);
+        assertNotEquals(first, new ProcessActor(20, ProcessActor.SubjectType.USER, "alice"));
+        assertThrows(IllegalArgumentException.class, () -> ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "http://idp.example/20"));
     }
 
     @Test

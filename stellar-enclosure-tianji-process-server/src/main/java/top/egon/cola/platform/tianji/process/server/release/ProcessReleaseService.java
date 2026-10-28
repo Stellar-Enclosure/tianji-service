@@ -13,6 +13,8 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
@@ -86,9 +88,9 @@ public final class ProcessReleaseService {
     private Release publishInTransaction(ProcessActor actor, String releaseKey, String manifestHash,
                                          List<PreparedModel> models) {
         int inserted = jdbc.update("INSERT INTO " + table("tianji_process_release") + " "
-                        + "(tenant_id, release_key, state, manifest_sha256, publisher_type, publisher_id, created_at) "
-                        + "VALUES (?, ?, 'PREPARING', ?, ?, ?, clock_timestamp()) ON CONFLICT DO NOTHING",
-                actor.tenantId(), releaseKey, manifestHash, actor.subjectType().name(), actor.subjectId());
+                        + "(tenant_id, release_key, state, manifest_sha256, publisher_type, publisher_id, publisher_issuer, created_at) "
+                        + "VALUES (?, ?, 'PREPARING', ?, ?, ?, ?, clock_timestamp()) ON CONFLICT DO NOTHING",
+                actor.tenantId(), releaseKey, manifestHash, actor.subjectType().name(), actor.subjectId(), actor.issuerFingerprint());
         if (inserted == 0) {
             Release existing = load(actor.tenantId(), releaseKey, true);
             if (!existing.manifestSha256().equals(manifestHash)) throw conflict();
@@ -247,8 +249,8 @@ public final class ProcessReleaseService {
         if (value == null || !value.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")) throw invalid();
     }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Process release request is invalid"); }
-    private static IllegalArgumentException unavailable() { return new IllegalArgumentException("Process release is unavailable"); }
-    private static IllegalStateException conflict() { return new IllegalStateException("Process release key already binds different content"); }
+    private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
+    private static ProcessConflictException conflict() { return new ProcessConflictException(); }
     private static IllegalStateException invalidDeployment() { return new IllegalStateException("Process model deployment is inconsistent"); }
     private static IllegalArgumentException invalidConfiguration() {
         return new IllegalArgumentException("Process release requires isolated engines and a shared JDBC transaction manager");

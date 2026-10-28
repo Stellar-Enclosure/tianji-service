@@ -16,6 +16,9 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandRece
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessDecisionFailedException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
@@ -116,7 +119,9 @@ public final class ProcessDecisionService {
             if (source == null) throw unavailable();
             byte[] xml = source.readNBytes(MAX_XML_BYTES + 1);
             if (!hash(xml).equals(binding.modelSha256())) throw unavailable();
-            ValidatedProcessModel model = validator.validateDmn(xml, binding.definitionKey());
+            ValidatedProcessModel model;
+            try { model = validator.validateDmn(xml, binding.definitionKey()); }
+            catch (IllegalArgumentException invalid) { throw new IllegalStateException("Stored decision model is invalid"); }
             if (!model.inputs().equals(binding.inputs())) throw unavailable();
             return model;
         } catch (FlowableObjectNotFoundException missing) {
@@ -179,9 +184,9 @@ public final class ProcessDecisionService {
         try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)); }
         catch (NoSuchAlgorithmException failure) { throw new IllegalStateException("SHA-256 is unavailable"); }
     }
-    private static IllegalArgumentException unavailable() { return new IllegalArgumentException("Decision or release is unavailable"); }
-    private static IllegalStateException conflict() { return new IllegalStateException("Decision request ID already binds different content"); }
-    private static IllegalStateException evaluationFailed() { return new IllegalStateException("Decision evaluation failed"); }
+    private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
+    private static ProcessConflictException conflict() { return new ProcessConflictException(); }
+    private static ProcessDecisionFailedException evaluationFailed() { return new ProcessDecisionFailedException(); }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Decision request is invalid"); }
 
     public record EvaluateCommand(String releaseKey, String decisionKey, String requestId, String correlationId,

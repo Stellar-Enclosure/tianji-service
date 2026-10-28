@@ -12,6 +12,8 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
@@ -107,7 +109,8 @@ public final class ProcessExecutionService {
             if (source == null) throw unavailable();
             byte[] xml = source.readNBytes(MAX_XML_BYTES + 1);
             if (!hash(xml).equals(binding.modelSha256())) throw unavailable();
-            validator.validateBpmn(xml, binding.definitionKey());
+            try { validator.validateBpmn(xml, binding.definitionKey()); }
+            catch (IllegalArgumentException invalid) { throw new IllegalStateException("Stored process model is invalid"); }
         } catch (FlowableObjectNotFoundException missing) {
             throw unavailable();
         } catch (IOException failure) {
@@ -157,8 +160,8 @@ public final class ProcessExecutionService {
         return true;
     }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Process request is invalid"); }
-    private static IllegalArgumentException unavailable() { return new IllegalArgumentException("Process instance or release is unavailable"); }
-    private static IllegalStateException conflict() { return new IllegalStateException("Process command ID already binds different content"); }
+    private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
+    private static ProcessConflictException conflict() { return new ProcessConflictException(); }
 
     public enum State { ACTIVE, SUSPENDED, COMPLETED, CANCELLED }
 

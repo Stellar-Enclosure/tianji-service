@@ -1,0 +1,301 @@
+package top.egon.cola.platform.tianji.process.server;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+import org.aopalliance.intercept.MethodInvocation;
+import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.context.WebApplicationContext;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+import org.springframework.web.servlet.config.annotation.EnableWebMvc;
+import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
+import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
+import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
+import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
+import top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions;
+import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.RuntimePolicyBinding;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ServicePolicySnapshot;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.SystemAuthorizationSnapshot;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.CatalogScope;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.DefinitionLifecycle;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.EffectivePermissionSnapshot;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifestCanonicalizer;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionMode;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionRequirement;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceAccess;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType;
+import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
+import top.egon.cola.platform.tianquan.jianshen.starter.cache.AuthorizationSnapshotLoader;
+import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionPolicyRegistry;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionServicePolicyGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.CurrentRbac3User;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3UserDetails;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3MethodAuthorizationManager;
+import top.egon.cola.platform.tianquan.jianshen.starter.authorization.AuthorizationService;
+import top.egon.cola.platform.tianquan.shoubing.contract.AuthenticationContext;
+import top.egon.cola.platform.tianquan.shoubing.contract.IdentityPrincipal;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.AccessTokenVerification;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpJwtVerifier;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.ServiceAccessTokenVerifier;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.UserAccessTokenVerifier;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedTenantContextFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedUserTokenCarrier;
+
+import java.net.URI;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+/** Real identity filters and Jianshen guard with controlled verifier and authorization responses. */
+class ProcessPermissionIntegrationTest {
+    private static final Instant NOW = Instant.now();
+    private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
+    private static final String DIGEST = "a".repeat(64);
+    private static final CatalogScope SCOPE = new CatalogScope("10", "20", "xingyuan", "tianji", "default", "test");
+    private static final IdentityPrincipal USER = new IdentityPrincipal("alice", "20", "token-id",
+            Set.of("https://api.example/tianji"), NOW.minusSeconds(60), NOW.plusSeconds(300),
+            AuthenticationContext.of("PASSWORD", NOW.minusSeconds(60)));
+    private final AtomicReference<Set<String>> granted = new AtomicReference<>(Set.of(TianjiProcessPermissions.READ));
+    private final AtomicReference<String> snapshotIssuer = new AtomicReference<>("https://idp.example/tenants/20");
+    private final PermissionManifest manifest = manifest();
+    private final Rbac3AuthorizationClient client = new Rbac3AuthorizationClient() {
+        @Override public SystemAuthorizationSnapshot fetch(String system, IdentityPrincipal principal) { return snapshot(granted.get()); }
+        @Override public ServicePolicySnapshot fetchPolicy(String system, ServiceIdentityPrincipal principal) {
+            return new ServicePolicySnapshot(SCOPE, "1", "3", binding(), resources(), NOW.plusSeconds(30));
+        }
+    };
+
+    @AfterEach
+    void clear() {
+        SecurityContextHolder.clearContext();
+        RequestContextHolder.resetRequestAttributes();
+    }
+
+    @Test
+    void servlet_chain_checks_current_user_permission_scope_and_trusted_tenant() {
+        var verifier = mock(IdpJwtVerifier.class);
+        when(verifier.verifyAny("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(TianjiProcessPermissions.READ_SCOPE), null, URI.create("https://idp.example/tenants/20")));
+        when(verifier.verifyUser("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(TianjiProcessPermissions.READ_SCOPE), null, URI.create("https://idp.example/tenants/20")));
+        when(verifier.verifyAny("without-scope")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(), null, URI.create("https://idp.example/tenants/20")));
+        when(verifier.verifyUser("without-scope")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(), null, URI.create("https://idp.example/tenants/20")));
+        var policy = new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy();
+        var identity = IdpBearerAuthenticationFilter.create(new UserAccessTokenVerifier(verifier),
+                new ServiceAccessTokenVerifier(verifier), policy, new com.fasterxml.jackson.databind.ObjectMapper(),
+                new VerifiedTenantContextFilter(), verifier);
+        var authorization = new Rbac3BearerAuthenticationFilter(new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
+                new com.fasterxml.jackson.databind.ObjectMapper());
+        var processes = mock(ProcessExecutionService.class);
+        var actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp.example/tenants/20");
+        when(processes.get(actor, "instance-1")).thenReturn(new ProcessExecutionService.Snapshot("instance-1", "v1", "invoice",
+                "order", "trace", ProcessExecutionService.State.ACTIVE, NOW, null));
+        new WebApplicationContextRunner().withUserConfiguration(TestWeb.class)
+                .withPropertyValues("stellar.tianji.process.api.enabled=true",
+                        "egon.cola.platform.tianquan.shoubing.register-filter=false",
+                        "egon.cola.platform.tianquan.jianshen.register-filter=false")
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> processes)
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean(PermissionExecutionGuard.class, this::guard)
+                .withBean(IdpBearerAuthenticationFilter.class, () -> identity)
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> authorization)
+                .run(context -> assertDoesNotThrow(() -> {
+                    assertNull(context.getStartupFailure());
+                    var mvc = MockMvcBuilders.webAppContextSetup((WebApplicationContext) context.getSourceApplicationContext())
+                            .apply(springSecurity()).build();
+                    mvc.perform(get("/api/tianji/v1/process-instances/instance-1")).andExpect(status().isUnauthorized());
+                    var response = mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
+                                    .header("Authorization", "Bearer verified-test-token").header("X-Tenant-ID", "21"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.instanceId").value("instance-1")).andReturn();
+                    assertThrows(IllegalStateException.class, () -> VerifiedUserTokenCarrier.current(response.getRequest()));
+                    assertNull(response.getRequest().getAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer"));
+                    assertNull(SecurityContextHolder.getContext().getAuthentication());
+                    mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
+                                    .header("Authorization", "Bearer verified-test-token").header("X-Egon-Tianji-Tenant", "21"))
+                            .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_TENANT_CONTEXT_CHANGED"));
+                    granted.set(Set.of());
+                    mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
+                    granted.set(Set.of(TianjiProcessPermissions.READ));
+                    mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
+                                    .header("Authorization", "Bearer without-scope"))
+                            .andExpect(status().isForbidden());
+                    snapshotIssuer.set("https://another-idp.example/tenants/20");
+                    mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
+                    mvc.perform(get("/unclassified").header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
+                    verify(processes, times(1)).get(actor, "instance-1");
+                }));
+    }
+
+    @Test
+    void service_requires_its_own_scope_and_policy() {
+        var request = new MockHttpServletRequest();
+        request.setAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer", "https://idp.example/tenants/20");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiProcessPermissions.READ_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(),
+                URI.create("https://idp.example/tenants/20")));
+        assertEquals(ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker", "https://idp.example/tenants/20"),
+                new TianjiProcessAccess(guard(), CLOCK).require(TianjiProcessPermissions.GET_API));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal));
+        assertThrows(org.springframework.security.authentication.AuthenticationCredentialsNotFoundException.class,
+                () -> new TianjiProcessAccess(guard(), CLOCK).require(TianjiProcessPermissions.GET_API));
+    }
+
+    @Test
+    void each_resource_requires_its_current_permission_and_matching_user_scope() {
+        var request = new MockHttpServletRequest();
+        VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        request.setAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer", "https://idp.example/tenants/20");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        Map<String, String> required = Map.of(
+                TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.RELEASE_PUBLISH,
+                TianjiProcessPermissions.RELEASE_GET_API, TianjiProcessPermissions.RELEASE_READ,
+                TianjiProcessPermissions.START_API, TianjiProcessPermissions.START,
+                TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ,
+                TianjiProcessPermissions.DECISION_API, TianjiProcessPermissions.DECISION_EXECUTE);
+        Set<String> all = Set.copyOf(required.values());
+        granted.set(all);
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(all)), List.of(
+                new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.RELEASE_PUBLISH_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.RELEASE_READ_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.START_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.READ_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.DECISION_SCOPE))));
+        var access = new TianjiProcessAccess(guard(), CLOCK);
+        for (String resource : required.keySet()) assertEquals(20, access.require(resource).tenantId());
+        required.forEach((resource, permission) -> {
+            var reduced = new java.util.HashSet<>(all);
+            reduced.remove(permission);
+            granted.set(Set.copyOf(reduced));
+            assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class, () -> access.require(resource));
+        });
+        granted.set(all);
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(all)), List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.READ_SCOPE))));
+        assertEquals(20, access.require(TianjiProcessPermissions.GET_API).tenantId());
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access.require(TianjiProcessPermissions.START_API));
+    }
+
+    @Test
+    void method_permission_annotation_matches_the_runtime_resource_policy() throws Exception {
+        var request = new MockHttpServletRequest();
+        VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiProcessPermissions.READ_SCOPE))));
+        MethodInvocation invocation = mock(MethodInvocation.class);
+        when(invocation.getMethod()).thenReturn(ProcessController.class.getMethod("instance", String.class));
+        var manager = new Rbac3MethodAuthorizationManager(mock(AuthorizationService.class), guard());
+        assertTrue(manager.check(() -> SecurityContextHolder.getContext().getAuthentication(), invocation).isGranted());
+    }
+
+    private PermissionExecutionGuard guard() {
+        var registry = new PermissionPolicyRegistry(manifest, DIGEST, CLOCK, List.of(SCOPE));
+        var scopes = new Rbac3StarterProperties.UserScopePolicyProperties().setEnabled(true)
+                .setPermissionScopes(Map.of(TianjiProcessPermissions.READ, Set.of(TianjiProcessPermissions.READ_SCOPE),
+                        TianjiProcessPermissions.START, Set.of(TianjiProcessPermissions.START_SCOPE),
+                        TianjiProcessPermissions.RELEASE_PUBLISH, Set.of(TianjiProcessPermissions.RELEASE_PUBLISH_SCOPE),
+                        TianjiProcessPermissions.RELEASE_READ, Set.of(TianjiProcessPermissions.RELEASE_READ_SCOPE),
+                        TianjiProcessPermissions.DECISION_EXECUTE, Set.of(TianjiProcessPermissions.DECISION_SCOPE)));
+        return new PermissionExecutionGuard(registry, new CurrentRbac3User(), new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
+                new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
+    }
+
+    private PermissionManifest manifest() {
+        var resources = List.of(
+                resource(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
+                        "GET", "/api/tianji/v1/process-instances/{instanceId}", "api.process.get"),
+                resource(TianjiProcessPermissions.START_API, TianjiProcessPermissions.START, TianjiProcessPermissions.START_SCOPE,
+                        "POST", "/api/tianji/v1/process-instances", "api.process.start"),
+                resource(TianjiProcessPermissions.RELEASE_GET_API, TianjiProcessPermissions.RELEASE_READ, TianjiProcessPermissions.RELEASE_READ_SCOPE,
+                        "GET", "/api/tianji/v1/process-releases/{releaseVersion}", "api.release.get"),
+                resource(TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.RELEASE_PUBLISH, TianjiProcessPermissions.RELEASE_PUBLISH_SCOPE,
+                        "POST", "/api/tianji/v1/process-releases", "api.release.publish"),
+                resource(TianjiProcessPermissions.DECISION_API, TianjiProcessPermissions.DECISION_EXECUTE, TianjiProcessPermissions.DECISION_SCOPE,
+                        "POST", "/api/tianji/v1/decisions/evaluate", "api.decision.evaluate"));
+        return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
+                new PermissionManifest.Producer("tianji-process-java", PermissionManifest.ProducerKind.JAVA,
+                        PermissionManifest.SnapshotMode.FULL, List.of("tianji.api.process."), List.of("process-server"),
+                        List.of("process-server"), false),
+                new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
+                List.of(), List.of(TianjiProcessPermissions.READ, TianjiProcessPermissions.START, TianjiProcessPermissions.RELEASE_READ,
+                TianjiProcessPermissions.RELEASE_PUBLISH, TianjiProcessPermissions.DECISION_EXECUTE), resources, List.of(), List.of());
+    }
+
+    private static PermissionManifest.ResourceDefinition resource(String key, String permission, String scope,
+                                                                  String method, String path, String label) {
+        return new PermissionManifest.ResourceDefinition(key, ResourceType.API, Map.of("methods", List.of(method), "paths", List.of(path)),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(permission)), null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE), List.of(scope),
+                new PermissionManifest.I18nReference("tianji.process.permissions", label), DefinitionLifecycle.ACTIVE);
+    }
+
+    private static Set<String> resources() {
+        return Set.of(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
+                TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API);
+    }
+
+    private RuntimePolicyBinding binding() {
+        var hashes = new PermissionManifestCanonicalizer().digests(manifest);
+        return new RuntimePolicyBinding("tianji-process-java", "1", DIGEST, hashes.policyDigest(), hashes.manifestDigest());
+    }
+
+    private SystemAuthorizationSnapshot snapshot(Set<String> permissions) {
+        var view = new EffectivePermissionSnapshot(snapshotIssuer.get(), USER.subject(), SCOPE,
+                "1", "2", "3", new EffectivePermissionSnapshot.ActiveRoleContext("tianji", List.of("50"), List.of("50")),
+                permissions.stream().sorted().toList(), NOW.plusSeconds(30));
+        return new SystemAuthorizationSnapshot("20", USER.subject(), "60", "tianji", 2, 3, List.of("50"), null, null,
+                permissions, resources(), Map.of(), Map.of(), "checksum", NOW,
+                view.snapshotExpiresAt(), view, binding());
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @EnableWebMvc
+    @EnableWebSecurity
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, ProcessApiErrors.class, ProcessRequestBodyAdvice.class})
+    static class TestWeb { }
+}
