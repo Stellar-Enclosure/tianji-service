@@ -12,6 +12,8 @@ import org.flowable.engine.ManagementService;
 import org.flowable.engine.RepositoryService;
 import org.flowable.engine.RuntimeService;
 import org.flowable.engine.TaskService;
+import org.flowable.engine.delegate.DelegateExecution;
+import org.flowable.engine.delegate.JavaDelegate;
 import org.flowable.job.service.impl.asyncexecutor.AsyncExecutor;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flywaydb.core.Flyway;
@@ -27,6 +29,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -39,10 +42,13 @@ import top.egon.cola.component.outbox.api.TransactionalOutbox;
 import top.egon.cola.component.outbox.delivery.DeliveryContext;
 import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
+import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 
 import javax.sql.DataSource;
 import java.time.Duration;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -55,7 +61,7 @@ class ProcessServerPostgresTest {
     private static final String TENANT = "20";
 
     @Test
-    void engines_persist_and_flowable_and_outbox_commit_or_roll_back_together() {
+    void engines_persist_and_flowable_and_outbox_commit_or_roll_back_together() throws Exception {
         String url = System.getProperty("tianji.process.postgres.test.url");
         if (url == null || !url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) {
             throw new IllegalArgumentException("integration tests require an explicit loopback tianji_it_ database");
@@ -126,23 +132,128 @@ class ProcessServerPostgresTest {
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser)) {
             var processConfig = app.getBean(SpringProcessEngineConfiguration.class);
             var caseConfig = app.getBean(SpringCmmnEngineConfiguration.class);
+            var decisionConfig = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
             assertFalse(processConfig.isAsyncExecutorActivate());
             assertFalse(caseConfig.isAsyncExecutorActivate());
+            assertTrue(processConfig.getBeans().isEmpty());
+            assertTrue(caseConfig.getBeans().isEmpty());
+            assertTrue(decisionConfig.getBeans().isEmpty());
             RepositoryService repository = app.getBean(RepositoryService.class);
             RuntimeService runtime = app.getBean(RuntimeService.class);
             TaskService tasks = app.getBean(TaskService.class);
             ManagementService jobs = app.getBean(ManagementService.class);
-            repository.createDeployment().tenantId(TENANT).addClasspathResource("fixtures/baseline.bpmn20.xml").deploy();
+            ProcessModelValidator validator = new ProcessModelValidator();
+            byte[] bpmn = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
+            byte[] dmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
+            repository.createDeployment().tenantId(TENANT)
+                    .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
             app.getBean(CmmnRepositoryService.class).createDeployment().tenantId(TENANT)
                     .addClasspathResource("fixtures/baseline.cmmn").deploy();
             app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
-                    .addClasspathResource("fixtures/baseline.dmn").deploy();
+                    .addDmnBytes("baseline.dmn", validator.validateDmn(dmn, "baselineDecision").xml()).deploy();
 
             DmnDecisionService decisions = app.getBean(DmnDecisionService.class);
             assertEquals("standard", decisions.createExecuteDecisionBuilder().decisionKey("baselineDecision")
                     .tenantId(TENANT).variable("amount", 10).executeWithSingleResult().get("route"));
             assertEquals("review", decisions.createExecuteDecisionBuilder().decisionKey("baselineDecision")
                     .tenantId(TENANT).variable("amount", 11).executeWithSingleResult().get("route"));
+            String multiTypeDecision = """
+                    <definitions xmlns="http://www.omg.org/spec/DMN/20151101" id="moreDefinitions"
+                        name="More" namespace="urn:test">
+                      <decision id="moreDecision" name="More"><decisionTable id="table" hitPolicy="FIRST">
+                        <input><inputExpression id="stateExpression" typeRef="string"><text>state</text></inputExpression></input>
+                        <input><inputExpression id="validExpression" typeRef="boolean"><text>valid</text></inputExpression></input>
+                        <output id="allowOutput" name="allow" typeRef="boolean"/>
+                        <output id="routeOutput" name="route" typeRef="string"/>
+                        <rule><inputEntry id="stateRule"><text>'ready'</text></inputEntry>
+                          <inputEntry id="validRule"><text>true</text></inputEntry>
+                          <outputEntry id="allowRule"><text>true</text></outputEntry>
+                          <outputEntry id="routeRule"><text>'approved'</text></outputEntry></rule>
+                      </decisionTable></decision>
+                    </definitions>
+                    """;
+            byte[] moreDmn = multiTypeDecision.getBytes(StandardCharsets.UTF_8);
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
+                    .addDmnBytes("more.dmn", validator.validateDmn(moreDmn, "moreDecision").xml()).deploy();
+            var multiResult = decisions.createExecuteDecisionBuilder().decisionKey("moreDecision")
+                    .tenantId(TENANT).variables(Map.of("state", "ready", "valid", true))
+                    .executeWithSingleResult();
+            assertEquals(true, multiResult.get("allow"));
+            assertEquals("approved", multiResult.get("route"));
+            String uniqueDmn = new String(dmn, StandardCharsets.UTF_8).replace("baselineDecision", "uniqueDecision")
+                    .replace("hitPolicy=\"FIRST\"", "hitPolicy=\"UNIQUE\"").replace("&gt; 10", "&lt;= 10");
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT).addDmnBytes("unique.dmn",
+                    validator.validateDmn(uniqueDmn.getBytes(StandardCharsets.UTF_8), "uniqueDecision").xml()).deploy();
+            var uniqueFailure = decisions.createExecuteDecisionBuilder().decisionKey("uniqueDecision")
+                    .tenantId(TENANT).variable("amount", 10).executeWithAuditTrail();
+            assertEquals(Boolean.TRUE, uniqueFailure.isFailed());
+            String anyDmn = uniqueDmn.replace("uniqueDecision", "anyDecision")
+                    .replace("hitPolicy=\"UNIQUE\"", "hitPolicy=\"ANY\"").replace("'review'", "'standard'");
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT).addDmnBytes("any.dmn",
+                    validator.validateDmn(anyDmn.getBytes(StandardCharsets.UTF_8), "anyDecision").xml()).deploy();
+            var anyResult = decisions.createExecuteDecisionBuilder().decisionKey("anyDecision")
+                    .tenantId(TENANT).variable("amount", 10).executeWithAuditTrail();
+            assertFalse(Boolean.TRUE.equals(anyResult.isFailed()));
+            assertEquals("standard", anyResult.getDecisionResult().getFirst().get("route"));
+            String anyMismatch = uniqueDmn.replace("uniqueDecision", "anyMismatch")
+                    .replace("hitPolicy=\"UNIQUE\"", "hitPolicy=\"ANY\"");
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT).addDmnBytes("any-mismatch.dmn",
+                    validator.validateDmn(anyMismatch.getBytes(StandardCharsets.UTF_8), "anyMismatch").xml()).deploy();
+            assertEquals(Boolean.TRUE, decisions.createExecuteDecisionBuilder().decisionKey("anyMismatch")
+                    .tenantId(TENANT).variable("amount", 10).executeWithAuditTrail().isFailed());
+            String noMatch = new String(dmn, StandardCharsets.UTF_8).replace("baselineDecision", "noMatch")
+                    .replace("&gt; 10", "&gt; 20");
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT).addDmnBytes("no-match.dmn",
+                    validator.validateDmn(noMatch.getBytes(StandardCharsets.UTF_8), "noMatch").xml()).deploy();
+            var emptyResult = decisions.createExecuteDecisionBuilder().decisionKey("noMatch")
+                    .tenantId(TENANT).variable("amount", 15).executeWithAuditTrail();
+            assertFalse(Boolean.TRUE.equals(emptyResult.isFailed()));
+            assertTrue(emptyResult.getDecisionResult() == null || emptyResult.getDecisionResult().isEmpty());
+            String firstVersion = new String(dmn, StandardCharsets.UTF_8).replace("'standard'", "'first'");
+            String secondVersion = new String(dmn, StandardCharsets.UTF_8).replace("'standard'", "'second'");
+            var firstDeployment = app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
+                    .parentDeploymentId("test-release-first").addDmnBytes("first.dmn",
+                            validator.validateDmn(firstVersion.getBytes(StandardCharsets.UTF_8), "baselineDecision").xml()).deploy();
+            var secondDeployment = app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
+                    .parentDeploymentId("test-release-second").addDmnBytes("second.dmn",
+                            validator.validateDmn(secondVersion.getBytes(StandardCharsets.UTF_8), "baselineDecision").xml()).deploy();
+            var firstDefinition = app.getBean(DmnRepositoryService.class).createDecisionQuery()
+                    .deploymentId(firstDeployment.getId()).singleResult();
+            var secondDefinition = app.getBean(DmnRepositoryService.class).createDecisionQuery()
+                    .deploymentId(secondDeployment.getId()).singleResult();
+            var selectedVersion = decisions.createExecuteDecisionBuilder().decisionKey("baselineDecision")
+                    .parentDeploymentId("test-release-first").tenantId(TENANT).variable("amount", 10).executeWithAuditTrail();
+            assertNull(selectedVersion.getDmnDeploymentId());
+            assertEquals(firstDefinition.getVersion(), selectedVersion.getDecisionVersion());
+            assertEquals("first", selectedVersion.getDecisionResult().getFirst().get("route"));
+            var missingVersion = decisions.createExecuteDecisionBuilder().decisionKey("baselineDecision")
+                    .parentDeploymentId("test-release-missing").tenantId(TENANT).variable("amount", 10).executeWithAuditTrail();
+            assertNull(missingVersion.getDmnDeploymentId());
+            assertEquals(secondDefinition.getVersion(), missingVersion.getDecisionVersion());
+            assertEquals("second", missingVersion.getDecisionResult().getFirst().get("route"));
+
+            // Bypass the release validator only here to verify the engine-level bean isolation independently.
+            String unsafeDmn = new String(dmn, StandardCharsets.UTF_8).replace("baselineDecision", "blockedDecision")
+                    .replace("'standard'", "${modelProbe.touch()}");
+            app.getBean(DmnRepositoryService.class).createDeployment().tenantId(TENANT)
+                    .addString("blocked.dmn", unsafeDmn).deploy();
+            var failedDecision = decisions.createExecuteDecisionBuilder().decisionKey("blockedDecision")
+                    .tenantId(TENANT).variable("amount", 10).executeWithAuditTrail();
+            assertEquals(Boolean.TRUE, failedDecision.isFailed());
+            String unsafeProcess = """
+                    <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:flowable="http://flowable.org/bpmn" targetNamespace="urn:test">
+                      <process id="blockedProcess" isExecutable="true">
+                        <startEvent id="start"/><sequenceFlow id="one" sourceRef="start" targetRef="call"/>
+                        <serviceTask id="call" flowable:delegateExpression="${modelProbe}"/>
+                        <sequenceFlow id="two" sourceRef="call" targetRef="end"/><endEvent id="end"/>
+                      </process>
+                    </definitions>
+                    """;
+            repository.createDeployment().tenantId(TENANT).addString("blocked.bpmn20.xml", unsafeProcess).deploy();
+            assertThrows(RuntimeException.class, () -> runtime.createProcessInstanceBuilder()
+                    .processDefinitionKey("blockedProcess").tenantId(TENANT).start());
+            assertEquals(0, app.getBean(ModelProbe.class).calls.get());
 
             processId = runtime.createProcessInstanceBuilder().processDefinitionKey("baseline").tenantId(TENANT)
                     .businessKey("persistent").variable("evidence", "retained").start().getId();
@@ -254,6 +365,9 @@ class ProcessServerPostgresTest {
 
     @TestConfiguration(proxyBeanMethods = false)
     static class TestDelivery {
+        @Bean("modelProbe")
+        ModelProbe modelProbe() { return new ModelProbe(); }
+
         @Bean
         DeliveryHandler testDeliveryHandler() {
             return new DeliveryHandler() {
@@ -266,6 +380,12 @@ class ProcessServerPostgresTest {
                 }
             };
         }
+    }
+
+    static final class ModelProbe implements JavaDelegate {
+        private final AtomicInteger calls = new AtomicInteger();
+        public String touch() { calls.incrementAndGet(); return "unexpected"; }
+        @Override public void execute(DelegateExecution execution) { calls.incrementAndGet(); }
     }
 
     @TestConfiguration(proxyBeanMethods = false)

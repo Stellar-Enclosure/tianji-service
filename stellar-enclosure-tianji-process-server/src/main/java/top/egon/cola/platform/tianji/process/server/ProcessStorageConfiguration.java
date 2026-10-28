@@ -21,6 +21,7 @@ import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 
 import javax.sql.DataSource;
+import java.util.Collections;
 
 /** Keeps Flowable and the JDBC Outbox on the same pre-provisioned local transaction. */
 @Configuration(proxyBeanMethods = false)
@@ -89,5 +90,7 @@ public class ProcessStorageConfiguration {
         if (!schema.equals(currentSchema)) {
             throw new IllegalStateException("Process DataSource search path does not select the configured schema");
         }
+        // Imported models must not obtain arbitrary Spring beans through Flowable expressions.
+        engine.setBeans(Collections.emptyMap());
     }
 }
