@@ -1,6 +1,8 @@
 package top.egon.cola.platform.tianji.agent.server.api;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +17,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermissions;
+import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantIssuer;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -37,10 +40,23 @@ import java.util.Objects;
 public class AgentRunController {
     private final AgentLedgerService ledger;
     private final TianjiAgentAccess access;
+    private final TianjiExecutionGrantIssuer executionGrants;
 
     public AgentRunController(AgentLedgerService ledger, TianjiAgentAccess access) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.access = Objects.requireNonNull(access, "access");
+        this.executionGrants = null;
+    }
+
+    @Autowired
+    public AgentRunController(AgentLedgerService ledger, TianjiAgentAccess access,
+                              ObjectProvider<TianjiExecutionGrantIssuer> executionGrants,
+                              org.springframework.core.env.Environment environment) {
+        this.ledger = Objects.requireNonNull(ledger, "ledger");
+        this.access = Objects.requireNonNull(access, "access");
+        boolean enabled = environment.getProperty("stellar.tianji.agent.execution-grants.enabled", Boolean.class, false);
+        this.executionGrants = enabled ? executionGrants.getIfAvailable() : null;
+        if (enabled && this.executionGrants == null) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_ISSUER_REQUIRED");
     }
 
     @PermissionResource(key = TianjiAgentPermissions.START_API, type = ResourceType.API,
@@ -50,9 +66,9 @@ public class AgentRunController {
     @RequiresPermissions(codes = TianjiAgentPermissions.START)
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<AgentRunDTO> start(@RequestBody StartAgentRunCommand command) {
-        var actor = access.require(TianjiAgentPermissions.START_API).actor();
+        var authorized = access.require(TianjiAgentPermissions.START_API);
         if (command.sessionId() != null) throw new IllegalArgumentException("session-backed runs use the session start endpoint");
-        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(ledger.start(actor, command));
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(start(authorized, command));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.SESSION_START_API, type = ResourceType.API,
@@ -62,9 +78,9 @@ public class AgentRunController {
     @RequiresPermissions(codes = {TianjiAgentPermissions.START, TianjiAgentPermissions.READ})
     @PostMapping(path = "/with-session", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<AgentRunDTO> startWithSession(@RequestBody StartAgentRunCommand command) {
-        var actor = access.require(TianjiAgentPermissions.SESSION_START_API).actor();
+        var authorized = access.require(TianjiAgentPermissions.SESSION_START_API);
         if (command.sessionId() == null) throw new IllegalArgumentException("session identifier is required");
-        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(ledger.start(actor, command));
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(start(authorized, command));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.LIST_API, type = ResourceType.API,
@@ -119,5 +135,10 @@ public class AgentRunController {
 
     private static <T> ResponseEntity<T> noStore(T body) {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    private AgentRunDTO start(TianjiAgentAccess.Authorized authorized, StartAgentRunCommand command) {
+        AgentRunDTO run = ledger.start(authorized.actor(), command);
+        return executionGrants == null ? run : executionGrants.ensure(authorized, run);
     }
 }

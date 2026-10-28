@@ -37,6 +37,17 @@ public final class AgentExecutionGrantStore {
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
     }
 
+    /** Read-only startup probe; Flyway validation remains the deployment owner's responsibility. */
+    public void requireSchema() {
+        transact(status -> {
+            jdbc.query("""
+                    SELECT tenant_id, run_id, binding_sha256, issue_epoch, grant_id, ciphertext, expires_at, updated_at
+                    FROM tianji_agent.agent_run_execution_grant WHERE false
+                    """, (rs, row) -> 1);
+            return Boolean.TRUE;
+        });
+    }
+
     /** Reserves a monotonically fenced attempt only while the exact owner's run is still queued. */
     public Optional<AgentExecutionGrant.Reservation> reserve(TrustedAgentActor actor, String runId, URI resource) {
         Objects.requireNonNull(actor, "actor");

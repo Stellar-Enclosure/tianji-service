@@ -134,6 +134,7 @@ class AgentExecutionGrantStorePostgresTest {
     }
 
     @Test void store_requires_the_ledgers_exact_transaction_bound_data_source() {
+        assertDoesNotThrow(store::requireSchema);
         var other = new DriverManagerDataSource(dataSource.getUrl());
         assertThrows(IllegalArgumentException.class, () -> new AgentExecutionGrantStore(other, ledger));
     }

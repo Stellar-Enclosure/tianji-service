@@ -17,6 +17,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticati
 
 import java.time.Clock;
 import java.time.Instant;
+import java.net.URI;
 import java.util.Objects;
 import java.util.Collections;
 
@@ -69,7 +70,8 @@ public final class TianjiAgentAccess {
         }
         TrustedAgentActor.SubjectType type = verified instanceof ServiceIdentityPrincipal
                 ? TrustedAgentActor.SubjectType.SERVICE : TrustedAgentActor.SubjectType.USER;
-        try { return new Authorized(TrustedAgentActor.verified(tenant, type, verified.subject(), verifiedIssuer), verified.expiresAt()); }
+        try { return new Authorized(TrustedAgentActor.verified(tenant, type, verified.subject(), verifiedIssuer),
+                verified.expiresAt(), URI.create(verifiedIssuer)); }
         catch (IllegalArgumentException invalid) { throw new AccessDeniedException("identity subject is invalid"); }
     }
 
@@ -101,5 +103,8 @@ public final class TianjiAgentAccess {
         throw new AuthenticationCredentialsNotFoundException("verified request issuer required");
     }
 
-    public record Authorized(TrustedAgentActor actor, Instant expiresAt) { }
+    public record Authorized(TrustedAgentActor actor, Instant expiresAt, URI issuer) {
+        public Authorized(TrustedAgentActor actor, Instant expiresAt) { this(actor, expiresAt, null); }
+        @Override public String toString() { return "TianjiAgentAccess.Authorized[redacted]"; }
+    }
 }

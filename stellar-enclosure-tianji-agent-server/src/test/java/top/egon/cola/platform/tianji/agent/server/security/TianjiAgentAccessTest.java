@@ -51,8 +51,9 @@ class TianjiAgentAccessTest {
     void derives_user_and_service_actor_from_verified_identity_after_permission_check() {
         var user = user("20", "alice", NOW.plusSeconds(60));
         SecurityContextHolder.getContext().setAuthentication(user);
-        assertEquals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/issuer"),
-                access.require(TianjiAgentPermissions.GET_API).actor());
+        var authorized = access.require(TianjiAgentPermissions.GET_API);
+        assertEquals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/issuer"), authorized.actor());
+        assertEquals(URI.create("https://idp.example/issuer"), authorized.issuer());
         verify(guard).requireExecution(TianjiAgentPermissions.GET_API);
 
         var service = service("21", NOW.plusSeconds(60));

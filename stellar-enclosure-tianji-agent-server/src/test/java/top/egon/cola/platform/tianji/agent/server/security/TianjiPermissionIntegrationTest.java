@@ -77,6 +77,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 import static org.springframework.security.test.web.servlet.setup.SecurityMockMvcConfigurers.springSecurity;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 /** Exercises the real permission guard with a controlled authorization backend. */
@@ -310,6 +311,66 @@ class TianjiPermissionIntegrationTest {
                     assertNull(result.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
                     assertNull(SecurityContextHolder.getContext().getAuthentication());
                 }));
+    }
+
+    @Test
+    void verified_user_request_supplies_the_original_proof_only_to_the_grant_issuer() throws Exception {
+        granted.set(Set.of(TianjiAgentPermissions.START));
+        URI issuer = URI.create("https://idp.example/tenants/20");
+        URI resource = URI.create("https://api.example/tianji");
+        var verifier = mock(IdpJwtVerifier.class);
+        when(verifier.verifyAny("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(TianjiAgentPermissions.START_SCOPE), null, issuer));
+        when(verifier.verifyUser("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(TianjiAgentPermissions.START_SCOPE), null, issuer));
+        var identity = IdpBearerAuthenticationFilter.create(new UserAccessTokenVerifier(verifier),
+                new ServiceAccessTokenVerifier(verifier), new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy(),
+                new com.fasterxml.jackson.databind.ObjectMapper(), new VerifiedTenantContextFilter(), verifier);
+        var rbac = new Rbac3BearerAuthenticationFilter(new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
+                new com.fasterxml.jackson.databind.ObjectMapper());
+        var ledger = mock(AgentLedgerService.class);
+        var store = mock(top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentExecutionGrantStore.class);
+        var authority = mock(top.egon.cola.platform.tianquan.shoubing.starter.execution.HttpExecutionGrantClient.class);
+        var issuers = mock(top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.class);
+        var trust = new top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.TrustedIssuerVO(issuer,
+                URI.create("https://idp.example/jwks"), "tenant:20",
+                top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.RealmType.TENANT, "20",
+                top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.Status.ACTIVE, 1);
+        when(issuers.findByIssuer(issuer.toString())).thenReturn(java.util.Optional.of(trust));
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", issuer.toString());
+        String runId = "00000000-0000-0000-0000-000000000123";
+        var run = new AgentRunDTO(runId, "research", 1, null, AgentRunStatusEnum.QUEUED, null,
+                false, 0, 0, 1, NOW.plusSeconds(60), NOW, null);
+        var binding = new top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Request(actor, runId, "research", 1,
+                "a".repeat(64), "b".repeat(64), "c".repeat(64), "policy-v1", false, run.deadlineAt());
+        var reservation = new top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant.Reservation(binding, resource, 1,
+                top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant.fingerprint(binding, resource));
+        when(ledger.start(eq(actor), any())).thenReturn(run);
+        when(ledger.executionMaterial(actor, new GetAgentRunQuery(runId))).thenReturn(new AgentLedgerService.ExecutionMaterial(run, null, binding));
+        when(ledger.get(actor, new GetAgentRunQuery(runId))).thenReturn(run);
+        when(store.current(binding, resource)).thenReturn(java.util.Optional.empty());
+        when(store.reserve(actor, runId, resource)).thenReturn(java.util.Optional.of(reservation));
+        when(store.complete(any(), any())).thenReturn(true);
+        when(authority.issue(any())).thenReturn(new top.egon.cola.platform.tianquan.shoubing.contract.execution.ExecutionGrantContract.Issued(
+                new top.egon.cola.platform.tianquan.shoubing.contract.execution.ExecutionGrantContract.Ticket("9" + "1".repeat(62),
+                        "ENC:v1:key:nonce:sealed"), NOW.plusSeconds(30)));
+        var grantIssuer = new TianjiExecutionGrantIssuer(ledger, store, resource, issuers, Map.of(issuer, authority));
+        @SuppressWarnings("unchecked") org.springframework.beans.factory.ObjectProvider<TianjiExecutionGrantIssuer> provider = mock(org.springframework.beans.factory.ObjectProvider.class);
+        when(provider.getIfAvailable()).thenReturn(grantIssuer);
+        var controller = new top.egon.cola.platform.tianji.agent.server.api.AgentRunController(ledger, access(), provider,
+                new org.springframework.mock.env.MockEnvironment().withProperty("stellar.tianji.agent.execution-grants.enabled", "true"));
+        var mvc = MockMvcBuilders.standaloneSetup(controller).addFilters(new org.springframework.web.filter.RequestContextFilter(),
+                identity, new VerifiedAgentIssuerFilter(), rbac).setControllerAdvice(new top.egon.cola.platform.tianji.agent.server.api.AgentApiErrors()).build();
+        var command = new top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand("research", 1, null, "request", null, null,
+                new top.egon.cola.platform.tianji.contract.agent.AgentInputDTO("input", List.of(), Map.of()), null);
+        var result = mvc.perform(post("/api/tianji/v1/agent-runs").header("Authorization", "Bearer verified-test-token")
+                .contentType(MediaType.APPLICATION_JSON).content(tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsBytes(command)))
+                .andExpect(status().isAccepted()).andReturn();
+        verify(authority).issue(argThat(value -> value.userToken().equals("verified-test-token")
+                && value.bindingSha256().equals(reservation.bindingSha256())));
+        assertThrows(IllegalStateException.class, () -> VerifiedUserTokenCarrier.current(result.getRequest()));
+        assertNull(result.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
+        assertNull(SecurityContextHolder.getContext().getAuthentication());
     }
 
     private TianjiAgentAccess access() {
