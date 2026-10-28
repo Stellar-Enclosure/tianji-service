@@ -108,6 +108,7 @@ class ProcessModelValidatorTest {
         var worker = process.workerTasks().get("worker");
         assertEquals("riskCheck", worker.topic());
         assertEquals("1", worker.schemaVersion());
+        assertEquals(ValidatedProcessModel.WorkerEffect.TRANSACTIONAL_RECEIPT, worker.effectSafety());
         assertEquals(java.util.List.of(new ValidatedProcessModel.WorkerParameter("amount", "requestedAmount", INTEGER)), worker.inputs());
         assertEquals(java.util.List.of(new ValidatedProcessModel.WorkerParameter("approved", "approved", BOOLEAN)), worker.outputs());
         validator.validateWorkerBindings(process, Map.of("amount", INTEGER), null);
@@ -117,8 +118,10 @@ class ProcessModelValidatorTest {
 
         for (String invalid : new String[] {
                 xml.replace("flowable:doNotIncludeVariables=\"true\"", ""),
-                xml.replace("flowable:topic=\"riskCheck\"", "flowable:topic=\"${execution.tenantId}\""),
+                xml.replace("flowable:topic=\"riskCheck:1\"", "flowable:topic=\"${execution.tenantId}\""),
+                xml.replace("flowable:topic=\"riskCheck:1\"", "flowable:topic=\"riskCheck:2\""),
                 xml.replace("tianji:schemaVersion=\"1\"", ""),
+                xml.replace("tianji:effectSafety=\"TRANSACTIONAL_RECEIPT\"", ""),
                 xml.replace("source=\"amount\"", "sourceExpression=\"${amount}\""),
                 xml.replace("target=\"requestedAmount\"", "target=\"execution\""),
                 xml.replace("tianji:type=\"INTEGER\"", "tianji:type=\"OBJECT\""),

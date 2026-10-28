@@ -10,6 +10,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
+import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 
 import javax.sql.DataSource;
 import java.security.MessageDigest;
@@ -22,6 +24,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /** JDBC lease evidence. The caller owns the transaction and must fence the native job in that transaction. */
@@ -66,15 +69,53 @@ public final class WorkerLeaseStore {
 
     /** The adapter must lock and verify the native job before locking a live lease. */
     public Lease lock(ProcessActor actor, String jobId, String tokenSha256) {
+        return find(actor, jobId, tokenSha256, true);
+    }
+
+    /** A non-locking lookup lets the adapter establish the native-job-first lock order. */
+    public Lease find(ProcessActor actor, String jobId, String tokenSha256) {
+        return find(actor, jobId, tokenSha256, false);
+    }
+
+    private Lease find(ProcessActor actor, String jobId, String tokenSha256, boolean lock) {
         requireTransaction();
         requireWorker(actor);
         id(jobId, 255);
         hash(tokenSha256);
         List<Lease> rows = jdbc.query("SELECT * FROM " + table + " WHERE token_sha256=? AND tenant_id=? "
-                        + "AND subject_issuer=? AND subject_id=? AND job_id=? FOR UPDATE",
+                        + "AND subject_issuer=? AND subject_id=? AND job_id=?" + (lock ? " FOR UPDATE" : ""),
                 (rs, row) -> read(rs), tokenSha256, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), jobId);
         if (rows.size() != 1) throw unavailable();
         return rows.getFirst();
+    }
+
+    /** Serializes an identity's acquisitions before enforcing both its topic and overall limits. */
+    public boolean hasCapacity(ProcessActor actor, String topic, String schemaVersion, int limit) {
+        requireTransaction();
+        requireWorker(actor);
+        ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
+        if (limit < 1 || limit > 32) throw invalid();
+        String key = ProcessRequestDigest.hash(List.of("worker-capacity-v1", Long.toString(actor.tenantId()),
+                actor.issuerFingerprint(), actor.subjectId()), Map.of());
+        jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { }, "tianji:worker:" + key);
+        int[] active = jdbc.queryForObject("SELECT count(*) AS total, count(*) FILTER (WHERE topic=? AND schema_version=?) AS topic_total FROM "
+                        + table + " WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND state='LEASED' "
+                        + "AND lease_expires_at>clock_timestamp()",
+                (rs, row) -> new int[] {rs.getInt("total"), rs.getInt("topic_total")}, topic, schemaVersion,
+                actor.tenantId(), actor.issuerFingerprint(), actor.subjectId());
+        if (active == null) throw new IllegalStateException("Worker lease capacity could not be checked");
+        return active[0] < 32 && active[1] < limit;
+    }
+
+    public boolean isLive(ProcessActor actor, String jobId, String tokenSha256) {
+        requireTransaction();
+        requireWorker(actor);
+        id(jobId, 255);
+        hash(tokenSha256);
+        Integer count = jdbc.queryForObject("SELECT count(*) FROM " + table + " WHERE token_sha256=? AND tenant_id=? "
+                        + "AND subject_issuer=? AND subject_id=? AND job_id=? AND state='LEASED' AND lease_expires_at>clock_timestamp()",
+                Integer.class, tokenSha256, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), jobId);
+        return count != null && count == 1;
     }
 
     /** Replays an identical terminal operation; the native operation and this update must share the caller's transaction. */

@@ -7,6 +7,7 @@ import java.util.List;
 public final class ValidatedProcessModel {
     public enum Type { BPMN, DMN }
     public enum ValueType { STRING, INTEGER, BOOLEAN }
+    public enum WorkerEffect { READ_ONLY, TRANSACTIONAL_RECEIPT, EXTERNAL_IDEMPOTENT }
 
     private final Type type;
     private final String definitionKey;
@@ -50,7 +51,8 @@ public final class ValidatedProcessModel {
 
     public record RouteCondition(String variable, ValueType type, String literal) { }
     public record WorkerParameter(String source, String target, ValueType type) { }
-    public record WorkerTask(String topic, String schemaVersion, List<WorkerParameter> inputs, List<WorkerParameter> outputs) {
+    public record WorkerTask(String topic, String schemaVersion, WorkerEffect effectSafety,
+                             List<WorkerParameter> inputs, List<WorkerParameter> outputs) {
         public WorkerTask {
             inputs = List.copyOf(inputs);
             outputs = List.copyOf(outputs);

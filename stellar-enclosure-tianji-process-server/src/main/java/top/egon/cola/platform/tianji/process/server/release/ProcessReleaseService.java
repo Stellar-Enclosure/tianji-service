@@ -14,6 +14,9 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -52,6 +55,7 @@ public final class ProcessReleaseService {
     private final TransactionTemplate read;
     private final String schema;
     private final boolean decisionTasksEnabled;
+    private final WorkerTopicRegistry workerTopics;
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
@@ -60,6 +64,11 @@ public final class ProcessReleaseService {
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, boolean decisionTasksEnabled) {
+        this(process, dmn, validator, decisionTasksEnabled, null);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics) {
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -73,7 +82,9 @@ public final class ProcessReleaseService {
                 || decisionTasksEnabled && (!(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || !dmn.isHistoryEnabled() || dmn.getDmnHistoryService() == null)) throw invalidConfiguration();
         this.decisionTasksEnabled = decisionTasksEnabled;
+        this.workerTopics = workerTopics;
         this.schema = process.getDatabaseSchema();
+        if (workerTopics != null) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);
@@ -84,7 +95,7 @@ public final class ProcessReleaseService {
     public Release publish(ProcessActor actor, String releaseKey, List<ModelResource> resources) {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
-        List<PreparedModel> models = prepare(resources);
+        List<PreparedModel> models = prepare(resources, actor.tenantId());
         String manifestHash = manifestHash(models);
         return Objects.requireNonNull(write.execute(status -> publishInTransaction(actor, releaseKey, manifestHash, models)));
     }
@@ -180,7 +191,7 @@ public final class ProcessReleaseService {
         return new Release(releaseKey, row.hash(), row.createdAt(), definitions);
     }
 
-    private List<PreparedModel> prepare(List<ModelResource> resources) {
+    private List<PreparedModel> prepare(List<ModelResource> resources, long tenantId) {
         if (resources == null || resources.isEmpty() || resources.size() > MAX_MODELS) throw invalid();
         List<PreparedModel> prepared = new ArrayList<>();
         Set<String> keys = new HashSet<>();
@@ -200,14 +211,21 @@ public final class ProcessReleaseService {
             prepared.add(new PreparedModel(model, hash(model.xml()), inputs));
         }
         for (PreparedModel processModel : prepared) {
-            // Publishing these tasks stays closed until the secured Worker adapter is available.
-            if (!processModel.model().workerTasks().isEmpty()) throw invalid();
-            if (processModel.model().type() != Type.BPMN || processModel.model().decisionTasks().isEmpty()) continue;
-            if (!decisionTasksEnabled) throw invalid();
-            String decisionKey = processModel.model().decisionTasks().values().iterator().next();
-            PreparedModel decision = prepared.stream().filter(item -> item.model().type() == Type.DMN
-                    && item.model().definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
-            validator.validateDecisionBinding(processModel.model(), processModel.inputs(), decision.model());
+            if (processModel.model().type() != Type.BPMN) continue;
+            PreparedModel decision = null;
+            if (!processModel.model().decisionTasks().isEmpty()) {
+                if (!decisionTasksEnabled) throw invalid();
+                String decisionKey = processModel.model().decisionTasks().values().iterator().next();
+                decision = prepared.stream().filter(item -> item.model().type() == Type.DMN
+                        && item.model().definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
+                validator.validateDecisionBinding(processModel.model(), processModel.inputs(), decision.model());
+            }
+            if (!processModel.model().workerTasks().isEmpty()) {
+                if (workerTopics == null) throw invalid();
+                WorkerNativeAvailability.require(process);
+                validator.validateWorkerBindings(processModel.model(), processModel.inputs(), decision == null ? null : decision.model());
+                if (processModel.model().workerTasks().values().stream().anyMatch(worker -> !workerTopics.acceptsModel(tenantId, worker))) throw invalid();
+            }
         }
         prepared.sort(Comparator.comparing((PreparedModel item) -> item.model().type().name())
                 .thenComparing(item -> item.model().definitionKey()));

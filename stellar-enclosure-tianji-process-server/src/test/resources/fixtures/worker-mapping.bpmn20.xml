@@ -5,8 +5,9 @@
     <process id="workerMapping" isExecutable="true">
         <startEvent id="start"/>
         <sequenceFlow id="toWorker" sourceRef="start" targetRef="worker"/>
-        <serviceTask id="worker" flowable:type="external-worker" flowable:topic="riskCheck"
-                     flowable:doNotIncludeVariables="true" tianji:schemaVersion="1">
+        <serviceTask id="worker" flowable:type="external-worker" flowable:topic="riskCheck:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="riskCheck" tianji:schemaVersion="1"
+                     tianji:effectSafety="TRANSACTIONAL_RECEIPT">
             <extensionElements>
                 <flowable:externalWorkerInParameter source="amount" target="requestedAmount" tianji:type="INTEGER"/>
                 <flowable:externalWorkerOutParameter source="approved" target="approved" tianji:type="BOOLEAN"/>

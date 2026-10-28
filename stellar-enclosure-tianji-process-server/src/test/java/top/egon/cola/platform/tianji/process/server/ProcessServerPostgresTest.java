@@ -50,12 +50,17 @@ import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
+import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
+import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
@@ -70,6 +75,14 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskResult;
+import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerAcquireStatusEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
@@ -284,6 +297,7 @@ class ProcessServerPostgresTest {
             verifyProcessStarts(app, jdbc, validator);
             verifyDecisionApplications(app, jdbc, validator, dmn);
             routingCases = prepareRoutingCases(app, validator, dmn);
+            verifyWorkerExecutorGate(app, validator);
             workerProbe = probeNativeExternalWorker(app, jdbc);
             verifyHttpAgainstDatabase(app, validator);
             repository.createDeployment().tenantId(TENANT)
@@ -542,7 +556,8 @@ class ProcessServerPostgresTest {
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser,
                 "--flowable.async-executor-activate=true",
                 "--flowable.process.async.executor.default-timer-job-acquire-wait-time=PT0.2S",
-                "--flowable.process.async.executor.default-async-job-acquire-wait-time=PT0.2S")) {
+                "--flowable.process.async.executor.default-async-job-acquire-wait-time=PT0.2S",
+                "--flowable.process.async.executor.reset-expired-jobs-interval=PT0.2S")) {
             RuntimeService runtime = app.getBean(RuntimeService.class);
             executor = app.getBean(SpringProcessEngineConfiguration.class).getAsyncExecutor();
             assertTrue(executor.isActive());
@@ -551,8 +566,291 @@ class ProcessServerPostgresTest {
             assertNotNull(app.getBean(HistoryService.class).createHistoricProcessInstanceQuery()
                     .processInstanceId(processId).finished().singleResult());
             verifyNativeWorkerReset(app, workerProbe);
+            verifyWorkerAdapter(app, jdbc);
         }
         assertFalse(executor.isActive());
+    }
+
+    private static void verifyWorkerExecutorGate(ConfigurableApplicationContext app, ProcessModelValidator validator) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var registry = new WorkerTopicRegistry(List.of(workerRegistration(20, "https://idp.example/20", "worker-service", "1")));
+        var service = new FlowableWorkerService(process, dmn, validator, registry);
+        var worker = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-service", "https://idp.example/20");
+        assertThrows(IllegalStateException.class, () -> service.acquire(worker, new AcquireWorkerTaskCommand("riskCheck", "1")));
+        byte[] xml = new ClassPathResource("fixtures/worker-mapping.bpmn20.xml").getContentAsByteArray();
+        var model = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", xml, Map.of("amount", ValueType.INTEGER));
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
+        assertThrows(IllegalStateException.class, () -> releases.publish(worker, "worker-disabled", List.of(model)));
+    }
+
+    private static void verifyWorkerAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var validator = new ProcessModelValidator();
+        var one = workerRegistration(20, "https://idp.example/20", "worker-service", "1");
+        var two = workerRegistration(20, "https://idp.example/20", "worker-service", "2");
+        var competitor = workerRegistration(20, "https://idp.example/20", "other-worker-service", "2");
+        var shortLease = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-service", "riskCheck", "3",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
+                Duration.ofSeconds(3), Duration.ofMillis(200), WorkerEffect.TRANSACTIONAL_RECEIPT);
+        var foreign = workerRegistration(21, "https://idp.example/21", "worker-service", "1");
+        var registry = new WorkerTopicRegistry(List.of(one, two, competitor, shortLease, foreign));
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
+        var runs = new ProcessExecutionService(process, dmn, validator);
+        var service = new FlowableWorkerService(process, dmn, validator, registry);
+        var owner20 = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/20");
+        var owner21 = ProcessActor.verified(21, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/21");
+        var worker20 = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-service", "https://idp.example/20");
+        var worker20b = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "other-worker-service", "https://idp.example/20");
+        var worker21 = ProcessActor.verified(21, ProcessActor.SubjectType.SERVICE, "worker-service", "https://idp.example/21");
+        byte[] v1 = new ClassPathResource("fixtures/worker-mapping.bpmn20.xml").getContentAsByteArray();
+        byte[] v2 = new String(v1, StandardCharsets.UTF_8).replace("riskCheck:1", "riskCheck:2")
+                .replace("tianji:schemaVersion=\"1\"", "tianji:schemaVersion=\"2\"").getBytes(StandardCharsets.UTF_8);
+        byte[] v3 = new String(v1, StandardCharsets.UTF_8).replace("riskCheck:1", "riskCheck:3")
+                .replace("tianji:schemaVersion=\"1\"", "tianji:schemaVersion=\"3\"").getBytes(StandardCharsets.UTF_8);
+        var inputs = Map.of("amount", ValueType.INTEGER, "privateFixture", ValueType.STRING);
+        var model1 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v1, inputs);
+        var model2 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v2, inputs);
+        var model3 = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", v3, inputs);
+        byte[] unauthorizedSource = new String(v1, StandardCharsets.UTF_8).replace("source=\"amount\"", "source=\"privateAmount\"")
+                .getBytes(StandardCharsets.UTF_8);
+        var unsafeModel = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", unauthorizedSource,
+                Map.of("privateAmount", ValueType.INTEGER));
+        assertThrows(IllegalArgumentException.class, () -> releases.publish(owner20, "worker-unauthorized-source", List.of(unsafeModel)));
+        releases.publish(owner20, "worker-v1", List.of(model1));
+        releases.publish(owner20, "worker-v2", List.of(model2));
+        releases.publish(owner20, "worker-v3", List.of(model3));
+        releases.publish(owner21, "worker-v1", List.of(model1));
+        var first = startWorkerRun(runs, owner20, "worker-v1", "worker-first");
+        var second = startWorkerRun(runs, owner20, "worker-v1", "worker-second");
+        var versionTwo = startWorkerRun(runs, owner20, "worker-v2", "worker-v2");
+        var otherTenant = startWorkerRun(runs, owner21, "worker-v1", "worker-tenant21");
+        var v1Request = new AcquireWorkerTaskCommand("riskCheck", "1");
+        assertThrows(IllegalArgumentException.class, () -> service.acquire(owner20, v1Request));
+        assertThrows(IllegalArgumentException.class, () -> service.acquire(
+                ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-service", "https://other.example/20"), v1Request));
+
+        var start = new CountDownLatch(1);
+        List<AcquireWorkerTaskResult> acquired;
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            List<Future<AcquireWorkerTaskResult>> futures = java.util.stream.IntStream.range(0, 8).mapToObj(index -> pool.submit(() -> {
+                start.await();
+                return service.acquire(worker20, v1Request);
+            })).toList();
+            start.countDown();
+            acquired = new java.util.ArrayList<>();
+            for (Future<AcquireWorkerTaskResult> future : futures) acquired.add(future.get(20, TimeUnit.SECONDS));
+        }
+        assertEquals(1, acquired.stream().filter(item -> item.status() == WorkerAcquireStatusEnum.ACQUIRED).count());
+        WorkerTaskDTO task = acquired.stream().filter(item -> item.task() != null).findFirst().orElseThrow().task();
+        assertTrue(Set.of(first.instanceId(), second.instanceId()).contains(task.processInstanceId()));
+        assertEquals(Map.of("requestedAmount", 10L), task.input());
+        assertEquals(20, task.tenantId());
+        assertEquals(WorkerAcquireStatusEnum.EMPTY, service.acquire(worker20, v1Request).status());
+
+        var v2Task = service.acquire(worker20, new AcquireWorkerTaskCommand("riskCheck", "2")).task();
+        assertNotNull(v2Task);
+        assertEquals(versionTwo.instanceId(), v2Task.processInstanceId());
+        var v2Command = complete(v2Task, "v2-receipt", true);
+        assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(worker20, v2Command).outcome());
+        assertEquals(service.complete(worker20, v2Command), service.complete(worker20, v2Command));
+
+        var wrongOutput = new CompleteWorkerTaskCommand(task.taskId(), task.activityOccurrenceId(), task.leaseToken(),
+                "receipt", Map.of("approved", true, "unauthorized", true));
+        assertThrows(IllegalArgumentException.class, () -> service.complete(worker20, wrongOutput));
+        var wrongIssuer = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-service", "https://other.example/20");
+        assertThrows(IllegalArgumentException.class, () -> service.complete(wrongIssuer, complete(task, "receipt", true)));
+        var changedPolicy = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-service", "riskCheck", "1",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
+                Duration.ofMinutes(2), Duration.ofSeconds(1), WorkerEffect.TRANSACTIONAL_RECEIPT);
+        var changedService = new FlowableWorkerService(process, dmn, validator, new WorkerTopicRegistry(List.of(changedPolicy)));
+        assertThrows(ProcessConflictException.class, () -> changedService.complete(worker20, complete(task, "receipt", true)));
+        RuntimeService runtime = app.getBean(RuntimeService.class);
+        runtime.setVariable(task.processInstanceId(), "amount", 11L);
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(task, "receipt", true)));
+        runtime.setVariable(task.processInstanceId(), "amount", 10L);
+
+        bootstrap.execute("""
+                CREATE FUNCTION tianji_process.test_worker_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.business_receipt_id='force-worker-rollback' THEN RAISE EXCEPTION 'forced worker receipt failure'; END IF;
+                  RETURN NEW;
+                END $$
+                """);
+        bootstrap.execute("CREATE TRIGGER test_worker_receipt_failure BEFORE UPDATE ON tianji_process.tianji_worker_lease_receipt "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_worker_receipt_failure()");
+        var rollback = complete(task, "force-worker-rollback", true);
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, rollback));
+        String tokenHash = WorkerLeaseStore.tokenHash(task.leaseToken());
+        assertEquals("LEASED", bootstrap.queryForObject("SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?", String.class, tokenHash));
+        assertEquals(1, app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(task.taskId()).count());
+        bootstrap.execute("DROP TRIGGER test_worker_receipt_failure ON tianji_process.tianji_worker_lease_receipt");
+        var accepted = service.complete(worker20, rollback);
+        assertEquals(accepted, service.complete(worker20, rollback));
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(task, "different-receipt", true)));
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                app.getBean(TaskService.class).createTaskQuery().processInstanceId(task.processInstanceId()).count() == 1);
+
+        WorkerTaskDTO stale = service.acquire(worker20, v1Request).task();
+        assertNotNull(stale);
+        expireNativeWorker(bootstrap, stale.taskId(), stale.processInstanceId());
+        expireWorkerLease(bootstrap, stale);
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
+        var next = awaitWorker(service, worker20, v1Request);
+        assertEquals(stale.taskId(), next.taskId());
+        assertEquals(stale.idempotencyKey(), next.idempotencyKey());
+        assertFalse(stale.leaseToken().equals(next.leaseToken()));
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
+        assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(worker20, complete(next, "fresh-receipt", true)).outcome());
+
+        var tenantTask = service.acquire(worker21, v1Request).task();
+        assertNotNull(tenantTask);
+        assertEquals(otherTenant.instanceId(), tenantTask.processInstanceId());
+        assertThrows(IllegalArgumentException.class, () -> service.complete(worker20, complete(tenantTask, "wrong-tenant", true)));
+        assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(worker21, complete(tenantTask, "tenant-receipt", true)).outcome());
+
+        startWorkerRun(runs, owner20, "worker-v1", "worker-retry");
+        WorkerTaskDTO retry = service.acquire(worker20, v1Request).task();
+        assertNotNull(retry);
+        var failed = new FailWorkerTaskCommand(retry.taskId(), retry.activityOccurrenceId(), retry.leaseToken(),
+                WorkerFailureKindEnum.RETRYABLE, "TEMPORARY_FAILURE");
+        var failureReceipt = service.fail(worker20, failed);
+        assertEquals(WorkerReceiptOutcomeEnum.RETRY_SCHEDULED, failureReceipt.outcome());
+        assertEquals(failureReceipt, service.fail(worker20, failed));
+        var retried = awaitWorker(service, worker20, v1Request);
+        assertEquals(retry.idempotencyKey(), retried.idempotencyKey());
+        var unknown = new FailWorkerTaskCommand(retried.taskId(), retried.activityOccurrenceId(), retried.leaseToken(),
+                WorkerFailureKindEnum.UNKNOWN, "OUTCOME_UNKNOWN");
+        var manual = service.fail(worker20, unknown);
+        assertEquals(WorkerReceiptOutcomeEnum.NEEDS_MANUAL, manual.outcome());
+        assertEquals(manual, service.fail(worker20, unknown));
+        assertEquals(1, app.getBean(ManagementService.class).createDeadLetterJobQuery().processInstanceId(retried.processInstanceId()).count());
+
+        verifyWorkerConcurrency(app, bootstrap, runs, service, owner20, worker20, worker20b);
+        verifyWorkerExpiry(app, bootstrap, runs, service, owner20, worker20);
+    }
+
+    private static void verifyWorkerConcurrency(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
+                                                ProcessExecutionService runs, FlowableWorkerService service,
+                                                ProcessActor owner20, ProcessActor worker20, ProcessActor worker20b) throws Exception {
+        startWorkerRun(runs, owner20, "worker-v2", "worker-two-competitors");
+        var raceStart = new CountDownLatch(1);
+        var versionTwoRequest = new AcquireWorkerTaskCommand("riskCheck", "2");
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            Future<AcquireWorkerTaskResult> left = pool.submit(() -> { raceStart.await(); return service.acquire(worker20, versionTwoRequest); });
+            Future<AcquireWorkerTaskResult> right = pool.submit(() -> { raceStart.await(); return service.acquire(worker20b, versionTwoRequest); });
+            raceStart.countDown();
+            var leftResult = left.get(15, TimeUnit.SECONDS);
+            var rightResult = right.get(15, TimeUnit.SECONDS);
+            assertEquals(1, (leftResult.task() == null ? 0 : 1) + (rightResult.task() == null ? 0 : 1));
+            var winner = leftResult.task() != null ? worker20 : worker20b;
+            var wonTask = leftResult.task() != null ? leftResult.task() : rightResult.task();
+            assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(winner, complete(wonTask, "race-receipt", true)).outcome());
+        }
+
+        startWorkerRun(runs, owner20, "worker-v2", "worker-duplicate-ack");
+        var duplicateTask = service.acquire(worker20, versionTwoRequest).task();
+        assertNotNull(duplicateTask);
+        var duplicateCommand = complete(duplicateTask, "duplicate-receipt", true);
+        var duplicateStart = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            List<Future<top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO>> futures =
+                    java.util.stream.IntStream.range(0, 20).mapToObj(index -> pool.submit(() -> {
+                        duplicateStart.await();
+                        return service.complete(worker20, duplicateCommand);
+                    })).toList();
+            duplicateStart.countDown();
+            var original = futures.getFirst().get(15, TimeUnit.SECONDS);
+            for (var future : futures) assertEquals(original, future.get(15, TimeUnit.SECONDS));
+        }
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                app.getBean(TaskService.class).createTaskQuery().processInstanceId(duplicateTask.processInstanceId()).count() == 1);
+        assertEquals(1, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_worker_lease_receipt "
+                + "WHERE tenant_id=20 AND job_id=? AND state='COMPLETED'", Integer.class, duplicateTask.taskId()));
+    }
+
+    private static void verifyWorkerExpiry(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
+                                           ProcessExecutionService runs, FlowableWorkerService service,
+                                           ProcessActor owner20, ProcessActor worker20) throws Exception {
+        var v1Request = new AcquireWorkerTaskCommand("riskCheck", "1");
+        startWorkerRun(runs, owner20, "worker-v1", "worker-expire-while-waiting");
+        WorkerTaskDTO waiting = service.acquire(worker20, v1Request).task();
+        assertNotNull(waiting);
+        try (var pool = Executors.newSingleThreadExecutor()) {
+            var future = new java.util.concurrent.atomic.AtomicReference<Future<Boolean>>();
+            new TransactionTemplate(new DataSourceTransactionManager(bootstrap.getDataSource())).executeWithoutResult(status -> {
+                expireWorkerLease(bootstrap, waiting);
+                future.set(pool.submit(() -> {
+                    try { service.complete(worker20, complete(waiting, "waiting-receipt", true)); return false; }
+                    catch (ProcessConflictException expected) { return true; }
+                }));
+                await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(50)).until(() ->
+                        bootstrap.queryForObject("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                                + "AND wait_event_type='Lock' AND query LIKE '%tianji_worker_lease_receipt%FOR UPDATE%'", Integer.class) > 0);
+            });
+            assertTrue(future.get().get(15, TimeUnit.SECONDS));
+        }
+        assertEquals(1, app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(waiting.taskId()).count());
+        expireNativeWorker(bootstrap, waiting.taskId(), waiting.processInstanceId());
+        var afterWait = awaitWorker(service, worker20, v1Request);
+        assertEquals(waiting.taskId(), afterWait.taskId());
+        assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(worker20, complete(afterWait, "after-wait", true)).outcome());
+
+        startWorkerRun(runs, owner20, "worker-v3", "worker-slow-native");
+        var shortTask = service.acquire(worker20, new AcquireWorkerTaskCommand("riskCheck", "3")).task();
+        assertNotNull(shortTask);
+        bootstrap.execute("""
+                CREATE FUNCTION tianji_process.test_slow_native_worker() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF OLD.handler_cfg_='riskCheck:3' THEN PERFORM pg_sleep(3.5); END IF;
+                  RETURN OLD;
+                END $$
+                """);
+        bootstrap.execute("CREATE TRIGGER test_slow_native_worker BEFORE DELETE ON tianji_process.act_ru_external_job "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_slow_native_worker()");
+        long beforeSlowAck = System.nanoTime();
+        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(shortTask, "slow-receipt", true)));
+        assertTrue(Duration.ofNanos(System.nanoTime() - beforeSlowAck).compareTo(Duration.ofSeconds(3)) >= 0);
+        assertEquals("LEASED", bootstrap.queryForObject("SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?",
+                String.class, WorkerLeaseStore.tokenHash(shortTask.leaseToken())));
+        assertEquals(1, app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(shortTask.taskId()).count());
+        assertEquals(0, app.getBean(TaskService.class).createTaskQuery().processInstanceId(shortTask.processInstanceId()).count());
+        bootstrap.execute("DROP TRIGGER test_slow_native_worker ON tianji_process.act_ru_external_job");
+    }
+
+    private static WorkerTopicRegistry.Registration workerRegistration(long tenant, String issuer, String subject, String version) {
+        return new WorkerTopicRegistry.Registration(tenant, issuer, subject, "riskCheck", version,
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
+                Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.TRANSACTIONAL_RECEIPT);
+    }
+
+    private static ProcessExecutionService.Snapshot startWorkerRun(ProcessExecutionService runs, ProcessActor actor, String release, String id) {
+        return runs.start(actor, new ProcessExecutionService.StartCommand(release, "workerMapping", id, id, "trace-" + id,
+                Map.of("amount", 10, "privateFixture", "not-for-worker")));
+    }
+
+    private static CompleteWorkerTaskCommand complete(WorkerTaskDTO task, String receipt, boolean approved) {
+        return new CompleteWorkerTaskCommand(task.taskId(), task.activityOccurrenceId(), task.leaseToken(), receipt, Map.of("approved", approved));
+    }
+
+    private static WorkerTaskDTO awaitWorker(FlowableWorkerService service, ProcessActor actor, AcquireWorkerTaskCommand command) {
+        var selected = new java.util.concurrent.atomic.AtomicReference<WorkerTaskDTO>();
+        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() -> {
+            var result = service.acquire(actor, command);
+            if (result.task() == null) return false;
+            selected.set(result.task());
+            return true;
+        });
+        return selected.get();
+    }
+
+    private static void expireWorkerLease(JdbcTemplate jdbc, WorkerTaskDTO task) {
+        assertEquals(1, jdbc.update("UPDATE tianji_process.tianji_worker_lease_receipt SET leased_at=clock_timestamp()-interval '5 seconds', "
+                + "lease_expires_at=clock_timestamp()-interval '1 second' WHERE token_sha256=?", WorkerLeaseStore.tokenHash(task.leaseToken())));
     }
 
     private static NativeWorkerProbe probeNativeExternalWorker(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
@@ -608,7 +906,7 @@ class ProcessServerPostgresTest {
         repository.createDeployment().tenantId("20").addBytes("worker-mapping.bpmn20.xml", mapped.xml()).deploy();
         String mappedInstance = runtime.createProcessInstanceBuilder().processDefinitionKey("workerMapping").tenantId("20")
                 .variable("amount", 10L).variable("privateFixture", "not-for-worker").start().getId();
-        var mappedJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskCheck", Duration.ofMinutes(1))
+        var mappedJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskCheck:1", Duration.ofMinutes(1))
                 .onlyBpmn().tenantId("20").acquireAndLock(1, "mapped-worker");
         assertEquals(1, mappedJobs.size());
         assertEquals(Map.of("requestedAmount", 10L), mappedJobs.getFirst().getVariables());
@@ -624,7 +922,7 @@ class ProcessServerPostgresTest {
         repository.createDeployment().tenantId("20").addBytes("worker-empty.bpmn20.xml", emptyModel.xml()).deploy();
         runtime.createProcessInstanceBuilder().processDefinitionKey("workerEmpty").tenantId("20")
                 .variable("privateFixture", "not-for-worker").start();
-        var emptyJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskEmpty", Duration.ofMinutes(1))
+        var emptyJobs = management.createExternalWorkerJobAcquireBuilder().topic("riskEmpty:1", Duration.ofMinutes(1))
                 .onlyBpmn().tenantId("20").acquireAndLock(1, "empty-worker");
         assertEquals(1, emptyJobs.size());
         assertTrue(emptyJobs.getFirst().getVariables().isEmpty());

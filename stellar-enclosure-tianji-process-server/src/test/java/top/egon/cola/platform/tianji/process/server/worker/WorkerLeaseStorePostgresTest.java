@@ -140,6 +140,16 @@ class WorkerLeaseStorePostgresTest {
         verifyConcurrentClaims(store, manager, actor, jdbc);
         var otherTenantClaim = claim(foreignTenant, "job-race", 30, now(jdbc).plusSeconds(90), Duration.ofSeconds(30));
         assertEquals(21, transaction.execute(status -> store.claim(otherTenantClaim)).tenantId());
+        var boundedActor = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "bounded-worker", "https://idp.example/20");
+        Instant nativeExpiry = now(jdbc).plusSeconds(90);
+        transaction.executeWithoutResult(status -> {
+            for (int number = 40; number < 72; number++) {
+                assertTrue(store.hasCapacity(boundedActor, "riskCheck", "1", 32));
+                store.claim(claim(boundedActor, "bounded-job-" + number, number, nativeExpiry, Duration.ofSeconds(30)));
+            }
+            assertFalse(store.hasCapacity(boundedActor, "riskCheck", "1", 32));
+            assertFalse(store.hasCapacity(boundedActor, "otherTopic", "1", 32));
+        });
     }
 
     private static void verifySchemaDrift(JdbcTemplate jdbc, ProcessApiSchemaVerifier verifier) {

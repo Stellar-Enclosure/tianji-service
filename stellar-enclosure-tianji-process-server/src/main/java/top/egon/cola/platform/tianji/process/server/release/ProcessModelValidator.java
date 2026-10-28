@@ -8,6 +8,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.RouteCondition;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerParameter;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerTask;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 
 import javax.xml.XMLConstants;
 import java.time.Duration;
@@ -95,7 +96,9 @@ public final class ProcessModelValidator {
                     Element extension = only(element, "extensionElements");
                     if ("dmn".equals(taskType)) {
                         if (element.hasAttributeNS(FLOWABLE, "topic") || element.hasAttributeNS(FLOWABLE, "doNotIncludeVariables")
-                                || element.hasAttributeNS(TIANJI_WORKER, "schemaVersion") || children(extension).size() != 1) throw invalid();
+                                || element.hasAttributeNS(TIANJI_WORKER, "schemaVersion") || element.hasAttributeNS(TIANJI_WORKER, "topic")
+                                || element.hasAttributeNS(TIANJI_WORKER, "effectSafety")
+                                || children(extension).size() != 1) throw invalid();
                         Element field = only(extension, "field");
                         if (!"decisionTableReferenceKey".equals(required(field, "name"))) throw invalid();
                         String decisionKey = only(field, "string").getTextContent();
@@ -180,10 +183,13 @@ public final class ProcessModelValidator {
     }
 
     private static WorkerTask workerTask(Element task, Element extension) {
-        String topic = task.getAttributeNS(FLOWABLE, "topic");
+        String topic = task.getAttributeNS(TIANJI_WORKER, "topic");
         String version = task.getAttributeNS(TIANJI_WORKER, "schemaVersion");
-        if (!IDENTIFIER.matcher(topic).matches() || !version.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+        if (!nativeWorkerTopic(topic, version).equals(task.getAttributeNS(FLOWABLE, "topic"))
                 || !"true".equals(task.getAttributeNS(FLOWABLE, "doNotIncludeVariables"))) throw invalid();
+        WorkerEffect effect;
+        try { effect = WorkerEffect.valueOf(task.getAttributeNS(TIANJI_WORKER, "effectSafety")); }
+        catch (IllegalArgumentException invalidEffect) { throw invalid(); }
         List<WorkerParameter> inputs = new ArrayList<>();
         List<WorkerParameter> outputs = new ArrayList<>();
         Set<String> inputNames = new HashSet<>();
@@ -208,7 +214,13 @@ public final class ProcessModelValidator {
             }
         }
         if (inputs.size() > 16 || outputs.size() > 16) throw invalid();
-        return new WorkerTask(topic, version, inputs, outputs);
+        return new WorkerTask(topic, version, effect, inputs, outputs);
+    }
+
+    public static String nativeWorkerTopic(String topic, String version) {
+        if (topic == null || !IDENTIFIER.matcher(topic).matches() || version == null
+                || !version.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}") || topic.length() + version.length() + 1 > 255) throw invalid();
+        return topic + ":" + version;
     }
 
     /** Validates the currently supported task mappings against the release's process and decision schemas. */
@@ -328,7 +340,7 @@ public final class ProcessModelValidator {
                 || text.contains("fn_addDate") || text.contains("fn_subtractDate"))) throw invalid();
     }
 
-    static void validateVariable(String variable) {
+    public static void validateVariable(String variable) {
         if (variable == null || !VARIABLE.matcher(variable).matches() || RESERVED.contains(variable)) throw invalid();
     }
 
@@ -363,7 +375,7 @@ public final class ProcessModelValidator {
             boolean flowableWorkerAttribute = BPMN.equals(namespace) && "serviceTask".equals(kind)
                     && FLOWABLE.equals(attribute.getNamespaceURI()) && Set.of("topic", "doNotIncludeVariables").contains(attribute.getLocalName());
             boolean workerVersion = BPMN.equals(namespace) && "serviceTask".equals(kind)
-                    && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "schemaVersion".equals(attribute.getLocalName());
+                    && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && Set.of("topic", "schemaVersion", "effectSafety").contains(attribute.getLocalName());
             boolean workerType = BPMN.equals(namespace) && Set.of("externalWorkerInParameter", "externalWorkerOutParameter").contains(kind)
                     && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "type".equals(attribute.getLocalName());
             boolean expressionType = BPMN.equals(namespace) && "conditionExpression".equals(kind)
