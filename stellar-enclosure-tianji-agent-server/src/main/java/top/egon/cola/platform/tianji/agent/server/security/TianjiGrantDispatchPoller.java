@@ -15,7 +15,7 @@ import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
 import top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 
-/** Rotates through grant-ready USER runs; the dispatcher and ledger retain claim and lease authority. */
+/** Rotates through grant-ready runs; the dispatcher and ledger retain claim and lease authority. */
 public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(TianjiGrantDispatchPoller.class);
     private final AgentLedgerService ledger;
@@ -25,6 +25,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
     private final Duration interval;
     private final Duration shutdownTimeout;
     private final Semaphore slots;
+    private final boolean includeService;
     private final Set<GrantReadyAgentRun> inFlight = ConcurrentHashMap.newKeySet();
     private final Object monitor = new Object();
     private final java.util.concurrent.atomic.AtomicBoolean discoveryFailureLogged = new java.util.concurrent.atomic.AtomicBoolean();
@@ -53,6 +54,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
             throw new IllegalArgumentException("TIANJI_DISPATCH_SETTINGS_INVALID");
         }
         this.batchSize = batchSize; this.interval = interval; this.shutdownTimeout = shutdownTimeout;
+        this.includeService = authorizer.supportsService();
         this.slots = new Semaphore(maxInFlight);
     }
 
@@ -73,7 +75,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
             activePoll = Thread.currentThread(); position = cursor;
         }
         try {
-            var candidates = ledger.grantReadyRuns(position, batchSize);
+            var candidates = includeService ? ledger.grantReadyRuns(position, batchSize, true) : ledger.grantReadyRuns(position, batchSize);
             discoveryFailureLogged.set(false);
             if (candidates.isEmpty()) {
                 synchronized (monitor) { if (running && generation == expected) cursor = null; }

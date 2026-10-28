@@ -270,7 +270,26 @@ final class JdbcAgentLedgerRepository {
     }
 
     List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit) {
-        String sql = """
+        return grantReadyRuns(after, limit, false);
+    }
+
+    List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit, boolean includeService) {
+        String sql = includeService ? """
+                SELECT r.tenant_id, r.subject_type, r.subject_issuer, r.subject_id, r.run_id, r.created_at
+                FROM tianji_agent.agent_run r
+                WHERE r.status = 'QUEUED' AND r.subject_issuer <> 'LEGACY'
+                  AND r.cancel_requested_at IS NULL AND r.deadline_at > clock_timestamp()
+                  AND ((r.subject_type = 'USER' AND EXISTS (
+                        SELECT 1 FROM tianji_agent.agent_run_execution_grant g
+                        WHERE g.tenant_id=r.tenant_id AND g.run_id=r.run_id
+                          AND g.grant_id IS NOT NULL AND g.ciphertext IS NOT NULL AND g.expires_at > clock_timestamp()))
+                    OR (r.subject_type = 'SERVICE' AND EXISTS (
+                        SELECT 1 FROM tianji_agent.agent_run_service_execution_grant g
+                        JOIN tianji_agent.agent_process_dispatch p ON p.tenant_id=g.tenant_id AND p.run_id=g.run_id
+                        WHERE g.tenant_id=r.tenant_id AND g.run_id=r.run_id AND g.subject_client_id=r.subject_id
+                          AND p.subject_issuer=r.subject_issuer AND p.subject_id=r.subject_id AND p.state='OPEN'
+                          AND g.grant_id IS NOT NULL AND g.ciphertext IS NOT NULL AND g.expires_at > clock_timestamp())))
+                """ : """
                 SELECT r.tenant_id, r.subject_type, r.subject_issuer, r.subject_id, r.run_id, r.created_at
                 FROM tianji_agent.agent_run r
                 JOIN tianji_agent.agent_run_execution_grant g ON g.tenant_id = r.tenant_id AND g.run_id = r.run_id

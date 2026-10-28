@@ -65,6 +65,21 @@ class TianjiGrantDispatchPollerTest {
         assertThrows(IllegalStateException.class, poller::start);
     }
 
+    @Test void service_discovery_is_enabled_only_for_the_matching_service_authorizer() {
+        when(authorizer.supportsService()).thenReturn(true);
+        poller.close();
+        poller = new TianjiGrantDispatchPoller(ledger, dispatcher, authorizer, scheduler, 2, 2,
+                Duration.ofSeconds(1), Duration.ofSeconds(1));
+        var actor = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/tenants/21");
+        var candidate = new GrantReadyAgentRun(actor, new GetAgentRunQuery("00000000-0000-0000-0000-000000000123"),
+                Instant.parse("2026-10-29T00:00:00Z"));
+        when(ledger.grantReadyRuns(null, 2, true)).thenReturn(List.of(candidate));
+        poller.start(); callback.get().run();
+        verify(ledger).grantReadyRuns(null, 2, true);
+        verify(ledger, never()).grantReadyRuns(any(), anyInt());
+        verify(dispatcher).dispatch(actor, candidate.query());
+    }
+
     @Test void admission_failures_do_not_pin_the_cursor_or_expose_details() {
         var first = candidate(21, "00000000-0000-0000-0000-000000000121");
         var second = candidate(22, "00000000-0000-0000-0000-000000000122");

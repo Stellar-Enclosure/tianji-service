@@ -212,7 +212,7 @@ class TianjiExecutionGrantAuthorizerTest {
                 .run(context -> assertTrue(context.getBeansOfType(TianjiExecutionGrantAuthorizer.class).isEmpty()));
         assertThrows(IllegalStateException.class, () -> new TianjiExecutionAuthorizationConfiguration()
                 .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null,
-                        new org.springframework.mock.env.MockEnvironment()));
+                        new org.springframework.mock.env.MockEnvironment(), null));
     }
 
     private TianjiExecutionGrantAuthorizer create(Duration timeout, int concurrency) {

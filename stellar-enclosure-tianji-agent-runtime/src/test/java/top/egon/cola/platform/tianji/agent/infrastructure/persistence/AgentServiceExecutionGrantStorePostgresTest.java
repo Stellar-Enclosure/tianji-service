@@ -170,6 +170,29 @@ class AgentServiceExecutionGrantStorePostgresTest {
                 Integer.class, value.actor().tenantId(), value.run().runId()));
     }
 
+    @Test void service_queue_discovery_is_opt_in_and_skips_closed_or_expired_fences() {
+        var first = start(); var second = start(); var unready = start();
+        for (var value : List.of(first, second)) {
+            var reservation = store.reserve(value.actor(), value.run().runId(), RESOURCE, SUBJECT).orElseThrow();
+            assertTrue(store.complete(reservation, new AgentServiceExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:ready", now().plusSeconds(30))));
+        }
+        for (var value : List.of(first, second, unready)) {
+            jdbc.update("UPDATE tianji_agent.agent_run SET created_at=? WHERE tenant_id=? AND run_id=?",
+                    Timestamp.from(Instant.parse("2099-01-01T00:00:00Z")), value.actor().tenantId(), value.run().runId());
+        }
+        var cursor = new top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun.Cursor(
+                Instant.parse("2098-01-01T00:00:00Z"), 1, "0");
+        assertTrue(ledger.grantReadyRuns(cursor, 2).isEmpty());
+        var page = ledger.grantReadyRuns(cursor, 2, true);
+        assertEquals(List.of(first.run().runId(), second.run().runId()), page.stream().map(item -> item.query().runId()).toList());
+        assertTrue(ledger.grantReadyRuns(page.getLast().cursor(), 2, true).isEmpty());
+        submissions.close(first.actor(), lookup(first.command()));
+        assertEquals(List.of(second.run().runId()), ledger.grantReadyRuns(cursor, 2, true).stream().map(item -> item.query().runId()).toList());
+        jdbc.update("UPDATE tianji_agent.agent_run_service_execution_grant SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=?",
+                second.actor().tenantId(), second.run().runId());
+        assertTrue(ledger.grantReadyRuns(cursor, 2, true).isEmpty());
+    }
+
     @Test void schema_verifier_rejects_missing_or_weakened_evidence_constraints() {
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
         transaction.executeWithoutResult(status -> {

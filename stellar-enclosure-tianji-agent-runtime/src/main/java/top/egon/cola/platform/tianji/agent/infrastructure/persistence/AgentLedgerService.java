@@ -468,8 +468,13 @@ public final class AgentLedgerService {
 
     /** Discovers only USER runs with unexpired sealed evidence; execution still reauthorizes each candidate. */
     public List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit) {
+        return grantReadyRuns(after, limit, false);
+    }
+
+    /** SERVICE discovery is opt-in and still requires current authorization for every candidate. */
+    public List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit, boolean includeService) {
         if (limit < 1 || limit > 1000) throw invalid("queue batch limit is invalid");
-        return List.copyOf(repository.grantReadyRuns(after, limit));
+        return List.copyOf(repository.grantReadyRuns(after, limit, includeService));
     }
 
     /** Records cancellation intent and its idempotent receipt in the same transaction. */

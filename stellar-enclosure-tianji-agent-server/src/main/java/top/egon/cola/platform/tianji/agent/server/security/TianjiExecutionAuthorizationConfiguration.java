@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.server.security;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.time.Duration;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -24,13 +25,19 @@ public class TianjiExecutionAuthorizationConfiguration {
             @Qualifier("identityAuthorityProperties") IdentityAuthorityProperties authority,
             @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers,
             @Qualifier("idpServiceOAuth2Client") IdpServiceOAuth2Client oauth,
-            @Qualifier("jacksonObjectMapper") ObjectMapper mapper, Rbac3StarterProperties rbac, Environment environment) {
+            @Qualifier("jacksonObjectMapper") ObjectMapper mapper, Rbac3StarterProperties rbac, Environment environment,
+            ObjectProvider<TianjiServiceExecutionGrantAuthorizer> serviceAuthorizers) {
         if (!environment.getProperty("stellar.tianji.agent.execution-grants.enabled", Boolean.class, false)) {
             throw new IllegalStateException("TIANJI_EXECUTION_AUTHORIZATION_REQUIRES_GRANTS");
         }
         long timeoutMillis = environment.getProperty("stellar.tianji.agent.execution-authorization.timeout-ms", Long.class, 10_000L);
         int concurrency = environment.getProperty("stellar.tianji.agent.execution-authorization.concurrency", Integer.class, 4);
+        TianjiServiceExecutionGrantAuthorizer service = null;
+        if (environment.getProperty("stellar.tianji.agent.service-execution.enabled", Boolean.class, false)) {
+            service = serviceAuthorizers.getIfAvailable();
+            if (service == null) throw new IllegalStateException("TIANJI_SERVICE_EXECUTION_AUTHORIZER_REQUIRED");
+        }
         return new TianjiExecutionGrantAuthorizer(ledger, store, starter, authority, issuers, oauth, mapper, rbac,
-                Duration.ofMillis(timeoutMillis), concurrency);
+                Duration.ofMillis(timeoutMillis), concurrency, service);
     }
 }
