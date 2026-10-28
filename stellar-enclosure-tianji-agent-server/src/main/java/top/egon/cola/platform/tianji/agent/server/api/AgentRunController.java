@@ -9,6 +9,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
@@ -17,9 +18,11 @@ import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermission
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType;
@@ -49,6 +52,18 @@ public class AgentRunController {
     public ResponseEntity<AgentRunDTO> start(@RequestBody StartAgentRunCommand command) {
         var actor = access.require(TianjiAgentPermissions.START_API).actor();
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(ledger.start(actor, command));
+    }
+
+    @PermissionResource(key = TianjiAgentPermissions.LIST_API, type = ResourceType.API,
+            labelPage = "tianji.permissions", labelKey = "api.agent.list",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = TianjiAgentPermissions.READ_SCOPE)
+    @RequiresPermissions(codes = TianjiAgentPermissions.READ)
+    @GetMapping
+    public ResponseEntity<AgentRunPageDTO> list(@RequestParam(required = false) String cursor,
+                                                @RequestParam(defaultValue = "20") int limit) {
+        var actor = access.require(TianjiAgentPermissions.LIST_API).actor();
+        return noStore(ledger.list(actor, new ListAgentRunsQuery(cursor, limit)));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.GET_API, type = ResourceType.API,

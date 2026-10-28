@@ -7,6 +7,7 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplicat
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.http.HttpMethod;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -38,6 +39,7 @@ public class TianjiAgentSecurityConfiguration {
                 .requestCache(cache -> cache.disable())
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
+                        .requestMatchers(HttpMethod.GET, "/api/v1/authorization/effective-permissions").authenticated()
                         .requestMatchers("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**")
                             .authenticated()
                         .anyRequest().denyAll())
@@ -74,7 +76,7 @@ public class TianjiAgentSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy tianjiEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"), List.of(),
-                List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**"), false);
+                List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**"), true);
     }
 
     @Bean

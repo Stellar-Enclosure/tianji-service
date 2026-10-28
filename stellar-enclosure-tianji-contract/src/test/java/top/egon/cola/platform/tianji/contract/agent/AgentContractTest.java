@@ -61,6 +61,9 @@ class AgentContractTest {
                 () -> new StartAgentRunCommand("review", 1, null, " ", null, null, input, null));
         assertThrows(IllegalArgumentException.class, () -> new AgentEventsQuery("run", -1, 1));
         assertThrows(IllegalArgumentException.class, () -> new AgentEventsQuery("run", 0, 1001));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsQuery(null, 0));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsQuery(null, 101));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsQuery("x".repeat(257), 1));
         assertFalse(List.of(StartAgentRunCommand.class.getRecordComponents()).stream()
                 .anyMatch(field -> field.getName().equalsIgnoreCase("tenantId")));
     }

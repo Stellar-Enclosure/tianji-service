@@ -11,10 +11,12 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.io.IOException;
@@ -108,6 +110,18 @@ class HttpAgentClientTest {
         assertEquals("application/json", requests.getFirst().contentType());
         assertEquals(start, mapper.readValue(requests.getFirst().body(), StartAgentRunCommand.class));
         assertEquals(cancel, mapper.readValue(requests.getLast().body(), CancelAgentRunCommand.class));
+    }
+
+    @Test
+    void list_encodes_the_cursor_and_returns_the_page() throws Exception {
+        var expected = new AgentRunPageDTO(List.of(run("run-1")), "next-cursor");
+        BlockingQueue<String> queries = new LinkedBlockingQueue<>();
+        handler.set(exchange -> {
+            queries.add(exchange.getRequestURI().getRawQuery());
+            respond(exchange, 200, "application/json", mapper.writeValueAsBytes(expected));
+        });
+        assertEquals(expected, client(Duration.ofSeconds(3), 0).list(new ListAgentRunsQuery("a+/=", 10)));
+        assertEquals("limit=10&cursor=a%2B%2F%3D", queries.poll(1, TimeUnit.SECONDS));
     }
 
     @Test

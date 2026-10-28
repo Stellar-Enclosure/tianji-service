@@ -20,6 +20,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.time.Duration;
@@ -132,6 +133,45 @@ class AgentLedgerPostgresTest {
         }
         AgentRunDTO sameKeyOtherSubject = ledger.start(service, command("key", "question", "trace"));
         assertNotEquals(run.runId(), sameKeyOtherSubject.runId());
+    }
+
+    @Test
+    void owner_scoped_keyset_pages_are_stable_when_timestamps_tie() {
+        TrustedAgentActor owner = actor(USER, "list-owner");
+        TrustedAgentActor otherSubject = new TrustedAgentActor(owner.tenantId(), USER, "other-owner");
+        TrustedAgentActor otherType = new TrustedAgentActor(owner.tenantId(), SERVICE, "list-owner");
+        TrustedAgentActor otherTenant = new TrustedAgentActor(owner.tenantId() + 1_000_000, USER, "list-owner");
+        ledger.publish(owner, spec(Map.of()));
+        ledger.publish(otherTenant, spec(Map.of()));
+        Set<String> expected = new HashSet<>();
+        for (int i = 0; i < 7; i++) expected.add(ledger.start(owner, command("page-" + i, "question", null)).runId());
+        String otherRun = ledger.start(otherSubject, command("page-other", "question", null)).runId();
+        String serviceRun = ledger.start(otherType, command("page-service", "question", null)).runId();
+        String tenantRun = ledger.start(otherTenant, command("page-tenant", "question", null)).runId();
+        jdbc.update("UPDATE tianji_agent.agent_run SET created_at=? WHERE tenant_id=? AND subject_type=? AND subject_id=?",
+                java.sql.Timestamp.from(Instant.parse("2026-01-01T00:00:00Z")), owner.tenantId(), "USER", "list-owner");
+
+        List<String> actual = new ArrayList<>();
+        String cursor = null;
+        do {
+            var page = ledger.list(owner, new ListAgentRunsQuery(cursor, 3));
+            assertTrue(page.items().size() <= 3);
+            actual.addAll(page.items().stream().map(AgentRunDTO::runId).toList());
+            cursor = page.nextCursor();
+        } while (cursor != null);
+        assertEquals(expected.size(), actual.size());
+        assertEquals(expected, new HashSet<>(actual));
+        assertEquals(actual.stream().sorted(java.util.Comparator.reverseOrder()).toList(), actual);
+        assertFalse(actual.contains(otherRun));
+        assertFalse(actual.contains(serviceRun));
+        assertFalse(actual.contains(tenantRun));
+        assertEquals(List.of(otherRun), ledger.list(otherSubject, new ListAgentRunsQuery(null, 10))
+                .items().stream().map(AgentRunDTO::runId).toList());
+        assertThrows(IllegalArgumentException.class, () -> ledger.list(owner, new ListAgentRunsQuery("invalid!", 3)));
+        String extreme = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                ("1|+1000000000-12-31T23:59:59.999999999Z|" + actual.getFirst())
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        assertThrows(IllegalArgumentException.class, () -> ledger.list(owner, new ListAgentRunsQuery(extreme, 3)));
     }
 
     @Test

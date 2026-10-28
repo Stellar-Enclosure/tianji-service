@@ -8,6 +8,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunController;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.CurrentEffectivePermissionView;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -35,6 +36,7 @@ class TianjiSecurityConfigurationTest {
         runner.withPropertyValues("stellar.tianji.agent.api.enabled=true")
                 .withBean(AgentLedgerService.class, () -> mock(AgentLedgerService.class))
                 .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(CurrentEffectivePermissionView.class, () -> mock(CurrentEffectivePermissionView.class))
                 .run(context -> {
                     assertThat(context).hasFailed();
                     assertThat(context.getStartupFailure()).hasRootCauseMessage(
@@ -43,13 +45,13 @@ class TianjiSecurityConfigurationTest {
     }
 
     @Test
-    void identity_policy_accepts_both_principal_types_only_on_declared_api_paths() {
+    void identity_policy_distinguishes_shared_agent_paths_from_user_only_paths() {
         var policy = new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy();
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/api/tianji/v1/agent-runs/run-1")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/unclassified")))
-                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.DENY);
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER);
     }
 }

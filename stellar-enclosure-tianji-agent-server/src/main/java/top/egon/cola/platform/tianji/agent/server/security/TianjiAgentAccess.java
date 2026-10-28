@@ -4,7 +4,11 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.authentication.AuthenticationCredentialsNotFoundException;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
 import top.egon.cola.platform.tianquan.shoubing.contract.IdpPrincipal;
@@ -14,6 +18,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticati
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Objects;
+import java.util.Collections;
 
 /** Obtains tenant and actor only from the authenticated identity after the resource policy allows access. */
 public final class TianjiAgentAccess {
@@ -42,11 +47,22 @@ public final class TianjiAgentAccess {
         if (!verified.expiresAt().isAfter(clock.instant())) {
             throw new AuthenticationCredentialsNotFoundException("identity expired");
         }
+        String tenantId = verified.tenantId();
+        if (tenantId == null || !tenantId.matches("[1-9][0-9]{0,18}")) {
+            throw new AccessDeniedException("tenant-scoped identity required");
+        }
         long tenant;
-        try { tenant = Long.parseLong(verified.tenantId()); }
+        try { tenant = Long.parseLong(tenantId); }
         catch (NumberFormatException invalid) { throw new AccessDeniedException("tenant-scoped identity required"); }
         if (tenant <= 0) throw new AccessDeniedException("tenant-scoped identity required");
         if (verified.subject().length() > 256) throw new AccessDeniedException("identity subject is invalid");
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes servlet) {
+            var expected = Collections.list(servlet.getRequest().getHeaders("X-Egon-Tianji-Tenant"));
+            if (expected.size() > 1 || (!expected.isEmpty() && !tenantId.equals(expected.getFirst()))) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_TENANT_CONTEXT_CHANGED,
+                        "The expected tenant does not match the verified identity");
+            }
+        }
         TrustedAgentActor.SubjectType type = verified instanceof ServiceIdentityPrincipal
                 ? TrustedAgentActor.SubjectType.SERVICE : TrustedAgentActor.SubjectType.USER;
         return new Authorized(new TrustedAgentActor(tenant, type, verified.subject()), verified.expiresAt());

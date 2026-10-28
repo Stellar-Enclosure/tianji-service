@@ -6,9 +6,11 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.net.URI;
@@ -70,6 +72,14 @@ public final class HttpAgentClient implements AgentClient {
     @Override
     public AgentRunDTO start(StartAgentRunCommand command) {
         return call("POST", path(""), Objects.requireNonNull(command, "command"), AgentRunDTO.class);
+    }
+
+    @Override
+    public AgentRunPageDTO list(ListAgentRunsQuery query) {
+        Objects.requireNonNull(query, "query");
+        String suffix = "?limit=" + query.limit() + (query.cursor() == null ? ""
+                : "&cursor=" + URLEncoder.encode(query.cursor(), StandardCharsets.UTF_8));
+        return call("GET", URI.create(path("").toString() + suffix), null, AgentRunPageDTO.class);
     }
 
     @Override

@@ -20,11 +20,13 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import javax.sql.DataSource;
@@ -38,6 +40,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.Base64;
+import java.nio.charset.StandardCharsets;
+import java.time.DateTimeException;
 
 /**
  * Local Agent ledger. Callers must authenticate and authorize before constructing the trusted actor;
@@ -127,6 +132,44 @@ public final class AgentLedgerService {
     public AgentRunDTO get(TrustedAgentActor actor, GetAgentRunQuery query) {
         return requireRun(actor, query).run();
     }
+
+    /** Pages only runs owned by the authenticated actor; the cursor is exclusive. */
+    public AgentRunPageDTO list(TrustedAgentActor actor, ListAgentRunsQuery query) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(query, "query");
+        RunCursor cursor = query.cursor() == null ? null : decodeCursor(query.cursor());
+        List<AgentRunDTO> rows = repository.list(actor, cursor == null ? null : cursor.createdAt(),
+                cursor == null ? null : cursor.runId(), query.limit() + 1);
+        boolean more = rows.size() > query.limit();
+        List<AgentRunDTO> items = List.copyOf(more ? rows.subList(0, query.limit()) : rows);
+        String next = more ? encodeCursor(items.getLast()) : null;
+        return new AgentRunPageDTO(items, next);
+    }
+
+    private static String encodeCursor(AgentRunDTO run) {
+        String value = "1|" + run.createdAt() + "|" + run.runId();
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static RunCursor decodeCursor(String value) {
+        try {
+            String decoded = new String(Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8);
+            String[] fields = decoded.split("\\|", -1);
+            if (fields.length != 3 || !"1".equals(fields[0])) throw new IllegalArgumentException();
+            Instant createdAt = Instant.parse(fields[1]);
+            String runId = UUID.fromString(fields[2]).toString();
+            if (!runId.equals(fields[2]) || createdAt.isBefore(Instant.EPOCH)
+                    || createdAt.isAfter(Instant.parse("9999-12-31T23:59:59.999999Z"))) {
+                throw new IllegalArgumentException();
+            }
+            java.sql.Timestamp.from(createdAt);
+            return new RunCursor(createdAt, runId);
+        } catch (IllegalArgumentException | DateTimeException | ArithmeticException invalid) {
+            throw new IllegalArgumentException("invalid Agent run cursor");
+        }
+    }
+
+    private record RunCursor(Instant createdAt, String runId) { }
 
     public Optional<AgentExecutionResult> getResult(TrustedAgentActor actor, GetAgentRunQuery query) {
         String result = requireRun(actor, query).resultJson();

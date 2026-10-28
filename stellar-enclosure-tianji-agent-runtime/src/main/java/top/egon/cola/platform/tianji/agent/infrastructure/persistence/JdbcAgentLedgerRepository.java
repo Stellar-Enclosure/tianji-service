@@ -23,6 +23,8 @@ import java.util.Optional;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 
 final class JdbcAgentLedgerRepository {
+    private static final String RUN_COLUMNS = "run_id, definition_key, definition_version, session_id, status, wait_reason, "
+            + "cancel_requested_at, attempt, revision, last_event_sequence, deadline_at, created_at, finished_at";
     private final JdbcTemplate jdbc;
     private final AgentJsonCodec json;
 
@@ -75,6 +77,18 @@ final class JdbcAgentLedgerRepository {
                 WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
                 """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(), runId)
                 .stream().findFirst();
+    }
+
+    List<AgentRunDTO> list(TrustedAgentActor actor, Instant beforeCreatedAt, String beforeRunId, int limit) {
+        String base = "SELECT " + RUN_COLUMNS + " FROM tianji_agent.agent_run "
+                + "WHERE tenant_id=? AND subject_type=? AND subject_id=? ";
+        if (beforeCreatedAt == null) {
+            return jdbc.query(base + "ORDER BY created_at DESC, run_id DESC LIMIT ?", (rs, row) -> mapRun(rs),
+                    actor.tenantId(), actor.subjectType().name(), actor.subjectId(), limit);
+        }
+        return jdbc.query(base + "AND (created_at,run_id) < (?,?) ORDER BY created_at DESC, run_id DESC LIMIT ?",
+                (rs, row) -> mapRun(rs), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                Timestamp.from(beforeCreatedAt), beforeRunId, limit);
     }
 
     int insertRun(TrustedAgentActor actor, String runId, String definitionKey, long definitionVersion,

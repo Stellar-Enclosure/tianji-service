@@ -20,6 +20,7 @@ import top.egon.cola.platform.tianji.agent.server.api.AgentRunSseController;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.RuntimePolicyBinding;
@@ -39,6 +40,7 @@ import top.egon.cola.platform.tianquan.jianshen.starter.cache.AuthorizationSnaps
 import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionPolicyRegistry;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.CurrentEffectivePermissionView;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionServicePolicyGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.CurrentRbac3User;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
@@ -90,7 +92,7 @@ class TianjiPermissionIntegrationTest {
         }
         @Override public ServicePolicySnapshot fetchPolicy(String system, ServiceIdentityPrincipal principal) {
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(),
-                    Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.EVENTS_API),
+                    Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API),
                     NOW.plusSeconds(30));
         }
     };
@@ -159,6 +161,8 @@ class TianjiPermissionIntegrationTest {
         var verifier = mock(IdpJwtVerifier.class);
         when(verifier.verifyAny("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
                 Set.of(TianjiAgentPermissions.READ_SCOPE), null, URI.create("https://idp.example/tenants/20")));
+        when(verifier.verifyUser("verified-test-token")).thenReturn(new AccessTokenVerification.Valid<>(USER,
+                Set.of(TianjiAgentPermissions.READ_SCOPE), null, URI.create("https://idp.example/tenants/20")));
         var identityFilter = IdpBearerAuthenticationFilter.create(new UserAccessTokenVerifier(verifier),
                 new ServiceAccessTokenVerifier(verifier), new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy(),
                 new com.fasterxml.jackson.databind.ObjectMapper(), new VerifiedTenantContextFilter(), verifier);
@@ -171,6 +175,7 @@ class TianjiPermissionIntegrationTest {
         var event = new AgentEventDTO("event-1", "run-1", 1, "RUN_COMPLETED", null, null, null,
                 NOW, null, "1", Map.of());
         when(ledger.get(actor, new GetAgentRunQuery("run-1"))).thenReturn(run);
+        when(ledger.list(eq(actor), any())).thenReturn(new AgentRunPageDTO(List.of(run), null));
         when(ledger.get(actor, new GetAgentRunQuery("foreign"))).thenThrow(
                 new AgentLedgerException(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "not found"));
         when(ledger.events(eq(actor), any())).thenReturn(List.of(event));
@@ -182,6 +187,7 @@ class TianjiPermissionIntegrationTest {
                         "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4")
                 .withBean(AgentLedgerService.class, () -> ledger)
                 .withBean(PermissionExecutionGuard.class, this::permissionGuard)
+                .withBean(CurrentEffectivePermissionView.class, this::currentPermissionView)
                 .withBean(IdpBearerAuthenticationFilter.class, () -> identityFilter)
                 .withBean(Rbac3BearerAuthenticationFilter.class, () -> rbacFilter)
                 .run(context -> assertDoesNotThrow(() -> {
@@ -189,9 +195,26 @@ class TianjiPermissionIntegrationTest {
                     var mvc = MockMvcBuilders.webAppContextSetup((WebApplicationContext) context.getSourceApplicationContext())
                             .apply(springSecurity()).build();
                     mvc.perform(get("/api/tianji/v1/agent-runs/run-1")).andExpect(status().isUnauthorized());
+                    mvc.perform(get("/api/v1/authorization/effective-permissions")).andExpect(status().isUnauthorized());
+                    mvc.perform(get("/api/v1/authorization/effective-permissions")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.data.subject").value("alice"));
+                    mvc.perform(get("/api/v1/authorization/effective-permissions").param("tenant", "other")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isBadRequest());
+                    mvc.perform(get("/unclassified").header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
                     mvc.perform(get("/api/tianji/v1/agent-runs/run-1")
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isOk());
+                    mvc.perform(get("/api/tianji/v1/agent-runs/run-1")
+                                    .header("Authorization", "Bearer verified-test-token")
+                                    .header("X-Egon-Tianji-Tenant", "21"))
+                            .andExpect(status().isConflict())
+                            .andExpect(jsonPath("$.code").value("TIANJI_TENANT_CONTEXT_CHANGED"));
+                    mvc.perform(get("/api/tianji/v1/agent-runs")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].runId").value("run-1"));
                     mvc.perform(get("/api/tianji/v1/agent-runs/foreign")
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isNotFound());
@@ -223,6 +246,11 @@ class TianjiPermissionIntegrationTest {
                 new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
     }
 
+    private CurrentEffectivePermissionView currentPermissionView() {
+        return new CurrentEffectivePermissionView(new CurrentRbac3User(),
+                new PermissionPolicyRegistry(manifest, DIGEST, CLOCK, List.of(SCOPE)), CLOCK);
+    }
+
     private PermissionManifest manifest() {
         var requirement = new PermissionRequirement(PermissionMode.ALL, List.of(TianjiAgentPermissions.READ));
         var resource = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.GET_API, ResourceType.API,
@@ -237,12 +265,22 @@ class TianjiPermissionIntegrationTest {
                 List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
                 List.of(TianjiAgentPermissions.READ_SCOPE),
                 new PermissionManifest.I18nReference("tianji.permissions", "api.agent.events"), DefinitionLifecycle.ACTIVE);
+        var list = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.LIST_API, ResourceType.API,
+                Map.of("methods", List.of("GET"), "paths", List.of("/api/tianji/v1/agent-runs")),
+                ResourceAccess.PROTECTED, requirement, null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.READ_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.agent.list"), DefinitionLifecycle.ACTIVE);
+        var current = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.CURRENT_AUTH_API, ResourceType.API,
+                Map.of("methods", List.of("GET"), "paths", List.of("/api/v1/authorization/effective-permissions")),
+                ResourceAccess.PUBLIC, null, null, List.of(PermissionManifest.PrincipalType.USER), List.of(),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.authorization.current"), DefinitionLifecycle.ACTIVE);
         return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
                 new PermissionManifest.Producer("tianji-java", PermissionManifest.ProducerKind.JAVA,
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji."), List.of("agent-server"),
                         List.of("agent-server"), false),
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
-                List.of(), List.of(TianjiAgentPermissions.READ), List.of(resource, events), List.of(), List.of());
+                List.of(), List.of(TianjiAgentPermissions.READ), List.of(resource, events, list, current), List.of(), List.of());
     }
 
     private RuntimePolicyBinding binding() {
@@ -255,7 +293,8 @@ class TianjiPermissionIntegrationTest {
                 "1", "2", "3", new EffectivePermissionSnapshot.ActiveRoleContext("tianji", List.of("50"), List.of("50")),
                 permissions.stream().sorted().toList(), NOW.plusSeconds(30));
         return new SystemAuthorizationSnapshot("20", USER.subject(), "60", "tianji", 2, 3, List.of("50"),
-                null, null, permissions, Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.EVENTS_API),
+                null, null, permissions, Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API,
+                        TianjiAgentPermissions.EVENTS_API, TianjiAgentPermissions.CURRENT_AUTH_API),
                 Map.of(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }

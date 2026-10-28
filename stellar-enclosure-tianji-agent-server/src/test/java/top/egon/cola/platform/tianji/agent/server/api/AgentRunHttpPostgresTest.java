@@ -99,12 +99,16 @@ class AgentRunHttpPostgresTest {
         String repeated = mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content(payload))
                 .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
         assertEquals(run.runId(), mapper.readValue(repeated, AgentRunDTO.class).runId());
+        mvc.perform(get(BASE).param("limit", "10")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].runId").value(run.runId()));
 
         authenticate("40002", "worker");
+        mvc.perform(get(BASE)).andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(0));
         mvc.perform(get(BASE + "/" + run.runId())).andExpect(status().isNotFound());
         mvc.perform(get(BASE + "/" + run.runId() + "/events").accept(MediaType.TEXT_EVENT_STREAM))
                 .andExpect(status().isNotFound());
         authenticate("40001", "other");
+        mvc.perform(get(BASE)).andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(0));
         mvc.perform(get(BASE + "/" + run.runId())).andExpect(status().isNotFound());
         authenticate("40001", "worker");
 

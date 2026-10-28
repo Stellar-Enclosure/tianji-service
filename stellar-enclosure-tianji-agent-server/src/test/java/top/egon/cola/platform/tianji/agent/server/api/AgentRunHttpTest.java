@@ -21,8 +21,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
@@ -106,6 +108,30 @@ class AgentRunHttpTest {
         };
         assertThrows(AgentRequestBodyAdvice.TooLarge.class,
                 () -> new AgentRequestBodyAdvice().beforeBodyRead(streamed, null, StartAgentRunCommand.class, null));
+    }
+
+    @Test
+    void list_uses_the_verified_actor_and_enforces_page_bounds() throws Exception {
+        when(ledger.list(ACTOR, new ListAgentRunsQuery("cursor", 2)))
+                .thenReturn(new AgentRunPageDTO(List.of(run(AgentRunStatusEnum.QUEUED, 1)), null));
+        mvc.perform(get(BASE).param("cursor", "cursor").param("limit", "2"))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].runId").value("run-1"));
+        verify(guard).requireExecution(TianjiAgentPermissions.LIST_API);
+        verify(ledger).list(ACTOR, new ListAgentRunsQuery("cursor", 2));
+        mvc.perform(get(BASE).param("limit", "101")).andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void expected_tenant_can_only_detect_mismatch_and_never_grants_access() throws Exception {
+        when(ledger.get(ACTOR, new GetAgentRunQuery("run-1"))).thenReturn(run(AgentRunStatusEnum.QUEUED, 1));
+        mvc.perform(get(BASE + "/run-1").header("X-Egon-Tianji-Tenant", "21"))
+                .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_TENANT_CONTEXT_CHANGED"));
+        mvc.perform(get(BASE + "/run-1").header("X-Egon-Tianji-Tenant", "20", "21"))
+                .andExpect(status().isConflict());
+        verifyNoInteractions(ledger);
+        mvc.perform(get(BASE + "/run-1").header("X-Egon-Tianji-Tenant", "20"))
+                .andExpect(status().isOk());
+        verify(ledger).get(ACTOR, new GetAgentRunQuery("run-1"));
     }
 
     @Test

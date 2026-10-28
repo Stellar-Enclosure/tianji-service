@@ -59,6 +59,10 @@ class TianjiAgentAccessTest {
         assertThrows(AccessDeniedException.class, () -> access.require(TianjiAgentPermissions.GET_API));
         SecurityContextHolder.getContext().setAuthentication(user("not-a-number", "alice", NOW.plusSeconds(60)));
         assertThrows(AccessDeniedException.class, () -> access.require(TianjiAgentPermissions.GET_API));
+        SecurityContextHolder.getContext().setAuthentication(user("020", "alice", NOW.plusSeconds(60)));
+        assertThrows(AccessDeniedException.class, () -> access.require(TianjiAgentPermissions.GET_API));
+        SecurityContextHolder.getContext().setAuthentication(user("+20", "alice", NOW.plusSeconds(60)));
+        assertThrows(AccessDeniedException.class, () -> access.require(TianjiAgentPermissions.GET_API));
     }
 
     @Test
