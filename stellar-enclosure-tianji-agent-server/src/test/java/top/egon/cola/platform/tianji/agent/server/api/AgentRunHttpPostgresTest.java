@@ -20,6 +20,7 @@ import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManag
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
+import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -54,7 +55,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @Timeout(60)
 class AgentRunHttpPostgresTest {
     private static final String BASE = "/api/tianji/v1/agent-runs";
-    private static final TrustedAgentActor OWNER = new TrustedAgentActor(40001, TrustedAgentActor.SubjectType.SERVICE, "worker");
+    private static final TrustedAgentActor OWNER = TrustedAgentActor.verified(40001, TrustedAgentActor.SubjectType.SERVICE,
+            "worker", "https://idp.example/tenants/40001");
     private static AgentLedgerService ledger;
     private static AgentSessionManager sessions;
     private static DriverManagerDataSource source;
@@ -94,6 +96,7 @@ class AgentRunHttpPostgresTest {
         mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access),
                 new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())),
                 new AgentSessionController(sessions, access))
+                .addFilters(new VerifiedAgentIssuerFilter())
                 .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
     }
 
@@ -121,6 +124,8 @@ class AgentRunHttpPostgresTest {
                 .andExpect(status().isNotFound());
         authenticate("40001", "other");
         mvc.perform(get(BASE)).andExpect(status().isOk()).andExpect(jsonPath("$.items.length()").value(0));
+        mvc.perform(get(BASE + "/" + run.runId())).andExpect(status().isNotFound());
+        authenticate("40001", "worker", "https://another-idp.example/tenants/40001");
         mvc.perform(get(BASE + "/" + run.runId())).andExpect(status().isNotFound());
         authenticate("40001", "worker");
 
@@ -159,6 +164,9 @@ class AgentRunHttpPostgresTest {
                 .andReturn().getResponse().getContentAsString();
         assertEquals(mapper.readTree(created), mapper.readTree(repeated));
         authenticate("40002", "worker");
+        mvc.perform(get(sessionsBase + "/detail").param("sessionId", id)).andExpect(status().isNotFound());
+        mvc.perform(delete(sessionsBase).param("sessionId", id)).andExpect(status().isNotFound());
+        authenticate("40001", "worker", "https://another-idp.example/tenants/40001");
         mvc.perform(get(sessionsBase + "/detail").param("sessionId", id)).andExpect(status().isNotFound());
         mvc.perform(delete(sessionsBase).param("sessionId", id)).andExpect(status().isNotFound());
         authenticate("40001", "worker");
@@ -202,12 +210,16 @@ class AgentRunHttpPostgresTest {
     }
 
     private static void authenticate(String tenant, String subject) {
+        authenticate(tenant, subject, "https://idp.example/tenants/" + tenant);
+    }
+
+    private static void authenticate(String tenant, String subject, String issuer) {
         Instant now = Instant.now();
         var identity = new ServiceIdentityPrincipal(subject, tenant, subject, "token-id",
                 URI.create("https://api.example/tianji"), 1,
                 Set.of("tianji:agent:read", "tianji:agent:start", "tianji:agent:cancel", "tianji:session:delete"),
                 "xingyuan", subject, "test", "credential", now.minusSeconds(60), now.plusSeconds(300));
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(identity, List.of(),
-                URI.create("https://idp.example/tenants/" + tenant)));
+                URI.create(issuer)));
     }
 }

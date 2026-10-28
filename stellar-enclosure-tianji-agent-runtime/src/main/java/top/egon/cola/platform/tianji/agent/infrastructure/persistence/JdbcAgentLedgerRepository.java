@@ -66,36 +66,36 @@ final class JdbcAgentLedgerRepository {
     Optional<StoredRun> byIdempotencyKey(TrustedAgentActor actor, String key) {
         return jdbc.query("""
                 SELECT * FROM tianji_agent.agent_run
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND idempotency_key = ?
-                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(), key)
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND idempotency_key = ?
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), key)
                 .stream().findFirst();
     }
 
     boolean lockOwnedSession(TrustedAgentActor actor, String sessionId) {
         return !jdbc.query("""
                 SELECT 1 FROM tianji_agent.agent_session
-                WHERE tenant_id=? AND subject_type=? AND subject_id=? AND app_name='tianji' AND session_id=?
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name='tianji' AND session_id=?
                 FOR KEY SHARE
-                """, (rs, row) -> 1, actor.tenantId(), actor.subjectType().name(), actor.subjectId(), sessionId).isEmpty();
+                """, (rs, row) -> 1, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), sessionId).isEmpty();
     }
 
     Optional<StoredRun> run(TrustedAgentActor actor, String runId) {
         return jdbc.query("""
                 SELECT * FROM tianji_agent.agent_run
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
-                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(), runId)
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId)
                 .stream().findFirst();
     }
 
     List<AgentRunDTO> list(TrustedAgentActor actor, Instant beforeCreatedAt, String beforeRunId, int limit) {
         String base = "SELECT " + RUN_COLUMNS + " FROM tianji_agent.agent_run "
-                + "WHERE tenant_id=? AND subject_type=? AND subject_id=? ";
+                + "WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? ";
         if (beforeCreatedAt == null) {
             return jdbc.query(base + "ORDER BY created_at DESC, run_id DESC LIMIT ?", (rs, row) -> mapRun(rs),
-                    actor.tenantId(), actor.subjectType().name(), actor.subjectId(), limit);
+                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), limit);
         }
         return jdbc.query(base + "AND (created_at,run_id) < (?,?) ORDER BY created_at DESC, run_id DESC LIMIT ?",
-                (rs, row) -> mapRun(rs), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                (rs, row) -> mapRun(rs), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 Timestamp.from(beforeCreatedAt), beforeRunId, limit);
     }
 
@@ -104,13 +104,13 @@ final class JdbcAgentLedgerRepository {
                   Instant deadline, String snapshot, Instant now) {
         return jdbc.update("""
                 INSERT INTO tianji_agent.agent_run
-                    (tenant_id, run_id, definition_key, definition_version, subject_type, subject_id,
+                    (tenant_id, run_id, definition_key, definition_version, subject_type, subject_issuer, subject_id,
                      idempotency_key, request_hash, session_id, correlation_id, status, revision,
                      last_event_sequence, deadline_at, execution_snapshot, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, 1, ?, CAST(? AS jsonb), ?)
-                ON CONFLICT (tenant_id, subject_type, subject_id, idempotency_key) DO NOTHING
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, 1, ?, CAST(? AS jsonb), ?)
+                ON CONFLICT (tenant_id, subject_type, subject_issuer, subject_id, idempotency_key) DO NOTHING
                 """, actor.tenantId(), runId, definitionKey, definitionVersion, actor.subjectType().name(),
-                actor.subjectId(), idempotencyKey, requestHash, sessionId, correlationId,
+                actor.issuerFingerprint(), actor.subjectId(), idempotencyKey, requestHash, sessionId, correlationId,
                 Timestamp.from(deadline), snapshot, Timestamp.from(now));
     }
 
@@ -121,11 +121,11 @@ final class JdbcAgentLedgerRepository {
                 SET status = 'RUNNING', revision = revision + 1, last_event_sequence = last_event_sequence + 1,
                     attempt = attempt + 1, lease_epoch = lease_epoch + 1, lease_owner = ?,
                     lease_expires_at = LEAST(clock_timestamp() + (? * interval '1 millisecond'), deadline_at)
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status = 'QUEUED' AND cancel_requested_at IS NULL
                   AND deadline_at > clock_timestamp()
                 RETURNING *
-                """, runMapper(), owner, leaseMillis, actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), owner, leaseMillis, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, expectedRevision).stream().findFirst();
     }
 
@@ -133,12 +133,12 @@ final class JdbcAgentLedgerRepository {
         return jdbc.query("""
                 UPDATE tianji_agent.agent_run
                 SET lease_expires_at = LEAST(clock_timestamp() + (? * interval '1 millisecond'), deadline_at)
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
                   AND cancel_requested_at IS NULL
                 RETURNING *
-                """, runMapper(), leaseMillis, actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), leaseMillis, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 lease.runId(), lease.owner(), lease.epoch()).stream().findFirst();
     }
 
@@ -146,12 +146,12 @@ final class JdbcAgentLedgerRepository {
         return jdbc.query("""
                 UPDATE tianji_agent.agent_run
                 SET revision = revision + 1, last_event_sequence = last_event_sequence + 1
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
                   AND cancel_requested_at IS NULL
                 RETURNING *
-                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 lease.runId(), expectedRevision, lease.owner(), lease.epoch()).stream().findFirst();
     }
 
@@ -162,14 +162,14 @@ final class JdbcAgentLedgerRepository {
                 SET status = ?, revision = revision + 1, last_event_sequence = last_event_sequence + 1,
                     result = CAST(? AS jsonb), error_code = ?, finished_at = clock_timestamp(),
                     lease_owner = NULL, lease_expires_at = NULL, active_model_calls = 0, active_tool_calls = 0
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
                   AND ((? = 'CANCELLED' AND cancel_requested_at IS NOT NULL)
                     OR (? <> 'CANCELLED' AND cancel_requested_at IS NULL))
                 RETURNING *
                 """, runMapper(), status.name(), resultJson, errorCode, actor.tenantId(), actor.subjectType().name(),
-                actor.subjectId(), lease.runId(), expectedRevision, lease.owner(), lease.epoch(), status.name(),
+                actor.issuerFingerprint(), actor.subjectId(), lease.runId(), expectedRevision, lease.owner(), lease.epoch(), status.name(),
                 status.name()).stream().findFirst();
     }
 
@@ -181,11 +181,11 @@ final class JdbcAgentLedgerRepository {
                     result = CAST(? AS jsonb), error_code = 'TIANJI_RUN_TIMED_OUT', finished_at = clock_timestamp(),
                     lease_epoch = lease_epoch + 1, lease_owner = NULL, lease_expires_at = NULL,
                     active_model_calls = 0, active_tool_calls = 0
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status IN ('QUEUED', 'RUNNING', 'WAITING', 'SUSPENDED')
                   AND deadline_at <= clock_timestamp()
                 RETURNING *
-                """, runMapper(), resultJson, actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), resultJson, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, expectedRevision).stream().findFirst();
     }
 
@@ -195,18 +195,18 @@ final class JdbcAgentLedgerRepository {
                 SET status = 'SUSPENDED', wait_reason = 'LEASE_EXPIRED', revision = revision + 1,
                     last_event_sequence = last_event_sequence + 1, lease_epoch = lease_epoch + 1,
                     lease_owner = NULL, lease_expires_at = NULL, active_model_calls = 0, active_tool_calls = 0
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status = 'RUNNING'
                   AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())
                   AND deadline_at > clock_timestamp()
                 RETURNING *
-                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, expectedRevision).stream().findFirst();
     }
 
     List<ReconciliationCandidate> dueRuns(int limit) {
         return jdbc.query("""
-                SELECT tenant_id, subject_type, subject_id, run_id, revision,
+                SELECT tenant_id, subject_type, subject_issuer, subject_id, run_id, revision,
                        (deadline_at <= clock_timestamp()) AS deadline_expired
                 FROM tianji_agent.agent_run
                 WHERE status IN ('QUEUED', 'RUNNING', 'WAITING', 'SUSPENDED')
@@ -215,44 +215,44 @@ final class JdbcAgentLedgerRepository {
                 ORDER BY deadline_at, created_at, run_id LIMIT ?
                 """, (rs, row) -> new ReconciliationCandidate(
                 new TrustedAgentActor(rs.getLong("tenant_id"),
-                        TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id")),
+                        TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id"), rs.getString("subject_issuer")),
                 rs.getString("run_id"), rs.getLong("revision"), rs.getBoolean("deadline_expired")), limit);
     }
 
     List<PendingAgentRun> queuedRuns(int limit) {
         return jdbc.query("""
-                SELECT tenant_id, subject_type, subject_id, run_id
+                SELECT tenant_id, subject_type, subject_issuer, subject_id, run_id
                 FROM tianji_agent.agent_run
                 WHERE status = 'QUEUED' AND cancel_requested_at IS NULL AND deadline_at > clock_timestamp()
                 ORDER BY created_at, run_id LIMIT ?
                 """, (rs, row) -> new PendingAgentRun(new TrustedAgentActor(rs.getLong("tenant_id"),
-                TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id")),
+                TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id"), rs.getString("subject_issuer")),
                 new GetAgentRunQuery(rs.getString("run_id"))), limit);
     }
 
     int insertCancelReceipt(TrustedAgentActor actor, String commandId, String hash, String runId, Instant now) {
         return jdbc.update("""
                 INSERT INTO tianji_agent.agent_run_command_receipt
-                    (tenant_id, subject_type, subject_id, command_id, operation, request_hash, run_id, created_at)
-                VALUES (?, ?, ?, ?, 'CANCEL', ?, ?, ?)
-                ON CONFLICT (tenant_id, subject_type, subject_id, operation, command_id) DO NOTHING
-                """, actor.tenantId(), actor.subjectType().name(), actor.subjectId(), commandId, hash, runId,
+                    (tenant_id, subject_type, subject_issuer, subject_id, command_id, operation, request_hash, run_id, created_at)
+                VALUES (?, ?, ?, ?, ?, 'CANCEL', ?, ?, ?)
+                ON CONFLICT (tenant_id, subject_type, subject_issuer, subject_id, operation, command_id) DO NOTHING
+                """, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId, hash, runId,
                 Timestamp.from(now));
     }
 
     Optional<CancelReceipt> cancelReceipt(TrustedAgentActor actor, String commandId) {
         return jdbc.query("""
                 SELECT request_hash, result::text AS result FROM tianji_agent.agent_run_command_receipt
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND operation = 'CANCEL' AND command_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND operation = 'CANCEL' AND command_id = ?
                 """, (rs, row) -> new CancelReceipt(rs.getString("request_hash"), rs.getString("result")),
-                actor.tenantId(), actor.subjectType().name(), actor.subjectId(), commandId).stream().findFirst();
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId).stream().findFirst();
     }
 
     void completeCancelReceipt(TrustedAgentActor actor, String commandId, String resultJson) {
         int updated = jdbc.update("""
                 UPDATE tianji_agent.agent_run_command_receipt SET result = CAST(? AS jsonb)
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND operation = 'CANCEL' AND command_id = ?
-                """, resultJson, actor.tenantId(), actor.subjectType().name(), actor.subjectId(), commandId);
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND operation = 'CANCEL' AND command_id = ?
+                """, resultJson, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId);
         if (updated != 1) {
             throw new IllegalStateException("Agent cancellation receipt is missing");
         }
@@ -263,10 +263,10 @@ final class JdbcAgentLedgerRepository {
                 UPDATE tianji_agent.agent_run
                 SET cancel_requested_at = clock_timestamp(), revision = revision + 1,
                     last_event_sequence = last_event_sequence + 1
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status = 'RUNNING' AND cancel_requested_at IS NULL
                 RETURNING *
-                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, expectedRevision).stream().findFirst();
     }
 
@@ -279,10 +279,10 @@ final class JdbcAgentLedgerRepository {
                     result = CAST(? AS jsonb), finished_at = clock_timestamp(),
                     lease_epoch = lease_epoch + 1, lease_owner = NULL, lease_expires_at = NULL,
                     active_model_calls = 0, active_tool_calls = 0
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND revision = ? AND status IN ('CREATED', 'QUEUED', 'WAITING', 'SUSPENDED')
                 RETURNING *
-                """, runMapper(), resultJson, actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, runMapper(), resultJson, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, expectedRevision).stream().findFirst();
     }
 
@@ -302,7 +302,7 @@ final class JdbcAgentLedgerRepository {
         String sql = """
                 SELECT b.* FROM tianji_agent.agent_budget_reservation b
                 JOIN tianji_agent.agent_run r ON r.tenant_id = b.tenant_id AND r.run_id = b.run_id
-                WHERE r.tenant_id = ? AND r.subject_type = ? AND r.subject_id = ?
+                WHERE r.tenant_id = ? AND r.subject_type = ? AND r.subject_issuer = ? AND r.subject_id = ?
                   AND b.run_id = ? AND b.reservation_id = ?
                 """ + (lock ? " FOR UPDATE OF b" : "");
         return jdbc.query(sql, (rs, row) -> new AgentBudgetReservation(rs.getString("reservation_id"),
@@ -310,18 +310,18 @@ final class JdbcAgentLedgerRepository {
                 rs.getString("tool_version"), rs.getLong("input_tokens"), rs.getLong("output_tokens"), rs.getBigDecimal("estimated_cost"),
                 AgentBudgetReservation.State.valueOf(rs.getString("state")),
                 rs.getObject("actual_input_tokens", Long.class), rs.getObject("actual_output_tokens", Long.class),
-                rs.getBigDecimal("actual_cost"), false), actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                rs.getBigDecimal("actual_cost"), false), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 runId, reservationId).stream().findFirst();
     }
 
     boolean validLease(TrustedAgentActor actor, AgentRunLease lease) {
         Boolean valid = jdbc.queryForObject("""
                 SELECT EXISTS(SELECT 1 FROM tianji_agent.agent_run
-                  WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                  WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                     AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                     AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
                     AND cancel_requested_at IS NULL)
-                """, Boolean.class, actor.tenantId(), actor.subjectType().name(), actor.subjectId(),
+                """, Boolean.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 lease.runId(), lease.owner(), lease.epoch());
         return Boolean.TRUE.equals(valid);
     }
@@ -329,12 +329,12 @@ final class JdbcAgentLedgerRepository {
     boolean lockLeaseForSettlement(TrustedAgentActor actor, AgentRunLease lease) {
         return !jdbc.query("""
                 SELECT run_id FROM tianji_agent.agent_run
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp()
                 FOR UPDATE
                 """, (rs, row) -> rs.getString("run_id"), actor.tenantId(), actor.subjectType().name(),
-                actor.subjectId(), lease.runId(), lease.owner(), lease.epoch()).isEmpty();
+                actor.issuerFingerprint(), actor.subjectId(), lease.runId(), lease.owner(), lease.epoch()).isEmpty();
     }
 
     int reserveBudget(TrustedAgentActor actor, AgentRunLease lease, AgentBudgetRequest request,
@@ -349,7 +349,7 @@ final class JdbcAgentLedgerRepository {
                     active_tool_calls = active_tool_calls + CASE WHEN ? = 'TOOL' THEN 1 ELSE 0 END,
                     input_tokens_reserved = input_tokens_reserved + ?, output_tokens_reserved = output_tokens_reserved + ?,
                     estimated_cost_reserved = estimated_cost_reserved + ?
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp() AND deadline_at > clock_timestamp()
                   AND cancel_requested_at IS NULL
@@ -360,7 +360,7 @@ final class JdbcAgentLedgerRepository {
                   AND (? = false OR estimated_cost_reserved <= ? - ?)
                 """, request.kind().name(), request.kind().name(), request.kind().name(), request.kind().name(),
                 request.inputTokens(), request.outputTokens(), cost,
-                actor.tenantId(), actor.subjectType().name(), actor.subjectId(), lease.runId(), lease.owner(), lease.epoch(),
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), lease.runId(), lease.owner(), lease.epoch(),
                 request.kind().name(), policy.maxModelCalls(), request.kind().name(), policy.maxToolCalls(),
                 policy.maxParallelism(),
                 policy.maxInputTokens(), request.inputTokens(), policy.maxOutputTokens(), request.outputTokens(),
@@ -372,11 +372,11 @@ final class JdbcAgentLedgerRepository {
                 SELECT model_calls_reserved, tool_calls_reserved, active_model_calls, active_tool_calls,
                        input_tokens_reserved, output_tokens_reserved, estimated_cost_reserved
                 FROM tianji_agent.agent_run
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                 """, (rs, row) -> new BudgetCounters(rs.getInt("model_calls_reserved"), rs.getInt("tool_calls_reserved"),
                 rs.getInt("active_model_calls"), rs.getInt("active_tool_calls"), rs.getLong("input_tokens_reserved"),
                 rs.getLong("output_tokens_reserved"), rs.getBigDecimal("estimated_cost_reserved")),
-                actor.tenantId(), actor.subjectType().name(), actor.subjectId(), runId);
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId);
     }
 
     int adjustBudget(TrustedAgentActor actor, AgentRunLease lease, AgentBudgetRequest.Kind kind,
@@ -387,14 +387,14 @@ final class JdbcAgentLedgerRepository {
                     estimated_cost_reserved = estimated_cost_reserved + ?,
                     active_model_calls = active_model_calls - CASE WHEN ? = 'MODEL' THEN 1 ELSE 0 END,
                     active_tool_calls = active_tool_calls - CASE WHEN ? = 'TOOL' THEN 1 ELSE 0 END
-                WHERE tenant_id = ? AND subject_type = ? AND subject_id = ? AND run_id = ?
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND status = 'RUNNING' AND lease_owner = ? AND lease_epoch = ?
                   AND lease_expires_at > clock_timestamp()
                   AND input_tokens_reserved + ? >= 0 AND output_tokens_reserved + ? >= 0
                   AND estimated_cost_reserved + ? >= 0
                   AND (? <> 'MODEL' OR active_model_calls > 0) AND (? <> 'TOOL' OR active_tool_calls > 0)
                 """, inputDelta, outputDelta, costDelta, kind.name(), kind.name(), actor.tenantId(),
-                actor.subjectType().name(), actor.subjectId(), lease.runId(), lease.owner(), lease.epoch(),
+                actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), lease.runId(), lease.owner(), lease.epoch(),
                 inputDelta, outputDelta, costDelta, kind.name(), kind.name());
     }
 

@@ -11,6 +11,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermissions;
+import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentSessionDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentSessionListDTO;
@@ -33,7 +34,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 class AgentSessionHttpTest {
     private static final String BASE = "/api/tianji/v1/agent-sessions";
-    private static final TrustedAgentActor ACTOR = new TrustedAgentActor(20, TrustedAgentActor.SubjectType.SERVICE, "worker");
+    private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/issuer");
     private final AgentSessionManager sessions = mock(AgentSessionManager.class);
     private final PermissionExecutionGuard guard = mock(PermissionExecutionGuard.class);
     private final Instant now = Instant.now();
@@ -49,6 +50,7 @@ class AgentSessionHttpTest {
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(identity, List.of(),
                 URI.create("https://idp.example/issuer")));
         mvc = MockMvcBuilders.standaloneSetup(new AgentSessionController(sessions, new TianjiAgentAccess(guard, Clock.systemUTC())))
+                .addFilters(new VerifiedAgentIssuerFilter())
                 .setControllerAdvice(new AgentApiErrors()).build();
     }
 

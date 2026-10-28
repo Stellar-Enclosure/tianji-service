@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.aopalliance.intercept.MethodInvocation;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -89,6 +90,7 @@ class TianjiPermissionIntegrationTest {
             AuthenticationContext.of("PASSWORD", NOW.minusSeconds(60)));
     private final PermissionManifest manifest = manifest();
     private final AtomicReference<Set<String>> granted = new AtomicReference<>(Set.of(TianjiAgentPermissions.READ));
+    private final AtomicReference<String> snapshotIssuer = new AtomicReference<>("https://idp.example/tenants/20");
     private final Rbac3AuthorizationClient client = new Rbac3AuthorizationClient() {
         @Override public SystemAuthorizationSnapshot fetch(String system, IdentityPrincipal principal) {
             return snapshot(granted.get());
@@ -102,6 +104,13 @@ class TianjiPermissionIntegrationTest {
         }
     };
 
+    @BeforeEach
+    void bindIssuer() {
+        var request = new MockHttpServletRequest();
+        request.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, "https://idp.example/tenants/20");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+    }
+
     @AfterEach
     void clear() {
         SecurityContextHolder.clearContext();
@@ -112,12 +121,13 @@ class TianjiPermissionIntegrationTest {
     void user_needs_current_permission_scope_and_verified_request_token() {
         var request = new MockHttpServletRequest();
         VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        request.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, "https://idp.example/tenants/20");
         RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
         SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
                 new Rbac3UserDetails(USER, snapshot(granted.get())),
                 List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
         TianjiAgentAccess access = access();
-        assertEquals(new TrustedAgentActor(20, TrustedAgentActor.SubjectType.USER, "alice"),
+        assertEquals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/tenants/20"),
                 access.require(TianjiAgentPermissions.GET_API).actor());
         granted.set(Set.of());
         assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
@@ -139,10 +149,10 @@ class TianjiPermissionIntegrationTest {
                 "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(),
                 URI.create("https://idp.example/tenants/20")));
-        assertEquals(new TrustedAgentActor(20, TrustedAgentActor.SubjectType.SERVICE, "worker"),
+        assertEquals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/tenants/20"),
                 access().require(TianjiAgentPermissions.GET_API).actor());
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal));
-        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+        assertThrows(org.springframework.security.authentication.AuthenticationCredentialsNotFoundException.class,
                 () -> access().require(TianjiAgentPermissions.GET_API));
     }
 
@@ -161,7 +171,7 @@ class TianjiPermissionIntegrationTest {
                 "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(both, List.of(),
                 URI.create("https://idp.example/tenants/20")));
-        assertEquals(new TrustedAgentActor(20, TrustedAgentActor.SubjectType.SERVICE, "worker"),
+        assertEquals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/tenants/20"),
                 access().require(TianjiAgentPermissions.SESSION_START_API).actor());
     }
 
@@ -169,6 +179,7 @@ class TianjiPermissionIntegrationTest {
     void session_read_and_delete_require_current_permissions_and_oauth_scopes() {
         var request = new MockHttpServletRequest();
         VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        request.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, "https://idp.example/tenants/20");
         RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
         granted.set(Set.of(TianjiAgentPermissions.START));
         SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
@@ -224,7 +235,7 @@ class TianjiPermissionIntegrationTest {
         var loader = new AuthorizationSnapshotLoader(client, "tianji", CLOCK);
         var rbacFilter = new Rbac3BearerAuthenticationFilter(loader, new com.fasterxml.jackson.databind.ObjectMapper());
         var ledger = mock(AgentLedgerService.class);
-        var actor = new TrustedAgentActor(20, TrustedAgentActor.SubjectType.USER, "alice");
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/tenants/20");
         var sessions = mock(AgentSessionManager.class);
         when(sessions.list(actor)).thenReturn(new AgentSessionListDTO(List.of(new AgentSessionDTO("session-1", NOW))));
         var run = new AgentRunDTO("run-1", "research", 1, null, AgentRunStatusEnum.COMPLETED, null,
@@ -285,12 +296,18 @@ class TianjiPermissionIntegrationTest {
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isForbidden());
                     granted.set(Set.of(TianjiAgentPermissions.READ));
+                    snapshotIssuer.set("https://another-idp.example/tenants/20");
+                    mvc.perform(get("/api/tianji/v1/agent-runs/run-1")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
+                    snapshotIssuer.set("https://idp.example/tenants/20");
                     var result = mvc.perform(get("/api/tianji/v1/agent-runs/run-1/events")
                                     .header("Authorization", "Bearer verified-test-token")
                                     .accept(MediaType.TEXT_EVENT_STREAM))
                             .andExpect(status().isOk()).andReturn();
                     assertTrue(result.getResponse().getContentAsString().contains("event: stream.complete"));
                     assertThrows(IllegalStateException.class, () -> VerifiedUserTokenCarrier.current(result.getRequest()));
+                    assertNull(result.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
                     assertNull(SecurityContextHolder.getContext().getAuthentication());
                 }));
     }
@@ -386,7 +403,7 @@ class TianjiPermissionIntegrationTest {
     }
 
     private SystemAuthorizationSnapshot snapshot(Set<String> permissions) {
-        var view = new EffectivePermissionSnapshot("https://idp.example/tenants/20", USER.subject(), SCOPE,
+        var view = new EffectivePermissionSnapshot(snapshotIssuer.get(), USER.subject(), SCOPE,
                 "1", "2", "3", new EffectivePermissionSnapshot.ActiveRoleContext("tianji", List.of("50"), List.of("50")),
                 permissions.stream().sorted().toList(), NOW.plusSeconds(30));
         return new SystemAuthorizationSnapshot("20", USER.subject(), "60", "tianji", 2, 3, List.of("50"),

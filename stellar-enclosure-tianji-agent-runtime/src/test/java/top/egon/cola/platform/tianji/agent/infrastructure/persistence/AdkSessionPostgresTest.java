@@ -124,6 +124,47 @@ class AdkSessionPostgresTest {
     }
 
     @Test
+    void same_subject_from_distinct_issuers_has_separate_sessions_state_and_run_fences() {
+        long tenant = PostgresTestDatabase.nextTenant();
+        var first = TrustedAgentActor.verified(tenant, USER, "alice", "https://idp-a.example/tenant");
+        var second = TrustedAgentActor.verified(tenant, USER, "alice", "https://idp-b.example/tenant");
+        var legacy = new TrustedAgentActor(tenant, USER, "alice");
+        var firstStore = service(first, true);
+        var secondStore = service(second, false);
+        var legacyStore = service(legacy, false);
+        firstStore.createSession("tianji", firstStore.adkUserId(),
+                Map.of("app:shared", "team", "user:color", "first", "local", "first"), "same-session").blockingGet();
+        secondStore.createSession("tianji", secondStore.adkUserId(),
+                Map.of("user:color", "second", "local", "second"), "same-session").blockingGet();
+        legacyStore.createSession("tianji", legacyStore.adkUserId(),
+                Map.of("user:color", "legacy", "local", "legacy"), "same-session").blockingGet();
+        assertEquals("team", secondStore.getSession("tianji", secondStore.adkUserId(), "same-session", Optional.empty())
+                .blockingGet().state().get("app:shared"));
+        assertEquals("first", firstStore.getSession("tianji", firstStore.adkUserId(), "same-session", Optional.empty())
+                .blockingGet().state().get("user:color"));
+        assertEquals("second", secondStore.getSession("tianji", secondStore.adkUserId(), "same-session", Optional.empty())
+                .blockingGet().state().get("user:color"));
+        assertEquals("legacy", legacyStore.getSession("tianji", legacyStore.adkUserId(), "same-session", Optional.empty())
+                .blockingGet().state().get("user:color"));
+        AgentRunLease firstRun = claim(first, "same-session", "first-issuer");
+        AgentRunLease secondRun = claim(second, "same-session", "second-issuer");
+        SessionLease firstLease = firstStore.acquireSessionLease("same-session", firstRun, Duration.ofSeconds(30));
+        SessionLease secondLease = secondStore.acquireSessionLease("same-session", secondRun, Duration.ofSeconds(30));
+        assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class,
+                () -> secondStore.withLease(firstLease)).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class,
+                () -> secondStore.acquireSessionLease("same-session", firstRun, Duration.ofSeconds(30))).code());
+        var bound = firstStore.withLease(firstLease);
+        Session current = bound.getSession("tianji", bound.adkUserId(), "same-session", Optional.empty()).blockingGet();
+        bound.appendEvent(current, event("first-only", 1_000, Map.of("user:color", "changed"))).blockingGet();
+        Session untouched = secondStore.withLease(secondLease).getSession("tianji", secondStore.adkUserId(), "same-session", Optional.empty()).blockingGet();
+        assertTrue(untouched.immutableEvents().isEmpty());
+        assertEquals("second", untouched.state().get("user:color"));
+        assertEquals("legacy", legacyStore.getSession("tianji", legacyStore.adkUserId(), "same-session", Optional.empty())
+                .blockingGet().state().get("user:color"));
+    }
+
+    @Test
     void a_run_requires_an_owned_session_and_active_runs_block_deletion() {
         TrustedAgentActor owner = actor("owner");
         TrustedAgentActor other = new TrustedAgentActor(owner.tenantId(), USER, "other");

@@ -33,15 +33,19 @@ public final class TianjiAgentAccess {
     public Authorized require(String resourceKey) {
         Authentication initial = SecurityContextHolder.getContext().getAuthentication();
         IdpPrincipal original = identity(initial);
+        String originalIssuer = issuer(initial);
+        String requestIssuer = requestIssuer();
+        if (!requestIssuer.equals(originalIssuer)) throw new AccessDeniedException("identity issuer mismatch");
         if (!original.expiresAt().isAfter(clock.instant())) {
             throw new AuthenticationCredentialsNotFoundException("identity expired");
         }
         permissions.requireExecution(resourceKey);
         Authentication current = SecurityContextHolder.getContext().getAuthentication();
         IdpPrincipal verified = identity(current);
+        String verifiedIssuer = issuer(current);
         if (!original.subject().equals(verified.subject()) || !Objects.equals(original.tenantId(), verified.tenantId())
                 || original.principalType() != verified.principalType() || !original.tokenId().equals(verified.tokenId())
-                || !original.expiresAt().equals(verified.expiresAt())) {
+                || !original.expiresAt().equals(verified.expiresAt()) || !requestIssuer.equals(verifiedIssuer)) {
             throw new AccessDeniedException("identity changed during authorization");
         }
         if (!verified.expiresAt().isAfter(clock.instant())) {
@@ -65,7 +69,8 @@ public final class TianjiAgentAccess {
         }
         TrustedAgentActor.SubjectType type = verified instanceof ServiceIdentityPrincipal
                 ? TrustedAgentActor.SubjectType.SERVICE : TrustedAgentActor.SubjectType.USER;
-        return new Authorized(new TrustedAgentActor(tenant, type, verified.subject()), verified.expiresAt());
+        try { return new Authorized(TrustedAgentActor.verified(tenant, type, verified.subject(), verifiedIssuer), verified.expiresAt()); }
+        catch (IllegalArgumentException invalid) { throw new AccessDeniedException("identity subject is invalid"); }
     }
 
     private static IdpPrincipal identity(Authentication authentication) {
@@ -76,6 +81,24 @@ public final class TianjiAgentAccess {
         if (authentication instanceof IdpAuthenticationToken service
                 && service.getPrincipal() instanceof ServiceIdentityPrincipal principal) return principal;
         throw new AuthenticationCredentialsNotFoundException("verified identity required");
+    }
+
+    private static String issuer(Authentication authentication) {
+        if (authentication instanceof Rbac3AuthenticationToken user) {
+            var snapshot = user.getPrincipal().snapshot().permissionSnapshot();
+            if (snapshot != null) return snapshot.issuer();
+        } else if (authentication instanceof IdpAuthenticationToken service) {
+            try { return service.verifiedIssuer().toString(); }
+            catch (IllegalStateException missing) { throw new AuthenticationCredentialsNotFoundException("verified issuer required"); }
+        }
+        throw new AuthenticationCredentialsNotFoundException("verified issuer required");
+    }
+
+    private static String requestIssuer() {
+        if (RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes servlet
+                && servlet.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE) instanceof String issuer
+                && !issuer.isBlank()) return issuer;
+        throw new AuthenticationCredentialsNotFoundException("verified request issuer required");
     }
 
     public record Authorized(TrustedAgentActor actor, Instant expiresAt) { }

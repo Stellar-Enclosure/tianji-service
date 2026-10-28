@@ -10,12 +10,16 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermissions;
+import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
@@ -50,7 +54,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 class AgentRunHttpTest {
     private static final String BASE = "/api/tianji/v1/agent-runs";
-    private static final TrustedAgentActor ACTOR = new TrustedAgentActor(20, TrustedAgentActor.SubjectType.SERVICE, "worker");
+    private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/issuer");
     private final AgentLedgerService ledger = mock(AgentLedgerService.class);
     private final PermissionExecutionGuard guard = mock(PermissionExecutionGuard.class);
     private final JsonMapper mapper = JsonMapper.builder().build();
@@ -68,11 +72,12 @@ class AgentRunHttpTest {
         var stream = new AgentRunEventStream(ledger, access, Clock.systemUTC());
         mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access),
                 new AgentRunSseController(access, stream))
+                .addFilters(new VerifiedAgentIssuerFilter())
                 .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
     }
 
     @AfterEach
-    void clear() { SecurityContextHolder.clearContext(); }
+    void clear() { SecurityContextHolder.clearContext(); RequestContextHolder.resetRequestAttributes(); }
 
     @Test
     void starts_under_the_verified_actor_and_maps_not_ready_and_not_found() throws Exception {
@@ -100,6 +105,9 @@ class AgentRunHttpTest {
         var command = new StartAgentRunCommand("research", 1, "session-1", "request-1", null, null,
                 new AgentInputDTO("question", List.of(), Map.of()), null);
         doThrow(new AccessDeniedException("denied")).when(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);
+        var request = new MockHttpServletRequest();
+        request.setAttribute(VerifiedAgentIssuerFilter.class.getName() + ".issuer", "https://idp.example/issuer");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
         var controller = new AgentRunController(ledger, new TianjiAgentAccess(guard, Clock.systemUTC()));
         assertThrows(AccessDeniedException.class, () -> controller.startWithSession(command));
         verify(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);

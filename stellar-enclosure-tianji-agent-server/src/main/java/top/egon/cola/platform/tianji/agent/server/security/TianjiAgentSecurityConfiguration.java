@@ -70,7 +70,8 @@ public class TianjiAgentSecurityConfiguration {
             }
             http.addFilterBefore(identity, AnonymousAuthenticationFilter.class);
             http.addFilterBefore(new RequestContextFilter(), IdpBearerAuthenticationFilter.class);
-            http.addFilterAfter(authorization, IdpBearerAuthenticationFilter.class);
+            http.addFilterAfter(new VerifiedAgentIssuerFilter(), IdpBearerAuthenticationFilter.class);
+            http.addFilterAfter(authorization, VerifiedAgentIssuerFilter.class);
         }
         return http.build();
     }

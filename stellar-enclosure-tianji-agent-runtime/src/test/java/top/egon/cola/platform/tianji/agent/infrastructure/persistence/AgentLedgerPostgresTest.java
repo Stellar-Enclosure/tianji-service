@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
+import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
@@ -133,6 +134,41 @@ class AgentLedgerPostgresTest {
         }
         AgentRunDTO sameKeyOtherSubject = ledger.start(service, command("key", "question", "trace"));
         assertNotEquals(run.runId(), sameKeyOtherSubject.runId());
+    }
+
+    @Test
+    void same_subject_from_distinct_issuers_has_distinct_runs_receipts_and_leases() {
+        long tenant = PostgresTestDatabase.nextTenant();
+        var first = TrustedAgentActor.verified(tenant, USER, "alice", "https://idp-a.example/tenant");
+        var second = TrustedAgentActor.verified(tenant, USER, "alice", "https://idp-b.example/tenant");
+        var legacy = new TrustedAgentActor(tenant, USER, "alice");
+        ledger.publish(first, spec(Map.of()));
+        var command = command("same-key", "question", "trace");
+        var firstRun = ledger.start(first, command);
+        var secondRun = ledger.start(second, command);
+        var legacyRun = ledger.start(legacy, command);
+        assertNotEquals(firstRun.runId(), secondRun.runId());
+        assertNotEquals(firstRun.runId(), legacyRun.runId());
+        assertEquals(firstRun.runId(), ledger.start(first, command).runId());
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> ledger.get(second, new GetAgentRunQuery(firstRun.runId()))).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> ledger.cancel(second, new CancelAgentRunCommand(firstRun.runId(), "foreign", 0, "test"))).code());
+        assertEquals(List.of(firstRun.runId()), ledger.list(first, new ListAgentRunsQuery(null, 10)).items().stream().map(AgentRunDTO::runId).toList());
+        assertEquals(List.of(secondRun.runId()), ledger.list(second, new ListAgentRunsQuery(null, 10)).items().stream().map(AgentRunDTO::runId).toList());
+        var pending = ledger.pendingRuns(1000).stream().filter(item -> item.query().runId().equals(firstRun.runId())).findFirst().orElseThrow();
+        assertEquals(first, pending.actor());
+        var claimed = ledger.claim(first, new GetAgentRunQuery(firstRun.runId()), 0, "issuer-worker", Duration.ofSeconds(30));
+        assertThrows(AgentLedgerException.class, () -> ledger.heartbeat(second, claimed.lease(), Duration.ofSeconds(30)));
+        ledger.cancel(second, new CancelAgentRunCommand(secondRun.runId(), "same-cancel", 0, "test"));
+        ledger.cancel(legacy, new CancelAgentRunCommand(legacyRun.runId(), "same-cancel", 0, "test"));
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run_command_receipt "
+                + "WHERE tenant_id=? AND command_id='same-cancel'", Integer.class, tenant));
+        var overdue = ledger.start(first, command("overdue", "question", "trace"));
+        jdbc.update("UPDATE tianji_agent.agent_run SET deadline_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=?",
+                tenant, overdue.runId());
+        assertTrue(ledger.reconcileDue(1000) > 0);
+        assertEquals(TIMED_OUT, ledger.get(first, new GetAgentRunQuery(overdue.runId())).status());
     }
 
     @Test

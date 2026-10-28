@@ -62,6 +62,11 @@ class AdkSessionMigrationPostgresTest {
                 VALUES (91, 'legacy-run', 'legacy', 1, 'USER', 'alice', 'legacy-request', ?,
                         'legacy-session', 'QUEUED', clock_timestamp()+interval '1 hour', '{}'::jsonb, clock_timestamp())
                 """, "b".repeat(64));
+        jdbc.update("""
+                INSERT INTO tianji_agent.agent_run_command_receipt
+                    (tenant_id, subject_type, subject_id, command_id, operation, request_hash, run_id, created_at)
+                VALUES (91, 'USER', 'alice', 'legacy-cancel', 'CANCEL', ?, 'legacy-run', clock_timestamp())
+                """, "c".repeat(64));
 
         Flyway version3 = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
                 .locations("classpath:db/tianji-agent").target("3").cleanDisabled(true).load();
@@ -96,6 +101,10 @@ class AdkSessionMigrationPostgresTest {
                 VALUES (91, 'USER', 'alice', 'tianji', 'legacy-session', 1, 'legacy-event', 1000, ?)
                 """, envelope.toString());
 
+        Flyway version4 = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
+                .locations("classpath:db/tianji-agent").target("4").cleanDisabled(true).load();
+        assertEquals(1, version4.migrate().migrationsExecuted);
+        Integer v4Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='4'", Integer.class);
         Flyway current = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
                 .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
         assertEquals(1, current.migrate().migrationsExecuted);
@@ -108,12 +117,17 @@ class AdkSessionMigrationPostgresTest {
                 });
         assertEquals(before, after);
         assertEquals(v3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='3'", Integer.class));
+        assertEquals(v4Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_agent.flyway_schema_history WHERE version='4'", Integer.class));
         assertEquals("legacy-session", jdbc.queryForObject("SELECT session_id FROM tianji_agent.agent_run "
                 + "WHERE tenant_id=91 AND run_id='legacy-run'", String.class));
         assertEquals("QUEUED", jdbc.queryForObject("SELECT status FROM tianji_agent.agent_run "
                 + "WHERE tenant_id=91 AND run_id='legacy-run'", String.class));
         assertEquals(1, jdbc.queryForObject("SELECT state_codec_version FROM tianji_agent.agent_session WHERE session_id='legacy-session'", Integer.class));
         assertEquals(1, jdbc.queryForObject("SELECT value_codec_version FROM tianji_agent.agent_session_scope_state WHERE state_key='color'", Integer.class));
+        assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_agent.agent_run WHERE run_id='legacy-run'", String.class));
+        assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_agent.agent_session WHERE session_id='legacy-session'", String.class));
+        assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_agent.agent_session_event WHERE native_event_id='legacy-event'", String.class));
+        assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_agent.agent_run_command_receipt WHERE command_id='legacy-cancel'", String.class));
 
         TrustedAgentActor owner = new TrustedAgentActor(91, USER, "alice");
         PostgresAdkSessionService sessions = new PostgresAdkSessionService(source, owner, "tianji");
@@ -122,6 +136,9 @@ class AdkSessionMigrationPostgresTest {
         assertEquals(List.of("long", "1"), restored.state().get("shape"));
         assertEquals("blue", restored.state().get("user:color"));
         assertEquals("legacy-event", restored.immutableEvents().getFirst().id());
+        TrustedAgentActor verified = TrustedAgentActor.verified(91, USER, "alice", "https://idp.example/tenants/91");
+        PostgresAdkSessionService isolated = new PostgresAdkSessionService(source, verified, "tianji");
+        assertNull(isolated.getSession("tianji", isolated.adkUserId(), "legacy-session", Optional.empty()).blockingGet());
         assertEquals(AgentErrorCodeEnum.TIANJI_SESSION_BUSY, assertThrows(AgentLedgerException.class,
                 () -> sessions.deleteSession("tianji", sessions.adkUserId(), "legacy-session").blockingAwait()).code());
     }
