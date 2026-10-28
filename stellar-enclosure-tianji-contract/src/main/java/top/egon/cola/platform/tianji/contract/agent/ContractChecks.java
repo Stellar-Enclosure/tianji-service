@@ -27,6 +27,19 @@ final class ContractChecks {
         return value == null ? null : required(value, name, maxLength);
     }
 
+    static String sessionId(String value) {
+        String id = required(value, "sessionId", 128);
+        for (int i = 0; i < id.length(); i++) {
+            char character = id.charAt(i);
+            if (character < 32 || character == 127 || Character.isLowSurrogate(character)
+                    || Character.isHighSurrogate(character)
+                    && (i + 1 >= id.length() || !Character.isLowSurrogate(id.charAt(++i)))) {
+                throw new IllegalArgumentException("sessionId contains invalid characters");
+            }
+        }
+        return id;
+    }
+
     static Map<String, Object> jsonObject(Map<String, ?> source) {
         if (source == null || source.isEmpty()) {
             return Map.of();

@@ -7,9 +7,15 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionClient;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionListDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
+import top.egon.cola.platform.tianji.contract.agent.CreateAgentSessionCommand;
+import top.egon.cola.platform.tianji.contract.agent.DeleteAgentSessionCommand;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
@@ -31,8 +37,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
 
-/** JDK HTTP transport for the engine-neutral Agent contract. Writes are never retried automatically. */
-public final class HttpAgentClient implements AgentClient {
+/** JDK HTTP transport for the engine-neutral Agent contract. It does not initiate write retries. */
+public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     private static final int MAX_JSON_BYTES = 2_097_152;
     private final URI baseUri;
     private final HttpClient http;
@@ -71,7 +77,8 @@ public final class HttpAgentClient implements AgentClient {
 
     @Override
     public AgentRunDTO start(StartAgentRunCommand command) {
-        return call("POST", path(""), Objects.requireNonNull(command, "command"), AgentRunDTO.class);
+        Objects.requireNonNull(command, "command");
+        return call("POST", path(command.sessionId() == null ? "" : "with-session"), command, AgentRunDTO.class);
     }
 
     @Override
@@ -106,13 +113,40 @@ public final class HttpAgentClient implements AgentClient {
                 requestTimeout, cursor -> eventRequest(query, cursor), this::error);
     }
 
+    @Override
+    public AgentSessionDTO createSession(CreateAgentSessionCommand command) {
+        Objects.requireNonNull(command, "command");
+        return call("PUT", sessionPath("", command.sessionId()), null, AgentSessionDTO.class, command.sessionId());
+    }
+
+    @Override
+    public AgentSessionDTO getSession(GetAgentSessionQuery query) {
+        Objects.requireNonNull(query, "query");
+        return call("GET", sessionPath("/detail", query.sessionId()), null, AgentSessionDTO.class, query.sessionId());
+    }
+
+    @Override
+    public AgentSessionListDTO listSessions() {
+        return call("GET", sessionPath("", null), null, AgentSessionListDTO.class);
+    }
+
+    @Override
+    public void deleteSession(DeleteAgentSessionCommand command) {
+        Objects.requireNonNull(command, "command");
+        call("DELETE", sessionPath("", command.sessionId()), null, Void.class);
+    }
+
     private <T> T call(String method, URI uri, Object body, Class<T> type) {
+        return call(method, uri, body, type, null);
+    }
+
+    private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId) {
         byte[] bytes = body == null ? null : mapper.writeValueAsBytes(body);
         if (bytes != null && bytes.length > MAX_JSON_BYTES) {
             throw new IllegalArgumentException("Agent request exceeds its size limit");
         }
         HttpRequest.Builder builder = request(uri).timeout(requestTimeout).header("Accept", "application/json");
-        HttpRequest request = body == null ? builder.GET().build()
+        HttpRequest request = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json")
                         .method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
         var call = http.sendAsync(request, info -> new BoundedBodySubscriber(MAX_JSON_BYTES));
@@ -121,8 +155,19 @@ public final class HttpAgentClient implements AgentClient {
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 throw error(response, response.body());
             }
+            if (type == Void.class) {
+                if (response.statusCode() != 204) {
+                    throw new AgentClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
+                }
+                return null;
+            }
             try {
-                return mapper.readValue(response.body(), type);
+                T value = mapper.readValue(response.body(), type);
+                if (expectedSessionId != null && (!(value instanceof AgentSessionDTO session)
+                        || !expectedSessionId.equals(session.sessionId()))) {
+                    throw new AgentClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
+                }
+                return value;
             } catch (RuntimeException invalid) {
                 throw new AgentClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
             }
@@ -162,6 +207,11 @@ public final class HttpAgentClient implements AgentClient {
 
     private URI path(String suffix) {
         return baseUri.resolve("api/tianji/v1/agent-runs" + (suffix.isEmpty() ? "" : "/" + suffix));
+    }
+
+    private URI sessionPath(String suffix, String sessionId) {
+        String query = sessionId == null ? "" : "?sessionId=" + URLEncoder.encode(sessionId, StandardCharsets.UTF_8);
+        return baseUri.resolve("api/tianji/v1/agent-sessions" + suffix + query);
     }
 
     private static String segment(String value) {

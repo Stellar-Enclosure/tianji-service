@@ -88,4 +88,15 @@ class AgentContractTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new AgentUsageDTO(AgentUsageKindEnum.ACTUAL, -1L, null, null, null, null, null));
     }
+
+    @Test
+    void session_commands_accept_unicode_but_reject_control_and_invalid_surrogate_characters() {
+        assertEquals("会话/😀 +", new CreateAgentSessionCommand("会话/😀 +").sessionId());
+        assertThrows(IllegalArgumentException.class, () -> new CreateAgentSessionCommand("bad\nvalue"));
+        assertThrows(IllegalArgumentException.class, () -> new GetAgentSessionQuery("bad\ud800"));
+        assertThrows(IllegalArgumentException.class, () -> new DeleteAgentSessionCommand("bad\udc00"));
+        assertThrows(IllegalArgumentException.class,
+                () -> new StartAgentRunCommand("review", 1, "bad\ud800", "key", null, null,
+                        new AgentInputDTO("text", null, null), null));
+    }
 }

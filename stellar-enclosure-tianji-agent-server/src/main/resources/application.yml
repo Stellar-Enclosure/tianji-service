@@ -24,3 +24,4 @@ egon:
               TIANJI_AGENT_START: ["tianji:agent:start"]
               TIANJI_AGENT_READ: ["tianji:agent:read"]
               TIANJI_AGENT_CANCEL: ["tianji:agent:cancel"]
+              TIANJI_SESSION_DELETE: ["tianji:session:delete"]

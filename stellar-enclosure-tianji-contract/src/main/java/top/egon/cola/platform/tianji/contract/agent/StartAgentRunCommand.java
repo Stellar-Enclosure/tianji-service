@@ -11,7 +11,7 @@ public record StartAgentRunCommand(String definitionKey, long definitionVersion,
         if (definitionVersion <= 0) {
             throw new IllegalArgumentException("definitionVersion must be positive");
         }
-        sessionId = ContractChecks.optional(sessionId, "sessionId", 128);
+        sessionId = sessionId == null ? null : ContractChecks.sessionId(sessionId);
         idempotencyKey = ContractChecks.required(idempotencyKey, "idempotencyKey", 128);
         businessKey = ContractChecks.optional(businessKey, "businessKey", 256);
         correlationId = ContractChecks.optional(correlationId, "correlationId", 128);

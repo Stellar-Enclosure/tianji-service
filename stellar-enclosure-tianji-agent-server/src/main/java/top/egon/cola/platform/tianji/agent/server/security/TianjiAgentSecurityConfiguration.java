@@ -15,12 +15,14 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.web.filter.RequestContextFilter;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunEventStream;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
 
+import javax.sql.DataSource;
 import java.time.Clock;
 import java.util.List;
 
@@ -41,6 +43,8 @@ public class TianjiAgentSecurityConfiguration {
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/authorization/effective-permissions").authenticated()
                         .requestMatchers("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**")
+                            .authenticated()
+                        .requestMatchers("/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**")
                             .authenticated()
                         .anyRequest().denyAll())
                 .exceptionHandling(errors -> errors
@@ -76,13 +80,21 @@ public class TianjiAgentSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy tianjiEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"), List.of(),
-                List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**"), true);
+                List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**",
+                        "/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**"), true);
     }
 
     @Bean
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
     TianjiAgentAccess tianjiAgentAccess(PermissionExecutionGuard permissions) {
         return new TianjiAgentAccess(permissions, Clock.systemUTC());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean(AgentSessionManager.class)
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
+    AgentSessionManager tianjiAgentSessionManager(AgentLedgerService ledger, DataSource dataSource) {
+        return new AgentSessionManager(ledger, dataSource);
     }
 
     @Bean

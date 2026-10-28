@@ -13,9 +13,14 @@ import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionListDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
+import top.egon.cola.platform.tianji.contract.agent.CreateAgentSessionCommand;
+import top.egon.cola.platform.tianji.contract.agent.DeleteAgentSessionCommand;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
@@ -122,6 +127,68 @@ class HttpAgentClientTest {
         });
         assertEquals(expected, client(Duration.ofSeconds(3), 0).list(new ListAgentRunsQuery("a+/=", 10)));
         assertEquals("limit=10&cursor=a%2B%2F%3D", queries.poll(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void session_operations_encode_identifiers_and_do_not_retry_delete() throws Exception {
+        String id = "a/会 +😀";
+        AgentSessionDTO session = new AgentSessionDTO(id, NOW);
+        AgentSessionListDTO list = new AgentSessionListDTO(List.of(session));
+        BlockingQueue<String> seen = new LinkedBlockingQueue<>();
+        AtomicInteger deletes = new AtomicInteger();
+        handler.set(exchange -> {
+            seen.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath() + "?"
+                    + exchange.getRequestURI().getRawQuery());
+            if (exchange.getRequestMethod().equals("DELETE")) {
+                deletes.incrementAndGet();
+                exchange.sendResponseHeaders(204, -1);
+            } else {
+                Object body = exchange.getRequestMethod().equals("GET") && exchange.getRequestURI().getRawQuery() == null
+                        ? list : session;
+                respond(exchange, 200, "application/json", mapper.writeValueAsBytes(body));
+            }
+        });
+        HttpAgentClient client = client(Duration.ofSeconds(3), 3);
+        assertEquals(session, client.createSession(new CreateAgentSessionCommand(id)));
+        assertEquals(session, client.getSession(new GetAgentSessionQuery(id)));
+        assertEquals(list, client.listSessions());
+        client.deleteSession(new DeleteAgentSessionCommand(id));
+        String encoded = "sessionId=a%2F%E4%BC%9A+%2B%F0%9F%98%80";
+        assertEquals("PUT /api/tianji/v1/agent-sessions?" + encoded, seen.poll(1, TimeUnit.SECONDS));
+        assertEquals("GET /api/tianji/v1/agent-sessions/detail?" + encoded, seen.poll(1, TimeUnit.SECONDS));
+        assertEquals("GET /api/tianji/v1/agent-sessions?null", seen.poll(1, TimeUnit.SECONDS));
+        assertEquals("DELETE /api/tianji/v1/agent-sessions?" + encoded, seen.poll(1, TimeUnit.SECONDS));
+        assertEquals(1, deletes.get());
+        handler.set(exchange -> {
+            deletes.incrementAndGet();
+            respond(exchange, 503, "application/json", "{\"code\":\"TIANJI_DEPENDENCY_UNAVAILABLE\"}".getBytes(StandardCharsets.UTF_8));
+        });
+        assertThrows(AgentClientException.class, () -> client.deleteSession(new DeleteAgentSessionCommand(id)));
+        assertEquals(2, deletes.get());
+    }
+
+    @Test
+    void session_backed_start_uses_the_combined_authorization_endpoint() throws Exception {
+        BlockingQueue<String> paths = new LinkedBlockingQueue<>();
+        handler.set(exchange -> {
+            paths.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath());
+            respond(exchange, 202, "application/json", mapper.writeValueAsBytes(run("run-1")));
+        });
+        StartAgentRunCommand command = new StartAgentRunCommand("research", 1, "session-1", "request-1", null,
+                null, new AgentInputDTO("question", List.of(), Map.of()), null);
+        assertEquals("run-1", client(Duration.ofSeconds(3), 0).start(command).runId());
+        assertEquals("POST /api/tianji/v1/agent-runs/with-session", paths.poll(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void session_metadata_must_match_the_requested_identifier() {
+        handler.set(exchange -> respond(exchange, 200, "application/json",
+                mapper.writeValueAsBytes(new AgentSessionDTO("other", NOW))));
+        HttpAgentClient client = client(Duration.ofSeconds(3), 0);
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class,
+                () -> client.createSession(new CreateAgentSessionCommand("expected"))).code());
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class,
+                () -> client.getSession(new GetAgentSessionQuery("expected"))).code());
     }
 
     @Test

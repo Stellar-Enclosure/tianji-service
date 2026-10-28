@@ -425,8 +425,13 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     }
 
     private static String sessionId(String value) {
-        if (value == null || value.isBlank() || value.length() > 128 || !value.equals(value.trim())
-                || value.chars().anyMatch(character -> character < 32 || character == 127)) throw invalid();
+        if (value == null || value.isBlank() || value.length() > 128 || !value.equals(value.trim())) throw invalid();
+        for (int i = 0; i < value.length(); i++) {
+            char character = value.charAt(i);
+            if (character < 32 || character == 127 || Character.isLowSurrogate(character)
+                    || Character.isHighSurrogate(character)
+                    && (i + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++i)))) throw invalid();
+        }
         return value;
     }
 

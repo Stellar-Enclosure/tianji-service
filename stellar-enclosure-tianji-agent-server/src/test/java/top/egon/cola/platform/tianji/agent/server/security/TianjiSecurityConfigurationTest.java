@@ -5,6 +5,7 @@ import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.security.web.SecurityFilterChain;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunController;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
@@ -35,6 +36,7 @@ class TianjiSecurityConfigurationTest {
     void enabling_api_without_both_identity_filters_fails_closed() {
         runner.withPropertyValues("stellar.tianji.agent.api.enabled=true")
                 .withBean(AgentLedgerService.class, () -> mock(AgentLedgerService.class))
+                .withBean(AgentSessionManager.class, () -> mock(AgentSessionManager.class))
                 .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
                 .withBean(CurrentEffectivePermissionView.class, () -> mock(CurrentEffectivePermissionView.class))
                 .run(context -> {
@@ -48,6 +50,8 @@ class TianjiSecurityConfigurationTest {
     void identity_policy_distinguishes_shared_agent_paths_from_user_only_paths() {
         var policy = new TianjiAgentSecurityConfiguration().tianjiEndpointAuthenticationPolicy();
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/api/tianji/v1/agent-runs/run-1")))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
+        assertThat(policy.requirement(new MockHttpServletRequest("DELETE", "/api/tianji/v1/agent-sessions")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);

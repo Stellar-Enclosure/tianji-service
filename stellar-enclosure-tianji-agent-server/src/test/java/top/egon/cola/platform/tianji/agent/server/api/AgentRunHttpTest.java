@@ -96,6 +96,20 @@ class AgentRunHttpTest {
     }
 
     @Test
+    void session_start_uses_a_separate_combined_permission_before_touching_the_ledger() {
+        var command = new StartAgentRunCommand("research", 1, "session-1", "request-1", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        doThrow(new AccessDeniedException("denied")).when(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);
+        var controller = new AgentRunController(ledger, new TianjiAgentAccess(guard, Clock.systemUTC()));
+        assertThrows(AccessDeniedException.class, () -> controller.startWithSession(command));
+        verify(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);
+        verifyNoInteractions(ledger);
+        assertThrows(IllegalArgumentException.class, () -> controller.start(command));
+        verify(guard).requireExecution(TianjiAgentPermissions.START_API);
+        verifyNoInteractions(ledger);
+    }
+
+    @Test
     void rejects_an_oversized_command_before_it_reaches_the_ledger() throws Exception {
         mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON)
                         .content(new byte[AgentRequestBodyAdvice.MAX_BYTES + 1]))

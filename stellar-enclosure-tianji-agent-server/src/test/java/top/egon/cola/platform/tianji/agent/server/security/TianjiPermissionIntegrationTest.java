@@ -15,12 +15,15 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunSseController;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentSessionListDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.RuntimePolicyBinding;
@@ -92,7 +95,9 @@ class TianjiPermissionIntegrationTest {
         }
         @Override public ServicePolicySnapshot fetchPolicy(String system, ServiceIdentityPrincipal principal) {
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(),
-                    Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API),
+                    Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API,
+                            TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
+                            TianjiAgentPermissions.SESSION_START_API),
                     NOW.plusSeconds(30));
         }
     };
@@ -142,6 +147,56 @@ class TianjiPermissionIntegrationTest {
     }
 
     @Test
+    void service_session_start_requires_both_scopes_in_one_policy_decision() {
+        var startOnly = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiAgentPermissions.START_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(startOnly, List.of(),
+                URI.create("https://idp.example/tenants/20")));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access().require(TianjiAgentPermissions.SESSION_START_API));
+        var both = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id",
+                URI.create("https://api.example/tianji"), 1,
+                Set.of(TianjiAgentPermissions.START_SCOPE, TianjiAgentPermissions.READ_SCOPE),
+                "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(both, List.of(),
+                URI.create("https://idp.example/tenants/20")));
+        assertEquals(new TrustedAgentActor(20, TrustedAgentActor.SubjectType.SERVICE, "worker"),
+                access().require(TianjiAgentPermissions.SESSION_START_API).actor());
+    }
+
+    @Test
+    void session_read_and_delete_require_current_permissions_and_oauth_scopes() {
+        var request = new MockHttpServletRequest();
+        VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        granted.set(Set.of(TianjiAgentPermissions.START));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(granted.get())), List.of(
+                new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.START_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE),
+                new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.SESSION_DELETE_SCOPE))));
+        TianjiAgentAccess access = access();
+        assertNotNull(access.require(TianjiAgentPermissions.START_API));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access.require(TianjiAgentPermissions.SESSION_START_API));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access.require(TianjiAgentPermissions.SESSION_GET_API));
+        granted.set(Set.of(TianjiAgentPermissions.START, TianjiAgentPermissions.READ));
+        assertNotNull(access.require(TianjiAgentPermissions.SESSION_GET_API));
+        assertNotNull(access.require(TianjiAgentPermissions.SESSION_START_API));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access.require(TianjiAgentPermissions.SESSION_DELETE_API));
+        granted.set(Set.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.SESSION_DELETE));
+        assertNotNull(access.require(TianjiAgentPermissions.SESSION_DELETE_API));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(
+                new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertThrows(org.springframework.security.authorization.AuthorizationDeniedException.class,
+                () -> access.require(TianjiAgentPermissions.SESSION_DELETE_API));
+    }
+
+    @Test
     void declared_sse_resource_matches_the_compiled_permission_contract() throws Exception {
         var request = new MockHttpServletRequest();
         VerifiedUserTokenCarrier.set(request, "verified-test-token");
@@ -170,6 +225,8 @@ class TianjiPermissionIntegrationTest {
         var rbacFilter = new Rbac3BearerAuthenticationFilter(loader, new com.fasterxml.jackson.databind.ObjectMapper());
         var ledger = mock(AgentLedgerService.class);
         var actor = new TrustedAgentActor(20, TrustedAgentActor.SubjectType.USER, "alice");
+        var sessions = mock(AgentSessionManager.class);
+        when(sessions.list(actor)).thenReturn(new AgentSessionListDTO(List.of(new AgentSessionDTO("session-1", NOW))));
         var run = new AgentRunDTO("run-1", "research", 1, null, AgentRunStatusEnum.COMPLETED, null,
                 false, 1, 2, 1, NOW.plusSeconds(60), NOW, NOW);
         var event = new AgentEventDTO("event-1", "run-1", 1, "RUN_COMPLETED", null, null, null,
@@ -186,6 +243,7 @@ class TianjiPermissionIntegrationTest {
                         "egon.cola.component.id.enabled=false",
                         "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4")
                 .withBean(AgentLedgerService.class, () -> ledger)
+                .withBean(AgentSessionManager.class, () -> sessions)
                 .withBean(PermissionExecutionGuard.class, this::permissionGuard)
                 .withBean(CurrentEffectivePermissionView.class, this::currentPermissionView)
                 .withBean(IdpBearerAuthenticationFilter.class, () -> identityFilter)
@@ -195,6 +253,7 @@ class TianjiPermissionIntegrationTest {
                     var mvc = MockMvcBuilders.webAppContextSetup((WebApplicationContext) context.getSourceApplicationContext())
                             .apply(springSecurity()).build();
                     mvc.perform(get("/api/tianji/v1/agent-runs/run-1")).andExpect(status().isUnauthorized());
+                    mvc.perform(get("/api/tianji/v1/agent-sessions")).andExpect(status().isUnauthorized());
                     mvc.perform(get("/api/v1/authorization/effective-permissions")).andExpect(status().isUnauthorized());
                     mvc.perform(get("/api/v1/authorization/effective-permissions")
                                     .header("Authorization", "Bearer verified-test-token"))
@@ -215,6 +274,9 @@ class TianjiPermissionIntegrationTest {
                     mvc.perform(get("/api/tianji/v1/agent-runs")
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].runId").value("run-1"));
+                    mvc.perform(get("/api/tianji/v1/agent-sessions")
+                                    .header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].sessionId").value("session-1"));
                     mvc.perform(get("/api/tianji/v1/agent-runs/foreign")
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isNotFound());
@@ -240,7 +302,9 @@ class TianjiPermissionIntegrationTest {
     private PermissionExecutionGuard permissionGuard() {
         var registry = new PermissionPolicyRegistry(manifest, DIGEST, CLOCK, List.of(SCOPE));
         var scopes = new Rbac3StarterProperties.UserScopePolicyProperties().setEnabled(true)
-                .setPermissionScopes(Map.of(TianjiAgentPermissions.READ, Set.of(TianjiAgentPermissions.READ_SCOPE)));
+                .setPermissionScopes(Map.of(TianjiAgentPermissions.READ, Set.of(TianjiAgentPermissions.READ_SCOPE),
+                        TianjiAgentPermissions.START, Set.of(TianjiAgentPermissions.START_SCOPE),
+                        TianjiAgentPermissions.SESSION_DELETE, Set.of(TianjiAgentPermissions.SESSION_DELETE_SCOPE)));
         return new PermissionExecutionGuard(registry, new CurrentRbac3User(),
                 new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
                 new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
@@ -275,12 +339,45 @@ class TianjiPermissionIntegrationTest {
                 Map.of("methods", List.of("GET"), "paths", List.of("/api/v1/authorization/effective-permissions")),
                 ResourceAccess.PUBLIC, null, null, List.of(PermissionManifest.PrincipalType.USER), List.of(),
                 new PermissionManifest.I18nReference("tianji.permissions", "api.authorization.current"), DefinitionLifecycle.ACTIVE);
+        var start = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.START_API, ResourceType.API,
+                Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/agent-runs")),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(TianjiAgentPermissions.START)), null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.START_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.agent.start"), DefinitionLifecycle.ACTIVE);
+        var sessionGet = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.SESSION_GET_API, ResourceType.API,
+                Map.of("methods", List.of("GET"), "paths", List.of("/api/tianji/v1/agent-sessions/detail")),
+                ResourceAccess.PROTECTED, requirement, null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.READ_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.session.get"), DefinitionLifecycle.ACTIVE);
+        var sessionStart = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.SESSION_START_API, ResourceType.API,
+                Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/agent-runs/with-session")),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL,
+                        List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START)), null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.READ_SCOPE, TianjiAgentPermissions.START_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.agent.startSession"), DefinitionLifecycle.ACTIVE);
+        var sessionList = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.SESSION_LIST_API, ResourceType.API,
+                Map.of("methods", List.of("GET"), "paths", List.of("/api/tianji/v1/agent-sessions")),
+                ResourceAccess.PROTECTED, requirement, null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.READ_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.session.list"), DefinitionLifecycle.ACTIVE);
+        var sessionDelete = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.SESSION_DELETE_API, ResourceType.API,
+                Map.of("methods", List.of("DELETE"), "paths", List.of("/api/tianji/v1/agent-sessions")),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL,
+                        List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.SESSION_DELETE)), null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
+                List.of(TianjiAgentPermissions.READ_SCOPE, TianjiAgentPermissions.SESSION_DELETE_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.session.delete"), DefinitionLifecycle.ACTIVE);
         return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
                 new PermissionManifest.Producer("tianji-java", PermissionManifest.ProducerKind.JAVA,
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji."), List.of("agent-server"),
                         List.of("agent-server"), false),
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
-                List.of(), List.of(TianjiAgentPermissions.READ), List.of(resource, events, list, current), List.of(), List.of());
+                List.of(), List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START, TianjiAgentPermissions.SESSION_DELETE),
+                List.of(resource, events, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete), List.of(), List.of());
     }
 
     private RuntimePolicyBinding binding() {
@@ -294,7 +391,9 @@ class TianjiPermissionIntegrationTest {
                 permissions.stream().sorted().toList(), NOW.plusSeconds(30));
         return new SystemAuthorizationSnapshot("20", USER.subject(), "60", "tianji", 2, 3, List.of("50"),
                 null, null, permissions, Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API,
-                        TianjiAgentPermissions.EVENTS_API, TianjiAgentPermissions.CURRENT_AUTH_API),
+                        TianjiAgentPermissions.EVENTS_API, TianjiAgentPermissions.CURRENT_AUTH_API,
+                        TianjiAgentPermissions.START_API, TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_START_API,
+                        TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API),
                 Map.of(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }

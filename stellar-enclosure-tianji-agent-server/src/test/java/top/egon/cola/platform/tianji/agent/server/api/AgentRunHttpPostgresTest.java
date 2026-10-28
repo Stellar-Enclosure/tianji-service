@@ -10,11 +10,14 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
+import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
@@ -25,10 +28,14 @@ import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.CurrentEffectivePermissionView;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 
 import java.math.BigDecimal;
+import javax.sql.DataSource;
 import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
@@ -49,6 +56,8 @@ class AgentRunHttpPostgresTest {
     private static final String BASE = "/api/tianji/v1/agent-runs";
     private static final TrustedAgentActor OWNER = new TrustedAgentActor(40001, TrustedAgentActor.SubjectType.SERVICE, "worker");
     private static AgentLedgerService ledger;
+    private static AgentSessionManager sessions;
+    private static DriverManagerDataSource source;
     private final JsonMapper mapper = JsonMapper.builder().build();
     private MockMvc mvc;
 
@@ -60,6 +69,7 @@ class AgentRunHttpPostgresTest {
         }
         var dataSource = new DriverManagerDataSource();
         dataSource.setUrl(url);
+        source = dataSource;
         if (new JdbcTemplate(dataSource).queryForObject(
                 "SELECT count(*) FROM pg_namespace WHERE nspname = 'tianji_agent'", Integer.class) != 0) {
             throw new IllegalStateException("HTTP integration tests require an empty database");
@@ -69,6 +79,7 @@ class AgentRunHttpPostgresTest {
         flyway.migrate();
         flyway.validate();
         ledger = new AgentLedgerService(dataSource);
+        sessions = new AgentSessionManager(ledger, dataSource);
         var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(20), Duration.ofSeconds(10),
                 5, 0, 1000, 500, new BigDecimal("2.00"), "USD", 2, Set.of(), null, null);
         ledger.publish(OWNER, new AgentDefinitionSpecDTO("review", 1, "SEQUENTIAL", null, "1", "1",
@@ -81,7 +92,8 @@ class AgentRunHttpPostgresTest {
         authenticate("40001", "worker");
         var access = new TianjiAgentAccess(mock(PermissionExecutionGuard.class), Clock.systemUTC());
         mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access),
-                new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())))
+                new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())),
+                new AgentSessionController(sessions, access))
                 .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
     }
 
@@ -137,11 +149,63 @@ class AgentRunHttpPostgresTest {
         assertTrue(resumed.endsWith("event: stream.complete\n\n"));
     }
 
+    @Test
+    void session_http_create_replays_and_active_runs_block_owner_deletion() throws Exception {
+        String sessionsBase = "/api/tianji/v1/agent-sessions";
+        String id = "会话/with +😀";
+        String created = mvc.perform(put(sessionsBase).param("sessionId", id)).andExpect(status().isOk())
+                .andExpect(jsonPath("$.sessionId").value(id)).andReturn().getResponse().getContentAsString();
+        String repeated = mvc.perform(put(sessionsBase).param("sessionId", id)).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(mapper.readTree(created), mapper.readTree(repeated));
+        authenticate("40002", "worker");
+        mvc.perform(get(sessionsBase + "/detail").param("sessionId", id)).andExpect(status().isNotFound());
+        mvc.perform(delete(sessionsBase).param("sessionId", id)).andExpect(status().isNotFound());
+        authenticate("40001", "worker");
+        var start = new StartAgentRunCommand("review", 1, id, "session-run", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        String body = mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(start)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        AgentRunDTO run = mapper.readValue(body, AgentRunDTO.class);
+        mvc.perform(delete(sessionsBase).param("sessionId", id)).andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("TIANJI_SESSION_BUSY"));
+        var cancel = new CancelAgentRunCommand(run.runId(), "session-cancel", run.revision(), "test");
+        mvc.perform(post(BASE + "/" + run.runId() + "/cancel").contentType(MediaType.APPLICATION_JSON)
+                .content(mapper.writeValueAsBytes(cancel))).andExpect(status().isOk());
+        mvc.perform(delete(sessionsBase).param("sessionId", id)).andExpect(status().isNoContent());
+        mvc.perform(get(sessionsBase + "/detail").param("sessionId", id)).andExpect(status().isNotFound());
+    }
+
+    @Test
+    void enabled_web_configuration_binds_session_manager_to_the_ledger_datasource() {
+        WebApplicationContextRunner runner = new WebApplicationContextRunner().withUserConfiguration(TianjiAgentServerApplication.class)
+                .withPropertyValues("stellar.tianji.agent.api.enabled=true",
+                        "egon.cola.platform.tianquan.shoubing.register-filter=false",
+                        "egon.cola.platform.tianquan.jianshen.register-filter=false",
+                        "egon.cola.component.id.enabled=false",
+                        "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4")
+                .withBean(AgentLedgerService.class, () -> ledger)
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(CurrentEffectivePermissionView.class, () -> mock(CurrentEffectivePermissionView.class))
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class));
+        runner.withBean(DataSource.class, () -> source).run(context -> {
+            assertNull(context.getStartupFailure());
+            assertNotNull(context.getBean(AgentSessionManager.class));
+        });
+        runner.withBean(DataSource.class, () -> new DriverManagerDataSource(source.getUrl())).run(context -> {
+            assertNotNull(context.getStartupFailure());
+            Throwable cause = context.getStartupFailure();
+            while (cause.getCause() != null) cause = cause.getCause();
+            assertEquals("Agent sessions and runs require the same DataSource", cause.getMessage());
+        });
+    }
+
     private static void authenticate(String tenant, String subject) {
         Instant now = Instant.now();
         var identity = new ServiceIdentityPrincipal(subject, tenant, subject, "token-id",
                 URI.create("https://api.example/tianji"), 1,
-                Set.of("tianji:agent:read", "tianji:agent:start", "tianji:agent:cancel"),
+                Set.of("tianji:agent:read", "tianji:agent:start", "tianji:agent:cancel", "tianji:session:delete"),
                 "xingyuan", subject, "test", "credential", now.minusSeconds(60), now.plusSeconds(300));
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(identity, List.of(),
                 URI.create("https://idp.example/tenants/" + tenant)));

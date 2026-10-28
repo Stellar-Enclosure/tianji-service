@@ -29,6 +29,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
@@ -39,7 +40,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
+import top.egon.cola.platform.tianji.contract.agent.CreateAgentSessionCommand;
+import top.egon.cola.platform.tianji.contract.agent.DeleteAgentSessionCommand;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.sql.Timestamp;
@@ -134,6 +138,48 @@ class AdkSessionPostgresTest {
         ledger.cancel(owner, new CancelAgentRunCommand(queued.runId(), "cancel", queued.revision(), "test"));
         sessions.deleteSession("tianji", sessions.adkUserId(), "owned").blockingAwait();
         assertNull(sessions.getSession("tianji", sessions.adkUserId(), "owned", Optional.empty()).blockingGet());
+    }
+
+    @Test
+    void management_create_is_idempotent_and_never_replaces_existing_history() throws Exception {
+        TrustedAgentActor owner = actor("manager");
+        TrustedAgentActor other = new TrustedAgentActor(owner.tenantId(), USER, "another");
+        AgentSessionManager manager = new AgentSessionManager(ledger, PostgresTestDatabase.dataSource());
+        String id = "report/会话 +😀";
+        assertEquals(id, manager.create(owner, new CreateAgentSessionCommand(id)).sessionId());
+        AgentRunLease run = claim(owner, id, "management-run");
+        PostgresAdkSessionService sessions = service(owner, false);
+        SessionLease lease = sessions.acquireSessionLease(id, run, Duration.ofSeconds(30));
+        PostgresAdkSessionService bound = sessions.withLease(lease);
+        Session current = bound.getSession("tianji", bound.adkUserId(), id, Optional.empty()).blockingGet();
+        bound.appendEvent(current, event("keep", 1_000, Map.of("local", "preserved"))).blockingGet();
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            CountDownLatch gate = new CountDownLatch(1);
+            List<Future<String>> futures = new ArrayList<>();
+            for (int i = 0; i < 8; i++) futures.add(pool.submit(() -> {
+                gate.await();
+                return manager.create(owner, new CreateAgentSessionCommand(id)).sessionId();
+            }));
+            gate.countDown();
+            for (Future<String> future : futures) assertEquals(id, future.get(10, TimeUnit.SECONDS));
+        }
+        assertEquals(id, manager.get(owner, new GetAgentSessionQuery(id)).sessionId());
+        assertEquals(List.of(id), manager.list(owner).items().stream().map(item -> item.sessionId()).toList());
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> manager.get(other, new GetAgentSessionQuery(id))).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> manager.delete(other, new DeleteAgentSessionCommand(id))).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_SESSION_BUSY, assertThrows(AgentLedgerException.class,
+                () -> manager.delete(owner, new DeleteAgentSessionCommand(id))).code());
+        Session unchanged = sessions.getSession("tianji", sessions.adkUserId(), id, Optional.empty()).blockingGet();
+        assertEquals(1, unchanged.immutableEvents().size());
+        assertEquals("preserved", unchanged.state().get("local"));
+        AgentRunDTO running = ledger.get(owner, new GetAgentRunQuery(run.runId()));
+        ledger.finish(owner, run, running.revision(), result(run, COMPLETED));
+        assertTrue(sessions.releaseSessionLease(lease));
+        manager.delete(owner, new DeleteAgentSessionCommand(id));
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> manager.get(owner, new GetAgentSessionQuery(id))).code());
     }
 
     @Test

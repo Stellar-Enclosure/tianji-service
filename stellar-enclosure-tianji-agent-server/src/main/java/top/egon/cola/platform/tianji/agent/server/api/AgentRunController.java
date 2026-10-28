@@ -51,6 +51,19 @@ public class AgentRunController {
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<AgentRunDTO> start(@RequestBody StartAgentRunCommand command) {
         var actor = access.require(TianjiAgentPermissions.START_API).actor();
+        if (command.sessionId() != null) throw new IllegalArgumentException("session-backed runs use the session start endpoint");
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(ledger.start(actor, command));
+    }
+
+    @PermissionResource(key = TianjiAgentPermissions.SESSION_START_API, type = ResourceType.API,
+            labelPage = "tianji.permissions", labelKey = "api.agent.startSession",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = {TianjiAgentPermissions.START_SCOPE, TianjiAgentPermissions.READ_SCOPE})
+    @RequiresPermissions(codes = {TianjiAgentPermissions.START, TianjiAgentPermissions.READ})
+    @PostMapping(path = "/with-session", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<AgentRunDTO> startWithSession(@RequestBody StartAgentRunCommand command) {
+        var actor = access.require(TianjiAgentPermissions.SESSION_START_API).actor();
+        if (command.sessionId() == null) throw new IllegalArgumentException("session identifier is required");
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(ledger.start(actor, command));
     }
 
