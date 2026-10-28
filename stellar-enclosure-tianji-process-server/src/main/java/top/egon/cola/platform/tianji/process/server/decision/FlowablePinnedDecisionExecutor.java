@@ -4,6 +4,7 @@ import org.flowable.dmn.api.DecisionExecutionAuditContainer;
 import org.flowable.dmn.api.DmnDecision;
 import org.flowable.dmn.api.ExecuteDecisionContext;
 import org.flowable.dmn.engine.impl.cmd.ExecuteDecisionWithAuditTrailCmd;
+import org.flowable.dmn.engine.impl.cmd.PersistHistoricDecisionExecutionCmd;
 import org.flowable.dmn.engine.impl.persistence.entity.DecisionEntity;
 import org.flowable.dmn.engine.impl.util.CommandContextUtil;
 import org.flowable.dmn.model.DmnDefinition;
@@ -45,12 +46,20 @@ public final class FlowablePinnedDecisionExecutor {
     }
 
     public Result evaluate(Binding binding, Map<String, Object> inputs) {
-        Objects.requireNonNull(binding, "binding");
-        Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
-        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked)));
+        return evaluate(binding, inputs, null);
     }
 
-    private Result evaluateInTransaction(Binding binding, Map<String, Object> inputs) {
+    /** A supplied execution reference is platform-owned and is not a BPMN process instance. */
+    public Result evaluate(Binding binding, Map<String, Object> inputs, String executionReference) {
+        Objects.requireNonNull(binding, "binding");
+        if (executionReference != null && !executionReference.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) {
+            throw new IllegalArgumentException("Decision execution reference is invalid");
+        }
+        Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
+        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, executionReference)));
+    }
+
+    private Result evaluateInTransaction(Binding binding, Map<String, Object> inputs, String executionReference) {
         var repository = engine.getDmnRepositoryService();
         DmnDecision definition = repository.createDecisionQuery().decisionId(binding.definitionId())
                 .deploymentId(binding.deploymentId()).decisionVersion(binding.definitionVersion())
@@ -68,6 +77,10 @@ public final class FlowablePinnedDecisionExecutor {
         context.setDecisionKey(binding.model().definitionKey());
         context.setTenantId(Long.toString(binding.tenantId()));
         context.setVariables(new HashMap<>(inputs));
+        if (executionReference != null) {
+            context.setInstanceId(executionReference);
+            context.setScopeType("tianji-decision");
+        }
         engine.getCommandExecutor().execute(new PinnedCommand(context, binding, engine));
         DecisionExecutionAuditContainer audit = context.getDecisionExecution();
         if (audit == null || !Boolean.FALSE.equals(audit.isFailed())
@@ -78,6 +91,8 @@ public final class FlowablePinnedDecisionExecutor {
                 || !binding.model().definitionKey().equals(audit.getDecisionKey())) {
             throw new IllegalStateException("Decision evaluation failed");
         }
+        // Flowable's public decision service persists history in a second command after execution.
+        if (engine.isHistoryEnabled()) engine.getCommandExecutor().execute(new PersistHistoricDecisionExecutionCmd(context));
         List<Map<String, Object>> rows = new ArrayList<>();
         if (audit.getDecisionResult() != null) {
             if (audit.getDecisionResult().size() > 256) throw new IllegalStateException("Decision evaluation failed");

@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
 import java.util.Map;
+import java.util.List;
 
 /** Immutable result: deployment must use these validated bytes rather than a caller's mutable buffer. */
 public final class ValidatedProcessModel {
@@ -12,14 +13,16 @@ public final class ValidatedProcessModel {
     private final byte[] xml;
     private final Map<String, ValueType> inputs;
     private final Map<String, ValueType> outputs;
+    private final List<String> ruleIds;
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
-                          Map<String, ValueType> inputs, Map<String, ValueType> outputs) {
+                          Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds) {
         this.type = type;
         this.definitionKey = definitionKey;
         this.xml = xml.clone();
         this.inputs = Map.copyOf(inputs);
         this.outputs = Map.copyOf(outputs);
+        this.ruleIds = List.copyOf(ruleIds);
     }
 
     public Type type() { return type; }
@@ -27,4 +30,5 @@ public final class ValidatedProcessModel {
     public byte[] xml() { return xml.clone(); }
     public Map<String, ValueType> inputs() { return inputs; }
     public Map<String, ValueType> outputs() { return outputs; }
+    public List<String> ruleIds() { return ruleIds; }
 }

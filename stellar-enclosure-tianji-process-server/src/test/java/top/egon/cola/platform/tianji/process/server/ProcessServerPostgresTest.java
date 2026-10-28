@@ -44,6 +44,7 @@ import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor;
+import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
@@ -98,10 +99,34 @@ class ProcessServerPostgresTest {
         }
         Flyway platform = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
                 .table("tianji_process_schema_history").baselineVersion("0")
-                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-process").target("1").cleanDisabled(true).load();
         platform.baseline();
         platform.migrate();
         platform.validate();
+        Integer oldChecksum = jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class);
+        var legacyActor = new ProcessActor(991, ProcessActor.SubjectType.USER, "alice");
+        var legacyCommand = new ProcessExecutionService.StartCommand("legacy", "baseline", "legacy-order", "legacy-command",
+                "legacy-correlation", Map.of("amount", 10));
+        String legacyInstance;
+        try (ConfigurableApplicationContext oldApp = context(TianjiProcessServerApplication.class, scopedUrl, System.getProperty("user.name"))) {
+            var oldProcess = oldApp.getBean(SpringProcessEngineConfiguration.class);
+            var oldDmn = oldApp.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+            var oldValidator = new ProcessModelValidator();
+            var oldRelease = new ProcessReleaseService(oldProcess, oldDmn, oldValidator);
+            oldRelease.publish(legacyActor, "legacy", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "baseline",
+                    new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray(), Map.of("amount", ValueType.INTEGER))));
+            legacyInstance = new ProcessExecutionService(oldProcess, oldDmn, oldValidator).start(legacyActor, legacyCommand).instanceId();
+        }
+        Flyway upgraded = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+        assertEquals(1, upgraded.migrate().migrationsExecuted);
+        upgraded.validate();
+        assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
+        assertEquals(legacyInstance, jdbc.queryForObject("SELECT resource_id FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
+        assertNull(jdbc.queryForObject("SELECT decision_result::text FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
         jdbc.execute("""
                 CREATE FUNCTION tianji_process.test_release_failure() RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN
@@ -181,10 +206,13 @@ class ProcessServerPostgresTest {
             TaskService tasks = app.getBean(TaskService.class);
             ManagementService jobs = app.getBean(ManagementService.class);
             ProcessModelValidator validator = new ProcessModelValidator();
+            assertEquals(legacyInstance, new ProcessExecutionService(processConfig, decisionConfig, validator)
+                    .start(legacyActor, legacyCommand).instanceId());
             byte[] bpmn = new ClassPathResource("fixtures/baseline.bpmn20.xml").getContentAsByteArray();
             byte[] dmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
             verifyReleaseTransactions(app, jdbc, validator, bpmn, dmn);
             verifyProcessStarts(app, jdbc, validator);
+            verifyDecisionApplications(app, jdbc, validator, dmn);
             repository.createDeployment().tenantId(TENANT)
                     .addBytes("baseline.bpmn20.xml", validator.validateBpmn(bpmn, "baseline").xml()).deploy();
             app.getBean(CmmnRepositoryService.class).createDeployment().tenantId(TENANT)
@@ -277,7 +305,13 @@ class ProcessServerPostgresTest {
             var firstResult = pinned.evaluate(firstBinding, Map.of("amount", 10));
             assertEquals("first", firstResult.outputs().getFirst().get("route"));
             assertEquals(firstDefinition.getId(), firstResult.definitionId());
-            assertFalse(firstResult.matchedRuleNumbers().isEmpty());
+            assertEquals(List.of(1), firstResult.matchedRuleNumbers());
+            String decisionReference = java.util.UUID.randomUUID().toString();
+            pinned.evaluate(firstBinding, Map.of("amount", 10), decisionReference);
+            var scopedHistory = app.getBean(DmnHistoryService.class).createHistoricDecisionExecutionQuery()
+                    .instanceId(decisionReference).scopeType("tianji-decision").tenantId(TENANT).singleResult();
+            assertNotNull(scopedHistory);
+            assertEquals(firstDefinition.getId(), scopedHistory.getDecisionDefinitionId());
             assertThrows(UnsupportedOperationException.class, () -> firstResult.outputs().getFirst().put("route", "changed"));
             assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of("amount", 10.0)));
             assertThrows(IllegalArgumentException.class, () -> pinned.evaluate(firstBinding, Map.of("amount", new Object())));
@@ -594,6 +628,109 @@ class ProcessServerPostgresTest {
         assertEquals(ProcessExecutionService.State.CANCELLED, service.get(actor, started.instanceId()).state());
         assertEquals(started.instanceId(), service.start(actor, request).instanceId());
         assertEquals(ProcessExecutionService.State.CANCELLED, service.start(actor, request).state());
+    }
+
+    private static void verifyDecisionApplications(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
+                                                   ProcessModelValidator validator, byte[] dmnXml) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var engine = app.getBean(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        var service = new ProcessDecisionService(process, engine, validator);
+        var actor = new ProcessActor(20, ProcessActor.SubjectType.USER, "alice");
+        var other = new ProcessActor(20, ProcessActor.SubjectType.USER, "bob");
+        var command = new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-1",
+                "decision-correlation", Map.of("amount", 10));
+        long beforeProcesses = process.getRuntimeService().createProcessInstanceQuery().processInstanceTenantId(TENANT).count();
+        var result = service.evaluate(actor, command);
+        assertEquals("standard", result.outputs().getFirst().get("route"));
+        assertEquals(List.of("row:1"), result.matchedRuleIds());
+        assertEquals(beforeProcesses, process.getRuntimeService().createProcessInstanceQuery().processInstanceTenantId(TENANT).count());
+        var replay = new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-1",
+                "decision-correlation", Map.of("amount", 10L));
+        assertEquals(result, service.evaluate(actor, replay));
+        assertEquals(1, engine.getDmnHistoryService().createHistoricDecisionExecutionQuery().tenantId(TENANT)
+                .scopeType("tianji-decision").instanceId(result.executionId()).count());
+        String saved = bootstrap.queryForObject("SELECT decision_result::text FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND subject_type='USER' AND subject_id='alice' AND command_type='DECISION' AND command_id='decision-1'", String.class);
+        bootstrap.update("UPDATE tianji_process.tianji_process_command_receipt SET decision_result=CAST(? AS jsonb) "
+                        + "WHERE tenant_id=20 AND subject_type='USER' AND subject_id='alice' AND command_type='DECISION' AND command_id='decision-1'",
+                "{\"codecVersion\":1,\"outputs\":[],\"matchedRuleIds\":[\"row:1\"]}");
+        assertThrows(IllegalStateException.class, () -> service.evaluate(actor, replay));
+        assertEquals(1, engine.getDmnHistoryService().createHistoricDecisionExecutionQuery().tenantId(TENANT)
+                .scopeType("tianji-decision").instanceId(result.executionId()).count());
+        bootstrap.update("UPDATE tianji_process.tianji_process_command_receipt SET decision_result=CAST(? AS jsonb) "
+                        + "WHERE tenant_id=20 AND subject_type='USER' AND subject_id='alice' AND command_type='DECISION' AND command_id='decision-1'", saved);
+        assertNotEquals(result.executionId(), service.evaluate(other, command).executionId());
+        assertThrows(IllegalStateException.class, () -> service.evaluate(actor,
+                new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-1",
+                        "decision-correlation", Map.of("amount", 11))));
+        assertThrows(IllegalStateException.class, () -> service.evaluate(actor,
+                new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-1",
+                        "another-correlation", Map.of("amount", 10))));
+        assertThrows(IllegalArgumentException.class, () -> service.evaluate(actor,
+                new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "bad-input",
+                        "correlation", Map.of("amount", 10.0))));
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_id='bad-input'", Integer.class));
+
+        var concurrent = new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "decision-concurrent",
+                "decision-concurrent-correlation", Map.of("amount", 11));
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            CountDownLatch gate = new CountDownLatch(1);
+            List<Future<ProcessDecisionService.Result>> futures = new java.util.ArrayList<>();
+            for (int i = 0; i < 8; i++) futures.add(pool.submit(() -> { gate.await(); return service.evaluate(actor, concurrent); }));
+            gate.countDown();
+            var first = futures.getFirst().get(20, TimeUnit.SECONDS);
+            for (Future<ProcessDecisionService.Result> future : futures) assertEquals(first, future.get(20, TimeUnit.SECONDS));
+            assertEquals(List.of("row:2"), first.matchedRuleIds());
+            assertEquals(1, engine.getDmnHistoryService().createHistoricDecisionExecutionQuery().tenantId(TENANT)
+                    .scopeType("tianji-decision").instanceId(first.executionId()).count());
+        }
+        long beforeFailure = engine.getDmnHistoryService().createHistoricDecisionExecutionQuery()
+                .tenantId(TENANT).decisionKey("baselineDecision").count();
+        assertThrows(RuntimeException.class, () -> service.evaluate(actor,
+                new ProcessDecisionService.EvaluateCommand("release-one", "baselineDecision", "rollback-command",
+                        "rollback-correlation", Map.of("amount", 10))));
+        assertEquals(beforeFailure, engine.getDmnHistoryService().createHistoricDecisionExecutionQuery()
+                .tenantId(TENANT).decisionKey("baselineDecision").count());
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_type='DECISION' AND command_id='rollback-command'", Integer.class));
+
+        var releases = new ProcessReleaseService(process, engine, validator);
+        String numeric = new String(dmnXml, StandardCharsets.UTF_8).replace("baselineDecision", "moneyDecision")
+                .replace("name=\"route\" typeRef=\"string\"", "name=\"route\" typeRef=\"number\"")
+                .replace("'standard'", "42").replace("'review'", "-1")
+                .replaceFirst("<rule>", "<rule id='approved'>");
+        releases.publish(actor, "numeric-release", List.of(new ProcessReleaseService.ModelResource(Type.DMN, "moneyDecision",
+                numeric.getBytes(StandardCharsets.UTF_8), Map.of())));
+        var numericCommand = new ProcessDecisionService.EvaluateCommand("numeric-release", "moneyDecision", "numeric-request",
+                "numeric-correlation", Map.of("amount", 10));
+        var numericResult = service.evaluate(actor, numericCommand);
+        assertEquals(42L, numericResult.outputs().getFirst().get("route"));
+        assertEquals(List.of("approved"), numericResult.matchedRuleIds());
+        assertEquals(numericResult, service.evaluate(actor, numericCommand));
+        String noMatch = new String(dmnXml, StandardCharsets.UTF_8).replace("baselineDecision", "emptyDecision")
+                .replace("&gt; 10", "&gt; 20");
+        releases.publish(actor, "empty-release", List.of(new ProcessReleaseService.ModelResource(Type.DMN, "emptyDecision",
+                noMatch.getBytes(StandardCharsets.UTF_8), Map.of())));
+        var empty = service.evaluate(actor, new ProcessDecisionService.EvaluateCommand("empty-release", "emptyDecision", "empty-request",
+                "empty-correlation", Map.of("amount", 15)));
+        assertTrue(empty.outputs().isEmpty());
+        assertTrue(empty.matchedRuleIds().isEmpty());
+        String overlap = new String(dmnXml, StandardCharsets.UTF_8).replace("baselineDecision", "invalidDecision")
+                .replace("hitPolicy=\"FIRST\"", "hitPolicy=\"UNIQUE\"").replace("&gt; 10", "&lt;= 10");
+        releases.publish(actor, "overlap-release", List.of(new ProcessReleaseService.ModelResource(Type.DMN, "invalidDecision",
+                overlap.getBytes(StandardCharsets.UTF_8), Map.of())));
+        assertThrows(IllegalStateException.class, () -> service.evaluate(actor,
+                new ProcessDecisionService.EvaluateCommand("overlap-release", "invalidDecision", "overlap-request",
+                        "overlap-correlation", Map.of("amount", 10))));
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE tenant_id=20 AND command_type='DECISION' AND command_id='overlap-request'", Integer.class));
+        assertThrows(RuntimeException.class, () -> bootstrap.update("""
+                INSERT INTO tianji_process.tianji_process_command_receipt
+                    (tenant_id, subject_type, subject_id, command_type, command_id, request_sha256, release_key,
+                     correlation_id, state, resource_id, created_at)
+                VALUES (20, 'USER', 'alice', 'DECISION', 'invalid-null', ?, 'release-one', 'c', 'APPLIED', 'x', clock_timestamp())
+                """, "a".repeat(64)));
     }
 
     private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {

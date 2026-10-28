@@ -73,4 +73,11 @@ class ProcessExecutionServiceTest {
         assertThrows(IllegalStateException.class, () -> ProcessValues.outputs(Map.of("n", ValueType.INTEGER), Map.of("n", 2.5)));
         assertEquals(2L, ProcessValues.outputs(Map.of("n", ValueType.INTEGER), Map.of("n", 2.0)).get("n"));
     }
+
+    @Test
+    void preserves_the_existing_start_command_hash_format() {
+        assertEquals("fb8b42a11d2a032688b07cfc47fd2aa72ca8bf873eb1976879bfbaeb28a00d5a",
+                ProcessRequestDigest.hash(java.util.List.of("release-one", "baseline", "order-1", "correlation-1"),
+                        Map.of("amount", 10L)));
+    }
 }

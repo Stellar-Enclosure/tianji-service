@@ -128,7 +128,7 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of());
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of());
     }
 
     public ValidatedProcessModel validateDmn(byte[] source, String expectedKey) {
@@ -163,14 +163,17 @@ public final class ProcessModelValidator {
         }
         List<ValueType> inputOrder = new ArrayList<>(inputTypes.values());
         List<ValueType> outputOrder = new ArrayList<>(outputTypes.values());
-        for (Element rule : rules) {
+        List<String> ruleIds = new ArrayList<>();
+        for (int ruleIndex = 0; ruleIndex < rules.size(); ruleIndex++) {
+            Element rule = rules.get(ruleIndex);
+            ruleIds.add(rule.hasAttribute("id") ? required(rule, "id") : "row:" + (ruleIndex + 1));
             List<Element> conditions = children(rule, "inputEntry");
             List<Element> results = children(rule, "outputEntry");
             if (conditions.size() != inputOrder.size() || results.size() != outputOrder.size()) throw invalid();
             for (int i = 0; i < conditions.size(); i++) validateLiteral(only(conditions.get(i), "text").getTextContent(), inputOrder.get(i), true);
             for (int i = 0; i < results.size(); i++) validateLiteral(only(results.get(i), "text").getTextContent(), outputOrder.get(i), false);
         }
-        return new ValidatedProcessModel(Type.DMN, key, bytes, inputTypes, outputTypes);
+        return new ValidatedProcessModel(Type.DMN, key, bytes, inputTypes, outputTypes, ruleIds);
     }
 
     private static void validateLiteral(String text, ValueType type, boolean condition) {

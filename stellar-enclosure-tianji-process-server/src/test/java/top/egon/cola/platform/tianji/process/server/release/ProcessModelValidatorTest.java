@@ -28,6 +28,9 @@ class ProcessModelValidatorTest {
         assertEquals(ValidatedProcessModel.Type.DMN, decision.type());
         assertEquals(Map.of("amount", INTEGER), decision.inputs());
         assertEquals(Map.of("route", STRING), decision.outputs());
+        assertEquals(java.util.List.of("row:1", "row:2"), decision.ruleIds());
+        String identified = new String(fixture("baseline.dmn"), StandardCharsets.UTF_8).replaceFirst("<rule>", "<rule id='approved'>");
+        assertEquals(java.util.List.of("approved", "row:2"), validator.validateDmn(bytes(identified), "baselineDecision").ruleIds());
         assertThrows(UnsupportedOperationException.class, () -> decision.inputs().put("other", STRING));
     }
 
