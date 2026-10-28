@@ -47,6 +47,8 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.sql.Timestamp;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -510,6 +512,47 @@ class AdkSessionPostgresTest {
         AgentRunDTO secondStatus = ledger.get(owner, new GetAgentRunQuery(secondRun.runId()));
         ledger.finish(owner, secondRun, secondStatus.revision(), result(secondRun, COMPLETED));
         assertTrue(secondStore.releaseSessionLease(secondLease));
+    }
+
+    @Test
+    void typed_session_state_survives_jsonb_and_replays_legacy_events_without_duplication() {
+        TrustedAgentActor owner = actor("typed-state");
+        PostgresAdkSessionService legacy = service(owner, true);
+        legacy.createSession("tianji", legacy.adkUserId(), Map.of("local", 1, "user:color", "blue"), "typed").blockingGet();
+        AgentRunLease run = claim(owner, "typed", "typed-run");
+        SessionLease lease = legacy.acquireSessionLease("typed", run, Duration.ofSeconds(30));
+        PostgresAdkSessionService legacyBound = legacy.withLease(lease);
+        Session first = legacyBound.getSession("tianji", legacy.adkUserId(), "typed", Optional.empty()).blockingGet();
+        Event old = event("legacy", 1_000, Map.of("local", 1));
+        legacyBound.appendEvent(first, old).blockingGet();
+
+        PostgresAdkSessionService typed = new PostgresAdkSessionService(PostgresTestDatabase.dataSource(), owner,
+                "tianji", true, true);
+        PostgresAdkSessionService bound = typed.withLease(lease);
+        Session current = bound.getSession("tianji", typed.adkUserId(), "typed", Optional.empty()).blockingGet();
+        bound.appendEvent(current, old).blockingGet();
+        assertEquals(1, current.immutableEvents().size());
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> bound.appendEvent(current, event("legacy", 1_000, Map.of("local", 1L))).blockingGet()).code());
+        Map<String, Object> values = Map.of("long", 1L, "short", (short) 2, "float", -0.0f,
+                "large", new BigInteger("123456789012345678901234567890"),
+                "decimal", new BigDecimal("12345678901234567890.00100"), "shape", List.of("long", "1"));
+        bound.appendEvent(current, event("typed-event", 2_000,
+                Map.of("local", values, "user:color", values, "app:shared", values))).blockingGet();
+        Session recovered = service(owner, false).getSession("tianji", legacy.adkUserId(), "typed", Optional.empty()).blockingGet();
+        assertEquals(values, recovered.state().get("local"));
+        assertEquals(values, recovered.state().get("user:color"));
+        assertEquals(values, recovered.state().get("app:shared"));
+        assertEquals(values, recovered.immutableEvents().getLast().actions().stateDelta().get("local"));
+        assertEquals(2, recovered.immutableEvents().size());
+        assertEquals(2, jdbc.queryForObject("SELECT state_codec_version FROM tianji_agent.agent_session WHERE tenant_id=? AND session_id='typed'",
+                Integer.class, owner.tenantId()));
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_session_scope_state WHERE tenant_id=? AND value_codec_version=2",
+                Integer.class, owner.tenantId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_session_event WHERE tenant_id=? AND payload::jsonb->>'codecVersion'='1'",
+                Integer.class, owner.tenantId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_session_event WHERE tenant_id=? AND payload::jsonb->>'codecVersion'='2'",
+                Integer.class, owner.tenantId()));
     }
 
     @Test

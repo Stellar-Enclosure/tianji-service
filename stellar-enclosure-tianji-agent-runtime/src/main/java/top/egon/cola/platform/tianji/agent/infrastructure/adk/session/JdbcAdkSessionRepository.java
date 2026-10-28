@@ -62,13 +62,14 @@ final class JdbcAdkSessionRepository {
         return Boolean.TRUE.equals(live);
     }
 
-    int insertSession(String id, String state) {
+    int insertSession(String id, String state, int codecVersion) {
         return jdbc.update("""
                 INSERT INTO tianji_agent.agent_session
-                    (tenant_id, subject_type, subject_id, app_name, session_id, session_state, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, CAST(? AS jsonb), clock_timestamp(), clock_timestamp())
+                    (tenant_id, subject_type, subject_id, app_name, session_id, session_state, state_codec_version,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, CAST(? AS jsonb), ?, clock_timestamp(), clock_timestamp())
                 ON CONFLICT DO NOTHING
-                """, actor.tenantId(), type(), actor.subjectId(), app, id, state);
+                """, actor.tenantId(), type(), actor.subjectId(), app, id, state, codecVersion);
     }
 
     void insertLease(String id) {
@@ -80,7 +81,7 @@ final class JdbcAdkSessionRepository {
     }
 
     Optional<SessionRow> session(String id, boolean lock) {
-        String sql = "SELECT session_id, session_state::text AS session_state, revision, last_event_sequence, updated_at "
+        String sql = "SELECT session_id, session_state::text AS session_state, state_codec_version, revision, last_event_sequence, updated_at "
                 + "FROM tianji_agent.agent_session WHERE tenant_id=? AND subject_type=? AND subject_id=? "
                 + "AND app_name=? AND session_id=?" + (lock ? " FOR UPDATE" : "");
         return jdbc.query(sql, (rs, row) -> sessionRow(rs), key(id)).stream().findFirst();
@@ -88,7 +89,7 @@ final class JdbcAdkSessionRepository {
 
     List<SessionRow> sessions(int limit) {
         return jdbc.query("""
-                SELECT session_id, '{}' AS session_state, revision, last_event_sequence, updated_at
+                SELECT session_id, '{}' AS session_state, 1 AS state_codec_version, revision, last_event_sequence, updated_at
                 FROM tianji_agent.agent_session
                 WHERE tenant_id=? AND subject_type=? AND subject_id=? AND app_name=?
                 ORDER BY updated_at DESC, session_id DESC LIMIT ?
@@ -197,28 +198,29 @@ final class JdbcAdkSessionRepository {
                 """, actor.tenantId(), type(), actor.subjectId(), app, id, sequence, nativeId, timestamp, payload);
     }
 
-    SessionRow updateSession(String id, long expectedRevision, long sequence, String state) {
+    SessionRow updateSession(String id, long expectedRevision, long sequence, String state, int codecVersion) {
         return jdbc.query("""
                 UPDATE tianji_agent.agent_session
-                SET session_state=CAST(? AS jsonb), revision=revision+1, last_event_sequence=?, updated_at=clock_timestamp()
+                SET session_state=CAST(? AS jsonb), state_codec_version=?, revision=revision+1,
+                    last_event_sequence=?, updated_at=clock_timestamp()
                 WHERE tenant_id=? AND subject_type=? AND subject_id=? AND app_name=? AND session_id=? AND revision=?
-                RETURNING session_id, session_state::text AS session_state, revision, last_event_sequence, updated_at
-                """, (rs, row) -> sessionRow(rs), state, sequence, actor.tenantId(), type(), actor.subjectId(), app,
+                RETURNING session_id, session_state::text AS session_state, state_codec_version, revision, last_event_sequence, updated_at
+                """, (rs, row) -> sessionRow(rs), state, codecVersion, sequence, actor.tenantId(), type(), actor.subjectId(), app,
                 id, expectedRevision).stream().findFirst()
                 .orElseThrow(() -> new IllegalStateException("ADK session revision changed while locked"));
     }
 
-    Map<String, String> scopeState() {
-        Map<String, String> values = new HashMap<>();
+    Map<String, ScopeValue> scopeState() {
+        Map<String, ScopeValue> values = new HashMap<>();
         jdbc.query("""
-                SELECT scope_type, state_key, state_value::text AS state_value
+                SELECT scope_type, state_key, state_value::text AS state_value, value_codec_version
                 FROM tianji_agent.agent_session_scope_state
                 WHERE tenant_id=? AND app_name=? AND
                     ((scope_type='APP' AND subject_type='' AND subject_id='') OR
                      (scope_type='USER' AND subject_type=? AND subject_id=?))
                 """, rs -> {
                     values.put(("APP".equals(rs.getString("scope_type")) ? "app:" : "user:")
-                            + rs.getString("state_key"), rs.getString("state_value"));
+                            + rs.getString("state_key"), new ScopeValue(rs.getString("state_value"), rs.getInt("value_codec_version")));
                 },
                 actor.tenantId(), app, type(), actor.subjectId());
         return values;
@@ -246,16 +248,16 @@ final class JdbcAdkSessionRepository {
                 actor.tenantId(), app, type(), actor.subjectId());
     }
 
-    void putScope(String scope, String key, String value) {
+    void putScope(String scope, String key, String value, int codecVersion) {
         String subjectType = "APP".equals(scope) ? "" : type();
         String subjectId = "APP".equals(scope) ? "" : actor.subjectId();
         jdbc.update("""
                 INSERT INTO tianji_agent.agent_session_scope_state
-                    (tenant_id, app_name, scope_type, subject_type, subject_id, state_key, state_value)
-                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb))
+                    (tenant_id, app_name, scope_type, subject_type, subject_id, state_key, state_value, value_codec_version)
+                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS jsonb), ?)
                 ON CONFLICT (tenant_id, app_name, scope_type, subject_type, subject_id, state_key)
-                DO UPDATE SET state_value=EXCLUDED.state_value
-                """, actor.tenantId(), app, scope, subjectType, subjectId, key, value);
+                DO UPDATE SET state_value=EXCLUDED.state_value, value_codec_version=EXCLUDED.value_codec_version
+                """, actor.tenantId(), app, scope, subjectType, subjectId, key, value, codecVersion);
     }
 
     void deleteScope(String scope, String key) {
@@ -273,7 +275,7 @@ final class JdbcAdkSessionRepository {
     private String type() { return actor.subjectType().name(); }
 
     private static SessionRow sessionRow(ResultSet rs) throws SQLException {
-        return new SessionRow(rs.getString("session_id"), rs.getString("session_state"), rs.getLong("revision"),
+        return new SessionRow(rs.getString("session_id"), rs.getString("session_state"), rs.getInt("state_codec_version"), rs.getLong("revision"),
                 rs.getLong("last_event_sequence"), rs.getTimestamp("updated_at").toInstant());
     }
 
@@ -288,7 +290,8 @@ final class JdbcAdkSessionRepository {
                 rs.getString("payload"), rs.getBoolean("matches"));
     }
 
-    record SessionRow(String id, String state, long revision, long lastEventSequence, Instant updatedAt) { }
+    record SessionRow(String id, String state, int codecVersion, long revision, long lastEventSequence, Instant updatedAt) { }
+    record ScopeValue(String value, int codecVersion) { }
     record LeaseRow(long epoch, String owner, Instant expiresAt, boolean live) { }
     record EventRow(long sequence, String nativeId, long timestampMillis, String payload, boolean matches) { }
     record EventBounds(long count, long bytes, long firstSequence, long lastSequence) { }

@@ -27,6 +27,14 @@ final class AdkSessionEventCodec {
     private static final String REMOVED_VALUE = "__ADK_SENTINEL_REMOVED__";
     private static final ObjectMapper MAPPER = JsonBaseModel.getMapper().copy()
             .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
+    private final int writeVersion;
+    private final AdkEventTypedValues typedValues = new AdkEventTypedValues();
+
+    AdkSessionEventCodec() { this(false); }
+
+    AdkSessionEventCodec(boolean typedWrites) {
+        this.writeVersion = typedWrites ? 2 : 1;
+    }
 
     String encode(Event event) {
         try {
@@ -39,32 +47,25 @@ final class AdkSessionEventCodec {
             event.actions().setModelResponse().ifPresent(value -> validateJsonValue(value, 0, false));
             event.actions().requestedToolConfirmations().values()
                     .forEach(confirmation -> validateJsonValue(confirmation.payload(), 0, false));
-            event.content().flatMap(content -> content.parts()).ifPresent(parts -> parts.forEach(part -> {
-                part.text().ifPresent(value -> validateJsonValue(value, 0, false));
-                part.inlineData().flatMap(blob -> blob.data()).ifPresent(AdkSessionEventCodec::validateBytes);
-                part.thoughtSignature().ifPresent(AdkSessionEventCodec::validateBytes);
-                part.functionCall().flatMap(call -> call.args()).ifPresent(value -> validateJsonValue(value, 0, false));
-                part.functionResponse().flatMap(response -> response.response())
-                        .ifPresent(value -> validateJsonValue(value, 0, false));
-                part.toolCall().flatMap(call -> call.args()).ifPresent(value -> validateJsonValue(value, 0, false));
-                part.toolResponse().flatMap(response -> response.response()).ifPresent(value -> validateJsonValue(value, 0, false));
-                part.partMetadata().ifPresent(value -> validateJsonValue(value, 0, false));
-            }));
+            event.content().flatMap(content -> content.parts()).ifPresent(parts -> parts.forEach(AdkSessionEventCodec::validatePart));
+            event.actions().compaction().flatMap(compaction -> compaction.compactedContent().parts())
+                    .ifPresent(parts -> parts.forEach(AdkSessionEventCodec::validatePart));
             Event durableEvent = event.toBuilder().actions(event.actions().toBuilder().stateDelta(delta).build()).build();
             JsonNode raw = MAPPER.readTree(durableEvent.toJson());
             if (!(raw instanceof ObjectNode nativeEvent)
                     || !(nativeEvent.path("actions").path("stateDelta") instanceof ObjectNode state)
-                    || !state.equals(MAPPER.valueToTree(delta))) throw invalid();
+                    || writeVersion == 1 && !state.equals(MAPPER.valueToTree(delta))) throw invalid();
             Set<String> removed = new TreeSet<>();
             delta.forEach((key, value) -> {
                 if (value == State.REMOVED) removed.add(key);
             });
             ObjectNode envelope = MAPPER.createObjectNode();
-            envelope.put("codecVersion", 1);
+            envelope.put("codecVersion", writeVersion);
             envelope.put("adkVersion", ADK_VERSION);
             envelope.set("event", nativeEvent);
             ArrayNode keys = envelope.putArray("removedStateKeys");
             removed.forEach(keys::add);
+            if (writeVersion == 2) envelope.set("typedValues", typedValues.encode(durableEvent));
             String stored = MAPPER.writeValueAsString(canonical(envelope));
             requireSize(stored);
             Event restored = decode(stored);
@@ -81,11 +82,13 @@ final class AdkSessionEventCodec {
         try {
             requireSize(stored);
             JsonNode envelope = MAPPER.readTree(stored);
-            if (!(envelope instanceof ObjectNode root) || root.size() != 4
-                    || !root.path("codecVersion").isInt() || root.path("codecVersion").intValue() != 1
+            if (!(envelope instanceof ObjectNode root) || !root.path("codecVersion").isInt()
+                    || (root.path("codecVersion").intValue() != 1 && root.path("codecVersion").intValue() != 2)
                     || !ADK_VERSION.equals(root.path("adkVersion").textValue())
                     || !(root.path("event") instanceof ObjectNode nativeEvent)
                     || !(root.path("removedStateKeys") instanceof ArrayNode removed)) throw invalid();
+            int version = root.path("codecVersion").intValue();
+            if (root.size() != (version == 1 ? 4 : 5) || version == 2 && !root.has("typedValues")) throw invalid();
             JsonNode state = nativeEvent.path("actions").path("stateDelta");
             if (!(state instanceof ObjectNode stateObject)) throw invalid();
             var fields = stateObject.fieldNames();
@@ -99,9 +102,20 @@ final class AdkSessionEventCodec {
             }
             Event event = MAPPER.treeToValue(nativeEvent, Event.class);
             validateEvent(event);
-            for (String key : seen) event.actions().stateDelta().put(key, State.REMOVED);
+            if (version == 2) typedValues.restore(event, root.get("typedValues"), seen);
+            else for (String key : seen) event.actions().stateDelta().put(key, State.REMOVED);
             if (!nativeEvent.equals(MAPPER.readTree(event.toJson()))) throw invalid();
             return event;
+        } catch (JsonProcessingException | RuntimeException failure) {
+            throw invalid();
+        }
+    }
+
+    boolean sameEvent(String stored, Event candidate) {
+        try {
+            Event existing = decode(stored);
+            return MAPPER.readTree(existing.toJson()).equals(MAPPER.readTree(candidate.toJson()))
+                    && sameGenericValues(existing, candidate);
         } catch (JsonProcessingException | RuntimeException failure) {
             throw invalid();
         }
@@ -119,13 +133,26 @@ final class AdkSessionEventCodec {
                 || !original.actions().setModelResponse().equals(restored.actions().setModelResponse())
                 || !original.actions().requestedToolConfirmations().equals(restored.actions().requestedToolConfirmations())
                 || !original.output().equals(restored.output())) return false;
-        List<Part> before = original.content().flatMap(content -> content.parts()).orElse(List.of());
-        List<Part> after = restored.content().flatMap(content -> content.parts()).orElse(List.of());
+        List<Part> before = new java.util.ArrayList<>(original.content().flatMap(content -> content.parts()).orElse(List.of()));
+        original.actions().compaction().flatMap(compaction -> compaction.compactedContent().parts()).ifPresent(before::addAll);
+        List<Part> after = new java.util.ArrayList<>(restored.content().flatMap(content -> content.parts()).orElse(List.of()));
+        restored.actions().compaction().flatMap(compaction -> compaction.compactedContent().parts()).ifPresent(after::addAll);
         if (before.size() != after.size()) return false;
         for (int i = 0; i < before.size(); i++) {
             if (!Objects.equals(genericPartValues(before.get(i)), genericPartValues(after.get(i)))) return false;
         }
         return true;
+    }
+
+    private static void validatePart(Part part) {
+        part.text().ifPresent(value -> validateJsonValue(value, 0, false));
+        part.inlineData().flatMap(blob -> blob.data()).ifPresent(AdkSessionEventCodec::validateBytes);
+        part.thoughtSignature().ifPresent(AdkSessionEventCodec::validateBytes);
+        part.functionCall().flatMap(call -> call.args()).ifPresent(value -> validateJsonValue(value, 0, false));
+        part.functionResponse().flatMap(response -> response.response()).ifPresent(value -> validateJsonValue(value, 0, false));
+        part.toolCall().flatMap(call -> call.args()).ifPresent(value -> validateJsonValue(value, 0, false));
+        part.toolResponse().flatMap(response -> response.response()).ifPresent(value -> validateJsonValue(value, 0, false));
+        part.partMetadata().ifPresent(value -> validateJsonValue(value, 0, false));
     }
 
     private static List<Object> genericPartValues(Part part) {
@@ -156,6 +183,12 @@ final class AdkSessionEventCodec {
         if (value == null || value instanceof Boolean) return;
         if (value instanceof String text) {
             if (text.length() > MAX_BYTES) throw invalid();
+            for (int i = 0; i < text.length(); i++) {
+                char character = text.charAt(i);
+                if (character == '\0' || Character.isLowSurrogate(character)
+                        || Character.isHighSurrogate(character)
+                        && (i + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(++i)))) throw invalid();
+            }
             return;
         }
         if (value == State.REMOVED && allowRemoved) return;
@@ -167,7 +200,8 @@ final class AdkSessionEventCodec {
         }
         if (value instanceof Map<?, ?> map) {
             for (Map.Entry<?, ?> entry : map.entrySet()) {
-                if (!(entry.getKey() instanceof String)) throw invalid();
+                if (!(entry.getKey() instanceof String key)) throw invalid();
+                validateJsonValue(key, depth + 1, false);
                 validateJsonValue(entry.getValue(), depth + 1, false);
             }
             return;

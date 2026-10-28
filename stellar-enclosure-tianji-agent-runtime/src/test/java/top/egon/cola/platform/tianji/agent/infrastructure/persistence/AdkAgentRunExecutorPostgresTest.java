@@ -433,7 +433,8 @@ class AdkAgentRunExecutorPostgresTest {
             prompts.add(prompt.getInstructions().stream().map(message -> message.getText()).filter(java.util.Objects::nonNull).toList());
             return FixtureModel.textStream(prompts.size() == 1 ? "FIRST answer" : "SECOND answer");
         };
-        AdkAgentRunExecutor worker = sessionExecutor(model);
+        AdkAgentRunExecutor worker = new AdkAgentRunExecutor(ledger, flowFactory, validator, Map.of("fixtureModel", model),
+                Map.of(), controlExecutor, estimator(), PostgresTestDatabase.dataSource(), true);
         AgentRunDTO first = ledger.start(actor, new StartAgentRunCommand("conversation", 1, "conversation", "turn-1",
                 null, null, new AgentInputDTO("first question", List.of(), Map.of()), null));
         assertEquals(COMPLETED, worker.executeQueued(actor, new GetAgentRunQuery(first.runId())).status());
@@ -444,6 +445,10 @@ class AdkAgentRunExecutorPostgresTest {
         assertTrue(prompts.get(1).containsAll(List.of("first question", "FIRST answer", "second question")));
         var saved = sessions.getSession("tianji", sessions.adkUserId(), "conversation", java.util.Optional.empty()).blockingGet();
         assertTrue(saved.immutableEvents().size() >= 4);
+        assertEquals(2, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
+                SELECT state_codec_version FROM tianji_agent.agent_session
+                WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji' AND session_id='conversation'
+                """, Integer.class, actor.tenantId(), actor.subjectId()));
         assertEquals(0, new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForObject("""
                 SELECT count(*) FROM tianji_agent.agent_session_lease
                 WHERE tenant_id=? AND subject_type='USER' AND subject_id=? AND app_name='tianji'

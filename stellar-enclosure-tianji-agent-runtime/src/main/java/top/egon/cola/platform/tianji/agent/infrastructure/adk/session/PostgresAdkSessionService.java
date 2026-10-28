@@ -64,6 +64,12 @@ public final class PostgresAdkSessionService implements BaseSessionService {
 
     public PostgresAdkSessionService(DataSource dataSource, TrustedAgentActor actor, String appName,
                                      boolean allowAppStateWrites) {
+        this(dataSource, actor, appName, allowAppStateWrites, false);
+    }
+
+    /** Enable typed writes only after every session reader has been upgraded to understand codec version 2. */
+    public PostgresAdkSessionService(DataSource dataSource, TrustedAgentActor actor, String appName,
+                                     boolean allowAppStateWrites, boolean typedWrites) {
         Objects.requireNonNull(dataSource, "dataSource");
         this.actor = Objects.requireNonNull(actor, "actor");
         if (!validApp(appName) || actor.subjectId().indexOf('\0') >= 0) throw invalid();
@@ -74,8 +80,8 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         DataSourceTransactionManager manager = new DataSourceTransactionManager(dataSource);
         this.write = transaction(manager, false);
         this.read = transaction(manager, true);
-        this.eventCodec = new AdkSessionEventCodec();
-        this.stateCodec = new AdkSessionStateCodec();
+        this.eventCodec = new AdkSessionEventCodec(typedWrites);
+        this.stateCodec = new AdkSessionStateCodec(typedWrites);
         this.revisions = Collections.synchronizedMap(new WeakHashMap<>());
         this.lease = null;
     }
@@ -159,7 +165,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
                 Map<String, Object> local = new HashMap<>();
                 // Prepare local state before inserting, then apply scoped changes in the same transaction.
                 applyLocalState(local, delta);
-                if (repository.insertSession(id, stateCodec.encode(local)) != 1) {
+                if (repository.insertSession(id, stateCodec.encode(local), stateCodec.writeVersion()) != 1) {
                     throw new SessionException(SessionException.SESSION_ALREADY_EXISTS);
                 }
                 repository.insertLease(id);
@@ -255,7 +261,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         requireSessionFence(id, lease);
         Optional<JdbcAdkSessionRepository.EventRow> duplicate = repository.event(id, event.id(), payload);
         if (duplicate.isPresent()) {
-            if (!duplicate.get().matches()) {
+            if (!duplicate.get().matches() && !eventCodec.sameEvent(duplicate.get().payload(), event)) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
                         "ADK event identifier conflicts with stored content");
             }
@@ -266,14 +272,14 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             return new AppendResult(row, apply);
         }
         if (row.revision() != expectedRevision || row.lastEventSequence() == Long.MAX_VALUE) throw revisionConflict();
-        Map<String, Object> local = localState(row.state());
+        Map<String, Object> local = localState(row);
         Map<String, Object> delta = event.actions().stateDelta();
         applyLocalState(local, delta);
         applyScopedState(delta);
         long sequence = row.lastEventSequence() + 1;
         repository.insertEvent(id, sequence, event.id(), event.timestamp(), payload);
         JdbcAdkSessionRepository.SessionRow updated = repository.updateSession(id, row.revision(), sequence,
-                stateCodec.encode(local));
+                stateCodec.encode(local), stateCodec.writeVersion());
         requireLiveFences(id, lease);
         return new AppendResult(updated, true);
     }
@@ -327,8 +333,8 @@ public final class PostgresAdkSessionService implements BaseSessionService {
 
     private SessionView view(JdbcAdkSessionRepository.SessionRow row, List<Event> events) {
         requireScopeWithinBounds();
-        Map<String, Object> state = localState(row.state());
-        repository.scopeState().forEach((key, json) -> state.put(key, stateCodec.decodeValue(json)));
+        Map<String, Object> state = localState(row);
+        repository.scopeState().forEach((key, value) -> state.put(key, stateCodec.decodeValue(value.value(), value.codecVersion())));
         Session session = Session.builder(row.id()).appName(appName).userId(userId).state(state)
                 .events(events).lastUpdateTime(row.updatedAt()).build();
         return new SessionView(session, row.revision());
@@ -339,8 +345,8 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         return view.session();
     }
 
-    private Map<String, Object> localState(String json) {
-        Map<String, Object> state = new HashMap<>(stateCodec.decodeMap(json));
+    private Map<String, Object> localState(JdbcAdkSessionRepository.SessionRow row) {
+        Map<String, Object> state = new HashMap<>(stateCodec.decodeMap(row.state(), row.codecVersion()));
         state.keySet().forEach(key -> {
             validateStateKey(key);
             if (key.startsWith(State.APP_PREFIX) || key.startsWith(State.USER_PREFIX) || key.startsWith(State.TEMP_PREFIX)) {
@@ -375,7 +381,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             if (name.isEmpty()) throw invalid();
             String scope = app ? "APP" : "USER";
             if (value == null || value == State.REMOVED) repository.deleteScope(scope, name);
-            else repository.putScope(scope, name, stateCodec.encode(value));
+            else repository.putScope(scope, name, stateCodec.encode(value), stateCodec.writeVersion());
         });
         if (hasScopedChanges) requireScopeWithinBounds();
     }

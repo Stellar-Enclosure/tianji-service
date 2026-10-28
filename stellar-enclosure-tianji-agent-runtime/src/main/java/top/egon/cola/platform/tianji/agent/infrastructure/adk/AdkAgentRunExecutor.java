@@ -73,6 +73,7 @@ public final class AdkAgentRunExecutor {
     private final ScheduledExecutorService controlExecutor;
     private final AgentModelBudgetEstimator budgetEstimator;
     private final DataSource sessionDataSource;
+    private final boolean typedSessionWrites;
     private final ObjectMapper mapper = new ObjectMapper();
     private final AdkEventProjector projector = new AdkEventProjector();
 
@@ -88,6 +89,16 @@ public final class AdkAgentRunExecutor {
                                Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
                                ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
                                DataSource sessionDataSource) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, false);
+    }
+
+    /** Typed session writes require a coordinated upgrade of all session readers. */
+    public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -99,6 +110,7 @@ public final class AdkAgentRunExecutor {
             throw new IllegalArgumentException("Agent sessions and runs require the same DataSource");
         }
         this.sessionDataSource = sessionDataSource;
+        this.typedSessionWrites = typedSessionWrites;
     }
 
     /** Uses one CAS to claim the run and one subscription to the ADK root invocation. */
@@ -166,7 +178,7 @@ public final class AdkAgentRunExecutor {
                 if (session == null) throw new IllegalStateException("ADK session could not be created");
                 sessionId = session.id();
             } else {
-                sessions = new PostgresAdkSessionService(sessionDataSource, actor, "tianji");
+                sessions = new PostgresAdkSessionService(sessionDataSource, actor, "tianji", false, typedSessionWrites);
                 sessionLease = sessions.acquireSessionLease(running.sessionId(), lease, LEASE_DURATION);
                 runner = new AgentFlowSessionRunner(root, "tianji", sessions.withLease(sessionLease), List.of(budget));
                 userId = sessions.adkUserId();
