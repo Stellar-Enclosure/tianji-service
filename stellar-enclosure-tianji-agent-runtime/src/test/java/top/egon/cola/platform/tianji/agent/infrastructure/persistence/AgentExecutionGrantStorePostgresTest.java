@@ -143,6 +143,52 @@ class AgentExecutionGrantStorePostgresTest {
         assertThrows(IllegalArgumentException.class, () -> new AgentExecutionGrantStore(other, ledger));
     }
 
+    @Test void rotating_queue_pages_skip_unready_service_and_expired_runs_without_losing_ties() {
+        var expected = new ArrayList<String>();
+        for (int index = 0; index < 4; index++) {
+            var actor = actor("page-" + index); var run = start(actor);
+            var attempt = store.reserve(actor, run.runId(), RESOURCE).orElseThrow();
+            assertTrue(store.complete(attempt, new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:page", ledger.databaseNow().plusSeconds(30))));
+            setFutureCreated(actor, run.runId()); expected.add(run.runId());
+        }
+        var unready = actor("unready"); var unreadyRun = start(unready); setFutureCreated(unready, unreadyRun.runId());
+        var expired = actor("expired-page"); var expiredRun = start(expired);
+        var expiredAttempt = store.reserve(expired, expiredRun.runId(), RESOURCE).orElseThrow();
+        assertTrue(store.complete(expiredAttempt, new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:expired", ledger.databaseNow().plusSeconds(30))));
+        jdbc.update("UPDATE tianji_agent.agent_run_execution_grant SET expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=?",
+                expired.tenantId(), expiredRun.runId()); setFutureCreated(expired, expiredRun.runId());
+        long serviceTenant = PostgresTestDatabase.nextTenant();
+        var service = TrustedAgentActor.verified(serviceTenant, TrustedAgentActor.SubjectType.SERVICE, "service", "https://idp.example/tenants/" + serviceTenant);
+        var serviceRun = start(service); setFutureCreated(service, serviceRun.runId());
+        jdbc.update("""
+                INSERT INTO tianji_agent.agent_run_execution_grant (tenant_id,run_id,binding_sha256,issue_epoch,grant_id,ciphertext,expires_at,updated_at)
+                VALUES (?,?,?,1,?,?,clock_timestamp()+interval '30 seconds',clock_timestamp())
+                """, service.tenantId(), serviceRun.runId(), "d".repeat(64), ID, "ENC:v1:key:nonce:service");
+        var legacy = new TrustedAgentActor(PostgresTestDatabase.nextTenant(), TrustedAgentActor.SubjectType.USER, "legacy");
+        var legacyRun = start(legacy); setFutureCreated(legacy, legacyRun.runId());
+        jdbc.update("""
+                INSERT INTO tianji_agent.agent_run_execution_grant (tenant_id,run_id,binding_sha256,issue_epoch,grant_id,ciphertext,expires_at,updated_at)
+                VALUES (?,?,?,1,?,?,clock_timestamp()+interval '30 seconds',clock_timestamp())
+                """, legacy.tenantId(), legacyRun.runId(), "e".repeat(64), ID, "ENC:v1:key:nonce:legacy");
+        var cancelled = actor("cancel-page"); var cancelledRun = start(cancelled);
+        var cancelAttempt = store.reserve(cancelled, cancelledRun.runId(), RESOURCE).orElseThrow();
+        assertTrue(store.complete(cancelAttempt, new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:cancel", ledger.databaseNow().plusSeconds(30))));
+        ledger.cancel(cancelled, new CancelAgentRunCommand(cancelledRun.runId(), "cancel", cancelledRun.revision(), "test"));
+        setFutureCreated(cancelled, cancelledRun.runId());
+        var after = new top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun.Cursor(Instant.parse("2098-01-01T00:00:00Z"), 1, "0");
+        var first = ledger.grantReadyRuns(after, 2); assertEquals(2, first.size());
+        var second = ledger.grantReadyRuns(first.getLast().cursor(), 2); assertEquals(2, second.size());
+        assertTrue(ledger.grantReadyRuns(second.getLast().cursor(), 2).isEmpty());
+        var found = new ArrayList<String>(); first.forEach(run -> found.add(run.query().runId())); second.forEach(run -> found.add(run.query().runId()));
+        assertEquals(expected, found); assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum.TIANJI_INVALID_COMMAND,
+                assertThrows(top.egon.cola.platform.tianji.agent.domain.AgentLedgerException.class, () -> ledger.grantReadyRuns(null, 0)).code());
+    }
+
+    private static void setFutureCreated(TrustedAgentActor actor, String runId) {
+        jdbc.update("UPDATE tianji_agent.agent_run SET created_at=? WHERE tenant_id=? AND run_id=?",
+                java.sql.Timestamp.from(Instant.parse("2099-01-01T00:00:00Z")), actor.tenantId(), runId);
+    }
+
     private static TrustedAgentActor actor(String subject) {
         long tenant = PostgresTestDatabase.nextTenant();
         return TrustedAgentActor.verified(tenant, TrustedAgentActor.SubjectType.USER, subject, "https://idp.example/tenants/" + tenant);

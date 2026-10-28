@@ -7,6 +7,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.PendingAgentRun;
+import top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -257,6 +258,24 @@ final class JdbcAgentLedgerRepository {
                 """, (rs, row) -> new PendingAgentRun(new TrustedAgentActor(rs.getLong("tenant_id"),
                 TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id"), rs.getString("subject_issuer")),
                 new GetAgentRunQuery(rs.getString("run_id"))), limit);
+    }
+
+    List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit) {
+        String sql = """
+                SELECT r.tenant_id, r.subject_type, r.subject_issuer, r.subject_id, r.run_id, r.created_at
+                FROM tianji_agent.agent_run r
+                JOIN tianji_agent.agent_run_execution_grant g ON g.tenant_id = r.tenant_id AND g.run_id = r.run_id
+                WHERE r.status = 'QUEUED' AND r.subject_type = 'USER' AND r.subject_issuer <> 'LEGACY'
+                  AND r.cancel_requested_at IS NULL AND r.deadline_at > clock_timestamp()
+                  AND g.grant_id IS NOT NULL AND g.ciphertext IS NOT NULL AND g.expires_at > clock_timestamp()
+                """;
+        var mapper = (org.springframework.jdbc.core.RowMapper<GrantReadyAgentRun>) (rs, row) -> new GrantReadyAgentRun(
+                new TrustedAgentActor(rs.getLong("tenant_id"), TrustedAgentActor.SubjectType.valueOf(rs.getString("subject_type")),
+                        rs.getString("subject_id"), rs.getString("subject_issuer")), new GetAgentRunQuery(rs.getString("run_id")),
+                rs.getTimestamp("created_at").toInstant());
+        if (after == null) return jdbc.query(sql + " ORDER BY r.created_at, r.tenant_id, r.run_id LIMIT ?", mapper, limit);
+        return jdbc.query(sql + " AND (r.created_at, r.tenant_id, r.run_id) > (?, ?, ?) ORDER BY r.created_at, r.tenant_id, r.run_id LIMIT ?",
+                mapper, Timestamp.from(after.createdAt()), after.tenantId(), after.runId(), limit);
     }
 
     int insertCancelReceipt(TrustedAgentActor actor, String commandId, String hash, String runId, Instant now) {

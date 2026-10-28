@@ -13,6 +13,7 @@ import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.ExecutionPolicyReducer;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.PendingAgentRun;
+import top.egon.cola.platform.tianji.agent.domain.GrantReadyAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
@@ -416,6 +417,12 @@ public final class AgentLedgerService {
     public List<PendingAgentRun> pendingRuns(int limit) {
         if (limit < 1 || limit > 1000) throw invalid("queue batch limit is invalid");
         return List.copyOf(repository.queuedRuns(limit));
+    }
+
+    /** Discovers only USER runs with unexpired sealed evidence; execution still reauthorizes each candidate. */
+    public List<GrantReadyAgentRun> grantReadyRuns(GrantReadyAgentRun.Cursor after, int limit) {
+        if (limit < 1 || limit > 1000) throw invalid("queue batch limit is invalid");
+        return List.copyOf(repository.grantReadyRuns(after, limit));
     }
 
     /** Records cancellation intent and its idempotent receipt in the same transaction. */
