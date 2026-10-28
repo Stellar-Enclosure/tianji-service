@@ -124,6 +124,36 @@ class LinkedAgentDispatchHttpPostgresTest {
                 .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_DISPATCH_CLOSED"));
         verify(guard, atLeastOnce()).requireExecution(TianjiAgentPermissions.LINKED_SUBMIT_API);
 
+        var http = mock(java.net.http.HttpClient.class);
+        when(http.followRedirects()).thenReturn(java.net.http.HttpClient.Redirect.NEVER);
+        when(http.<byte[]>sendAsync(any(), any())).thenAnswer(invocation -> {
+            java.net.http.HttpRequest request = invocation.getArgument(0);
+            java.net.http.HttpResponse.BodyHandler<byte[]> handler = invocation.getArgument(1);
+            var response = mvc.perform(post(request.uri().getRawPath()).contentType(MediaType.APPLICATION_JSON)
+                    .header("Authorization", request.headers().firstValue("Authorization").orElseThrow())
+                    .content(readBody(request))).andReturn().getResponse();
+            @SuppressWarnings("unchecked") java.net.http.HttpResponse<byte[]> result = mock(java.net.http.HttpResponse.class);
+            when(result.statusCode()).thenReturn(response.getStatus());
+            var info = mock(java.net.http.HttpResponse.ResponseInfo.class); when(info.statusCode()).thenReturn(response.getStatus());
+            var subscriber = handler.apply(info);
+            subscriber.onSubscribe(new java.util.concurrent.Flow.Subscription() { public void request(long count) { } public void cancel() { } });
+            subscriber.onNext(List.of(java.nio.ByteBuffer.wrap(response.getContentAsByteArray()))); subscriber.onComplete();
+            byte[] bytes = subscriber.getBody().toCompletableFuture().join(); when(result.body()).thenReturn(bytes);
+            return java.util.concurrent.CompletableFuture.completedFuture(result);
+        });
+        var sdkLink = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "process-1", "occurrence-sdk",
+                definition.contentSha256(), now.plusSeconds(60));
+        var sdkCommand = new LinkedAgentStartCommand(new StartAgentRunCommand("review", 1, null, "intent-sdk", null, "trace-sdk",
+                new AgentInputDTO("input", List.of(), Map.of()), null), sdkLink);
+        var sdkQuery = new LinkedAgentLookupQuery("intent-sdk", sdkLink);
+        try (var sdk = new top.egon.cola.platform.tianji.client.HttpLinkedAgentClient(URI.create("https://api.example"), http,
+                operation -> "service-fixture", Duration.ofSeconds(5))) {
+            var started = sdk.submit(sdkCommand);
+            assertEquals(started.run().runId(), sdk.resolve(sdkQuery).submission().run().runId());
+            assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.CANCELLED,
+                    sdk.close(sdkQuery).submission().run().status());
+        }
+
         var context = new ApplicationContextRunner().withUserConfiguration(TianjiLinkedDispatchConfiguration.class, LinkedAgentDispatchController.class)
                 .withPropertyValues("stellar.tianji.agent.api.enabled=true", "stellar.tianji.agent.linked.enabled=true",
                         "stellar.tianji.agent.linked.bindings[0].issuer=" + issuer,
@@ -141,5 +171,16 @@ class LinkedAgentDispatchHttpPostgresTest {
         context.withPropertyValues("stellar.tianji.agent.linked.submission-enabled=true")
                 .withBean(TianjiLinkedServiceAdmission.class, () -> admission)
                 .run(value -> assertThat(value).hasNotFailed().hasSingleBean(LinkedAgentDispatchController.class));
+    }
+
+    private static byte[] readBody(java.net.http.HttpRequest request) {
+        var result = new java.util.concurrent.CompletableFuture<byte[]>(); var output = new java.io.ByteArrayOutputStream();
+        request.bodyPublisher().orElseThrow().subscribe(new java.util.concurrent.Flow.Subscriber<>() {
+            public void onSubscribe(java.util.concurrent.Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
+            public void onNext(java.nio.ByteBuffer bytes) { byte[] value = new byte[bytes.remaining()]; bytes.get(value); output.writeBytes(value); }
+            public void onError(Throwable error) { result.completeExceptionally(error); }
+            public void onComplete() { result.complete(output.toByteArray()); }
+        });
+        return result.join();
     }
 }
