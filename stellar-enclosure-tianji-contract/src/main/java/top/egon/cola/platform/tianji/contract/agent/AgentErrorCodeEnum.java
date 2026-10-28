@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.contract.agent;
 /** Stable external codes; transport status and retry policy are supplied by the service. */
 public enum AgentErrorCodeEnum {
     TIANJI_INVALID_COMMAND,
+    TIANJI_REQUEST_TOO_LARGE,
     TIANJI_UNAUTHENTICATED,
     TIANJI_PERMISSION_DENIED,
     TIANJI_RESOURCE_NOT_FOUND,
@@ -12,6 +13,7 @@ public enum AgentErrorCodeEnum {
     TIANJI_LEASE_EXPIRED,
     TIANJI_SESSION_BUSY,
     TIANJI_EVENT_CURSOR_EXPIRED,
+    TIANJI_RESULT_NOT_READY,
     TIANJI_CAPACITY_EXCEEDED,
     TIANJI_BUDGET_EXCEEDED,
     TIANJI_USAGE_UNKNOWN,

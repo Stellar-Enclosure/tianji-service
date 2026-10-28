@@ -27,8 +27,9 @@ import java.util.function.LongFunction;
 
 /** Reads persisted SSE events on demand and reconnects from the last delivered sequence. */
 final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
-    private static final int MAX_FRAME_CHARS = 1_048_576;
+    private static final int MAX_FRAME_CHARS = 2_097_152;
     private static final int MAX_ERROR_BYTES = 2_097_152;
+    private static final long MIN_ROTATION_NANOS = Duration.ofSeconds(1).toNanos();
     private static final System.Logger log = System.getLogger(AgentEventPublisher.class.getName());
     private final HttpClient http;
     private final JsonMapper mapper;
@@ -114,6 +115,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                     awaitDemand();
                     if (isDone()) return;
                     HttpRequest request = requestFactory.apply(cursor);
+                    long connectedAt = System.nanoTime();
                     CompletableFuture<HttpResponse<InputStream>> call =
                             http.sendAsync(request, info -> info.statusCode() >= 200 && info.statusCode() < 300
                                     ? HttpResponse.BodySubscribers.ofInputStream()
@@ -129,6 +131,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                         if (done) { close(response.body()); return; }
                         input = response.body();
                     }
+                    boolean plannedRotation = false;
                     try (InputStream stream = response.body()) {
                         if (response.statusCode() < 200 || response.statusCode() >= 300) {
                             throw errorFactory.apply(response, stream.readAllBytes());
@@ -138,13 +141,21 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                             throw new ProtocolFailure();
                         }
                         long previousCursor = cursor;
-                        if (readStream(stream)) {
+                        ReadOutcome outcome = readStream(stream);
+                        if (outcome == ReadOutcome.COMPLETE) {
                             terminate(null, true);
                             return;
                         }
+                        plannedRotation = outcome == ReadOutcome.ROTATE
+                                && System.nanoTime() - connectedAt >= MIN_ROTATION_NANOS;
                         if (cursor > previousCursor) reconnects = 0;
                     } finally {
                         synchronized (monitor) { input = null; }
+                    }
+                    if (plannedRotation) {
+                        reconnects = 0;
+                        pauseBeforeReconnect();
+                        continue;
                     }
                     if (reconnects++ >= maxReconnects) {
                         fail(new AgentClientException(0, "TIANJI_EVENT_STREAM_DISCONNECTED", null, null));
@@ -192,7 +203,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
             }
         }
 
-        private boolean readStream(InputStream stream) throws IOException, InterruptedException {
+        private ReadOutcome readStream(InputStream stream) throws IOException, InterruptedException {
             var decoder = StandardCharsets.UTF_8.newDecoder()
                     .onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT);
             BufferedReader lines = new BufferedReader(new InputStreamReader(stream, decoder));
@@ -203,11 +214,14 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
             int duplicates = 0;
             while (!isDone()) {
                 String line = boundedLine(lines);
-                if (line == null) return false;
+                if (line == null) return ReadOutcome.DISCONNECTED;
                 frameChars += line.length() + 1;
                 if (frameChars > MAX_FRAME_CHARS) throw new ProtocolFailure();
                 if (line.isEmpty()) {
-                    if ("stream.complete".equals(event)) return true;
+                    if ("stream.complete".equals(event) || "stream.reconnect".equals(event)) {
+                        if (id != null || !data.isEmpty()) throw new ProtocolFailure();
+                        return "stream.complete".equals(event) ? ReadOutcome.COMPLETE : ReadOutcome.ROTATE;
+                    }
                     if (!data.isEmpty()) {
                         if (event != null && !"agent.event".equals(event)) throw new ProtocolFailure();
                         if (data.toString().getBytes(StandardCharsets.UTF_8).length > MAX_FRAME_CHARS) {
@@ -221,7 +235,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                         if (value.sequence() > cursor) {
                             if (value.sequence() != cursor + 1) throw new ProtocolFailure();
                             awaitDemand();
-                            if (isDone()) return false;
+                            if (isDone()) return ReadOutcome.DISCONNECTED;
                             emit(value);
                             cursor = value.sequence();
                             duplicates = 0;
@@ -250,7 +264,7 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
                     default -> { }
                 }
             }
-            return false;
+            return ReadOutcome.DISCONNECTED;
         }
 
         private void emit(AgentEventDTO event) {
@@ -333,4 +347,5 @@ final class AgentEventPublisher implements Flow.Publisher<AgentEventDTO> {
     }
 
     private static final class ProtocolFailure extends RuntimeException { }
+    private enum ReadOutcome { COMPLETE, ROTATE, DISCONNECTED }
 }

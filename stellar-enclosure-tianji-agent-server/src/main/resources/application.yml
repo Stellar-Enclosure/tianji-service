@@ -1,5 +1,26 @@
 spring:
   application:
     name: tianji-agent-server
+  autoconfigure:
+    exclude:
+      - org.redisson.spring.starter.RedissonAutoConfigurationV4
   main:
     web-application-type: none
+
+egon:
+  cola:
+    component:
+      id:
+        enabled: false
+    platform:
+      tianquan:
+        shoubing:
+          register-filter: false
+        jianshen:
+          register-filter: false
+          user-scope-policy:
+            enabled: true
+            permission-scopes:
+              TIANJI_AGENT_START: ["tianji:agent:start"]
+              TIANJI_AGENT_READ: ["tianji:agent:read"]
+              TIANJI_AGENT_CANCEL: ["tianji:agent:cancel"]

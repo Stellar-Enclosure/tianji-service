@@ -6,23 +6,22 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class TianjiAgentServerApplicationTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
-            .withUserConfiguration(TianjiAgentServerApplication.class);
+            .withUserConfiguration(TianjiAgentServerApplication.class)
+            .withPropertyValues("spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4",
+                    "egon.cola.component.id.enabled=false");
 
     @Test
-    void default_shell_has_health_without_exposing_an_agent_client_or_web_stack() {
+    void default_shell_has_health_without_exposing_an_agent_client_or_web_server() {
         runner.run(context -> {
             assertThat(context).hasNotFailed();
             assertThat(context).hasSingleBean(HealthEndpoint.class);
             assertThat(context).doesNotHaveBean(AgentClient.class);
             assertThat(context).doesNotHaveBean("webServerFactory");
         });
-        assertThrows(ClassNotFoundException.class,
-                () -> Class.forName("org.springframework.web.servlet.DispatcherServlet"));
     }
 
     @Test

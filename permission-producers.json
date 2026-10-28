@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "producers": [
+    {
+      "producerId": "tianji-agent-java",
+      "module": "stellar-enclosure-tianji-agent-server",
+      "artifactFile": "stellar-enclosure-tianji-agent-server-exec.jar"
+    }
+  ]
+}

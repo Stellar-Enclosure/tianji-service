@@ -192,6 +192,56 @@ class HttpAgentClientTest {
     }
 
     @Test
+    void sse_accepts_a_maximum_sized_persisted_payload_plus_event_metadata() throws Exception {
+        var event = new AgentEventDTO("event-1", "run-1", 1, "TEXT_DELTA", null, null, null, NOW,
+                "trace-1", "1", Map.of("text", "x".repeat(1_048_400)));
+        String frame = "id: 1\nevent: agent.event\ndata: " + mapper.writeValueAsString(event)
+                + "\n\nevent: stream.complete\n\n";
+        assertTrue(frame.getBytes(StandardCharsets.UTF_8).length > 1_048_576);
+        handler.set(exchange -> respond(exchange, 200, "text/event-stream", frame.getBytes(StandardCharsets.UTF_8)));
+        RecordingSubscriber subscriber = new RecordingSubscriber(1);
+        client(Duration.ofSeconds(3), 0).events(new AgentEventsQuery("run-1", 0, 100)).subscribe(subscriber);
+        assertTrue(subscriber.terminal.await(5, TimeUnit.SECONDS));
+        assertNull(subscriber.error.get());
+        assertEquals(event, subscriber.events.getFirst());
+        assertTrue(subscriber.completed);
+    }
+
+    @Test
+    void planned_stream_rotation_reconnects_without_spending_failure_retries() throws Exception {
+        AtomicInteger connections = new AtomicInteger();
+        handler.set(exchange -> {
+            int count = connections.incrementAndGet();
+            if (count == 1) {
+                try { Thread.sleep(Duration.ofMillis(1100)); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            }
+            String body = count == 1 ? "event: stream.reconnect\n\n" : frame(1) + "event: stream.complete\n\n";
+            respond(exchange, 200, "text/event-stream", body.getBytes(StandardCharsets.UTF_8));
+        });
+        RecordingSubscriber subscriber = new RecordingSubscriber(1);
+        client(Duration.ofSeconds(3), 0).events(new AgentEventsQuery("run-1", 0, 100)).subscribe(subscriber);
+        assertTrue(subscriber.terminal.await(5, TimeUnit.SECONDS));
+        assertTrue(subscriber.completed);
+        assertNull(subscriber.error.get());
+        assertEquals(2, connections.get());
+    }
+
+    @Test
+    void repeated_immediate_rotation_is_bounded_as_a_disconnect() throws Exception {
+        AtomicInteger connections = new AtomicInteger();
+        handler.set(exchange -> {
+            connections.incrementAndGet();
+            respond(exchange, 200, "text/event-stream", "event: stream.reconnect\n\n".getBytes(StandardCharsets.UTF_8));
+        });
+        RecordingSubscriber subscriber = new RecordingSubscriber(1);
+        client(Duration.ofSeconds(3), 1).events(new AgentEventsQuery("run-1", 0, 100)).subscribe(subscriber);
+        assertTrue(subscriber.terminal.await(5, TimeUnit.SECONDS));
+        assertEquals("TIANJI_EVENT_STREAM_DISCONNECTED", ((AgentClientException) subscriber.error.get()).code());
+        assertEquals(2, connections.get());
+    }
+
+    @Test
     void sse_honors_demand_and_closing_subscription_does_not_cancel_run() throws Exception {
         AtomicInteger requests = new AtomicInteger();
         handler.set(exchange -> {
@@ -272,7 +322,7 @@ class HttpAgentClientTest {
                 frame(2).getBytes(StandardCharsets.UTF_8),
                 frame(1).replace("id: 1", "id: 99").getBytes(StandardCharsets.UTF_8),
                 new byte[]{'d', 'a', 't', 'a', ':', ' ', (byte) 0xc3, (byte) 0x28, '\n', '\n'},
-                ("data: " + "x".repeat(1_048_577) + "\n\n").getBytes(StandardCharsets.UTF_8));
+                ("data: " + "x".repeat(2_097_153) + "\n\n").getBytes(StandardCharsets.UTF_8));
         for (byte[] body : invalid) {
             handler.set(exchange -> respond(exchange, 200, "text/event-stream", body));
             RecordingSubscriber subscriber = new RecordingSubscriber(1);
