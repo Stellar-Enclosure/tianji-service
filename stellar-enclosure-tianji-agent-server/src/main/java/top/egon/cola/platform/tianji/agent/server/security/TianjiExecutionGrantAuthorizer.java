@@ -21,6 +21,8 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentExecutionGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ServiceExecutionAuthorizationContract;
+import top.egon.cola.platform.tianquan.shoubing.contract.state.IdentityAuthorityScopes;
 import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
 import top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
@@ -121,6 +123,19 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
 
     private static Map<String, BoundClient> clients(IdpStarterProperties starter, IdentityAuthorityProperties authority,
             TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac) {
+        return clients(starter, authority, issuers, oauth, mapper, rbac, IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE,
+                ExecutionAuthorizationContract.SERVICE_SCOPE);
+    }
+
+    static Map<String, BoundClient> clients(IdpStarterProperties starter, IdentityAuthorityProperties authority,
+            TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
+            String issueScope, String decisionScope) {
+        if (!(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE.equals(issueScope)
+                && ExecutionAuthorizationContract.SERVICE_SCOPE.equals(decisionScope))
+                && !(IdentityAuthorityScopes.SERVICE_EXECUTION_GRANT_ISSUE.equals(issueScope)
+                && ServiceExecutionAuthorizationContract.SERVICE_SCOPE.equals(decisionScope))) {
+            throw new IllegalArgumentException("TIANJI_EXECUTION_AUTHORIZATION_SCOPE_INVALID");
+        }
         Objects.requireNonNull(rbac, "rbac");
         var authorization = rbac.getAuthorization();
         var target = authorization.getServiceToken().getResourceUri();
@@ -128,9 +143,9 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
         if (target == null || endpoint == null) throw new IllegalStateException("TIANJI_EXECUTION_AUTHORIZATION_TARGET_REQUIRED");
         URI audience = TianjiExecutionAuthorityBindings.resource(URI.create(target)); URI base = URI.create(endpoint);
         Map<String, BoundClient> result = new LinkedHashMap<>();
-        TianjiExecutionAuthorityBindings.source(starter, authority, issuers).forEach((issuer, source) -> {
+        TianjiExecutionAuthorityBindings.source(starter, authority, issuers, issueScope).forEach((issuer, source) -> {
             var context = new IdpServiceTokenRequest(source.registrationId(), source.appId(), audience, source.context(), source.tenantId(),
-                    Set.of(ExecutionAuthorizationContract.SERVICE_SCOPE));
+                    Set.of(decisionScope));
             var client = new HttpExecutionAuthorizationClient(base, issuer, context, oauth, mapper, authorization.getFetchTimeout());
             String key = TrustedIssuerRegistry.issuerHash(issuer);
             if (result.putIfAbsent(key, new BoundClient(issuer, source.tenantId(), client)) != null) {
@@ -141,7 +156,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     }
 
     private static String systemCode(Rbac3StarterProperties value) { return systemCode(Objects.requireNonNull(value, "rbac").getSystemCode()); }
-    private static String systemCode(String value) {
+    static String systemCode(String value) {
         if (value == null || !value.matches("[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")) {
             throw new IllegalArgumentException("TIANJI_EXECUTION_AUTHORIZATION_SYSTEM_INVALID");
         }

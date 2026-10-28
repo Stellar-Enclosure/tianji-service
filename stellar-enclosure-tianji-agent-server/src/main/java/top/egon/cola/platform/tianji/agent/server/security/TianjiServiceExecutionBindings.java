@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
 import java.util.Objects;
+import java.net.URI;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -26,6 +27,10 @@ public final class TianjiServiceExecutionBindings {
     }
 
     public AgentServiceExecutionGrant.Subject require(AgentRunAuthorization.Request request, AgentProcessLink link) {
+        return resolve(request, link).subject();
+    }
+
+    Bound resolve(AgentRunAuthorization.Request request, AgentProcessLink link) {
         if (request == null || link == null || request.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE
                 || "LEGACY".equals(request.actor().issuerFingerprint())
                 || !request.definitionSha256().equals(link.definitionContentSha256())) throw unavailable();
@@ -43,8 +48,9 @@ public final class TianjiServiceExecutionBindings {
         if (sources.size() != 1) throw unavailable();
         var source = sources.getFirst();
         requireTrust(source);
-        return new AgentServiceExecutionGrant.Subject(binding.clientId(), binding.appId(), binding.businessCode(),
+        var subject = new AgentServiceExecutionGrant.Subject(binding.clientId(), binding.appId(), binding.businessCode(),
                 binding.applicationCode(), binding.environment(), source.resourceUri());
+        return new Bound(source.issuer(), subject);
     }
 
     boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return issuers == candidate; }
@@ -61,4 +67,7 @@ public final class TianjiServiceExecutionBindings {
     }
 
     private static IllegalStateException unavailable() { return new IllegalStateException("TIANJI_SERVICE_EXECUTION_BINDING_UNAVAILABLE"); }
+    record Bound(URI issuer, AgentServiceExecutionGrant.Subject subject) {
+        @Override public String toString() { return "TianjiServiceExecutionBindings.Bound[redacted]"; }
+    }
 }
