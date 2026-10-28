@@ -68,17 +68,55 @@ The internal `ProcessDecisionService` evaluates a release-bound DMN without crea
 
 Set `stellar.tianji.process.api.enabled=true` only in an explicitly configured servlet host. The source provides `POST /api/tianji/v1/process-releases`, `GET /api/tianji/v1/process-releases/{releaseVersion}`, `POST /api/tianji/v1/process-instances`, `GET /api/tianji/v1/process-instances/{instanceId}` and `POST /api/tianji/v1/decisions/evaluate`. The adapter requires verified Tianquan-Shoubing USER or tenant-scoped SERVICE identity, the Tianquan-Jianshen guard, and respectively `TIANJI_PROCESS_RELEASE_PUBLISH`, `TIANJI_PROCESS_RELEASE_READ`, `TIANJI_PROCESS_START`, `TIANJI_PROCESS_READ`, or `TIANJI_DECISION_EXECUTE` with their matching OAuth scopes. Tenant, subject and issuer never come from request bodies; instance reads remain owner-scoped. Registration, activation and role/client grants are separate deployment steps and are not performed by the build.
 
-The current checks cover the resource permission, OAuth scope, tenant and instance owner. Business-specific object and data scopes are not yet applied, and the initial model subset does not execute external workers or business writes.
+The current checks cover the resource permission, OAuth scope, tenant and instance owner. Business-specific object and data scopes are not yet applied.
 
-The engine-neutral Worker contract and HTTP client define one-task acquisition and completion/failure receipts, but the corresponding Process Server endpoints and Worker Starter are **not implemented yet**. No Worker capability is enabled by these types. Acquisition derives tenant from the authenticated service identity, and an uncertain acquisition may leave a lease until it expires. An accepted completion or failure can be replayed with the exact same lease and payload; an unknown side effect requires manual reconciliation. A receipt ID alone does not prove business idempotency: the eventual Worker integration must commit the business change and its receipt in the same business transaction or use an external system's verified idempotency mechanism. Lease tokens and task data are redacted from the contract objects' string representations.
+The engine-neutral Worker contract and HTTP client define one-task acquisition and completion/failure receipts. The opt-in Process Server endpoints are `POST /api/tianji/v1/worker-tasks/acquire`, `/complete` and `/fail`. They accept only verified SERVICE identities: acquire requires `TIANJI_WORKER_ACQUIRE` and `tianji:worker:acquire`; complete/fail require `TIANJI_WORKER_REPORT` and `tianji:worker:report`. Acquisition derives tenant from the verified identity, and an uncertain acquisition may leave a lease until it expires. An accepted completion or failure can be replayed with the exact same lease and payload; a lost lease returns HTTP 409 with `TIANJI_WORKER_LEASE_LOST`, while a different payload for an accepted receipt returns `TIANJI_IDEMPOTENCY_CONFLICT`. An unknown side effect requires manual reconciliation. A receipt ID alone does not prove business idempotency: the Worker integration must commit the business change and its receipt in the same business transaction or use an external system's verified idempotency mechanism. The Worker Starter is not implemented yet. Lease tokens and task data are redacted from the contract objects' string representations.
 
-The validator recognizes a candidate external-worker model with a literal logical topic, a schema version, an effect-safety mode, `doNotIncludeVariables=true` and explicit typed input/output mappings, illustrated in `worker-mapping.bpmn20.xml`. Its Flowable topic must be `logical-topic:schema-version`; the separator cannot appear in either part, so incompatible versions have separate native queues. The current mapping check allows inputs only from declared process inputs and rejects output names that overwrite those inputs or other decision/worker outputs. The public release endpoint continues to reject these models unless a later, explicitly enabled Worker integration supplies an operator-controlled registry.
+The validator recognizes an external-worker model with a literal logical topic, a schema version, an effect-safety mode, `doNotIncludeVariables=true` and explicit typed input/output mappings, illustrated in `worker-mapping.bpmn20.xml`. Its Flowable topic must be `logical-topic:schema-version`; the separator cannot appear in either part, so incompatible versions have separate native queues. The current mapping check allows inputs only from declared process inputs and rejects output names that overwrite those inputs or other decision/worker outputs. The public release endpoint rejects these models unless Worker is explicitly enabled and an operator-controlled registry authorizes the exact mappings.
 
-ProcessDB migration V4 adds the Worker lease and receipt table without changing earlier migrations. The internal JDBC store binds each lease to a verified service issuer, subject, tenant and native job; stores only a hash of the lease token; limits the database-timed expiry to the native lock and configured duration; and retains accepted receipts for exact replay. The store requires the caller's transaction and does not itself lock or verify a Flowable job. It is not an operational Worker endpoint. The existing Process API continues to verify V1–V3; `verifyWorker()` separately checks V4 before a future Worker adapter can be enabled. Apply V4 through the operator-controlled ProcessDB migration process, never automatically at application startup.
+ProcessDB migration V4 adds the Worker lease and receipt table without changing earlier migrations. The internal JDBC store binds each lease to a verified service issuer, subject, tenant and native job; stores only a hash of the lease token; limits the database-timed expiry to the native lock and configured duration; and retains accepted receipts for exact replay. The store requires the caller's transaction and does not itself lock or verify a Flowable job. The existing Process API continues to verify V1–V3; enabling Worker additionally verifies V4. Apply V4 through the operator-controlled ProcessDB migration process, never automatically at application startup.
 
-The internal Flowable Worker adapter currently handles BPMN jobs. It adds native-job locking and rechecks the release, topic, mapped input, effect-safety mode and output schema before accepting a completion. Its operator-provided registry binds exact tenant, verified issuer, service subject, topic and version, explicitly permits process-variable sources and output targets, limits leases per registration and caps each service identity at 32 live leases. A change to the registration policy during a lease prevents that lease from completing until it is reconciled. Acquisition requires the native async executor and expired-job reset to be active; completion creates a native async job before the process advances. Retryable failures follow the configured delay and native retry budget, while unknown outcomes and business rejections enter Flowable's dead-letter state for manual recovery. These internal methods have no HTTP endpoint or Worker Starter yet; CMMN Worker execution, registration, permission grants, business receipt atomicity, real network behavior and multi-node configuration consistency still need implementation and acceptance.
+The Flowable Worker adapter currently handles BPMN jobs. It adds native-job locking and rechecks the release, topic, mapped input, effect-safety mode and output schema before accepting a completion. Its operator-provided registry binds exact tenant, verified issuer, service subject, topic and version, explicitly permits process-variable sources and output targets, limits leases per registration and caps each service identity at 32 live leases. A change to the registration policy during a lease prevents that lease from completing until it is reconciled. Acquisition requires the native async executor and expired-job reset to be active; completion creates a native async job before the process advances. Retryable failures follow the configured delay and native retry budget, while unknown outcomes and business rejections enter Flowable's dead-letter state for manual recovery. CMMN Worker execution, dynamic registration, permission grants, business receipt atomicity, real network behavior and multi-node configuration consistency still need implementation and acceptance.
 
-Enabling the API performs read-only checks of platform Flyway checksums, columns, key constraints and the start receipt index; the runtime role needs SELECT on `tianji_process_schema_history` and the PostgreSQL catalog. These checks and the engine/API integration have been exercised against PostgreSQL 18.3; other PostgreSQL versions and real identity/permission services require separate acceptance. The adapter bounds JSON request bodies to 9 MiB and does not install schema or publish permissions at startup.
+Worker is disabled unless both `stellar.tianji.process.api.enabled` and `stellar.tianji.process.worker.enabled` are true in a servlet host. Startup also requires V4, a nonempty operator registry and an enabled native async executor with job acquisition and expired-lock reset. All Process Server nodes must use the same registry before publishing Worker models. A configuration shape for the test fixture is:
+
+```yaml
+spring:
+  main:
+    web-application-type: servlet
+flowable:
+  async-executor-activate: true
+  process:
+    async:
+      executor:
+        async-job-acquisition-enabled: true
+        reset-expired-job-enabled: true
+stellar:
+  tianji:
+    process:
+      api:
+        enabled: true
+      worker:
+        enabled: true
+        registrations:
+          - tenant-id: 1001
+            issuer: https://issuer.example/tenants/1001
+            subject-id: example-worker-service
+            topic: riskCheck
+            schema-version: "1"
+            inputs: {requestedAmount: INTEGER}
+            outputs: {approved: BOOLEAN}
+            input-sources: {requestedAmount: [amount]}
+            output-targets: {approved: [approved]}
+            max-concurrent: 1
+            lease-duration: 2m
+            retry-delay: 1s
+            effect-safety: TRANSACTIONAL_RECEIPT
+```
+
+The registry is an operator grant, not a worker-supplied claim. Register and activate the generated permission manifest and assign the required scopes and service permissions through the existing IAM process; building or setting this configuration does not grant them. The selected effect-safety mode is a contract that the business implementation must actually satisfy.
+
+Enabling the API performs read-only checks of platform Flyway checksums, columns, key constraints and the start receipt index; the runtime role needs SELECT on `tianji_process_schema_history` and the PostgreSQL catalog. These checks and the engine/API integration have been exercised against PostgreSQL 18.3; other PostgreSQL versions and real identity/permission services require separate acceptance. The adapter bounds Process JSON bodies to 9 MiB and Worker bodies to 256 KiB, rejects unknown Worker fields and duplicate keys, and does not install schema or publish permissions at startup.
 
 For a JDK 25 environment with the Stellar-Enclosure platform parent and Components BOM available in Maven, run this from the repository root. It builds the sibling Components, Tianquan-Shoubing and Tianquan-Jianshen checkouts and Tianji in one reactor without installing or publishing artifacts:
 

@@ -15,6 +15,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 
 import java.time.Duration;
@@ -119,13 +120,13 @@ class WorkerLeaseStorePostgresTest {
         var stale = claim(actor, "job-stale", 3, now(jdbc).plusSeconds(90), Duration.ofSeconds(30));
         transaction.execute(status -> store.claim(stale));
         expire(jdbc, stale.tokenSha256());
-        assertThrows(ProcessConflictException.class, () -> transaction.execute(status -> store.finish(actor, stale.jobId(), stale.tokenSha256(), completed)));
+        assertThrows(WorkerLeaseLostException.class, () -> transaction.execute(status -> store.finish(actor, stale.jobId(), stale.tokenSha256(), completed)));
         var replacement = claim(actor, "job-stale", 4, now(jdbc).plusSeconds(90), Duration.ofSeconds(30));
         assertThrows(InjectedFailure.class, () -> transaction.execute(status -> { store.claim(replacement); throw new InjectedFailure(); }));
         assertEquals("LEASED", transaction.execute(status -> store.lock(actor, stale.jobId(), stale.tokenSha256())).state());
         transaction.execute(status -> store.claim(replacement));
         assertEquals("EXPIRED", transaction.execute(status -> store.lock(actor, stale.jobId(), stale.tokenSha256())).state());
-        assertThrows(ProcessConflictException.class, () -> transaction.execute(status -> store.finish(actor, stale.jobId(), stale.tokenSha256(), completed)));
+        assertThrows(WorkerLeaseLostException.class, () -> transaction.execute(status -> store.finish(actor, stale.jobId(), stale.tokenSha256(), completed)));
         var manual = new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.NEEDS_MANUAL, "e".repeat(64), null,
                 WorkerFailureKindEnum.UNKNOWN, "OUTCOME_UNKNOWN");
         assertEquals("NEEDS_MANUAL", transaction.execute(status -> store.finish(actor, replacement.jobId(), replacement.tokenSha256(), manual)).state());

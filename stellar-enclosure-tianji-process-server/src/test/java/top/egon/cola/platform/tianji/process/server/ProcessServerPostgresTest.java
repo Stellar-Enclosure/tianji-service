@@ -54,6 +54,7 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
@@ -62,6 +63,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
@@ -110,6 +112,8 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -522,11 +526,25 @@ class ProcessServerPostgresTest {
         byte[] routingDmn = new ClassPathResource("fixtures/baseline.dmn").getContentAsByteArray();
         new WebApplicationContextRunner().withUserConfiguration(TianjiProcessServerApplication.class, TestDelivery.class)
                 .withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.decision-tasks.enabled=true",
+                        "stellar.tianji.process.worker.enabled=true",
+                        "stellar.tianji.process.worker.registrations[0].tenant-id=20",
+                        "stellar.tianji.process.worker.registrations[0].issuer=https://idp.example/20",
+                        "stellar.tianji.process.worker.registrations[0].subject-id=worker-service",
+                        "stellar.tianji.process.worker.registrations[0].topic=riskCheck",
+                        "stellar.tianji.process.worker.registrations[0].schema-version=1",
+                        "stellar.tianji.process.worker.registrations[0].inputs.requestedAmount=INTEGER",
+                        "stellar.tianji.process.worker.registrations[0].outputs.approved=BOOLEAN",
+                        "stellar.tianji.process.worker.registrations[0].input-sources.requestedAmount[0]=amount",
+                        "stellar.tianji.process.worker.registrations[0].output-targets.approved[0]=approved",
+                        "stellar.tianji.process.worker.registrations[0].max-concurrent=1",
+                        "stellar.tianji.process.worker.registrations[0].lease-duration=PT2M",
+                        "stellar.tianji.process.worker.registrations[0].retry-delay=PT0.2S",
+                        "stellar.tianji.process.worker.registrations[0].effect-safety=TRANSACTIONAL_RECEIPT",
                         "spring.datasource.url=" + scopedUrl,
                         "spring.datasource.username=" + runtimeUser,
                         "spring.sql.init.mode=never", "spring.flyway.enabled=false",
                         "flowable.database-schema=tianji_process", "flowable.database-schema-update=false",
-                        "flowable.async-executor-activate=false", "flowable.async-history-executor-activate=false",
+                        "flowable.async-executor-activate=true", "flowable.async-history-executor-activate=false",
                         "flowable.check-process-definitions=false", "flowable.cmmn.deploy-resources=false",
                         "flowable.dmn.deploy-resources=false", "flowable.idm.enabled=false", "flowable.eventregistry.enabled=false",
                         "egon.cola.component.transactional-outbox.enabled=true",
@@ -544,6 +562,12 @@ class ProcessServerPostgresTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed();
                     assertThat(context).hasSingleBean(ProcessController.class);
+                    assertThat(context).hasSingleBean(WorkerController.class);
+                    assertThat(context).hasSingleBean(WorkerTopicRegistry.class);
+                    assertThat(context).hasSingleBean(FlowableWorkerService.class);
+                    var worker = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-service", "https://idp.example/20");
+                    assertEquals(Map.of("requestedAmount", ValueType.INTEGER), context.getBean(WorkerTopicRegistry.class)
+                            .require(worker, "riskCheck", "1").inputs());
                     assertThat(context).hasSingleBean(ProcessApiSchemaVerifier.class);
                     var release = context.getBean(ProcessReleaseService.class).publish(
                             new ProcessActor(20, ProcessActor.SubjectType.USER, "routing-user"), "routing-configured", List.of(
@@ -698,12 +722,12 @@ class ProcessServerPostgresTest {
         assertNotNull(stale);
         expireNativeWorker(bootstrap, stale.taskId(), stale.processInstanceId());
         expireWorkerLease(bootstrap, stale);
-        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
+        assertThrows(WorkerLeaseLostException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
         var next = awaitWorker(service, worker20, v1Request);
         assertEquals(stale.taskId(), next.taskId());
         assertEquals(stale.idempotencyKey(), next.idempotencyKey());
         assertFalse(stale.leaseToken().equals(next.leaseToken()));
-        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
+        assertThrows(WorkerLeaseLostException.class, () -> service.complete(worker20, complete(stale, "stale-receipt", true)));
         assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, service.complete(worker20, complete(next, "fresh-receipt", true)).outcome());
 
         var tenantTask = service.acquire(worker21, v1Request).task();
@@ -730,7 +754,40 @@ class ProcessServerPostgresTest {
         assertEquals(1, app.getBean(ManagementService.class).createDeadLetterJobQuery().processInstanceId(retried.processInstanceId()).count());
 
         verifyWorkerConcurrency(app, bootstrap, runs, service, owner20, worker20, worker20b);
+        verifyWorkerHttpAgainstDatabase(runs, service, owner20, worker20, worker21);
         verifyWorkerExpiry(app, bootstrap, runs, service, owner20, worker20);
+    }
+
+    private static void verifyWorkerHttpAgainstDatabase(ProcessExecutionService runs, FlowableWorkerService service,
+                                                        ProcessActor owner, ProcessActor worker, ProcessActor otherTenant) throws Exception {
+        startWorkerRun(runs, owner, "worker-v1", "worker-http");
+        var access = mock(TianjiProcessAccess.class);
+        when(access.require(anyString())).thenReturn(worker);
+        var mvc = MockMvcBuilders.standaloneSetup(new WorkerController(service, access))
+                .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
+        var mapper = JsonMapper.builder().build();
+        var acquire = new AcquireWorkerTaskCommand("riskCheck", "1");
+        byte[] body = mvc.perform(post("/api/tianji/v1/worker-tasks/acquire").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(acquire)))
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andReturn().getResponse().getContentAsByteArray();
+        var task = mapper.readValue(body, AcquireWorkerTaskResult.class).task();
+        assertNotNull(task);
+        var command = complete(task, "http-receipt", true);
+        byte[] completion = mapper.writeValueAsBytes(command);
+        when(access.require(anyString())).thenReturn(otherTenant);
+        mvc.perform(post("/api/tianji/v1/worker-tasks/complete").contentType(MediaType.APPLICATION_JSON).content(completion))
+                .andExpect(status().isNotFound());
+        when(access.require(anyString())).thenReturn(worker);
+        byte[] first = mvc.perform(post("/api/tianji/v1/worker-tasks/complete").contentType(MediaType.APPLICATION_JSON).content(completion))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray();
+        byte[] replay = mvc.perform(post("/api/tianji/v1/worker-tasks/complete").contentType(MediaType.APPLICATION_JSON).content(completion))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsByteArray();
+        assertEquals(mapper.readValue(first, top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO.class),
+                mapper.readValue(replay, top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO.class));
+        when(access.require(anyString())).thenReturn(owner);
+        mvc.perform(post("/api/tianji/v1/worker-tasks/acquire").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(acquire))).andExpect(status().isForbidden());
     }
 
     private static void verifyWorkerConcurrency(ConfigurableApplicationContext app, JdbcTemplate bootstrap,
@@ -785,7 +842,7 @@ class ProcessServerPostgresTest {
                 expireWorkerLease(bootstrap, waiting);
                 future.set(pool.submit(() -> {
                     try { service.complete(worker20, complete(waiting, "waiting-receipt", true)); return false; }
-                    catch (ProcessConflictException expected) { return true; }
+                    catch (WorkerLeaseLostException expected) { return true; }
                 }));
                 await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(50)).until(() ->
                         bootstrap.queryForObject("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
@@ -812,7 +869,7 @@ class ProcessServerPostgresTest {
         bootstrap.execute("CREATE TRIGGER test_slow_native_worker BEFORE DELETE ON tianji_process.act_ru_external_job "
                 + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_slow_native_worker()");
         long beforeSlowAck = System.nanoTime();
-        assertThrows(RuntimeException.class, () -> service.complete(worker20, complete(shortTask, "slow-receipt", true)));
+        assertThrows(WorkerLeaseLostException.class, () -> service.complete(worker20, complete(shortTask, "slow-receipt", true)));
         assertTrue(Duration.ofNanos(System.nanoTime() - beforeSlowAck).compareTo(Duration.ofSeconds(3)) >= 0);
         assertEquals("LEASED", bootstrap.queryForObject("SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?",
                 String.class, WorkerLeaseStore.tokenHash(shortTask.leaseToken())));

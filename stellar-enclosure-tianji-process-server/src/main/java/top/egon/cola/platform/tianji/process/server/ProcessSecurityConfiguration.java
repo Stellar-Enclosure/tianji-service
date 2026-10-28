@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.process.server;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -24,6 +25,10 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidato
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
+import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
@@ -43,6 +48,8 @@ public class ProcessSecurityConfiguration {
             ObjectProvider<Rbac3BearerAuthenticationFilter> authorizationFilters,
             ObjectProvider<PermissionExecutionGuard> policies) throws Exception {
         boolean enabled = environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false);
+        boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
+        if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -51,6 +58,7 @@ public class ProcessSecurityConfiguration {
                     if (enabled) authorize.requestMatchers("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                             "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                             "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**").authenticated();
+                    if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     authorize.anyRequest().denyAll();
                 });
         if (enabled) {
@@ -86,7 +94,8 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnMissingBean(IdpEndpointAuthenticationPolicy.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy processEndpointAuthenticationPolicy() {
-        return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"), List.of(),
+        return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
+                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**"),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**"), true);
@@ -119,9 +128,13 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnMissingBean(ProcessReleaseService.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessReleaseService processReleaseService(ProcessEngine process, DmnEngine dmn,
-                                                 ProcessModelValidator validator, Environment environment) {
+                                                 ProcessModelValidator validator, Environment environment,
+                                                 ObjectProvider<WorkerTopicRegistry> registries) {
         boolean decisionTasksEnabled = environment.getProperty("stellar.tianji.process.decision-tasks.enabled", Boolean.class, false);
-        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled);
+        boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
+        WorkerTopicRegistry registry = workerEnabled ? registries.getIfAvailable() : null;
+        if (workerEnabled && registry == null) throw new IllegalStateException("Worker API requires an operator-owned topic registry");
+        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry);
     }
 
     @Bean
@@ -138,6 +151,26 @@ public class ProcessSecurityConfiguration {
     ProcessDecisionService processDecisionService(ProcessEngine process, DmnEngine dmn,
                                                    ProcessModelValidator validator) {
         return new ProcessDecisionService(processConfiguration(process), decisionConfiguration(dmn), validator);
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "worker.enabled"}, havingValue = "true")
+    @EnableConfigurationProperties(WorkerTopicProperties.class)
+    static class WorkerConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(WorkerTopicRegistry.class)
+        WorkerTopicRegistry workerTopicRegistry(WorkerTopicProperties properties) {
+            return new WorkerTopicRegistry(properties.registrations());
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(FlowableWorkerService.class)
+        FlowableWorkerService flowableWorkerService(ProcessEngine process, DmnEngine dmn,
+                                                     ProcessModelValidator validator, WorkerTopicRegistry registry) {
+            var configuration = processConfiguration(process);
+            WorkerNativeAvailability.requireConfigured(configuration);
+            return new FlowableWorkerService(configuration, decisionConfiguration(dmn), validator, registry);
+        }
     }
 
     private static SpringProcessEngineConfiguration processConfiguration(ProcessEngine engine) {

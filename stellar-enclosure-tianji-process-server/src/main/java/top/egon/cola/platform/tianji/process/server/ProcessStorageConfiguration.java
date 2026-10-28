@@ -8,9 +8,12 @@ import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flowable.spring.boot.EngineConfigurationConfigurer;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.ApplicationContext;
+import org.springframework.web.context.WebApplicationContext;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
@@ -42,6 +45,17 @@ public class ProcessStorageConfiguration {
                     || !environment.getProperty(OUTBOX + "storage.validate-schema", Boolean.class, true)
                     || !schema.matches("[a-z_][a-z0-9_]{0,62}") || !schema.equals(outboxSchema)) {
                 throw new IllegalStateException("Process storage requires a pre-provisioned shared Flowable and JDBC Outbox schema");
+            }
+        };
+    }
+
+    @Bean
+    SmartInitializingSingleton workerWebBoundaryGuard(Environment environment, ApplicationContext context) {
+        return () -> {
+            if (environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false)
+                    && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false)
+                    || !(context instanceof WebApplicationContext))) {
+                throw new IllegalStateException("Worker API requires an enabled servlet Process API");
             }
         };
     }

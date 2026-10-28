@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -162,6 +163,7 @@ public final class FlowableWorkerService {
     private WorkerReceiptDTO replayFailure(ProcessActor actor, FailWorkerTaskCommand command, String hash, String resultHash,
                                             WorkerLeaseStore.Lease lease) {
         WorkerReceiptOutcomeEnum outcome;
+        if ("EXPIRED".equals(lease.state())) throw lost();
         try { outcome = WorkerReceiptOutcomeEnum.valueOf(lease.state()); }
         catch (IllegalArgumentException invalid) { throw conflict(); }
         if (outcome == WorkerReceiptOutcomeEnum.COMPLETED) throw conflict();
@@ -173,9 +175,10 @@ public final class FlowableWorkerService {
 
     private VerifiedJob verifyLease(ProcessActor actor, WorkerLeaseStore.Lease lease, NativeJob job,
                                     WorkerTopicRegistry.Registration registration) {
-        if (job == null || !job.live() || !lease.nativeOwner().equals(job.owner()) || !lease.scopeId().equals(job.processInstanceId())
-                || !lease.definitionId().equals(job.definitionId()) || !lease.elementId().equals(job.elementId())
-                || lease.scopeType() != WorkerScopeTypeEnum.BPMN || !leases.isLive(actor, job.id(), lease.tokenSha256())) throw conflict();
+        if (job == null || !job.live() || !lease.nativeOwner().equals(job.owner())
+                || !leases.isLive(actor, lease.jobId(), lease.tokenSha256())) throw lost();
+        if (!lease.scopeId().equals(job.processInstanceId()) || !lease.definitionId().equals(job.definitionId())
+                || !lease.elementId().equals(job.elementId()) || lease.scopeType() != WorkerScopeTypeEnum.BPMN) throw conflict();
         VerifiedJob verified = verifyJob(actor.tenantId(), job, registration);
         if (!lease.releaseKey().equals(verified.releaseKey()) || !lease.modelSha256().equals(verified.modelSha256())) throw conflict();
         return verified;
@@ -255,6 +258,7 @@ public final class FlowableWorkerService {
     private static IllegalArgumentException invalidConfiguration() { return new IllegalArgumentException("Worker execution requires shared Flowable JDBC storage"); }
     private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
+    private static WorkerLeaseLostException lost() { return new WorkerLeaseLostException(); }
 
     private record NativeJob(String id, String owner, Instant expiresAt, String processInstanceId, String executionId,
                              String definitionId, String elementId, String topic, int retries, boolean live) { }

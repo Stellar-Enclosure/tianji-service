@@ -9,6 +9,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcome
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
@@ -124,6 +125,7 @@ public final class WorkerLeaseStore {
         Objects.requireNonNull(finish, "finish");
         Lease current = lock(actor, jobId, tokenSha256);
         if (!"LEASED".equals(current.state())) {
+            if ("EXPIRED".equals(current.state())) throw lost();
             if (finish.outcome().name().equals(current.state()) && finish.resultSha256().equals(current.resultSha256())
                     && Objects.equals(finish.businessReceiptId(), current.businessReceiptId())
                     && Objects.equals(finish.failureKind(), current.failureKind())
@@ -137,7 +139,7 @@ public final class WorkerLeaseStore {
                 finish.outcome().name(), finish.resultSha256(), finish.businessReceiptId(),
                 finish.failureKind() == null ? null : finish.failureKind().name(), finish.failureCode(), tokenSha256,
                 actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), jobId);
-        if (rows.size() != 1) throw conflict();
+        if (rows.size() != 1) throw lost();
         return rows.getFirst();
     }
 
@@ -188,6 +190,7 @@ public final class WorkerLeaseStore {
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Worker lease request is invalid"); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
     private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
+    private static WorkerLeaseLostException lost() { return new WorkerLeaseLostException(); }
 
     public record Claim(ProcessActor actor, String tokenSha256, String topic, String schemaVersion, String jobId,
                         String occurrenceId, WorkerScopeTypeEnum scopeType, String scopeId, String releaseKey,

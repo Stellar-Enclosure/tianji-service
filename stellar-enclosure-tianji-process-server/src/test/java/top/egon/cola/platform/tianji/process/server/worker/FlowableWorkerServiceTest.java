@@ -22,8 +22,10 @@ class FlowableWorkerServiceTest {
         when(engine.getAsyncExecutorConfiguration()).thenReturn(configuration);
         when(configuration.isAsyncJobAcquisitionEnabled()).thenReturn(true);
         when(configuration.isResetExpiredJobEnabled()).thenReturn(true);
+        assertDoesNotThrow(() -> WorkerNativeAvailability.requireConfigured(engine));
         assertDoesNotThrow(() -> WorkerNativeAvailability.require(engine));
         when(configuration.isResetExpiredJobEnabled()).thenReturn(false);
+        assertThrows(IllegalStateException.class, () -> WorkerNativeAvailability.requireConfigured(engine));
         assertThrows(IllegalStateException.class, () -> WorkerNativeAvailability.require(engine));
         when(configuration.isResetExpiredJobEnabled()).thenReturn(true);
         when(configuration.isAsyncJobAcquisitionEnabled()).thenReturn(false);

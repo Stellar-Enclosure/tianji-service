@@ -6,10 +6,17 @@ import org.flowable.spring.SpringProcessEngineConfiguration;
 public final class WorkerNativeAvailability {
     private WorkerNativeAvailability() { }
 
-    public static void require(SpringProcessEngineConfiguration process) {
+    public static void requireConfigured(SpringProcessEngineConfiguration process) {
         var configuration = process.getAsyncExecutorConfiguration();
-        if (!process.isAsyncExecutorActivate() || process.getAsyncExecutor() == null || !process.getAsyncExecutor().isActive()
-                || configuration == null || !configuration.isAsyncJobAcquisitionEnabled() || !configuration.isResetExpiredJobEnabled()) {
+        if (!process.isAsyncExecutorActivate() || configuration == null
+                || !configuration.isAsyncJobAcquisitionEnabled() || !configuration.isResetExpiredJobEnabled()) {
+            throw new IllegalStateException("Worker acquisition requires the native job executor and expired-lock reset");
+        }
+    }
+
+    public static void require(SpringProcessEngineConfiguration process) {
+        requireConfigured(process);
+        if (process.getAsyncExecutor() == null || !process.getAsyncExecutor().isActive()) {
             throw new IllegalStateException("Worker acquisition requires the native job executor and expired-lock reset");
         }
     }

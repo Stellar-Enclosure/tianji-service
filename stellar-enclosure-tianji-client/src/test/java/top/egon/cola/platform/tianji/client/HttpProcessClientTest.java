@@ -229,6 +229,10 @@ class HttpProcessClientTest {
         assertNull(failure.correlationId());
         assertFalse(failure.toString().contains(lease));
         assertNull(failure.getCause());
+        handler.set(exchange -> respond(exchange, 409, "application/json",
+                "{\"code\":\"TIANJI_WORKER_LEASE_LOST\"}".getBytes(StandardCharsets.UTF_8)));
+        assertEquals("TIANJI_WORKER_LEASE_LOST", assertThrows(ProcessClientException.class,
+                () -> client(Duration.ofSeconds(3)).complete(command)).code());
     }
 
     private HttpProcessClient client(Duration timeout) { return new HttpProcessClient(base, HttpClient.newHttpClient(), () -> TOKEN, timeout); }

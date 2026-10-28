@@ -18,6 +18,7 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessConflictExcepti
 import top.egon.cola.platform.tianji.process.server.error.ProcessDecisionFailedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessTenantChangedException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 
 @RestControllerAdvice(basePackageClasses = ProcessController.class)
 @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
@@ -28,6 +29,9 @@ public final class ProcessApiErrors {
 
     @ExceptionHandler(ProcessConflictException.class)
     ResponseEntity<OrchestrationErrorDTO> conflict() { return error(HttpStatus.CONFLICT, "TIANJI_IDEMPOTENCY_CONFLICT"); }
+
+    @ExceptionHandler(WorkerLeaseLostException.class)
+    ResponseEntity<OrchestrationErrorDTO> workerLeaseLost() { return error(HttpStatus.CONFLICT, "TIANJI_WORKER_LEASE_LOST"); }
 
     @ExceptionHandler(ProcessTenantChangedException.class)
     ResponseEntity<OrchestrationErrorDTO> tenantChanged() { return error(HttpStatus.CONFLICT, "TIANJI_TENANT_CONTEXT_CHANGED"); }

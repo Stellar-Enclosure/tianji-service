@@ -54,3 +54,5 @@ egon:
               TIANJI_PROCESS_START: ["tianji:process:start"]
               TIANJI_PROCESS_READ: ["tianji:process:read"]
               TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]
+              TIANJI_WORKER_ACQUIRE: ["tianji:worker:acquire"]
+              TIANJI_WORKER_REPORT: ["tianji:worker:report"]

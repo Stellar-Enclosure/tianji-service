@@ -4,6 +4,8 @@ import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.context.ApplicationContext;
+import org.springframework.web.context.WebApplicationContext;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 
@@ -50,6 +52,19 @@ class ProcessStorageConfigurationTest {
         engine.setDataSource(source);
         engine.setTransactionManager(new DataSourceTransactionManager(source));
         assertThrows(IllegalStateException.class, () -> configurer.configure(engine));
+    }
+
+    @Test
+    void worker_enablement_requires_an_enabled_servlet_process_api() {
+        var config = new ProcessStorageConfiguration();
+        var disabled = new MockEnvironment();
+        assertDoesNotThrow(() -> config.workerWebBoundaryGuard(disabled, mock(ApplicationContext.class)).afterSingletonsInstantiated());
+        var enabled = new MockEnvironment().withProperty("stellar.tianji.process.worker.enabled", "true")
+                .withProperty("stellar.tianji.process.api.enabled", "true");
+        assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(enabled, mock(ApplicationContext.class)).afterSingletonsInstantiated());
+        assertDoesNotThrow(() -> config.workerWebBoundaryGuard(enabled, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        enabled.setProperty("stellar.tianji.process.api.enabled", "false");
+        assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(enabled, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
     }
 
     private static void guard(MockEnvironment environment) {
