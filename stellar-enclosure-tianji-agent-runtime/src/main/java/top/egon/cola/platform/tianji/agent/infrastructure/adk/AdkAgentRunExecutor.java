@@ -11,8 +11,11 @@ import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Scheduler;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties;
@@ -20,9 +23,13 @@ import top.egon.cola.component.agentflow.config.AgentFlowConfigDTO;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.component.agentflow.runtime.AgentFlowInMemoryRunner;
+import top.egon.cola.component.agentflow.runtime.AgentFlowSchedulers;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
+import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
+import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
@@ -32,7 +39,6 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
-import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.HashSet;
@@ -41,48 +47,86 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** Executes one explicitly selected queued run; it does not schedule or expose an endpoint. */
 public final class AdkAgentRunExecutor {
     private static final Logger log = LoggerFactory.getLogger(AdkAgentRunExecutor.class);
+    private static final Duration LEASE_DURATION = Duration.ofSeconds(30);
+    private static final long HEARTBEAT_SECONDS = 1;
     private final AgentLedgerService ledger;
     private final AgentFlowFactory flowFactory;
     private final AgentFlowConfigValidator flowValidator;
     private final Map<String, ChatModel> chatModels;
-    private final Map<String, Supplier<? extends BaseAgent>> codeFirstFactories;
-    private final Clock clock;
+    private final Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories;
+    private final String workerId = UUID.randomUUID().toString();
+    private final ScheduledExecutorService controlExecutor;
+    private final AgentModelBudgetEstimator budgetEstimator;
     private final ObjectMapper mapper = new ObjectMapper();
     private final AdkEventProjector projector = new AdkEventProjector();
 
     public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
                                AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
-                               Map<String, Supplier<? extends BaseAgent>> codeFirstFactories, Clock clock) {
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
         this.chatModels = Map.copyOf(chatModels);
         this.codeFirstFactories = Map.copyOf(codeFirstFactories);
-        this.clock = Objects.requireNonNull(clock, "clock");
+        this.controlExecutor = Objects.requireNonNull(controlExecutor, "controlExecutor");
+        this.budgetEstimator = Objects.requireNonNull(budgetEstimator, "budgetEstimator");
     }
 
     /** Uses one CAS to claim the run and one subscription to the ADK root invocation. */
     public AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(query, "query");
+        Map<String, String> previous = MDC.getCopyOfContextMap();
+        try {
+            MDC.put("tenantId", Long.toString(actor.tenantId()));
+            if (actor.subjectType() == TrustedAgentActor.SubjectType.USER) {
+                MDC.put("userId", actor.subjectId());
+            } else {
+                MDC.remove("userId");
+            }
+            return executeScoped(actor, query);
+        } finally {
+            MDC.clear();
+            if (previous != null && !previous.isEmpty()) MDC.setContextMap(previous);
+        }
+    }
+
+    private AgentRunDTO executeScoped(TrustedAgentActor actor, GetAgentRunQuery query) {
         AgentRunDTO queued = ledger.get(actor, query);
+        if (AgentRunTransitions.terminal(queued.status())) {
+            return queued;
+        }
         if (queued.status() != AgentRunStatusEnum.QUEUED) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent run is not queued");
         }
-        if (!queued.deadlineAt().isAfter(clock.instant())) {
-            AgentExecutionResult expired = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.TIMED_OUT,
-                    Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(), "NONE");
-            return ledger.transition(actor, query, queued.revision(), AgentRunStatusEnum.QUEUED,
-                    AgentRunStatusEnum.TIMED_OUT, null, expired);
+        if (!queued.deadlineAt().isAfter(ledger.databaseNow())) {
+            return ledger.expireDeadline(actor, query, queued.revision());
         }
-        AgentRunDTO running = ledger.transition(actor, query, queued.revision(), AgentRunStatusEnum.QUEUED,
-                AgentRunStatusEnum.RUNNING, null, null);
+        ClaimedAgentRun claimed;
+        try {
+            claimed = ledger.claim(actor, query, queued.revision(), workerId, LEASE_DURATION);
+        } catch (AgentLedgerException race) {
+            if (race.code() != AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT) throw race;
+            AgentRunDTO latest = ledger.get(actor, query);
+            if (AgentRunTransitions.terminal(latest.status())) return latest;
+            if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                return ledger.expireDeadline(actor, query, latest.revision());
+            }
+            throw race;
+        }
+        AgentRunDTO running = claimed.run();
+        AgentRunLease lease = claimed.lease();
         AtomicReference<AgentRunDTO> current = new AtomicReference<>(running);
         AgentFlowInMemoryRunner runner = null;
         try {
@@ -90,30 +134,45 @@ public final class AdkAgentRunExecutor {
             requireSupportedInput(snapshot, running);
             BaseAgent root = buildRoot(snapshot.definition());
             requireNoTools(root);
-            runner = new AgentFlowInMemoryRunner(root, "tianji_" + query.runId().replace('-', '_'));
+            AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
+                    Schedulers.from(controlExecutor), controlExecutor);
+            runner = new AgentFlowInMemoryRunner(root, "tianji_" + query.runId().replace('-', '_'), List.of(budget));
             String userId = actor.tenantId() + ":" + actor.subjectType().name() + ":" + actor.subjectId();
             Session session = runner.sessionService().createSession(runner.appName(), userId).blockingGet();
             if (session == null) {
                 throw new IllegalStateException("ADK session could not be created");
             }
-            Duration remaining = Duration.between(clock.instant(), running.deadlineAt());
+            Duration remaining = Duration.between(ledger.databaseNow(), running.deadlineAt());
             if (remaining.isZero() || remaining.isNegative()) {
                 throw new IllegalStateException("Agent deadline has elapsed", new TimeoutException());
             }
             RunConfig config = RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE)
                     .setMaxLlmCalls(snapshot.effectivePolicy().maxModelCalls()).build();
-            Flowable<Long> deadline = Flowable.timer(Math.max(1, remaining.toMillis()), TimeUnit.MILLISECONDS)
+            long deadlineMillis = Math.max(1, remaining.toMillis());
+            if (remaining.compareTo(Duration.ofMillis(deadlineMillis)) > 0 && deadlineMillis < Long.MAX_VALUE) {
+                deadlineMillis++;
+            }
+            Flowable<Long> deadline = Flowable.timer(deadlineMillis, TimeUnit.MILLISECONDS)
                     .flatMap(ignored -> Flowable.error(new TimeoutException("Agent deadline elapsed")));
+            Flowable<Long> control = Flowable.interval(HEARTBEAT_SECONDS, TimeUnit.SECONDS,
+                            Schedulers.from(controlExecutor))
+                    .concatMap(ignored -> switch (ledger.heartbeat(actor, lease, LEASE_DURATION)) {
+                        case ACTIVE -> Flowable.empty();
+                        case CANCEL_REQUESTED -> Flowable.error(new CancellationSignal());
+                        case DEADLINE_EXPIRED -> Flowable.error(new TimeoutException("Agent deadline elapsed"));
+                        case LEASE_LOST -> Flowable.error(new AgentLedgerException(
+                                AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent run lease is no longer valid"));
+                    });
             Map<String, String> agentOutputs = new LinkedHashMap<>();
             Set<String> agentNames = new HashSet<>();
             collectAgentNames(root, agentNames);
             runner.runAsync(userId, session.id(), Content.fromParts(Part.fromText(snapshot.input().text())), config)
-                    .takeUntil(deadline)
+                    .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout()))
                     .blockingForEach(event -> projector.project(event, agentNames).ifPresent(projected -> {
                         if (projected.completeAgentOutput()) {
                             agentOutputs.put(projected.author(), (String) projected.payload().get("text"));
                         }
-                        current.set(ledger.appendEvent(actor, query, current.get().revision(),
+                        current.set(ledger.appendEvent(actor, lease, current.get().revision(),
                                 projected.type(), projected.author(), projected.payload()));
                     }));
             if (agentOutputs.isEmpty()) {
@@ -127,16 +186,30 @@ public final class AdkAgentRunExecutor {
             }
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.COMPLETED,
                     output, null, snapshot.definition().outputSchemaVersion(), null, null, "UNKNOWN");
-            return ledger.transition(actor, query, current.get().revision(), AgentRunStatusEnum.RUNNING,
-                    AgentRunStatusEnum.COMPLETED, null, result);
+            return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } catch (RuntimeException failure) {
             if (failure instanceof AgentLedgerException conflict
-                    && conflict.code() == AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT) {
+                    && (conflict.code() == AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT
+                    || conflict.code() == AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED)) {
                 AgentRunDTO latest = ledger.get(actor, query);
                 if (AgentRunTransitions.terminal(latest.status())) {
                     return latest;
                 }
+                if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()) {
+                    return finishCancellation(actor, lease, latest);
+                }
+                if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                    return ledger.expireDeadline(actor, query, latest.revision());
+                }
                 throw failure;
+            }
+            if (hasCause(failure, CancellationSignal.class)) {
+                return finishCancellation(actor, lease, ledger.get(actor, query));
+            }
+            if (hasCause(failure, AdkRunBudgetPlugin.ModelIdleTimeout.class)) {
+                AgentExecutionResult idle = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.TIMED_OUT,
+                        Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_MODEL_IDLE_TIMEOUT.name(), "UNKNOWN");
+                return finishOrResolve(actor, query, lease, current.get().revision(), idle);
             }
             AgentRunStatusEnum status = isTimeout(failure) ? AgentRunStatusEnum.TIMED_OUT : AgentRunStatusEnum.FAILED;
             String code = isTimeout(failure) ? AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name()
@@ -144,8 +217,12 @@ public final class AdkAgentRunExecutor {
                     : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), status, Map.of(), null, null,
                     null, code, "UNKNOWN");
-            return ledger.transition(actor, query, current.get().revision(), AgentRunStatusEnum.RUNNING,
-                    status, null, result);
+            if (status == AgentRunStatusEnum.TIMED_OUT) {
+                AgentRunDTO latest = ledger.get(actor, query);
+                return AgentRunTransitions.terminal(latest.status()) ? latest
+                        : ledger.expireDeadline(actor, query, latest.revision());
+            }
+            return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } finally {
             if (runner != null) {
                 try {
@@ -155,6 +232,35 @@ public final class AdkAgentRunExecutor {
                             closeFailure.getClass().getSimpleName());
                 }
             }
+        }
+    }
+
+    private AgentRunDTO finishCancellation(TrustedAgentActor actor, AgentRunLease lease, AgentRunDTO current) {
+        if (AgentRunTransitions.terminal(current.status())) {
+            return current;
+        }
+        AgentExecutionResult result = new AgentExecutionResult(lease.runId(), AgentRunStatusEnum.CANCELLED,
+                Map.of(), null, null, null, null, "UNKNOWN");
+        return finishOrResolve(actor, new GetAgentRunQuery(lease.runId()), lease, current.revision(), result);
+    }
+
+    private AgentRunDTO finishOrResolve(TrustedAgentActor actor, GetAgentRunQuery query, AgentRunLease lease,
+                                        long revision, AgentExecutionResult result) {
+        try {
+            return ledger.finish(actor, lease, revision, result);
+        } catch (AgentLedgerException race) {
+            if (race.code() != AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT
+                    && race.code() != AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED) throw race;
+            AgentRunDTO latest = ledger.get(actor, query);
+            if (AgentRunTransitions.terminal(latest.status())) return latest;
+            if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                return ledger.expireDeadline(actor, query, latest.revision());
+            }
+            if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()
+                    && result.status() != AgentRunStatusEnum.CANCELLED) {
+                return finishCancellation(actor, lease, latest);
+            }
+            throw race;
         }
     }
 
@@ -187,11 +293,12 @@ public final class AdkAgentRunExecutor {
             return flowFactory.compileRoot("tianji", config, chatModels, List.of());
         }
         if ("CODE_FIRST".equals(definition.executionMode()) && definition.codeRef() != null) {
-            Supplier<? extends BaseAgent> factory = codeFirstFactories.get(definition.codeRef());
+            Function<Scheduler, ? extends BaseAgent> factory = codeFirstFactories.get(definition.codeRef());
             if (factory == null) {
                 throw new IllegalArgumentException("trusted Agent factory is unavailable");
             }
-            return Objects.requireNonNull(factory.get(), "trusted Agent factory returned null");
+            return Objects.requireNonNull(factory.apply(AgentFlowSchedulers.contextAwareIo()),
+                    "trusted Agent factory returned null");
         }
         throw new IllegalArgumentException("unsupported Agent definition mode");
     }
@@ -226,12 +333,16 @@ public final class AdkAgentRunExecutor {
     }
 
     private static boolean isTimeout(Throwable failure) {
+        return hasCause(failure, TimeoutException.class);
+    }
+
+    private static boolean hasCause(Throwable failure, Class<? extends Throwable> type) {
         Throwable current = failure;
         for (int depth = 0; current != null && depth < 64; depth++, current = current.getCause()) {
-            if (current instanceof TimeoutException) {
-                return true;
-            }
+            if (type.isInstance(current)) return true;
         }
         return false;
     }
+
+    private static final class CancellationSignal extends RuntimeException { }
 }

@@ -3,6 +3,8 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 import com.google.adk.events.Event;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.util.List;
 import java.util.Map;
@@ -13,7 +15,8 @@ import java.util.Set;
 final class AdkEventProjector {
     Optional<Projection> project(Event event, Set<String> agentNames) {
         if (event.errorMessage().isPresent() || event.errorCode().isPresent() || event.interrupted().orElse(false)) {
-            throw new IllegalStateException("ADK reported an execution failure");
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "ADK reported an execution failure");
         }
         if (event.author() == null || !agentNames.contains(event.author())) {
             return Optional.empty();

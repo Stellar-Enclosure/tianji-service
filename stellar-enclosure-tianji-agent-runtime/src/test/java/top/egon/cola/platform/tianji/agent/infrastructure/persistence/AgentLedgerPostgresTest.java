@@ -8,6 +8,8 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
@@ -20,9 +22,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
-import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -42,7 +43,6 @@ import static top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.*;
 @EnabledIfSystemProperty(named = "tianji.postgres.test.url", matches = ".+")
 @Timeout(90)
 class AgentLedgerPostgresTest {
-    private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-28T00:00:00Z"), ZoneOffset.UTC);
     private static DriverManagerDataSource dataSource;
     private static JdbcTemplate jdbc;
     private static AgentLedgerService ledger;
@@ -51,7 +51,7 @@ class AgentLedgerPostgresTest {
     static void migrateIsolatedDatabase() {
         dataSource = PostgresTestDatabase.dataSource();
         jdbc = new JdbcTemplate(dataSource);
-        ledger = new AgentLedgerService(dataSource, CLOCK);
+        ledger = new AgentLedgerService(dataSource);
     }
 
     @Test
@@ -135,7 +135,7 @@ class AgentLedgerPostgresTest {
     }
 
     @Test
-    void cas_winner_emits_one_event_and_terminal_result_cannot_be_rewritten() throws Exception {
+    void one_claim_wins_the_cas_and_terminal_result_cannot_be_rewritten() throws Exception {
         TrustedAgentActor owner = actor(USER, "alice");
         ledger.publish(owner, spec(Map.of()));
         AgentRunDTO queued = ledger.start(owner, command("key", "question", "trace"));
@@ -143,30 +143,22 @@ class AgentLedgerPostgresTest {
         CountDownLatch gate = new CountDownLatch(1);
         try (ExecutorService pool = Executors.newFixedThreadPool(2)) {
             List<Future<Object>> attempts = List.of(
-                    pool.submit(() -> transitionOrError(gate, owner, query, RUNNING)),
-                    pool.submit(() -> transitionOrError(gate, owner, query, CANCELLED)));
+                    pool.submit(() -> claimOrError(gate, owner, query, "worker-a")),
+                    pool.submit(() -> claimOrError(gate, owner, query, "worker-b")));
             gate.countDown();
             List<Object> outcomes = List.of(attempts.get(0).get(20, TimeUnit.SECONDS), attempts.get(1).get(20, TimeUnit.SECONDS));
-            assertEquals(1, outcomes.stream().filter(AgentRunDTO.class::isInstance).count());
+            assertEquals(1, outcomes.stream().filter(ClaimedAgentRun.class::isInstance).count());
             assertEquals(1, outcomes.stream().filter(AgentLedgerException.class::isInstance).count());
+            ClaimedAgentRun claimed = (ClaimedAgentRun) outcomes.stream()
+                    .filter(ClaimedAgentRun.class::isInstance).findFirst().orElseThrow();
+            AgentExecutionResult result = result(query.runId(), COMPLETED);
+            assertEquals(COMPLETED, ledger.finish(owner, claimed.lease(), 1, result).status());
         }
         AgentRunDTO winner = ledger.get(owner, query);
-        assertEquals(1, winner.revision());
-        assertEquals(2, winner.lastEventSequence());
-        assertEquals(2, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 10)).size());
-        if (winner.status() == RUNNING) {
-            AgentExecutionResult result = result(query.runId(), COMPLETED);
-            AgentRunDTO completed = ledger.transition(owner, query, 1, RUNNING, COMPLETED, null, result);
-            assertEquals(2, completed.revision());
-            assertEquals(result, ledger.getResult(owner, query).orElseThrow());
-            assertEquals(3, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 10)).size());
-            assertEquals(1, ledger.events(owner, new AgentEventsQuery(query.runId(), 2, 10)).size());
-            assertThrows(AgentLedgerException.class,
-                    () -> ledger.transition(owner, query, 2, COMPLETED, RUNNING, null, null));
-        } else {
-            assertEquals(CANCELLED, winner.status());
-            assertEquals(CANCELLED, ledger.getResult(owner, query).orElseThrow().status());
-        }
+        assertEquals(2, winner.revision());
+        assertEquals(3, winner.lastEventSequence());
+        assertEquals(result(query.runId(), COMPLETED), ledger.getResult(owner, query).orElseThrow());
+        assertEquals(3, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 10)).size());
     }
 
     @Test
@@ -175,18 +167,18 @@ class AgentLedgerPostgresTest {
         ledger.publish(owner, spec(Map.of()));
         AgentRunDTO queued = ledger.start(owner, command("key", "question", "trace"));
         GetAgentRunQuery query = new GetAgentRunQuery(queued.runId());
-        AgentRunDTO running = ledger.transition(owner, query, 0, QUEUED, RUNNING, null, null);
+        ClaimedAgentRun claimed = ledger.claim(owner, query, 0, "worker", Duration.ofSeconds(10));
+        AgentRunDTO running = claimed.run();
         assertEquals(1, running.attempt());
         AgentExecutionResult result = result(query.runId(), COMPLETED);
-        AgentRunDTO completed = ledger.transition(owner, query, 1, RUNNING, COMPLETED, null, result);
+        AgentRunDTO completed = ledger.finish(owner, claimed.lease(), 1, result);
         assertEquals(2, completed.revision());
         assertEquals(3, completed.lastEventSequence());
         assertEquals(result, ledger.getResult(owner, query).orElseThrow());
         assertEquals(List.of(2L, 3L), ledger.events(owner, new AgentEventsQuery(query.runId(), 1, 10))
                 .stream().map(event -> event.sequence()).toList());
         assertEquals("trace", ledger.events(owner, new AgentEventsQuery(query.runId(), 2, 10)).getFirst().correlationId());
-        assertThrows(AgentLedgerException.class,
-                () -> ledger.transition(owner, query, 2, COMPLETED, RUNNING, null, null));
+        assertThrows(AgentLedgerException.class, () -> ledger.finish(owner, claimed.lease(), 2, result));
     }
 
     @Test
@@ -197,14 +189,15 @@ class AgentLedgerPostgresTest {
         GetAgentRunQuery query = new GetAgentRunQuery(queued.runId());
         assertEquals(definition.contentSha256(), ledger.snapshot(owner, query).definitionContentSha256());
         assertEquals("question", ledger.snapshot(owner, query).input().text());
+        AgentRunLease fake = new AgentRunLease(query.runId(), "fake", 1, Instant.now().plusSeconds(10));
         assertThrows(AgentLedgerException.class,
-                () -> ledger.appendEvent(owner, query, 0, "TEXT_DELTA", "planner", Map.of("text", "a")));
-        ledger.transition(owner, query, 0, QUEUED, RUNNING, null, null);
-        AgentRunDTO appended = ledger.appendEvent(owner, query, 1, "TEXT_DELTA", "planner", Map.of("text", "a"));
+                () -> ledger.appendEvent(owner, fake, 0, "TEXT_DELTA", "planner", Map.of("text", "a")));
+        ClaimedAgentRun claimed = ledger.claim(owner, query, 0, "worker", Duration.ofSeconds(10));
+        AgentRunDTO appended = ledger.appendEvent(owner, claimed.lease(), 1, "TEXT_DELTA", "planner", Map.of("text", "a"));
         assertEquals(2, appended.revision());
         assertEquals(3, appended.lastEventSequence());
         assertThrows(AgentLedgerException.class,
-                () -> ledger.appendEvent(owner, query, 1, "TEXT_DELTA", "planner", Map.of("text", "duplicate")));
+                () -> ledger.appendEvent(owner, claimed.lease(), 1, "TEXT_DELTA", "planner", Map.of("text", "duplicate")));
         assertEquals(3, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 10)).size());
 
         jdbc.update("""
@@ -227,7 +220,7 @@ class AgentLedgerPostgresTest {
             assertThrows(DataIntegrityViolationException.class,
                     () -> ledger.start(owner, command("failed-start", "question", "trace")));
             assertThrows(DataIntegrityViolationException.class,
-                    () -> ledger.transition(owner, new GetAgentRunQuery(queued.runId()), 0, QUEUED, RUNNING, null, null));
+                    () -> ledger.claim(owner, new GetAgentRunQuery(queued.runId()), 0, "worker", Duration.ofSeconds(10)));
         } finally {
             jdbc.execute("ALTER TABLE tianji_agent.agent_event DROP CONSTRAINT it_forced_event_failure");
         }
@@ -240,12 +233,11 @@ class AgentLedgerPostgresTest {
         assertEquals(1, ledger.events(owner, new AgentEventsQuery(queued.runId(), 0, 10)).size());
     }
 
-    private static Object transitionOrError(CountDownLatch gate, TrustedAgentActor owner,
-                                            GetAgentRunQuery query, AgentRunStatusEnum target) throws InterruptedException {
+    private static Object claimOrError(CountDownLatch gate, TrustedAgentActor owner,
+                                       GetAgentRunQuery query, String worker) throws InterruptedException {
         gate.await();
         try {
-            AgentExecutionResult result = target == CANCELLED ? result(query.runId(), CANCELLED) : null;
-            return ledger.transition(owner, query, 0, QUEUED, target, null, result);
+            return ledger.claim(owner, query, 0, worker, Duration.ofSeconds(10));
         } catch (AgentLedgerException failure) {
             return failure;
         }

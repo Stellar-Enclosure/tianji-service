@@ -4,6 +4,7 @@ import com.google.adk.events.Event;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import org.junit.jupiter.api.Test;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 
 import java.util.Map;
 import java.util.Set;
@@ -31,7 +32,7 @@ class AdkEventProjectorTest {
         Event user = Event.builder().author("user").content(Content.fromParts(Part.fromText("input"))).build();
         assertTrue(projector.project(user, Set.of("planner")).isEmpty());
         Event failure = Event.builder().author("unknown").errorMessage("sensitive detail").build();
-        IllegalStateException error = assertThrows(IllegalStateException.class,
+        AgentLedgerException error = assertThrows(AgentLedgerException.class,
                 () -> projector.project(failure, Set.of("planner")));
         assertFalse(error.getMessage().contains("sensitive detail"));
     }

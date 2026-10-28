@@ -10,6 +10,8 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
+import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
@@ -60,6 +62,14 @@ final class AgentJsonCodec {
         return hash(write(content, MAX_SNAPSHOT_BYTES));
     }
 
+    String cancelHash(CancelAgentRunCommand command) {
+        Map<String, Object> content = new TreeMap<>();
+        content.put("runId", command.runId());
+        content.put("expectedRevision", command.expectedRevision());
+        content.put("reason", command.reason());
+        return hash(write(content, MAX_EVENT_BYTES));
+    }
+
     String snapshot(AgentDefinitionSpecDTO spec, String definitionHash,
                     ExecutionPolicyDTO effective, StartAgentRunCommand command) {
         Map<String, Object> snapshot = new TreeMap<>();
@@ -93,6 +103,10 @@ final class AgentJsonCodec {
 
     AgentExecutionSnapshot readSnapshot(String json) {
         return read(json, AgentExecutionSnapshot.class);
+    }
+
+    CancelAgentRunResult readCancelResult(String json) {
+        return read(json, CancelAgentRunResult.class);
     }
 
     Map<String, Object> readObject(String json) {

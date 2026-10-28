@@ -9,8 +9,8 @@ final class PolicyChecks {
 
     static void duration(Duration value, String name) {
         Objects.requireNonNull(value, name);
-        if (value.isZero() || value.isNegative()) {
-            throw new IllegalArgumentException(name + " must be positive");
+        if (value.isZero() || value.isNegative() || value.compareTo(Duration.ofNanos(Long.MAX_VALUE)) > 0) {
+            throw new IllegalArgumentException(name + " must be positive and fit nanoseconds");
         }
     }
 
