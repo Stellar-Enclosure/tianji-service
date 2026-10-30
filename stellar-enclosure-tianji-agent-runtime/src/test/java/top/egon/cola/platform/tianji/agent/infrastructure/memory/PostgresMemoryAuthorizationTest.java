@@ -17,6 +17,11 @@ import java.sql.Connection;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
 
 import javax.sql.DataSource;
 import java.time.Clock;
@@ -25,6 +30,9 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Set;
+import java.util.Map;
+import java.util.Optional;
+import java.math.BigDecimal;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -105,6 +113,31 @@ class PostgresMemoryAuthorizationTest {
     private static void initialize(PostgresMemoryService service) {
         // This controlled verifier proves only the service boundary; it is not schema or database acceptance.
         try (var verifiers = mockConstruction(MemoryStorageVerifier.class)) { service.verifyStorage(2, "0.8.0"); assertEquals(1, verifiers.constructed().size()); }
+    }
+    @Test
+    void a_context_batch_uses_one_current_scope_decision_and_never_returns_a_forgotten_body() throws Exception {
+        var source = mock(DataSource.class); var connection = mock(Connection.class); when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
+        var authorization = mock(MemoryAuthorization.class); when(authorization.authorize(any())).thenReturn(MemoryAuthorization.Decision.ALLOW);
+        var service = service(source, authorization); initialize(service); var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice");
+        var content = new MemoryContentDTO("private fact", Map.of()); String hash = new MemoryJsonCodec().contentSha256(content);
+        var active = new MemoryEntryDTO(owner, "research", "keep", MemoryKindEnum.FACT, 1, null, MemoryStateEnum.ACTIVE, content, hash, new MemorySourceDTO("claim", "a".repeat(64), null, null),
+                BigDecimal.ONE, true, MemorySensitivityEnum.CONFIDENTIAL, service.policyReferences().getFirst(), NOW.minusSeconds(1), NOW.plusSeconds(60), NOW.minusSeconds(1), NOW);
+        var forgotten = new MemoryEntryDTO(owner, "research", "gone", MemoryKindEnum.FACT, 2, 1L, MemoryStateEnum.FORGOTTEN, null, hash, null,
+                BigDecimal.ONE, true, active.sensitivity(), active.retentionPolicyRef(), active.effectiveAt(), active.expiresAt(), active.createdAt(), NOW);
+        try (var repositories = mockConstruction(JdbcMemoryRepository.class, (repository, ignored) -> {
+            when(repository.databaseNow()).thenReturn(NOW);
+            when(repository.current(anyString(), eq(false))).thenAnswer(call -> {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive()); var entry = call.getArgument(0).equals("keep") ? active : forgotten;
+                return Optional.of(new JdbcMemoryRepository.StoredMemory(entry, service.indexBinding().modelRef(), "a".repeat(64), ACTOR.identityFingerprint(), "EXPLICIT_CREATE", null));
+            });
+        })) {
+            assertEquals(List.of(active), service.contextEntries(context(ACTOR), owner, "research", List.of("keep", "gone")));
+            verify(authorization).authorize(argThat(value -> value.operation() == MemoryAuthorization.Operation.RETRIEVE && value.memoryId() == null)); verify(connection).commit();
+            assertEquals(1, repositories.constructed().size());
+        }
+        doReturn(MemoryAuthorization.Decision.DENY).when(authorization).authorize(any());
+        assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> service.contextEntries(context(ACTOR), owner, "research", List.of())).code());
+        verify(source, times(1)).getConnection();
     }
     private static GetMemoryQuery query(MemoryOwnerTypeEnum type, String owner) { return new GetMemoryQuery(new MemoryOwnerDTO(type, owner), "research", "memory"); }
     private static MemoryOperationContext context(TrustedAgentActor actor) { return new MemoryOperationContext(actor, NOW.plusSeconds(5), null); }

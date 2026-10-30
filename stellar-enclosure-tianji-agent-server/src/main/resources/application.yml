@@ -47,6 +47,8 @@ stellar:
       model-budgets:
         enabled: false
       context:
+        memory:
+          enabled: false
         rag:
           enabled: false
         trimming:

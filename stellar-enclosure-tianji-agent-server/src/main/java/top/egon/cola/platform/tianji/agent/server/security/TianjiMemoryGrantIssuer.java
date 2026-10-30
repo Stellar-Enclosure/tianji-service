@@ -80,6 +80,7 @@ public final class TianjiMemoryGrantIssuer {
         }
     }
 
+    public boolean usesBindings(List<MemoryContextBinding> configured) { return bindings.equals(configured); }
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && store.usesLedger(candidate); }
     boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return issuers == candidate && (services == null || services.usesIssuerRegistry(candidate)); }
     boolean usesResource(URI candidate) { return resource.toASCIIString().equals(candidate.toASCIIString()); }

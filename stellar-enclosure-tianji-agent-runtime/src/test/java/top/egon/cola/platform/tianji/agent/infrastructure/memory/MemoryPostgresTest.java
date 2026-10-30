@@ -117,6 +117,7 @@ class MemoryPostgresTest {
             assertThrows(AgentLedgerException.class, () -> new MemoryStorageVerifier(source, 3, version, binding).verify());
             var work = new MemoryIndexWork(source, memory, index, event -> { if (event.tenantId() != 20) throw new IllegalArgumentException("untrusted test origin"); }, Clock.systemUTC());
             lifecycle(jdbc, memory, work, events);
+            contextSelection(memory, work, events);
             rollback(jdbc, memory, failPublication);
             concurrency(memory);
             lateEmbedding(jdbc, memory, work, events, delegate);
@@ -208,6 +209,20 @@ class MemoryPostgresTest {
         assertTrue(store.current(request, resource, new MemoryReadGrant.Scope(OWNER, "other", "f".repeat(64), null)).isEmpty());
         ledger.cancel(ALICE, new CancelAgentRunCommand(started.runId(), "cancel-grant", started.revision(), "controlled cancellation"));
         assertTrue(store.current(request, resource, scope).isEmpty()); assertFalse(store.complete(second, ticket));
+    }
+
+    private static void contextSelection(PostgresMemoryService memory, MemoryIndexWork work, Map<String, MemoryIndexPublication.Event> events) {
+        for (var sensitivity : List.of(MemorySensitivityEnum.INTERNAL, MemorySensitivityEnum.CONFIDENTIAL)) {
+            String id = sensitivity == MemorySensitivityEnum.INTERNAL ? "a-context-excluded" : "b-context-approved";
+            memory.upsert(context(), new UpsertMemoryCommand("create-" + id, OWNER, "context-policy", id, MemoryKindEnum.FACT, 0, new MemoryContentDTO(id, Map.of()), PROVENANCE,
+                    BigDecimal.ONE, true, sensitivity, POLICY.reference(), null, null));
+            if (sensitivity == MemorySensitivityEnum.CONFIDENTIAL) work.apply(build(events, id, 1), Instant.now().plusSeconds(10));
+        }
+        var query = new MemoryRetrievalQuery(OWNER, "context-policy", null, null, null, 1);
+        assertEquals("a-context-excluded", memory.retrieve(context(), query).items().getFirst().entry().memoryId());
+        assertEquals("b-context-approved", memory.retrieveContext(context(), query, Set.of(POLICY.reference())).items().getFirst().entry().memoryId());
+        var semantic = new MemoryRetrievalQuery(OWNER, "context-policy", null, "query", null, 1);
+        assertEquals("b-context-approved", memory.retrieveContext(context(), semantic, Set.of(POLICY.reference())).items().getFirst().entry().memoryId());
     }
 
     private static void serviceGrantCorrection(AgentLedgerService ledger, DriverManagerDataSource source, JdbcTemplate jdbc) {

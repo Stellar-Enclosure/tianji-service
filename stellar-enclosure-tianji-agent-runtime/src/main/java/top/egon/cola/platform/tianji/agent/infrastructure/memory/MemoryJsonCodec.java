@@ -14,6 +14,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
@@ -45,6 +46,7 @@ final class MemoryJsonCodec {
 
     String content(MemoryContentDTO content) { return write(content, CONTENT_BYTES); }
     String contentSha256(MemoryContentDTO content) { return sha256("TIANJI_MEMORY_CONTENT_V1:" + content(content)); }
+    String modelContext(MemoryEntryDTO entry) { return write(Map.of("kind", entry.kind(), "confidence", entry.confidence(), "content", entry.content()), CONTENT_BYTES); }
     String source(MemorySourceDTO source) { return write(source, SOURCE_BYTES); }
 
     MemoryContentDTO readContent(String value, String expectedSha256) {

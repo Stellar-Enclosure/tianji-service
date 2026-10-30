@@ -40,6 +40,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
@@ -181,24 +182,52 @@ public final class PostgresMemoryService {
     }
 
     public MemoryRetrievalPageDTO retrieve(MemoryOperationContext context, MemoryRetrievalQuery query) {
+        return retrieve(context, query, null);
+    }
+
+    /** Model-egress policy is forced before SQL/native-vector topK, so excluded facts cannot crowd approved evidence. */
+    public MemoryRetrievalPageDTO retrieveContext(MemoryOperationContext context, MemoryRetrievalQuery query, Set<String> retentionPolicyRefs) {
+        var selected = Set.copyOf(retentionPolicyRefs); if (selected.isEmpty() || selected.size() > 32) throw new IllegalArgumentException("Memory context policy selection is invalid");
+        selected.forEach(this::policy); return retrieve(context, query, selected);
+    }
+
+    private MemoryRetrievalPageDTO retrieve(MemoryOperationContext context, MemoryRetrievalQuery query, Set<String> contextPolicies) {
         Objects.requireNonNull(query, "query");
         var authorized = authorize(context, query.owner(), query.scopeId(), query.text() == null ? MemoryAuthorization.Operation.RETRIEVE : MemoryAuthorization.Operation.SEARCH, null, 0, null);
-        if (query.text() != null) return semantic(authorized, query);
+        if (query.text() != null) return semantic(authorized, query, contextPolicies);
         return transaction(authorized, query.owner(), query.scopeId(), false, (repository, now) -> {
-            var found = repository.list(now, query.kind(), query.afterMemoryId(), query.limit() + 1); boolean more = found.size() > query.limit();
+            var found = contextPolicies == null ? repository.list(now, query.kind(), query.afterMemoryId(), query.limit() + 1)
+                    : repository.list(now, query.kind(), query.afterMemoryId(), query.limit() + 1, contextAllowed(contextPolicies));
+            boolean more = found.size() > query.limit();
             var items = found.stream().limit(query.limit()).map(row -> new MemoryHitDTO(row.entry(), null)).toList();
             return new MemoryRetrievalPageDTO(query.owner(), query.scopeId(), items, more ? items.getLast().entry().memoryId() : null);
         });
     }
 
-    private MemoryRetrievalPageDTO semantic(MemoryOperationContext context, MemoryRetrievalQuery query) {
+    /** Revalidates a bounded context batch under one current scope-read decision, without embedding or replaying old bodies. */
+    public List<MemoryEntryDTO> contextEntries(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, List<String> memoryIds) {
+        var ids = List.copyOf(memoryIds); if (ids.size() > 32 || new HashSet<>(ids).size() != ids.size()) throw new IllegalArgumentException("Memory context batch is invalid");
+        for (var id : ids) new GetMemoryQuery(owner, scope, id);
+        var authorized = authorize(context, owner, scope, MemoryAuthorization.Operation.RETRIEVE, null, 0, null);
+        if (ids.isEmpty()) return List.of();
+        return transaction(authorized, owner, scope, false, (repository, now) -> {
+            var entries = new ArrayList<MemoryEntryDTO>();
+            for (var id : ids) {
+                var current = repository.current(id, false); if (current.isEmpty()) continue; var entry = current.orElseThrow().entry();
+                if (entry.state() == MemoryStateEnum.ACTIVE && entry.confirmed() && live(entry, now) && !entry.effectiveAt().isAfter(now)) entries.add(entry);
+            }
+            return List.copyOf(entries);
+        });
+    }
+
+    private MemoryRetrievalPageDTO semantic(MemoryOperationContext context, MemoryRetrievalQuery query, Set<String> contextPolicies) {
         if (index == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Memory semantic index is not configured");
-        var prepared = transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> new SearchPreparation(now, allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding))));
+        var prepared = transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> new SearchPreparation(now, allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding), contextPolicies)));
         var candidates = index.search(context.actor().tenantId(), context.actor().issuerFingerprint(), query.owner(), query.scopeId(), query.kind(), query.text(), query.limit(),
                 prepared.allowed(), prepared.now(), context.deadlineAt());
         var currentContext = authorize(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.SEARCH, null, 0, null);
         return transaction(currentContext, query.owner(), query.scopeId(), false, (repository, now) -> {
-            allowed(currentContext, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding));
+            allowed(currentContext, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding), contextPolicies);
             var found = new ArrayList<MemoryHitDTO>(); var seen = new HashSet<String>();
             for (var candidate : candidates) {
                 Object rawId = candidate.getMetadata().get("memoryId");
@@ -207,7 +236,8 @@ public final class PostgresMemoryService {
                 var current = repository.current(id, false); if (current.isEmpty()) continue;
                 var row = current.orElseThrow(); var entry = row.entry();
                 if (!live(entry, now) || entry.state() != MemoryStateEnum.ACTIVE || entry.effectiveAt().isAfter(now) || query.kind() != null && entry.kind() != query.kind()) continue;
-                var policy = policy(entry.retentionPolicyRef());
+                if (contextPolicies != null && !contextPolicies.contains(entry.retentionPolicyRef())) continue;
+                var policy = policy(entry.retentionPolicyRef()); if (contextPolicies != null && !policy.modelContextAllowed().contains(entry.sensitivity())) continue;
                 if (!policy.semanticQueryAllowed() || !policy.embeddingAllowed().contains(entry.sensitivity())) continue;
                 var expectedId = MemoryIndexPublication.vectorDocumentId(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), entry.owner(), entry.scopeId(), id, entry.revision(), binding.modelRef());
                 if (!expectedId.toString().equals(candidate.getId()) || !binding.modelRef().equals(row.indexModelRef())
@@ -218,11 +248,19 @@ public final class PostgresMemoryService {
         });
     }
 
-    private List<PgVectorMemoryIndex.Allowed> allowed(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, List<JdbcMemoryRepository.IndexReadiness> rows) {
+    private List<PgVectorMemoryIndex.Allowed> contextAllowed(Set<String> references) {
+        var selected = new ArrayList<PgVectorMemoryIndex.Allowed>();
+        for (var reference : references.stream().sorted().toList()) for (var sensitivity : policy(reference).modelContextAllowed().stream().sorted().toList()) selected.add(new PgVectorMemoryIndex.Allowed(reference, sensitivity));
+        return List.copyOf(selected);
+    }
+
+    private List<PgVectorMemoryIndex.Allowed> allowed(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, List<JdbcMemoryRepository.IndexReadiness> rows, Set<String> contextPolicies) {
         if (rows.size() > 10_000) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REQUEST_TOO_LARGE, "Memory retrieval scope exceeds its fixed limit");
         var allowed = new LinkedHashSet<PgVectorMemoryIndex.Allowed>();
         for (var row : rows) {
-            var policy = policy(row.retentionPolicyRef()); if (!policy.embeddingAllowed().contains(row.sensitivity())) continue;
+            if (contextPolicies != null && !contextPolicies.contains(row.retentionPolicyRef())) continue;
+            var policy = policy(row.retentionPolicyRef()); if (contextPolicies != null && !policy.modelContextAllowed().contains(row.sensitivity())) continue;
+            if (!policy.embeddingAllowed().contains(row.sensitivity())) continue;
             if (!policy.semanticQueryAllowed()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Memory semantic egress is outside the fixed policy");
             var expectedId = MemoryIndexPublication.vectorDocumentId(context.actor().tenantId(), context.actor().issuerFingerprint(), owner, scope, row.memoryId(), row.revision(), binding.modelRef());
             if (!binding.modelRef().equals(row.modelRef()) || !"ACTIVE".equals(row.state()) || !row.physicalPresent() || !expectedId.equals(row.documentId())

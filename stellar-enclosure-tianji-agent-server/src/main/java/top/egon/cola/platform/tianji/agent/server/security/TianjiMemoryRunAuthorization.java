@@ -82,6 +82,7 @@ public final class TianjiMemoryRunAuthorization implements MemoryAuthorization, 
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-memory-authorization-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
     }
 
+    public boolean usesBindings(List<MemoryContextBinding> configured) { return bindings.equals(configured); }
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && store.usesLedger(candidate); }
     boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return issuers == candidate && (services == null || services.usesIssuerRegistry(candidate)); }
 

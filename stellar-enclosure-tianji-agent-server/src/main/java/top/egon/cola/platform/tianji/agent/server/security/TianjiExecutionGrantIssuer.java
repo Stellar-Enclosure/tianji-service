@@ -31,6 +31,8 @@ public final class TianjiExecutionGrantIssuer {
     private final Map<URI, HttpExecutionGrantClient> clients;
     private final TianjiMemoryGrantIssuer memory;
 
+    public boolean usesMemoryIssuer(TianjiMemoryGrantIssuer candidate) { return memory == candidate; }
+
     public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper) {

@@ -46,6 +46,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     private final TianjiServiceExecutionGrantAuthorizer services;
     private final TianjiMemoryRunAuthorization memory;
 
+    public boolean usesMemoryAuthorization(TianjiMemoryRunAuthorization candidate) { return memory == candidate; }
+
     public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,

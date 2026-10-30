@@ -83,10 +83,20 @@ final class JdbcMemoryRepository {
     }
 
     List<StoredMemory> list(Instant now, MemoryKindEnum kind, String after, int limit) {
+        return list(now, kind, after, limit, null);
+    }
+
+    List<StoredMemory> list(Instant now, MemoryKindEnum kind, String after, int limit, List<PgVectorMemoryIndex.Allowed> allowed) {
+        if (allowed != null && allowed.isEmpty()) return List.of();
         var tail = new ArrayList<Object>(); tail.add(timestamp(now)); tail.add(timestamp(now));
         String sql = CURRENT + " AND e.state='ACTIVE' AND e.confirmed AND e.effective_at<=? AND e.expires_at>?";
         if (kind != null) { sql += " AND e.kind=?"; tail.add(kind.name()); }
         if (after != null) { sql += " AND e.memory_id>?"; tail.add(after); }
+        if (allowed != null) {
+            var alternatives = new ArrayList<String>();
+            for (var item : allowed) { alternatives.add("(e.retention_policy_ref=? AND e.sensitivity=?)"); tail.add(item.retentionPolicyRef()); tail.add(item.sensitivity().name()); }
+            sql += " AND (" + String.join(" OR ", alternatives) + ')';
+        }
         sql += " ORDER BY e.memory_id LIMIT ?"; tail.add(limit);
         return jdbc.query(sql, (rs, row) -> stored(rs), key(tail.toArray()));
     }

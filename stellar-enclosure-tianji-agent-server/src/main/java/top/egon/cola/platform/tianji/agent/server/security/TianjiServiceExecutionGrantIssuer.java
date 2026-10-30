@@ -42,6 +42,8 @@ public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServ
     private final Clock clock;
     private final TianjiMemoryGrantIssuer memory;
 
+    public boolean usesMemoryIssuer(TianjiMemoryGrantIssuer candidate) { return memory == candidate; }
+
     public TianjiServiceExecutionGrantIssuer(AgentLedgerService ledger, AgentServiceExecutionGrantStore store,
             TianjiServiceExecutionBindings bindings, IdpStarterProperties starter, IdentityAuthorityProperties authority,
             TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth, ObjectMapper mapper) {
