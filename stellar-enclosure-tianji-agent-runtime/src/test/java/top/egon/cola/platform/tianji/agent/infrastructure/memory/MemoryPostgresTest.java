@@ -121,6 +121,7 @@ class MemoryPostgresTest {
             rollback(jdbc, memory, failPublication);
             concurrency(memory);
             lateEmbedding(jdbc, memory, work, events, delegate);
+            retention(source, jdbc, memory, work, publication, events, failPublication);
             grants(ledger, source);
             serviceGrantCorrection(ledger, source, jdbc); memory.verifyStorage(2, version);
             jdbc.execute("ALTER TABLE tianji_agent.agent_memory_entry DROP CONSTRAINT memory_entry_confirmation");
@@ -209,6 +210,29 @@ class MemoryPostgresTest {
         assertTrue(store.current(request, resource, new MemoryReadGrant.Scope(OWNER, "other", "f".repeat(64), null)).isEmpty());
         ledger.cancel(ALICE, new CancelAgentRunCommand(started.runId(), "cancel-grant", started.revision(), "controlled cancellation"));
         assertTrue(store.current(request, resource, scope).isEmpty()); assertFalse(store.complete(second, ticket));
+    }
+
+    private static void retention(DriverManagerDataSource source, JdbcTemplate jdbc, PostgresMemoryService memory, MemoryIndexWork indexWork, MemoryIndexPublication publication,
+                                  Map<String, MemoryIndexPublication.Event> events, AtomicBoolean failPublication) throws Exception {
+        var expires = Instant.now().plusSeconds(2);
+        memory.upsert(context(), new UpsertMemoryCommand("retention-create", OWNER, "retention", "retained-private", MemoryKindEnum.FACT, 0, new MemoryContentDTO("expired private fact", Map.of()), PROVENANCE,
+                BigDecimal.ONE, true, MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), Instant.now().minusSeconds(1), expires));
+        indexWork.apply(build(events, "retained-private", 1), Instant.now().plusSeconds(10));
+        while (Instant.now().isBefore(expires)) Thread.sleep(10);
+        assertNull(memory.get(context(), new GetMemoryQuery(OWNER, "retention", "retained-private")).content());
+        var origin = new MemoryRetentionWork.Origin(ALICE.tenantId(), ALICE.issuerFingerprint());
+        var retention = new MemoryRetentionWork(source, memory, publication, List.of(origin), Set.of(POLICY.reference()), Clock.systemUTC());
+        failPublication.set(true);
+        try { assertThrows(IllegalStateException.class, () -> retention.apply(origin, 10, Instant.now().plusSeconds(5))); }
+        finally { failPublication.set(false); }
+        assertEquals("ACTIVE", jdbc.queryForObject("SELECT state FROM tianji_agent.agent_memory_entry WHERE memory_id='retained-private'", String.class));
+        assertEquals(1, retention.apply(origin, 10, Instant.now().plusSeconds(5)).expired());
+        var expired = memory.get(context(), new GetMemoryQuery(OWNER, "retention", "retained-private")); assertEquals(MemoryStateEnum.EXPIRED, expired.state()); assertEquals(2, expired.revision());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_revision WHERE memory_id='retained-private' AND (content_json IS NOT NULL OR source_json IS NOT NULL)", Integer.class));
+        var deletion = events.values().stream().filter(event -> event.action() == MemoryIndexPublication.Action.DELETE_MEMORY && event.memoryId().equals("retained-private")).findFirst().orElseThrow();
+        indexWork.apply(deletion, Instant.now().plusSeconds(10));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_vector_v1 WHERE metadata->>'memoryId'='retained-private'", Integer.class));
+        assertEquals(0, retention.apply(origin, 10, Instant.now().plusSeconds(5)).selected());
     }
 
     private static void contextSelection(PostgresMemoryService memory, MemoryIndexWork work, Map<String, MemoryIndexPublication.Event> events) {

@@ -42,6 +42,8 @@ stellar:
     agent:
       memory:
         enabled: false
+        retention:
+          enabled: false
         http:
           enabled: false
       model-budgets:

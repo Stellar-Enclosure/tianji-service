@@ -273,12 +273,27 @@ public final class PostgresMemoryService {
     }
 
     private StoredMemory retire(JdbcMemoryRepository repository, MemoryOperationContext context, StoredMemory previous, MemoryStateEnum state, String reason, Instant now) {
+        return retire(repository, previous, state, reason, now, context.actor().identityFingerprint());
+    }
+
+    boolean readyForRetention(DataSource candidate, MemoryIndexPublication publisher) { return initialized.get() && source == candidate && publication == publisher && binding.equals(publisher.binding()); }
+
+    StoredMemory expireForRetention(JdbcMemoryRepository repository, StoredMemory previous, String technicalActorSha256, Instant now) {
+        if (!initialized.get() || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)
+                || technicalActorSha256 == null || !technicalActorSha256.matches("[0-9a-f]{64}")) throw unavailable();
+        var entry = previous.entry(); policy(entry.retentionPolicyRef());
+        if (entry.state() != MemoryStateEnum.ACTIVE && entry.state() != MemoryStateEnum.CANDIDATE || entry.expiresAt().isAfter(now)) throw revisionConflict();
+        return retire(repository, previous, MemoryStateEnum.EXPIRED, "RETENTION_EXPIRED", now, technicalActorSha256);
+    }
+
+    private StoredMemory retire(JdbcMemoryRepository repository, StoredMemory previous, MemoryStateEnum state, String reason, Instant now, String actorSha256) {
         var old = previous.entry();
         var entry = new MemoryEntryDTO(old.owner(), old.scopeId(), old.memoryId(), old.kind(), next(old.revision()), old.revision(), state, null, old.contentSha256(), null,
                 old.confidence(), old.confirmed(), old.sensitivity(), old.retentionPolicyRef(), old.effectiveAt(), old.expiresAt(), old.createdAt(), now);
-        var retired = new StoredMemory(entry, previous.indexModelRef(), previous.sourceEvidenceSha256(), context.actor().identityFingerprint(), reason, now);
+        var retired = new StoredMemory(entry, previous.indexModelRef(), previous.sourceEvidenceSha256(), actorSha256, reason, now);
         repository.replace(retired, old.revision(), true);
-        publication.publish(event(context, entry, MemoryIndexPublication.Action.DELETE_MEMORY, null, null, now)); return retired;
+        publication.publish(new MemoryIndexPublication.Event(MemoryIndexPublication.Action.DELETE_MEMORY, repository.tenantId(), repository.issuer(), entry.owner(), entry.scopeId(),
+                entry.memoryId(), entry.revision(), entry.contentSha256(), null, null, now)); return retired;
     }
 
     private void build(JdbcMemoryRepository repository, MemoryOperationContext context, StoredMemory stored, MemoryRetentionPolicy policy, Instant now) {
