@@ -53,6 +53,7 @@ public final class TianjiMemoryHttpAuthorization implements MemoryAuthorization 
         return switch (operation) {
             case GET -> TianjiAgentPermissions.MEMORY_GET_API;
             case RETRIEVE, SEARCH -> TianjiAgentPermissions.MEMORY_RETRIEVE_API;
+            case CANDIDATES -> TianjiAgentPermissions.MEMORY_CANDIDATES_API;
             case UPSERT -> TianjiAgentPermissions.MEMORY_UPSERT_API;
             case CORRECT -> TianjiAgentPermissions.MEMORY_CORRECT_API;
             case FORGET -> TianjiAgentPermissions.MEMORY_FORGET_API;
@@ -60,7 +61,7 @@ public final class TianjiMemoryHttpAuthorization implements MemoryAuthorization 
     }
     static String permission(Operation operation) {
         return switch (operation) {
-            case GET, RETRIEVE, SEARCH -> TianjiAgentPermissions.MEMORY_READ;
+            case GET, RETRIEVE, SEARCH, CANDIDATES -> TianjiAgentPermissions.MEMORY_READ;
             case UPSERT, CORRECT -> TianjiAgentPermissions.MEMORY_WRITE;
             case FORGET -> TianjiAgentPermissions.MEMORY_FORGET;
         };

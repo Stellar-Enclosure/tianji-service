@@ -18,6 +18,8 @@ import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryHitDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
@@ -183,6 +185,16 @@ public final class PostgresMemoryService {
 
     public MemoryRetrievalPageDTO retrieve(MemoryOperationContext context, MemoryRetrievalQuery query) {
         return retrieve(context, query, null);
+    }
+
+    public MemoryCandidatePageDTO candidates(MemoryOperationContext context, MemoryCandidateQuery query) {
+        Objects.requireNonNull(query, "query");
+        var authorized = authorize(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.CANDIDATES, null, 0, null);
+        return transaction(authorized, query.owner(), query.scopeId(), false, (repository, now) -> {
+            var found = repository.candidates(now, query.kind(), query.afterMemoryId(), query.limit() + 1); boolean more = found.size() > query.limit();
+            var items = found.stream().limit(query.limit()).map(StoredMemory::entry).toList();
+            return new MemoryCandidatePageDTO(query.owner(), query.scopeId(), items, more ? items.getLast().memoryId() : null);
+        });
     }
 
     /** Model-egress policy is forced before SQL/native-vector topK, so excluded facts cannot crowd approved evidence. */

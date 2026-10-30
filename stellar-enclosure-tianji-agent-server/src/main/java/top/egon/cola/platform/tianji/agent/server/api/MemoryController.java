@@ -16,6 +16,8 @@ import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
@@ -57,6 +59,16 @@ public class MemoryController {
     @PostMapping("/retrieve")
     public ResponseEntity<MemoryRetrievalPageDTO> retrieve(@RequestBody MemoryRetrievalQuery request) {
         return noStore(memory.retrieve(context(TianjiAgentPermissions.MEMORY_RETRIEVE_API), request));
+    }
+
+    @PermissionResource(key = TianjiAgentPermissions.MEMORY_CANDIDATES_API, type = ResourceType.API,
+            labelPage = "tianji.permissions", labelKey = "api.memory.candidates",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = TianjiAgentPermissions.MEMORY_READ_SCOPE)
+    @RequiresPermissions(codes = TianjiAgentPermissions.MEMORY_READ)
+    @PostMapping("/candidates")
+    public ResponseEntity<MemoryCandidatePageDTO> candidates(@RequestBody MemoryCandidateQuery request) {
+        return noStore(memory.candidates(context(TianjiAgentPermissions.MEMORY_CANDIDATES_API), request));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.MEMORY_UPSERT_API, type = ResourceType.API,

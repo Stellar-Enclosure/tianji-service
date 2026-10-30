@@ -38,6 +38,7 @@ import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
@@ -118,6 +119,7 @@ class MemoryPostgresTest {
             var work = new MemoryIndexWork(source, memory, index, event -> { if (event.tenantId() != 20) throw new IllegalArgumentException("untrusted test origin"); }, Clock.systemUTC());
             lifecycle(jdbc, memory, work, events);
             contextSelection(memory, work, events);
+            candidates(memory);
             rollback(jdbc, memory, failPublication);
             concurrency(memory);
             lateEmbedding(jdbc, memory, work, events, delegate);
@@ -210,6 +212,18 @@ class MemoryPostgresTest {
         assertTrue(store.current(request, resource, new MemoryReadGrant.Scope(OWNER, "other", "f".repeat(64), null)).isEmpty());
         ledger.cancel(ALICE, new CancelAgentRunCommand(started.runId(), "cancel-grant", started.revision(), "controlled cancellation"));
         assertTrue(store.current(request, resource, scope).isEmpty()); assertFalse(store.complete(second, ticket));
+    }
+
+    private static void candidates(PostgresMemoryService memory) {
+        for (var id : List.of("future", "now")) memory.upsert(context(), new UpsertMemoryCommand("candidate-create-" + id, OWNER, "candidate-review", id, MemoryKindEnum.FACT, 0,
+                new MemoryContentDTO("candidate " + id, Map.of()), PROVENANCE, new BigDecimal("0.5"), false, MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), id.equals("future") ? Instant.now().plusSeconds(60) : null, null));
+        var query = new MemoryCandidateQuery(OWNER, "candidate-review", null, null, 1); var first = memory.candidates(context(), query);
+        assertEquals("future", first.items().getFirst().memoryId()); assertEquals("future", first.nextAfterMemoryId());
+        var next = memory.candidates(context(), new MemoryCandidateQuery(OWNER, "candidate-review", null, first.nextAfterMemoryId(), 1)); assertEquals("now", next.items().getFirst().memoryId()); assertNull(next.nextAfterMemoryId());
+        assertTrue(memory.retrieve(context(), new MemoryRetrievalQuery(OWNER, "candidate-review", null, null, null, 5)).items().isEmpty());
+        memory.correct(context(), new CorrectMemoryCommand("confirm-candidate", OWNER, "candidate-review", "now", 1, new MemoryContentDTO("approved fact", Map.of()), PROVENANCE, BigDecimal.ONE, "USER_CONFIRMED"));
+        assertEquals(List.of("future"), memory.candidates(context(), new MemoryCandidateQuery(OWNER, "candidate-review", null, null, 5)).items().stream().map(item -> item.memoryId()).toList());
+        assertEquals("now", memory.retrieve(context(), new MemoryRetrievalQuery(OWNER, "candidate-review", null, null, null, 5)).items().getFirst().entry().memoryId());
     }
 
     private static void retention(DriverManagerDataSource source, JdbcTemplate jdbc, PostgresMemoryService memory, MemoryIndexWork indexWork, MemoryIndexPublication publication,

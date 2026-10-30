@@ -11,7 +11,7 @@ public interface MemoryAuthorization {
     Decision authorize(Request request);
 
     enum Decision { ALLOW, DENY, UNAVAILABLE }
-    enum Operation { GET, RETRIEVE, SEARCH, UPSERT, CORRECT, FORGET }
+    enum Operation { GET, RETRIEVE, SEARCH, CANDIDATES, UPSERT, CORRECT, FORGET }
 
     /** Source run/event IDs additionally require current source-read permission; caller-declared hashes are not a proof. */
     record Request(MemoryOperationContext context, MemoryOwnerDTO owner, String scopeId, Operation operation,
@@ -19,7 +19,7 @@ public interface MemoryAuthorization {
         public Request {
             context = Objects.requireNonNull(context, "context"); owner = Objects.requireNonNull(owner, "owner"); operation = Objects.requireNonNull(operation, "operation");
             if (scopeId == null || scopeId.isBlank() || scopeId.length() > 128 || !scopeId.equals(scopeId.trim())
-                    || (operation == Operation.RETRIEVE || operation == Operation.SEARCH) != (memoryId == null) || memoryId != null && (memoryId.isBlank() || memoryId.length() > 128)
+                    || (operation == Operation.RETRIEVE || operation == Operation.SEARCH || operation == Operation.CANDIDATES) != (memoryId == null) || memoryId != null && (memoryId.isBlank() || memoryId.length() > 128)
                     || expectedRevision < 0 || (operation == Operation.CORRECT || operation == Operation.FORGET) && expectedRevision < 1
                     || (sourceRunId == null) != (sourceEventId == null)) throw new IllegalArgumentException("Memory authorization request is invalid");
         }

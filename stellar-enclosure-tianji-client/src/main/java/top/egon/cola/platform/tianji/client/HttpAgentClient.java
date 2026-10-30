@@ -3,6 +3,8 @@ package top.egon.cola.platform.tianji.client;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
 import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
@@ -184,6 +186,19 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
             if (query.text() == null) {
                 if (previous != null && java.util.Arrays.compareUnsigned(previous.getBytes(StandardCharsets.UTF_8), hit.entry().memoryId().getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse(); previous = hit.entry().memoryId();
             }
+        }
+        return page;
+    }
+
+    @Override
+    public MemoryCandidatePageDTO memoryCandidates(MemoryCandidateQuery query) {
+        Objects.requireNonNull(query, "query");
+        var page = call("POST", memoryPath("candidates"), query, MemoryCandidatePageDTO.class, null, memories::candidates, 8_388_608);
+        requireMemoryScope(query.owner(), query.scopeId(), page.owner(), page.scopeId()); if (page.items().size() > query.limit()) throw invalidMemoryResponse();
+        String previous = query.afterMemoryId();
+        for (var entry : page.items()) {
+            if (query.kind() != null && query.kind() != entry.kind() || previous != null && java.util.Arrays.compareUnsigned(previous.getBytes(StandardCharsets.UTF_8), entry.memoryId().getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse();
+            previous = entry.memoryId();
         }
         return page;
     }

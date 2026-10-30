@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
@@ -139,6 +140,25 @@ class PostgresMemoryAuthorizationTest {
         assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> service.contextEntries(context(ACTOR), owner, "research", List.of())).code());
         verify(source, times(1)).getConnection();
     }
+    @Test
+    void candidate_review_pages_are_current_scope_authorized_and_return_an_exclusive_bounded_cursor() throws Exception {
+        var source = mock(DataSource.class); var connection = mock(Connection.class); when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
+        var authority = mock(MemoryAuthorization.class); when(authority.authorize(any())).thenReturn(MemoryAuthorization.Decision.ALLOW); var service = service(source, authority); initialize(service);
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var content = new MemoryContentDTO("unconfirmed candidate", Map.of()); var values = new java.util.ArrayList<JdbcMemoryRepository.StoredMemory>();
+        for (var id : List.of("candidate-a", "candidate-b")) {
+            var entry = new MemoryEntryDTO(owner, "research", id, MemoryKindEnum.PREFERENCE, 1, null, MemoryStateEnum.CANDIDATE, content, new MemoryJsonCodec().contentSha256(content),
+                    new MemorySourceDTO("claim", "a".repeat(64), null, null), BigDecimal.ONE, false, MemorySensitivityEnum.CONFIDENTIAL, service.policyReferences().getFirst(), NOW.plusSeconds(10), NOW.plusSeconds(60), NOW, NOW);
+            values.add(new JdbcMemoryRepository.StoredMemory(entry, service.indexBinding().modelRef(), "a".repeat(64), ACTOR.identityFingerprint(), "EXPLICIT_CREATE", null));
+        }
+        try (var repositories = mockConstruction(JdbcMemoryRepository.class, (repository, ignored) -> {
+            when(repository.databaseNow()).thenReturn(NOW); when(repository.candidates(eq(NOW), eq(MemoryKindEnum.PREFERENCE), isNull(), eq(2))).thenReturn(values);
+        })) {
+            var page = service.candidates(context(ACTOR), new MemoryCandidateQuery(owner, "research", MemoryKindEnum.PREFERENCE, null, 1));
+            assertEquals(1, page.items().size()); assertEquals("candidate-a", page.nextAfterMemoryId()); assertFalse(page.items().getFirst().confirmed());
+            verify(authority).authorize(argThat(value -> value.operation() == MemoryAuthorization.Operation.CANDIDATES && value.memoryId() == null));
+        }
+    }
+
     private static GetMemoryQuery query(MemoryOwnerTypeEnum type, String owner) { return new GetMemoryQuery(new MemoryOwnerDTO(type, owner), "research", "memory"); }
     private static MemoryOperationContext context(TrustedAgentActor actor) { return new MemoryOperationContext(actor, NOW.plusSeconds(5), null); }
     private static PostgresMemoryService service(DataSource source, MemoryAuthorization authorization) { return service(source, authorization, null); }

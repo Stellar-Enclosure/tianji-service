@@ -77,6 +77,7 @@ class TianjiMemoryRunAuthorizationTest {
         assertEquals(MemoryReadGrant.fingerprint(run, RESOURCE, scope), expected.getValue().bindingSha256());
         assertNotEquals(run.runId(), expected.getValue().intentId()); assertNotEquals(AgentExecutionGrant.fingerprint(run, RESOURCE), expected.getValue().bindingSha256());
         assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(request(binding(MemoryOwnerTypeEnum.USER), MemoryAuthorization.Operation.FORGET)));
+        assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(request(binding(MemoryOwnerTypeEnum.USER), MemoryAuthorization.Operation.CANDIDATES)));
         verify(client, never()).decide(any(), any()); verify(client, never()).decideService(any(), any());
     }
 
@@ -190,7 +191,7 @@ class TianjiMemoryRunAuthorizationTest {
             owner == MemoryOwnerTypeEnum.TEAM ? "team" : null, "research", null, true, 5, Set.of(POLICY)); }
     private MemoryAuthorization.Request request(MemoryContextBinding binding, MemoryAuthorization.Operation operation) {
         return new MemoryAuthorization.Request(new MemoryOperationContext(actor, NOW.plusSeconds(5), run), binding.owner(actor), binding.scopeId(), operation,
-                operation == MemoryAuthorization.Operation.RETRIEVE || operation == MemoryAuthorization.Operation.SEARCH ? null : "memory", operation == MemoryAuthorization.Operation.FORGET ? 1 : 0, null, null);
+                operation == MemoryAuthorization.Operation.RETRIEVE || operation == MemoryAuthorization.Operation.SEARCH || operation == MemoryAuthorization.Operation.CANDIDATES ? null : "memory", operation == MemoryAuthorization.Operation.FORGET ? 1 : 0, null, null);
     }
     private static AgentRunAuthorization.Request run(TrustedAgentActor actor) { return new AgentRunAuthorization.Request(actor, "00000000-0000-0000-0000-000000000001", "definition", 1, HASH, HASH, HASH, "policy", true, NOW.plusSeconds(600)); }
     private ExecutionScopeAuthorizationContract.Decision decision(HttpExecutionAuthorizationClient.Expectation expected, Instant expires, Map<String, DataScopeDecision> scopes) {

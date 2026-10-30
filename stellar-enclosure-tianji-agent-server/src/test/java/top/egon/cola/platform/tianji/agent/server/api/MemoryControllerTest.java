@@ -22,6 +22,8 @@ import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
@@ -89,6 +91,16 @@ class MemoryControllerTest {
                 && context.runAuthorization() == null && context.deadlineAt().isAfter(NOW) && !context.deadlineAt().isAfter(Instant.now().plusSeconds(30))), eq(get));
         for (var resource : List.of(TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API,
                 TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API)) verify(permissions).requireExecution(resource);
+    }
+
+    @Test void candidate_review_requires_its_own_current_read_resource_and_strict_query_shape() throws Exception {
+        var query = new MemoryCandidateQuery(OWNER, "research", null, null, 5); when(memory.candidates(any(), eq(query))).thenReturn(new MemoryCandidatePageDTO(OWNER, "research", List.of(), null));
+        mvc.perform(post("/api/tianji/v1/memories/candidates").contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(query))).andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"));
+        verify(permissions).requireExecution(TianjiAgentPermissions.MEMORY_CANDIDATES_API);
+        var encoded = json.writeValueAsString(query);
+        for (var invalid : List.of(encoded.replace("\"limit\":5", "\"limit\":\"5\""), encoded.replace("\"limit\":5", "\"limit\":null"), encoded.substring(0, encoded.length() - 1) + ",\"text\":\"query\"}"))
+            mvc.perform(post("/api/tianji/v1/memories/candidates").contentType(MediaType.APPLICATION_JSON).content(invalid)).andExpect(status().isBadRequest());
+        verify(memory, times(1)).candidates(any(), any());
     }
 
     @Test void malformed_or_ambiguous_intentions_never_reach_storage() throws Exception {

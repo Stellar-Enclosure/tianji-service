@@ -9,6 +9,7 @@ public interface MemoryClient {
 
     MemoryEntryDTO getMemory(GetMemoryQuery query);
     MemoryRetrievalPageDTO retrieveMemory(MemoryRetrievalQuery query);
+    default MemoryCandidatePageDTO memoryCandidates(MemoryCandidateQuery query) { throw new UnsupportedOperationException("Candidate review is unavailable in this client"); }
     MemoryMutationResultDTO upsertMemory(UpsertMemoryCommand command);
     MemoryMutationResultDTO correctMemory(CorrectMemoryCommand command);
     MemoryMutationResultDTO forgetMemory(ForgetMemoryCommand command);

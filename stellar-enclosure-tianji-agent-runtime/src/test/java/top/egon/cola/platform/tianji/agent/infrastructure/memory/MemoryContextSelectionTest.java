@@ -77,6 +77,17 @@ class MemoryContextSelectionTest {
         assertFalse(sql.get().contains("'first'"));
     }
 
+    @Test void candidate_sql_filters_confirmation_and_expiry_before_limit_without_hiding_future_effective_reviews() {
+        var jdbc = mock(JdbcTemplate.class); var sql = new AtomicReference<String>(); var parameters = new AtomicReference<Object[]>();
+        doAnswer(call -> { sql.set(call.getArgument(0)); parameters.set((Object[]) call.getRawArguments()[2]); return List.of(); })
+                .when(jdbc).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<JdbcMemoryRepository.StoredMemory>>any(), any(Object[].class));
+        new JdbcMemoryRepository(jdbc, 20, ACTOR.issuerFingerprint(), OWNER, "review", new MemoryJsonCodec()).candidates(NOW, null, "after", 2);
+        assertTrue(sql.get().contains("AND e.state='CANDIDATE' AND NOT e.confirmed AND e.expires_at>?"));
+        assertFalse(sql.get().contains("e.effective_at<=?")); assertTrue(sql.get().contains("AND e.memory_id>? ORDER BY e.memory_id LIMIT ?"));
+        assertEquals(List.of(20L, ACTOR.issuerFingerprint(), "USER", "alice", "review"), java.util.Arrays.asList(parameters.get()).subList(0, 5));
+        assertEquals(List.of("after", 2), java.util.Arrays.asList(parameters.get()).subList(parameters.get().length - 2, parameters.get().length));
+    }
+
     private static MemoryRetentionPolicy policy(String key) { return new MemoryRetentionPolicy(key, 1, Duration.ofDays(1), Duration.ofDays(30), 100,
             Set.of(MemorySensitivityEnum.CONFIDENTIAL, MemorySensitivityEnum.INTERNAL), Set.of(MemorySensitivityEnum.CONFIDENTIAL), true); }
 }

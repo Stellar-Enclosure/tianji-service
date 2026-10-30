@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -586,6 +588,25 @@ class HttpAgentClientTest {
         assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).retrieveMemory(query)).code());
         response.set(new MemoryRetrievalPageDTO(owner, "research", List.of(new MemoryHitDTO(entry, 0.8)), null));
         assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).retrieveMemory(query)).code());
+    }
+
+    @Test
+    void candidate_review_uses_a_private_bounded_query_and_rejects_active_or_foreign_pages() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var active = memoryEntry("memory", owner);
+        var candidate = new MemoryEntryDTO(owner, active.scopeId(), active.memoryId(), active.kind(), active.revision(), active.supersedesRevision(), MemoryStateEnum.CANDIDATE,
+                active.content(), active.contentSha256(), active.source(), active.confidence(), false, active.sensitivity(), active.retentionPolicyRef(), active.effectiveAt(), active.expiresAt(), active.createdAt(), active.updatedAt());
+        var page = new MemoryCandidatePageDTO(owner, "research", List.of(candidate), "memory"); var encoded = mapper.writeValueAsString(page); var response = new AtomicReference<>(encoded);
+        var query = new MemoryCandidateQuery(owner, "research", MemoryKindEnum.PREFERENCE, "before", 1);
+        handler.set(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/candidates", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), MemoryCandidateQuery.class));
+            respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(page, client(Duration.ofSeconds(3), 0).memoryCandidates(query));
+        for (var invalid : List.of(encoded.replace("alice", "bob"), encoded.replace("research", "foreign"), encoded.replace("\"CANDIDATE\"", "\"ACTIVE\"").replace("\"confirmed\":false", "\"confirmed\":true"),
+                encoded.replace("\"confirmed\":false,", ""), encoded.replace("\"revision\":1", "\"revision\":1.5"), encoded.replace("PREFERENCE", "FACT"), encoded.substring(0, encoded.length() - 1) + ",\"unknown\":true}")) {
+            response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).memoryCandidates(query)).code());
+        }
     }
 
     private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {

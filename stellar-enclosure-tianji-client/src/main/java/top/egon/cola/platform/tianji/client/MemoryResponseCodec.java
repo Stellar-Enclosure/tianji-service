@@ -9,6 +9,7 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 
 /** Memory responses have a closed typed decoder without changing existing Agent/Session wire compatibility. */
 final class MemoryResponseCodec {
@@ -30,6 +31,12 @@ final class MemoryResponseCodec {
             var score = hit.path("score"); if (!score.isMissingNode() && !score.isNull() && !score.isNumber()) throw invalid();
         }
         return mapper.treeToValue(node, MemoryRetrievalPageDTO.class);
+    }
+    MemoryCandidatePageDTO candidates(byte[] bytes) {
+        var node = mapper.readTree(bytes); owner(node.path("owner")); strings(node, "scopeId"); optional(node.path("nextAfterMemoryId"), true);
+        if (!node.path("items").isArray() || node.path("items").size() > 50) throw invalid();
+        for (var item : node.path("items")) entry(item);
+        return mapper.treeToValue(node, MemoryCandidatePageDTO.class);
     }
     private static void entry(JsonNode node) {
         owner(node.path("owner")); strings(node, "scopeId", "memoryId", "kind", "state", "contentSha256", "sensitivity", "retentionPolicyRef", "effectiveAt", "createdAt", "updatedAt");

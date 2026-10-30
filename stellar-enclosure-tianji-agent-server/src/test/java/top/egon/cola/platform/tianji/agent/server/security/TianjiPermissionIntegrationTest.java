@@ -113,7 +113,7 @@ class TianjiPermissionIntegrationTest {
                             TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
                             TianjiAgentPermissions.SESSION_START_API, TianjiAgentPermissions.LINKED_SUBMIT_API,
                             TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API,
-                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
+                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_CANDIDATES_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
                     NOW.plusSeconds(30));
         }
     };
@@ -514,6 +514,7 @@ class TianjiPermissionIntegrationTest {
         assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
         memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 2)));
         assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(query));
+        assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(new MemoryAuthorization.Request(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.CANDIDATES, null, 0, null, null)));
         var foreignIssuer = new TianjiMemoryAccessProperties(List.of(new TianjiMemoryAccessProperties.Team(20, URI.create(snapshotIssuer.get().replace("idp.example", "IDP.example")),
                 "researchers", "research", TianjiMemoryAccessProperties.DirectoryType.ORGANIZATION, "10")));
         assertEquals(MemoryAuthorization.Decision.DENY, new TianjiMemoryHttpAuthorization(access(), foreignIssuer, CLOCK).authorize(query));
@@ -680,6 +681,7 @@ class TianjiPermissionIntegrationTest {
                         linkedSubmit, linkedResolve, linkedClose,
                         memoryResource("get", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
                         memoryResource("retrieve", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
+                        memoryResource("candidates", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
                         memoryResource("upsert", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
                         memoryResource("correct", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
                         memoryResource("forget", TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.MEMORY_FORGET_SCOPE)), List.of(), List.of());
@@ -716,7 +718,7 @@ class TianjiPermissionIntegrationTest {
                         TianjiAgentPermissions.START_API, TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_START_API,
                         TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API,
                         TianjiAgentPermissions.LINKED_SUBMIT_API, TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API,
-                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
+                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_CANDIDATES_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
                 memoryScopes.get(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }

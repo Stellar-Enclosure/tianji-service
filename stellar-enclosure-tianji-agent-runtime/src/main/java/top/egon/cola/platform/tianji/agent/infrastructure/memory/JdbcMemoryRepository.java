@@ -107,6 +107,15 @@ final class JdbcMemoryRepository {
         if (count == null || count < 0) throw unavailable(); return count;
     }
 
+    List<StoredMemory> candidates(Instant now, MemoryKindEnum kind, String after, int limit) {
+        var tail = new ArrayList<Object>(); tail.add(timestamp(now));
+        String sql = CURRENT + " AND e.state='CANDIDATE' AND NOT e.confirmed AND e.expires_at>?";
+        if (kind != null) { sql += " AND e.kind=?"; tail.add(kind.name()); }
+        if (after != null) { sql += " AND e.memory_id>?"; tail.add(after); }
+        sql += " ORDER BY e.memory_id LIMIT ?"; tail.add(limit);
+        return jdbc.query(sql, (rs, row) -> stored(rs), key(tail.toArray()));
+    }
+
     List<IndexReadiness> indexReadiness(Instant now, MemoryKindEnum kind, MemoryIndexPublication.Binding binding) {
         String sql = """
                 SELECT e.memory_id,e.current_revision,e.content_sha256,e.retention_policy_ref,e.sensitivity,e.index_model_ref,

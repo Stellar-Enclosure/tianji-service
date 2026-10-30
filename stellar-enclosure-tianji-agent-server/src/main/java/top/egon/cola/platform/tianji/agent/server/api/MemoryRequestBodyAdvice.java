@@ -17,6 +17,7 @@ import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
 import java.io.ByteArrayInputStream;
@@ -30,7 +31,7 @@ import java.util.Set;
 @ConditionalOnProperty(prefix = "stellar.tianji.agent", name = {"api.enabled", "memory.enabled", "memory.http.enabled"}, havingValue = "true")
 public final class MemoryRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 131_072;
-    private static final Set<Type> TYPES = Set.of(GetMemoryQuery.class, MemoryRetrievalQuery.class, UpsertMemoryCommand.class, CorrectMemoryCommand.class, ForgetMemoryCommand.class);
+    private static final Set<Type> TYPES = Set.of(GetMemoryQuery.class, MemoryRetrievalQuery.class, MemoryCandidateQuery.class, UpsertMemoryCommand.class, CorrectMemoryCommand.class, ForgetMemoryCommand.class);
     private static final JsonMapper JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS, DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
             .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).build();
@@ -43,7 +44,7 @@ public final class MemoryRequestBodyAdvice extends RequestBodyAdviceAdapter {
         try {
             var root = JSON.readTree(body); if (root == null || !root.isObject()) throw new IllegalArgumentException();
             strings(root.path("owner"), "type", "id"); strings(root, "scopeId");
-            if (type != MemoryRetrievalQuery.class) strings(root, "memoryId");
+            if (type != MemoryRetrievalQuery.class && type != MemoryCandidateQuery.class) strings(root, "memoryId");
             if (type == UpsertMemoryCommand.class || type == CorrectMemoryCommand.class || type == ForgetMemoryCommand.class) {
                 strings(root, "commandId");
                 if (!root.path("expectedRevision").isIntegralNumber() || !root.path("expectedRevision").canConvertToLong()) throw new IllegalArgumentException();
@@ -53,6 +54,9 @@ public final class MemoryRequestBodyAdvice extends RequestBodyAdviceAdapter {
             if (type == MemoryRetrievalQuery.class) {
                 if (!root.path("limit").isIntegralNumber()) throw new IllegalArgumentException();
                 optionalStrings(root, "kind", "text", "afterMemoryId");
+            }
+            if (type == MemoryCandidateQuery.class) {
+                if (!root.path("limit").isIntegralNumber()) throw new IllegalArgumentException(); optionalStrings(root, "kind", "afterMemoryId");
             }
             optionalStrings(root, "effectiveAt", "expiresAt");
             if (type == UpsertMemoryCommand.class || type == CorrectMemoryCommand.class) {
