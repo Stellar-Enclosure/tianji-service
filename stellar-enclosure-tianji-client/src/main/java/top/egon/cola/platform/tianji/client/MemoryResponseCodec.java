@@ -10,6 +10,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 
 /** Memory responses have a closed typed decoder without changing existing Agent/Session wire compatibility. */
 final class MemoryResponseCodec {
@@ -19,9 +20,18 @@ final class MemoryResponseCodec {
 
     MemoryEntryDTO entry(byte[] bytes) { var node = mapper.readTree(bytes); entry(node); return mapper.treeToValue(node, MemoryEntryDTO.class); }
     MemoryMutationResultDTO mutation(byte[] bytes) {
-        var node = mapper.readTree(bytes); owner(node.path("owner"));
-        strings(node, "commandId", "scopeId", "memoryId", "outcome", "stateAtMutation", "occurredAt"); integers(node, "revision");
+        var node = mapper.readTree(bytes); mutation(node);
         return mapper.treeToValue(node, MemoryMutationResultDTO.class);
+    }
+    MemoryPreferenceExtractionResultDTO extraction(byte[] bytes) {
+        var node = mapper.readTree(bytes); owner(node.path("owner"));
+        strings(node, "scopeId", "runId", "sourceEventId", "bindingId", "policyRef", "outcome");
+        if (!node.path("items").isArray() || node.path("items").size() > 32) throw invalid();
+        for (var item : node.path("items")) { strings(item, "preferenceKey"); mutation(item.path("receipt")); }
+        return mapper.treeToValue(node, MemoryPreferenceExtractionResultDTO.class);
+    }
+    private static void mutation(JsonNode node) {
+        owner(node.path("owner")); strings(node, "commandId", "scopeId", "memoryId", "outcome", "stateAtMutation", "occurredAt"); integers(node, "revision");
     }
     MemoryRetrievalPageDTO page(byte[] bytes) {
         var node = mapper.readTree(bytes); owner(node.path("owner")); strings(node, "scopeId"); optional(node.path("nextAfterMemoryId"), true);

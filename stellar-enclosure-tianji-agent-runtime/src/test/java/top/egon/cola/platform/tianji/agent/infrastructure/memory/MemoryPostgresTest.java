@@ -15,6 +15,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
+import top.egon.cola.platform.tianji.agent.application.memory.MemoryPreferenceAdmission;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -23,11 +24,16 @@ import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryOperationContext;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryReadGrant;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryRetentionPolicy;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryExtractionPolicy;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceSourceBinding;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryReadGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryStorageVerifier;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
@@ -35,6 +41,7 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
@@ -120,6 +127,7 @@ class MemoryPostgresTest {
             lifecycle(jdbc, memory, work, events);
             contextSelection(memory, work, events);
             candidates(memory);
+            preferenceAdmission(ledger, memory, authority, jdbc);
             rollback(jdbc, memory, failPublication);
             concurrency(memory);
             lateEmbedding(jdbc, memory, work, events, delegate);
@@ -212,6 +220,44 @@ class MemoryPostgresTest {
         assertTrue(store.current(request, resource, new MemoryReadGrant.Scope(OWNER, "other", "f".repeat(64), null)).isEmpty());
         ledger.cancel(ALICE, new CancelAgentRunCommand(started.runId(), "cancel-grant", started.revision(), "controlled cancellation"));
         assertTrue(store.current(request, resource, scope).isEmpty()); assertFalse(store.complete(second, ticket));
+    }
+
+    private static void preferenceAdmission(AgentLedgerService ledger, PostgresMemoryService memory, MemoryAuthorization authority, JdbcTemplate jdbc) {
+        var execution = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(10), Duration.ofSeconds(5), 2, 0, 1000, 100, BigDecimal.ONE, "USD", 1, Set.of(), "retry", "approval");
+        var definition = ledger.publish(ALICE, new AgentDefinitionSpecDTO("preference-source", 1, "CONFIG", null, "1", "1", new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "route", "policy"), execution, Map.of()));
+        var run = ledger.start(ALICE, new StartAgentRunCommand("preference-source", 1, null, "preference-source", null, null, new AgentInputDTO("memory.preference.language=zh-CN", null, null), null));
+        var claimed = ledger.claim(ALICE, new GetAgentRunQuery(run.runId()), run.revision(), "preference-worker", Duration.ofSeconds(30));
+        var finished = ledger.finish(ALICE, claimed.lease(), claimed.run().revision(), new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED, Map.of("text", "model text must not be a source"), null, "1", null, null, null));
+        var event = ledger.events(ALICE, new AgentEventsQuery(run.runId(), finished.lastEventSequence() - 1, 1)).getFirst();
+        var policy = new MemoryExtractionPolicy("preferences", 1, Map.of("language", Set.of("zh-CN", "en-US")), new BigDecimal("0.5"), MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), 3);
+        var binding = new MemoryPreferenceSourceBinding("personal-preferences", 20, ALICE.issuerFingerprint(), "preference-source", 1, definition.contentSha256(), "extraction", policy.reference());
+        var admission = new MemoryPreferenceAdmission(ledger, memory, authority, List.of(binding), List.of(policy), Clock.systemUTC());
+        var command = new ExtractMemoryPreferencesCommand(OWNER, "extraction", run.runId(), event.eventId(), binding.id(), policy.reference());
+        var first = admission.extract(context(), command); assertEquals(1, first.items().size()); assertEquals(MemoryStateEnum.CANDIDATE, first.items().getFirst().receipt().stateAtMutation());
+        assertEquals(first, admission.extract(context(), command));
+        String id = first.items().getFirst().receipt().memoryId();
+        assertTrue(memory.retrieve(context(), new MemoryRetrievalQuery(OWNER, "extraction", null, null, null, 5)).items().isEmpty());
+        memory.forget(context(), new ForgetMemoryCommand("forget-extracted", OWNER, "extraction", id, 1, "USER_REJECTED_CANDIDATE"));
+        assertEquals(first, admission.extract(context(), command));
+        assertEquals(first, admission.extract(context(), new ExtractMemoryPreferencesCommand(OWNER, "extraction", run.runId(), event.eventId(), binding.id(), policy.reference())));
+        assertEquals(MemoryStateEnum.FORGOTTEN, memory.get(context(), new GetMemoryQuery(OWNER, "extraction", id)).state());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_revision WHERE memory_id=? AND (content_json IS NOT NULL OR source_json IS NOT NULL)", Integer.class, id));
+        assertTrue(memory.candidates(context(), new MemoryCandidateQuery(OWNER, "extraction", null, null, 5)).items().isEmpty());
+        memory.upsert(context(), new UpsertMemoryCommand("canonical-before-extract", OWNER, "extraction-alias", "canonical-preference", MemoryKindEnum.PREFERENCE, 0,
+                new MemoryContentDTO(null, Map.of("language", "zh-CN")), PROVENANCE, new BigDecimal("0.5"), false, MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), null, null));
+        var aliasBinding = new MemoryPreferenceSourceBinding("alias-source", 20, ALICE.issuerFingerprint(), "preference-source", 1, definition.contentSha256(), "extraction-alias", policy.reference());
+        var aliasAdmission = new MemoryPreferenceAdmission(ledger, memory, authority, List.of(aliasBinding), List.of(policy), Clock.systemUTC());
+        var aliasCommand = new ExtractMemoryPreferencesCommand(OWNER, "extraction-alias", run.runId(), event.eventId(), aliasBinding.id(), policy.reference());
+        var aliasReceipt = aliasAdmission.extract(context(), aliasCommand); assertEquals("canonical-preference", aliasReceipt.items().getFirst().receipt().memoryId());
+        assertEquals(MemoryMutationOutcomeEnum.DEDUPLICATED, aliasReceipt.items().getFirst().receipt().outcome());
+        memory.forget(context(), new ForgetMemoryCommand("forget-canonical-preference", OWNER, "extraction-alias", "canonical-preference", 1, "USER_REJECTED_CANDIDATE"));
+        assertEquals(aliasReceipt, aliasAdmission.extract(context(), aliasCommand));
+        var changedPolicy = new MemoryExtractionPolicy("preferences", 2, policy.preferenceValues(), new BigDecimal("0.4"), policy.sensitivity(), POLICY.reference(), 3);
+        var changedBinding = new MemoryPreferenceSourceBinding("new-alias-source", 20, ALICE.issuerFingerprint(), "preference-source", 1, definition.contentSha256(), "extraction-alias", changedPolicy.reference());
+        var changedAdmission = new MemoryPreferenceAdmission(ledger, memory, authority, List.of(changedBinding), List.of(changedPolicy), Clock.systemUTC());
+        assertThrows(AgentLedgerException.class, () -> changedAdmission.extract(context(), new ExtractMemoryPreferencesCommand(OWNER, "extraction-alias", run.runId(), event.eventId(), changedBinding.id(), changedPolicy.reference())));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_entry WHERE scope_id='extraction-alias'", Integer.class));
+        assertTrue(memory.candidates(context(), new MemoryCandidateQuery(OWNER, "extraction-alias", null, null, 5)).items().isEmpty());
     }
 
     private static void candidates(PostgresMemoryService memory) {

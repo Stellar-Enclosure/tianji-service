@@ -42,6 +42,9 @@ stellar:
     agent:
       memory:
         enabled: false
+        extraction:
+          http:
+            enabled: false
         retention:
           enabled: false
         http:

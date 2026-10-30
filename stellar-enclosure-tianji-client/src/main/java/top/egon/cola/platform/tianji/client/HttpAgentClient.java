@@ -5,6 +5,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentClient;
 import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
@@ -201,6 +203,16 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
             previous = entry.memoryId();
         }
         return page;
+    }
+
+    @Override
+    public MemoryPreferenceExtractionResultDTO extractMemoryPreferences(ExtractMemoryPreferencesCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", memoryPath("extract-preferences"), command, MemoryPreferenceExtractionResultDTO.class, null, memories::extraction);
+        requireMemoryScope(command.owner(), command.scopeId(), result.owner(), result.scopeId());
+        if (!command.runId().equals(result.runId()) || !command.sourceEventId().equals(result.sourceEventId())
+                || !command.bindingId().equals(result.bindingId()) || !command.policyRef().equals(result.policyRef())) throw invalidMemoryResponse();
+        return result;
     }
 
     @Override

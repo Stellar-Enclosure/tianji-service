@@ -85,6 +85,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Retrieve authorized Memory facts"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.candidates", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Review unconfirmed Memory candidates"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.extractPreferences", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Extract candidates from approved owned preference sources"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.upsert", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Create or deduplicate a Memory fact"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.correct", defaultLocale = "en-US",
@@ -101,6 +103,7 @@ public final class TianjiAgentPermissions {
     public static final String MEMORY_GET_API = "tianji.api.memory.get";
     public static final String MEMORY_RETRIEVE_API = "tianji.api.memory.retrieve";
     public static final String MEMORY_CANDIDATES_API = "tianji.api.memory.candidates";
+    public static final String MEMORY_EXTRACT_PREFERENCES_API = "tianji.api.memory.extractPreferences";
     public static final String MEMORY_UPSERT_API = "tianji.api.memory.upsert";
     public static final String MEMORY_CORRECT_API = "tianji.api.memory.correct";
     public static final String MEMORY_FORGET_API = "tianji.api.memory.forget";

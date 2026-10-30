@@ -10,6 +10,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionItemDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -607,6 +611,29 @@ class HttpAgentClientTest {
                 encoded.replace("\"confirmed\":false,", ""), encoded.replace("\"revision\":1", "\"revision\":1.5"), encoded.replace("PREFERENCE", "FACT"), encoded.substring(0, encoded.length() - 1) + ",\"unknown\":true}")) {
             response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).memoryCandidates(query)).code());
         }
+    }
+
+    @Test
+    void explicit_preference_extraction_binds_all_source_fields_and_item_receipts_without_automatic_replay() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice");
+        var command = new ExtractMemoryPreferencesCommand(owner, "research", "run", "terminal", "source", "preferences@1#" + "a".repeat(64));
+        var item = new MemoryMutationResultDTO(command.itemCommandId("language"), owner, "research", "memory", 1, MemoryMutationOutcomeEnum.CREATED, MemoryStateEnum.CANDIDATE, NOW);
+        var result = new MemoryPreferenceExtractionResultDTO(owner, "research", "run", "terminal", "source", command.policyRef(), MemoryPreferenceExtractionOutcomeEnum.ELIGIBLE, List.of(new MemoryPreferenceExtractionItemDTO("language", item)));
+        var encoded = mapper.writeValueAsString(result); var response = new AtomicReference<>(encoded); var calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/extract-preferences", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(command, mapper.readValue(exchange.getRequestBody().readAllBytes(), ExtractMemoryPreferencesCommand.class));
+            respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(result, client(Duration.ofSeconds(3), 2).extractMemoryPreferences(command));
+        for (var invalid : List.of(encoded.replace("alice", "bob"), encoded.replace("terminal", "other"), encoded.replace("\"source\"", "\"foreign\""),
+                encoded.replace(command.itemCommandId("language"), "foreign-command"), encoded.replace("\"CANDIDATE\"", "\"ACTIVE\""),
+                encoded.replace("\"revision\":1", "\"revision\":1.5"), encoded.substring(0, encoded.length() - 1) + ",\"unknown\":true}")) {
+            response.set(invalid); int before = calls.get();
+            assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 2).extractMemoryPreferences(command)).code()); assertEquals(before + 1, calls.get());
+        }
+        calls.set(0); handler.set(exchange -> { calls.incrementAndGet(); respond(exchange, 503, "application/json", "{}".getBytes(StandardCharsets.UTF_8)); });
+        assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 2).extractMemoryPreferences(command)); assertEquals(1, calls.get());
     }
 
     private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {

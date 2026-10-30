@@ -115,7 +115,7 @@ public class TianjiMemoryConfiguration {
         };
     }
 
-    private static void requireOrigin(long tenantId, String fingerprint, TianjiMemoryProperties properties, TrustedIssuerRegistry issuers) {
+    static void requireOrigin(long tenantId, String fingerprint, TianjiMemoryProperties properties, TrustedIssuerRegistry issuers) {
         var binding = properties.origins().stream().filter(origin -> origin.tenantId() == tenantId && origin.issuerFingerprint().equals(fingerprint)).findFirst().orElseThrow(TianjiMemoryConfiguration::unavailable);
         var issuer = issuers.findByIssuer(binding.issuer().toASCIIString()).orElseThrow(TianjiMemoryConfiguration::unavailable);
         if (issuer.status() != TrustedIssuerRegistry.Status.ACTIVE || issuer.realmType() != TrustedIssuerRegistry.RealmType.TENANT || !Long.toString(tenantId).equals(issuer.tenantId())) throw unavailable();
