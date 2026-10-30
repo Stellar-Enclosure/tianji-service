@@ -92,11 +92,13 @@ class TianjiPermissionIntegrationTest {
     private final PermissionManifest manifest = manifest();
     private final AtomicReference<Set<String>> granted = new AtomicReference<>(Set.of(TianjiAgentPermissions.READ));
     private final AtomicReference<String> snapshotIssuer = new AtomicReference<>("https://idp.example/tenants/20");
+    private final java.util.concurrent.atomic.AtomicBoolean policyUnavailable = new java.util.concurrent.atomic.AtomicBoolean();
     private final Rbac3AuthorizationClient client = new Rbac3AuthorizationClient() {
         @Override public SystemAuthorizationSnapshot fetch(String system, IdentityPrincipal principal) {
             return snapshot(granted.get());
         }
         @Override public ServicePolicySnapshot fetchPolicy(String system, ServiceIdentityPrincipal principal) {
+            if (policyUnavailable.get()) throw new Rbac3AuthorizationClient.AuthorizationUnavailableException("private-backend-detail");
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(),
                     Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API,
                             TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
@@ -246,6 +248,15 @@ class TianjiPermissionIntegrationTest {
                 .andExpect(status().isOk()).andExpect(jsonPath("$.found").value(false)).andReturn();
         verify(submissions).resolve(actor, query);
         assertNull(result.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
+        assertNull(SecurityContextHolder.getContext().getAuthentication());
+        policyUnavailable.set(true);
+        var unavailable = mvc.perform(post("/api/tianji/v1/agent-process-dispatches/resolve").header("Authorization", "Bearer service-token")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isServiceUnavailable()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE")).andReturn();
+        assertFalse(unavailable.getResponse().getContentAsString().contains("private-backend-detail"));
+        verify(submissions, times(1)).resolve(actor, query);
+        assertNull(unavailable.getRequest().getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
         assertNull(SecurityContextHolder.getContext().getAuthentication());
     }
 

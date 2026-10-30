@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorDTO;
+import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient;
 
 @RestControllerAdvice(basePackageClasses = AgentRunController.class)
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
@@ -42,6 +43,11 @@ public final class AgentApiErrors {
     @ExceptionHandler(AgentRequestBodyAdvice.TooLarge.class)
     ResponseEntity<AgentErrorDTO> tooLarge() {
         return error(HttpStatus.PAYLOAD_TOO_LARGE, AgentErrorCodeEnum.TIANJI_REQUEST_TOO_LARGE);
+    }
+
+    @ExceptionHandler(Rbac3AuthorizationClient.AuthorizationUnavailableException.class)
+    ResponseEntity<AgentErrorDTO> authorizationUnavailable() {
+        return error(HttpStatus.SERVICE_UNAVAILABLE, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
     }
 
     private static ResponseEntity<AgentErrorDTO> error(HttpStatus status, AgentErrorCodeEnum code) {

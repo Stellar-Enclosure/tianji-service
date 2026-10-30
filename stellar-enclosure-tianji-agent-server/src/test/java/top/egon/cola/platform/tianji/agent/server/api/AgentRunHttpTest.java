@@ -101,6 +101,18 @@ class AgentRunHttpTest {
     }
 
     @Test
+    void unavailable_permission_backend_returns_a_noncacheable_sanitized_retryable_response_before_ledger_access() throws Exception {
+        doThrow(new top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient.AuthorizationUnavailableException(
+                "private-backend-detail", new IllegalStateException("private-cause"))).when(guard).requireExecution(TianjiAgentPermissions.GET_API);
+        var response = mvc.perform(get(BASE + "/run-1")).andExpect(status().isServiceUnavailable())
+                .andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE")).andReturn().getResponse();
+        assertFalse(response.getContentAsString().contains("private-backend-detail"));
+        assertFalse(response.getContentAsString().contains("private-cause"));
+        verifyNoInteractions(ledger);
+    }
+
+    @Test
     void session_start_uses_a_separate_combined_permission_before_touching_the_ledger() {
         var command = new StartAgentRunCommand("research", 1, "session-1", "request-1", null, null,
                 new AgentInputDTO("question", List.of(), Map.of()), null);
