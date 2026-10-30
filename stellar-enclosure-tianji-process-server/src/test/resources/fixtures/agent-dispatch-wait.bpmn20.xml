@@ -18,16 +18,24 @@
         <eventBasedGateway id="resultGateway"/>
         <sequenceFlow id="toResult" sourceRef="resultGateway" targetRef="waitResult"/>
         <sequenceFlow id="toTimeout" sourceRef="resultGateway" targetRef="waitTimeout"/>
-        <intermediateCatchEvent id="waitResult" tianji:workerRef="worker">
+        <intermediateCatchEvent id="waitResult" tianji:workerRef="worker" tianji:statusVariable="agentStatus">
             <messageEventDefinition messageRef="agentFinished"/>
         </intermediateCatchEvent>
         <intermediateCatchEvent id="waitTimeout">
             <timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>
         </intermediateCatchEvent>
-        <sequenceFlow id="toReview" sourceRef="waitResult" targetRef="review"/>
+        <sequenceFlow id="toStatus" sourceRef="waitResult" targetRef="statusRouting"/>
+        <exclusiveGateway id="statusRouting" default="toFailure"/>
+        <sequenceFlow id="toReview" sourceRef="statusRouting" targetRef="review">
+            <conditionExpression><![CDATA[${agentStatus == 'COMPLETED'}]]></conditionExpression>
+        </sequenceFlow>
         <userTask id="review"/>
         <sequenceFlow id="toEnd" sourceRef="review" targetRef="end"/>
         <endEvent id="end"/>
+        <sequenceFlow id="toFailure" sourceRef="statusRouting" targetRef="failureReview"/>
+        <userTask id="failureReview"/>
+        <sequenceFlow id="toFailureEnd" sourceRef="failureReview" targetRef="failureEnd"/>
+        <endEvent id="failureEnd"/>
         <sequenceFlow id="toTimeoutReview" sourceRef="waitTimeout" targetRef="timeoutReview"/>
         <userTask id="timeoutReview"/>
         <sequenceFlow id="toTimeoutEnd" sourceRef="timeoutReview" targetRef="timeoutEnd"/>

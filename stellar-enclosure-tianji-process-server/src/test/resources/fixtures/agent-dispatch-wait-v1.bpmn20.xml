@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn" xmlns:tianji="urn:stellar-enclosure:tianji:worker:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <message id="agentFinished" name="TianjiAgentFinishedV1"/>
+    <process id="agentDispatch" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toWorker" sourceRef="start" targetRef="worker"/>
+        <serviceTask id="worker" flowable:type="external-worker" flowable:topic="agentStart:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="agentStart" tianji:schemaVersion="1"
+                     tianji:effectSafety="EXTERNAL_IDEMPOTENT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="amount" target="requestedAmount" tianji:type="INTEGER"/>
+                <flowable:externalWorkerOutParameter source="runId" target="agentRunId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <sequenceFlow id="toGateway" sourceRef="worker" targetRef="resultGateway"/>
+        <eventBasedGateway id="resultGateway"/>
+        <sequenceFlow id="toResult" sourceRef="resultGateway" targetRef="waitResult"/>
+        <sequenceFlow id="toTimeout" sourceRef="resultGateway" targetRef="waitTimeout"/>
+        <intermediateCatchEvent id="waitResult" tianji:workerRef="worker">
+            <messageEventDefinition messageRef="agentFinished"/>
+        </intermediateCatchEvent>
+        <intermediateCatchEvent id="waitTimeout">
+            <timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>
+        </intermediateCatchEvent>
+        <sequenceFlow id="toReview" sourceRef="waitResult" targetRef="review"/>
+        <userTask id="review"/>
+        <sequenceFlow id="toEnd" sourceRef="review" targetRef="end"/>
+        <endEvent id="end"/>
+        <sequenceFlow id="toTimeoutReview" sourceRef="waitTimeout" targetRef="timeoutReview"/>
+        <userTask id="timeoutReview"/>
+        <sequenceFlow id="toTimeoutEnd" sourceRef="timeoutReview" targetRef="timeoutEnd"/>
+        <endEvent id="timeoutEnd"/>
+    </process>
+</definitions>

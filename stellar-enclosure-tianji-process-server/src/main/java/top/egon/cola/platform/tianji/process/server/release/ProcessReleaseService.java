@@ -241,7 +241,7 @@ public final class ProcessReleaseService {
             var waits = processModel.model().messageWaits();
             if (!waits.isEmpty() && !agentMessageWaitsEnabled) throw invalid();
             for (var wait : waits.values()) {
-                if (workerTopics == null || !workerTopics.isInternalAgentDispatch(tenantId,
+                if (wait.statusVariable() == null || workerTopics == null || !workerTopics.isInternalAgentDispatch(tenantId,
                         processModel.model().workerTasks().get(wait.workerElementId()))) throw invalid();
             }
             for (var entry : processModel.model().workerTasks().entrySet()) {

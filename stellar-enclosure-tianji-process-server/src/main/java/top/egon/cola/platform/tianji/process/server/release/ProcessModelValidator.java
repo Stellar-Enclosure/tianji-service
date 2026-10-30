@@ -95,6 +95,7 @@ public final class ProcessModelValidator {
             messages.put(id, name);
         }
         Map<String, String> messageRefs = new LinkedHashMap<>();
+        Map<String, String> messageStatusVariables = new LinkedHashMap<>();
         Map<String, Duration> timers = new LinkedHashMap<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
@@ -128,8 +129,13 @@ public final class ProcessModelValidator {
                         if (!IDENTIFIER.matcher(ref).matches() || !messages.containsKey(ref) || messageRefs.containsValue(ref)
                                 || !IDENTIFIER.matcher(element.getAttributeNS(TIANJI_WORKER, "workerRef")).matches()) throw invalid();
                         messageRefs.put(id, ref);
+                        if (element.hasAttributeNS(TIANJI_WORKER, "statusVariable")) {
+                            String variable = element.getAttributeNS(TIANJI_WORKER, "statusVariable");
+                            validateVariable(variable);
+                            messageStatusVariables.put(id, variable);
+                        }
                     } else {
-                        if (element.hasAttributeNS(TIANJI_WORKER, "workerRef")) throw invalid();
+                        if (element.hasAttributeNS(TIANJI_WORKER, "workerRef") || element.hasAttributeNS(TIANJI_WORKER, "statusVariable")) throw invalid();
                         Element duration = only(only(element, "timerEventDefinition"), "timeDuration");
                         try {
                             String literal = duration.getTextContent();
@@ -154,7 +160,7 @@ public final class ProcessModelValidator {
         }
         if (decisions.size() > 1 || workers.size() > 16
                 || (!decisions.isEmpty() || !workers.isEmpty()) && nodes.values().stream().anyMatch(n -> "parallelGateway".equals(n.kind))
-                || decisions.isEmpty() && nodes.values().stream().anyMatch(n -> "exclusiveGateway".equals(n.kind))) throw invalid();
+                || decisions.isEmpty() && messageRefs.isEmpty() && nodes.values().stream().anyMatch(n -> "exclusiveGateway".equals(n.kind))) throw invalid();
         FlowNode start = null;
         List<RouteCondition> routes = new ArrayList<>();
         int splits = 0;
@@ -176,8 +182,13 @@ public final class ProcessModelValidator {
                 }
                 case "exclusiveGateway" -> {
                     if (node.incoming == 1 && outgoing >= 2 && outgoing <= 4) {
-                        if (++splits > 1 || !decisions.containsKey(node.previous.getFirst().element.getAttribute("id"))) throw invalid();
-                        routes.addAll(validateRoutes(node));
+                        String previous = node.previous.getFirst().element.getAttribute("id");
+                        if (++splits > 1 || !decisions.containsKey(previous) && !messageStatusVariables.containsKey(previous)) throw invalid();
+                        var conditions = validateRoutes(node);
+                        if (messageStatusVariables.containsKey(previous) && conditions.stream().anyMatch(route ->
+                                !messageStatusVariables.get(previous).equals(route.variable()) || route.type() != ValueType.STRING
+                                        || !Set.of("'COMPLETED'", "'FAILED'", "'CANCELLED'", "'TIMED_OUT'").contains(route.literal()))) throw invalid();
+                        routes.addAll(conditions);
                     } else if (node.incoming < 2 || node.incoming > 4 || outgoing != 1 || node.element.hasAttribute("default")) throw invalid();
                 }
                 default -> throw invalid();
@@ -197,7 +208,7 @@ public final class ProcessModelValidator {
                     || !waitingWorkers.add(worker)) throw invalid();
             String timer = gateway.next.stream().map(next -> next.element.getAttribute("id")).filter(timers::containsKey)
                     .findFirst().orElseThrow(ProcessModelValidator::invalid);
-            waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer)));
+            waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer), messageStatusVariables.get(entry.getKey())));
         }
         if (start == null) throw invalid();
         ArrayDeque<FlowNode> ready = new ArrayDeque<>();
@@ -279,6 +290,9 @@ public final class ProcessModelValidator {
                 if (!outputs.add(output.target())) throw invalid();
             }
         }
+        for (MessageWait wait : bpmn.messageWaits().values()) {
+            if (wait.statusVariable() != null && !outputs.add(wait.statusVariable())) throw invalid();
+        }
     }
 
     private static List<RouteCondition> validateRoutes(FlowNode gateway) {
@@ -322,7 +336,9 @@ public final class ProcessModelValidator {
         }
         if (decision.outputs().keySet().stream().anyMatch(processInputs::containsKey)) throw invalid();
         for (RouteCondition route : bpmn.routeConditions()) {
-            if (decision.outputs().get(route.variable()) != route.type()) throw invalid();
+            boolean terminalStatus = route.type() == ValueType.STRING && bpmn.messageWaits().values().stream()
+                    .anyMatch(wait -> route.variable().equals(wait.statusVariable()));
+            if (!terminalStatus && decision.outputs().get(route.variable()) != route.type()) throw invalid();
         }
     }
 
@@ -418,7 +434,7 @@ public final class ProcessModelValidator {
             boolean workerType = BPMN.equals(namespace) && Set.of("externalWorkerInParameter", "externalWorkerOutParameter").contains(kind)
                     && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "type".equals(attribute.getLocalName());
             boolean workerWait = BPMN.equals(namespace) && "intermediateCatchEvent".equals(kind)
-                    && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "workerRef".equals(attribute.getLocalName());
+                    && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && Set.of("workerRef", "statusVariable").contains(attribute.getLocalName());
             boolean expressionType = BPMN.equals(namespace) && "conditionExpression".equals(kind)
                     && XMLConstants.W3C_XML_SCHEMA_INSTANCE_NS_URI.equals(attribute.getNamespaceURI())
                     && "type".equals(attribute.getLocalName()) && "tFormalExpression".equals(attribute.getNodeValue());

@@ -54,7 +54,12 @@ public final class ValidatedProcessModel {
     public Map<String, MessageWait> messageWaits() { return messageWaits; }
 
     public record RouteCondition(String variable, ValueType type, String literal) { }
-    public record MessageWait(String messageName, String workerElementId, String timerElementId, Duration maximumWait) { }
+    public record MessageWait(String messageName, String workerElementId, String timerElementId, Duration maximumWait,
+                              String statusVariable) {
+        public MessageWait(String messageName, String workerElementId, String timerElementId, Duration maximumWait) {
+            this(messageName, workerElementId, timerElementId, maximumWait, null);
+        }
+    }
     public record WorkerParameter(String source, String target, ValueType type) { }
     public record WorkerTask(String topic, String schemaVersion, WorkerEffect effectSafety,
                              List<WorkerParameter> inputs, List<WorkerParameter> outputs) {

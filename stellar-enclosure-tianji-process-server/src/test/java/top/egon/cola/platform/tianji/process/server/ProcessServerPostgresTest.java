@@ -653,6 +653,9 @@ class ProcessServerPostgresTest {
         var owner = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/20");
         var actor = registration.actor();
         byte[] model = new ClassPathResource("fixtures/agent-dispatch-wait.bpmn20.xml").getContentAsByteArray();
+        byte[] legacyWait = new ClassPathResource("fixtures/agent-dispatch-wait-v1.bpmn20.xml").getContentAsByteArray();
+        assertThrows(IllegalArgumentException.class, () -> releases.publish(owner, "agent-status-missing", List.of(
+                new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", legacyWait, Map.of("amount", ValueType.INTEGER)))));
         releases.publish(owner, "agent-dispatch", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", model,
                 Map.of("amount", ValueType.INTEGER))));
         var instance = runs.start(owner, new ProcessExecutionService.StartCommand("agent-dispatch", "agentDispatch", "business-one",
@@ -707,12 +710,12 @@ class ProcessServerPostgresTest {
         assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count());
         var ownerTransaction = new TransactionTemplate(manager);
         assertThrows(IllegalStateException.class, () -> ownerTransaction.execute(status -> {
-            process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId());
+            process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId(), Map.of("agentStatus", "COMPLETED"));
             throw new IllegalStateException("controlled rollback after message delivery");
         }));
         assertEquals(1, process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(instance.instanceId()).eventType("message").count());
         assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count());
-        process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId());
+        process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId(), Map.of("agentStatus", "COMPLETED"));
         assertEquals(1, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).taskDefinitionKey("review").count());
         assertEquals(0, process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(instance.instanceId()).count());
         assertEquals(0, process.getManagementService().createTimerJobQuery().processInstanceId(instance.instanceId()).count());
@@ -745,6 +748,28 @@ class ProcessServerPostgresTest {
         when(client.close(timedIntent.query())).thenReturn(new LinkedAgentCloseResult(timedIntent.query(), new LinkedAgentSubmissionDTO(true, timedRun)));
         assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
         assertEquals(AgentDispatchStore.State.CLOSED, store.refresh(timedIntent.seed().key(), true).state());
+        for (var terminal : List.of(AgentRunStatusEnum.FAILED, AgentRunStatusEnum.CANCELLED, AgentRunStatusEnum.TIMED_OUT)) {
+            String suffix = terminal.name();
+            var failedInstance = runs.start(owner, new ProcessExecutionService.StartCommand("agent-dispatch", "agentDispatch", "business-" + suffix,
+                    "dispatch-" + suffix, "correlation-" + suffix, Map.of("amount", 10L)));
+            var failedTask = workers.acquireAgentDispatch(binding).task();
+            assertNotNull(failedTask);
+            var failedIntent = workers.prepareAgentDispatch(actor, failedTask, binding, store);
+            var failedRun = new AgentRunDTO("probe-" + suffix, "research", 2, null, AgentRunStatusEnum.QUEUED, null, false,
+                    0, 1, 0, Instant.now().plusSeconds(600), Instant.now(), null);
+            store.record(failedIntent.seed().key(), failedIntent.query(), new LinkedAgentSubmissionDTO(false, failedRun));
+            workers.completeAgentDispatch(actor, failedTask, binding, store, failedRun.runId());
+            await().atMost(Duration.ofSeconds(10)).until(() -> process.getRuntimeService().createEventSubscriptionQuery()
+                    .processInstanceId(failedInstance.instanceId()).eventName("TianjiAgentFinishedV1").count() == 1);
+            var failedSubscription = process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(failedInstance.instanceId())
+                    .eventName("TianjiAgentFinishedV1").singleResult();
+            process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", failedSubscription.getExecutionId(), Map.of("agentStatus", suffix));
+            assertEquals(1, process.getTaskService().createTaskQuery().processInstanceId(failedInstance.instanceId()).taskDefinitionKey("failureReview").count());
+            assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(failedInstance.instanceId()).taskDefinitionKey("review").count());
+            process.getRuntimeService().deleteProcessInstance(failedInstance.instanceId(), "controlled terminal branch cleanup");
+            when(client.close(failedIntent.query())).thenReturn(new LinkedAgentCloseResult(failedIntent.query(), new LinkedAgentSubmissionDTO(true, failedRun)));
+            assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
+        }
     }
 
     private static void verifyWorkerAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {

@@ -21,6 +21,14 @@ class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
 
     @Test
+    void previously_persisted_wait_models_without_status_projection_remain_readable() throws Exception {
+        var previous = validator.validateBpmn(fixture("agent-dispatch-wait-v1.bpmn20.xml"), "agentDispatch");
+        assertNull(previous.messageWaits().get("waitResult").statusVariable());
+        assertTrue(previous.routeConditions().isEmpty());
+        validator.validateWorkerBindings(previous, Map.of("amount", INTEGER), null);
+    }
+
+    @Test
     void fixed_flowable_converter_retains_the_literal_subscription_and_competing_timer() throws Exception {
         byte[] xml = fixture("agent-dispatch-wait.bpmn20.xml");
         var nativeModel = new BpmnXMLConverter().convertToBpmnModel(
@@ -41,8 +49,13 @@ class ProcessModelValidatorTest {
         String xml = new String(fixture("agent-dispatch-wait.bpmn20.xml"), StandardCharsets.UTF_8);
         var model = validator.validateBpmn(bytes(xml), "agentDispatch");
         assertEquals(Map.of("waitResult", new ValidatedProcessModel.MessageWait("TianjiAgentFinishedV1", "worker", "waitTimeout",
-                Duration.ofMinutes(5))), model.messageWaits());
+                Duration.ofMinutes(5), "agentStatus")), model.messageWaits());
         validator.validateWorkerBindings(model, Map.of("amount", INTEGER), null);
+        assertThrows(IllegalArgumentException.class, () -> validator.validateWorkerBindings(model, Map.of("amount", INTEGER, "agentStatus", STRING), null));
+        var overwriting = validator.validateBpmn(bytes(xml.replace("statusVariable=\"agentStatus\"", "statusVariable=\"agentRunId\"")
+                .replace("agentStatus ==", "agentRunId ==")), "agentDispatch");
+        assertThrows(IllegalArgumentException.class, () -> validator.validateWorkerBindings(overwriting, Map.of("amount", INTEGER), null));
+        assertEquals(java.util.List.of(new ValidatedProcessModel.RouteCondition("agentStatus", STRING, "'COMPLETED'")), model.routeConditions());
         assertThrows(UnsupportedOperationException.class, () -> model.messageWaits().clear());
         for (String unsafe : new String[] {
                 xml.replace("name=\"TianjiAgentFinishedV1\"", "name=\"${execution.tenantId}\""),
@@ -50,6 +63,11 @@ class ProcessModelValidatorTest {
                 xml.replace("messageRef=\"agentFinished\"", "messageRef=\"missing\""),
                 xml.replace("tianji:workerRef=\"worker\"", "tianji:workerRef=\"review\""),
                 xml.replace("tianji:workerRef=\"worker\"", ""),
+                xml.replace("tianji:statusVariable=\"agentStatus\"", "tianji:statusVariable=\"execution\""),
+                xml.replace("tianji:statusVariable=\"agentStatus\"", ""),
+                xml.replace("agentStatus == 'COMPLETED'", "agentStatus == 'QUEUED'"),
+                xml.replace("agentStatus == 'COMPLETED'", "amount == 10"),
+                xml.replace("agentStatus == 'COMPLETED'", "agentStatus.class == 'COMPLETED'"),
                 xml.replace("<eventBasedGateway id=\"resultGateway\"/>", "<parallelGateway id=\"resultGateway\"/>"),
                 xml.replace("targetRef=\"worker\"", "targetRef=\"resultGateway\""),
                 xml.replace("<timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>",
