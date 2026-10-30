@@ -13,6 +13,9 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -28,6 +31,7 @@ final class JdbcAgentLedgerRepository {
             + "cancel_requested_at, attempt, revision, last_event_sequence, deadline_at, created_at, finished_at";
     private final JdbcTemplate jdbc;
     private final AgentJsonCodec json;
+    private final AgentContextJsonCodec contexts = new AgentContextJsonCodec();
 
     JdbcAgentLedgerRepository(JdbcTemplate jdbc, AgentJsonCodec json) {
         this.jdbc = jdbc;
@@ -44,6 +48,13 @@ final class JdbcAgentLedgerRepository {
                 (rs, row) -> rs.getString(1), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), runId, linkSha256);
         if (keys.size() > 1) throw new IllegalStateException("Linked terminal submission evidence is ambiguous");
         return keys.stream().findFirst();
+    }
+
+    boolean ownedRunExists(TrustedAgentActor actor, String runId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM tianji_agent.agent_run
+                    WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?)
+                """, Boolean.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId));
     }
 
     void insertDefinitionFamily(TrustedAgentActor actor, String key, Instant now) {
@@ -409,6 +420,77 @@ final class JdbcAgentLedgerRepository {
                 lease.runId(), lease.owner(), lease.epoch());
         return Boolean.TRUE.equals(valid);
     }
+
+    boolean contextPolicyMatches(TrustedAgentActor actor, String runId, AgentContextMetadataDTO metadata, String payload) {
+        Boolean matches = jdbc.queryForObject("""
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM tianji_agent.agent_context_snapshot c
+                    JOIN tianji_agent.agent_run r ON r.tenant_id=c.tenant_id AND r.run_id=c.run_id
+                    WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.run_id=?
+                      AND (c.metadata->'window'->>'modelName') COLLATE "C" = ?
+                      AND ((c.metadata->'window') IS DISTINCT FROM (CAST(? AS jsonb)->'window')
+                        OR (c.metadata->>'sourcePolicySha256') COLLATE "C" IS DISTINCT FROM ?
+                        OR (c.metadata->>'modelAdapterSha256') COLLATE "C" IS DISTINCT FROM ?
+                        OR (c.metadata->>'trimmingPolicySha256') COLLATE "C" IS DISTINCT FROM ?)
+                )
+                """, Boolean.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId,
+                metadata.window().modelName(), payload, metadata.sourcePolicySha256(), metadata.modelAdapterSha256(), metadata.trimmingPolicySha256());
+        return Boolean.TRUE.equals(matches);
+    }
+
+    int insertContextSnapshot(TrustedAgentActor actor, AgentRunLease lease, String reservationId, String payload, String fingerprint) {
+        return jdbc.update("""
+                INSERT INTO tianji_agent.agent_context_snapshot
+                    (tenant_id, run_id, reservation_id, model_call_number, attempt, lease_epoch, metadata, metadata_sha256, captured_at)
+                SELECT r.tenant_id, r.run_id, b.reservation_id, r.model_calls_reserved, r.attempt, b.lease_epoch,
+                       CAST(? AS jsonb), ?, clock_timestamp()
+                FROM tianji_agent.agent_run r
+                JOIN tianji_agent.agent_budget_reservation b ON b.tenant_id=r.tenant_id AND b.run_id=r.run_id
+                WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.run_id=?
+                  AND r.status='RUNNING' AND r.lease_owner=? AND r.lease_epoch=? AND b.lease_epoch=r.lease_epoch
+                  AND r.lease_expires_at>clock_timestamp() AND r.deadline_at>clock_timestamp() AND r.cancel_requested_at IS NULL
+                  AND b.reservation_id=? AND b.kind='MODEL' AND b.state='RESERVED'
+                ON CONFLICT (tenant_id, run_id, reservation_id) DO NOTHING
+                """, payload, fingerprint, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                lease.runId(), lease.owner(), lease.epoch(), reservationId);
+    }
+
+    Optional<ContextRow> contextSnapshot(TrustedAgentActor actor, String runId, String reservationId) {
+        return jdbc.query("""
+                SELECT c.*, b.kind AS budget_kind, b.lease_epoch AS budget_lease_epoch FROM tianji_agent.agent_context_snapshot c
+                JOIN tianji_agent.agent_run r ON r.tenant_id=c.tenant_id AND r.run_id=c.run_id
+                JOIN tianji_agent.agent_budget_reservation b ON b.tenant_id=c.tenant_id AND b.run_id=c.run_id AND b.reservation_id=c.reservation_id
+                WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.run_id=?
+                  AND c.reservation_id=?
+                """, contextMapper(actor), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId, reservationId).stream().findFirst();
+    }
+
+    List<ContextRow> contextSnapshots(TrustedAgentActor actor, AgentContextSnapshotsQuery query) {
+        return jdbc.query("""
+                SELECT c.*, b.kind AS budget_kind, b.lease_epoch AS budget_lease_epoch FROM tianji_agent.agent_context_snapshot c
+                JOIN tianji_agent.agent_run r ON r.tenant_id=c.tenant_id AND r.run_id=c.run_id
+                JOIN tianji_agent.agent_budget_reservation b ON b.tenant_id=c.tenant_id AND b.run_id=c.run_id AND b.reservation_id=c.reservation_id
+                WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.run_id=?
+                  AND c.model_call_number>?
+                ORDER BY c.model_call_number LIMIT ?
+                """, contextMapper(actor), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                query.runId(), query.afterModelCall(), query.limit() + 1);
+    }
+
+    private RowMapper<ContextRow> contextMapper(TrustedAgentActor actor) {
+        return (rs, row) -> {
+            String fingerprint = rs.getString("metadata_sha256");
+            if (!"MODEL".equals(rs.getString("budget_kind")) || rs.getLong("budget_lease_epoch") != rs.getLong("lease_epoch")) {
+                throw new IllegalStateException("Context snapshot budget link is inconsistent");
+            }
+            var metadata = contexts.read(rs.getString("metadata"), fingerprint);
+            if (!metadata.ownerSha256().equals(actor.identityFingerprint())) throw new IllegalStateException("Context snapshot owner is inconsistent");
+            return new ContextRow(new AgentContextSnapshotDTO(rs.getString("run_id"), rs.getString("reservation_id"), rs.getInt("model_call_number"),
+                    rs.getInt("attempt"), rs.getLong("lease_epoch"), metadata, rs.getTimestamp("captured_at").toInstant()), fingerprint);
+        };
+    }
+
+    record ContextRow(AgentContextSnapshotDTO snapshot, String fingerprint) { }
 
     boolean lockLeaseForSettlement(TrustedAgentActor actor, AgentRunLease lease) {
         return !jdbc.query("""

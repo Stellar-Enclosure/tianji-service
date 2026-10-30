@@ -38,5 +38,7 @@ stellar:
   tianji:
     agent:
       context:
+        snapshots:
+          enabled: false
         tianshu:
           enabled: false

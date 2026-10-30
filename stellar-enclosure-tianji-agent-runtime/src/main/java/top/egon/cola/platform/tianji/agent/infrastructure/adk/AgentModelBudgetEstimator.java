@@ -21,6 +21,14 @@ public interface AgentModelBudgetEstimator {
         throw new UnsupportedOperationException("model context window is unavailable");
     }
 
+    /**
+     * Stable SHA-256 of the selected route's adapter mapping, model defaults and tokenizer/pricing policy.
+     * Excludes credentials, transport headers and per-call request data; snapshots require this capability.
+     */
+    default String modelAdapterFingerprint(AgentExecutionSnapshot snapshot, LlmRequest request) {
+        throw new UnsupportedOperationException("versioned model adapter identity is unavailable");
+    }
+
     record Estimate(long inputTokens, int maxOutputTokens, BigDecimal maximumCost) {
         public Estimate {
             if (inputTokens < 0 || maxOutputTokens < 1) {

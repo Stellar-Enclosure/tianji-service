@@ -57,10 +57,11 @@ public class TianjiAgentRuntimeAutoConfiguration {
             throw new IllegalStateException("TIANJI_RUNTIME_MODEL_CONFIGURATION_INVALID");
         }
         validateControlExecutor(control);
-        new AgentStorageVerifier(dataSource).verify();
+        boolean snapshots = environment.getProperty("stellar.tianji.agent.context.snapshots.enabled", Boolean.class, false);
+        if (!snapshots) new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
         return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
-                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new));
+                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), snapshots);
     }
 
     @Bean(destroyMethod = "close")

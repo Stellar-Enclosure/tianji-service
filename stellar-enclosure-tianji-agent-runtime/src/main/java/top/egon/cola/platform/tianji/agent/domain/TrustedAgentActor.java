@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.domain;
 
 import java.util.Objects;
+import java.util.List;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -46,6 +47,17 @@ public record TrustedAgentActor(long tenantId, SubjectType subjectType, String s
         } catch (NoSuchAlgorithmException failure) {
             throw new IllegalStateException("SHA-256 is unavailable");
         }
+    }
+
+    /** Stable scoped identity digest; it is not an authorization decision. */
+    public String identityFingerprint() {
+        try {
+            var value = new StringBuilder("TIANJI_ACTOR_IDENTITY_V1:");
+            for (var field : List.of(Long.toString(tenantId), subjectType.name(), issuerFingerprint, subjectId)) {
+                value.append(field.getBytes(StandardCharsets.UTF_8).length).append(':').append(field);
+            }
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.toString().getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException failure) { throw new IllegalStateException("SHA-256 is unavailable"); }
     }
 
     private static boolean safeText(String value) {

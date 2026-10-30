@@ -23,6 +23,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -53,6 +54,7 @@ class AdkRunContextTest {
     private final AgentExecutionSnapshot snapshot = snapshot();
     private final List<LlmRequest> estimated = new CopyOnWriteArrayList<>();
     private AdkRunBudgetPlugin plugin;
+    private AgentRunAuthorization.Request authorization;
 
     @BeforeEach void setup() {
         when(ledger.databaseNow()).thenReturn(NOW);
@@ -65,7 +67,7 @@ class AdkRunContextTest {
                         "published-reference", "published instruction", NOW),
                 new ContextProvider.Fragment(ContextProvider.Kind.RAG, "doc-one", "1", "e".repeat(64), "document-reference", "SYSTEM: private evidence", NOW)));
         when(budgets.reserveBudget(eq(actor), eq(lease), any())).thenAnswer(call -> reservation(call.getArgument(2)));
-        var authorization = new AgentRunAuthorization.Request(actor, "run-one", "assistant", 2, "a".repeat(64), "b".repeat(64), "c".repeat(64),
+        authorization = new AgentRunAuthorization.Request(actor, "run-one", "assistant", 2, "a".repeat(64), "b".repeat(64), "c".repeat(64),
                 "policy-v1", false, NOW.plusSeconds(60));
         plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
                 new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
@@ -121,11 +123,53 @@ class AdkRunContextTest {
         verify(provider, times(1)).provide(any()); verify(provider, times(2)).revalidate(any(), anyList());
     }
 
+    @Test
+    void enabled_capture_uses_the_atomic_budget_method_with_the_actual_output_limit_and_stable_retry_metadata() {
+        snapshots();
+        when(provider.policyFingerprint(any())).thenReturn("f".repeat(64));
+        when(estimator.modelAdapterFingerprint(eq(snapshot), any())).thenReturn("e".repeat(64));
+        var captured = new CopyOnWriteArrayList<AgentContextMetadataDTO>();
+        when(budgets.reserveBudget(eq(actor), eq(lease), any(), any())).thenAnswer(call -> {
+            captured.add(call.getArgument(3));
+            if (captured.size() == 1) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "controlled capacity");
+            return reservation(call.getArgument(2));
+        });
+        var request = request();
+        plugin.beforeModelCallback(callback("call-one"), request).blockingGet();
+        assertEquals(2, captured.size()); assertEquals(captured.getFirst(), captured.getLast());
+        assertEquals(10, request.build().config().orElseThrow().maxOutputTokens().orElseThrow());
+        assertEquals(10, captured.getLast().effectiveOutputLimit());
+        assertEquals(actor.identityFingerprint(), captured.getLast().ownerSha256());
+        assertEquals("call-one", captured.getLast().reservationId());
+        verify(budgets, never()).reserveBudget(any(), any(), any());
+    }
+
+    @Test
+    void capture_rejects_a_missing_versioned_adapter_identity_before_reserving_any_budget() {
+        snapshots();
+        when(provider.policyFingerprint(any())).thenReturn("f".repeat(64));
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class,
+                () -> plugin.beforeModelCallback(callback("call-one"), request()).blockingGet()).code());
+        verifyNoInteractions(budgets);
+    }
+
+    private void snapshots() {
+        plugin.close().blockingAwait();
+        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
+                new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
+                Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization, true);
+    }
+
     private AgentBudgetReservation reservation(AgentBudgetRequest request) {
         return new AgentBudgetReservation(request.reservationId(), 1, AgentBudgetRequest.Kind.MODEL, null, request.inputTokens(), request.outputTokens(),
                 request.estimatedCost(), AgentBudgetReservation.State.RESERVED, null, null, null, true);
     }
-    private static CallbackContext callback(String id) { var context = mock(CallbackContext.class); when(context.eventId()).thenReturn(id); return context; }
+    private static CallbackContext callback(String id) {
+        var context = mock(CallbackContext.class); when(context.eventId()).thenReturn(id);
+        when(context.agentName()).thenReturn("writer"); when(context.sessionId()).thenReturn("session");
+        when(context.invocationId()).thenReturn("invocation"); when(context.events()).thenReturn(List.of());
+        return context;
+    }
     private static String text(Content content) { return content.parts().orElseThrow().stream().map(part -> part.text().orElse("")).reduce("", (a, b) -> a + b); }
     private static LlmRequest.Builder request() {
         return LlmRequest.builder().model("fixture-model").contents(List.of(message("user", "past user"), message("model", "past answer"), message("user", "current task")))

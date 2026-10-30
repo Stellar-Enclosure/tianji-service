@@ -20,6 +20,7 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
 
 /** Read-only startup check for the pre-provisioned Agent ledger and session schema. */
 public final class AgentStorageVerifier {
@@ -143,6 +144,79 @@ public final class AgentStorageVerifier {
         } catch (DataAccessException failure) {
             throw invalid();
         }
+    }
+
+    /** Optional model-context capture requires the complete migrated history but no additional secret-table grants. */
+    public void verifyContextSnapshots() {
+        verify();
+        try {
+            transaction.executeWithoutResult(status -> {
+                Map.of("7", "V7__add_process_dispatch_fence.sql", "8", "V8__add_service_execution_grant.sql", "9", "V9__add_context_snapshots.sql")
+                        .forEach((version, file) -> {
+                            int expected = checksum(file);
+                            var history = jdbc.query("SELECT success,checksum FROM tianji_agent.flyway_schema_history WHERE version=? AND type='SQL'",
+                                    (rs, row) -> rs.getBoolean("success") && rs.getObject("checksum") != null && rs.getInt("checksum") == expected, version);
+                            if (history.size() != 1 || !history.getFirst()) throw invalid();
+                        });
+                verifyContextColumns();
+                var keys = List.of("tenant_id", "run_id", "reservation_id");
+                if (!readConstraints().containsAll(Set.of(key("agent_context_snapshot", "p", keys),
+                        key("agent_context_snapshot", "u", "tenant_id", "run_id", "model_call_number"),
+                        foreign("agent_context_snapshot", keys, "agent_budget_reservation", keys, "c")))) throw invalid();
+                Map<String, String> checks = new HashMap<>();
+                jdbc.query("""
+                        SELECT c.conname,c.convalidated,pg_get_constraintdef(c.oid) AS definition FROM pg_constraint c
+                        JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                        WHERE n.nspname='tianji_agent' AND t.relname='agent_context_snapshot' AND c.contype='c'
+                        """, rs -> {
+                    if (!rs.getBoolean("convalidated")) throw invalid();
+                    checks.put(rs.getString("conname"), normalizedCheck(rs.getString("definition")));
+                });
+                for (var entry : contextChecks().entrySet()) if (!entry.getValue().equals(checks.get(entry.getKey()))) throw invalid();
+                String table = "tianji_agent.agent_context_snapshot";
+                if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT has_table_privilege(current_user,?,'SELECT') "
+                        + "AND has_table_privilege(current_user,?,'INSERT')", Boolean.class, table, table))) throw invalid();
+            });
+        } catch (DataAccessException failure) { throw invalid(); }
+    }
+
+    private void verifyContextColumns() {
+        Map<String, Column> expected = Map.ofEntries(column("tenant_id", "bigint", true, false), column("run_id", "character varying(64)", true, false),
+                column("reservation_id", "character varying(128)", true, false), column("model_call_number", "integer", true, false),
+                column("attempt", "integer", true, false), column("lease_epoch", "bigint", true, false), column("metadata", "jsonb", true, false),
+                column("metadata_sha256", "character(64)", true, true), column("captured_at", "timestamp with time zone", true, false));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,co.collname FROM pg_class t
+                JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_context_snapshot' AND t.relkind IN ('r','p')
+                """, rs -> {
+            actual.put(rs.getString("attname"), new Column(rs.getString("type"), rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname"))));
+        });
+        for (var entry : expected.entrySet()) if (!entry.getValue().equals(actual.get(entry.getKey()))) throw invalid();
+    }
+
+    private static Map<String, String> contextChecks() {
+        String fields = Arrays.stream(AgentContextMetadataDTO.class.getRecordComponents()).map(java.lang.reflect.RecordComponent::getName)
+                .sorted().map(value -> "'" + value + "'").collect(java.util.stream.Collectors.joining(","));
+        return Map.ofEntries(
+                Map.entry("agent_context_tenant_positive", "CHECKtenant_id>0"), Map.entry("agent_context_call_positive", "CHECKmodel_call_number>0"),
+                Map.entry("agent_context_attempt_positive", "CHECKattempt>0"), Map.entry("agent_context_epoch_positive", "CHECKlease_epoch>0"),
+                Map.entry("agent_context_metadata_hash", "CHECKmetadata_sha256~'^[0-9a-f]{64}$'"),
+                Map.entry("agent_context_metadata_size", "CHECKoctet_lengthmetadata<=294912"), Map.entry("agent_context_metadata_object", "CHECKjsonb_typeofmetadata='object'"),
+                Map.entry("agent_context_metadata_version", "CHECKmetadata->>'schemaVersion'='1'"),
+                Map.entry("agent_context_projection_version", "CHECKmetadata->>'projectionVersion'='ADK_GENAI_MODEL_V1'"),
+                Map.entry("agent_context_metadata_keys", "CHECKmetadata?&ARRAY[" + fields + "]"),
+                Map.entry("agent_context_metadata_closed", "CHECKmetadata-ARRAY[" + fields + "]='{}'::jsonb"),
+                Map.entry("agent_context_run_binding", "CHECKmetadata->'runId'=to_jsonbrun_id"),
+                Map.entry("agent_context_call_binding", "CHECKmetadata->'reservationId'=to_jsonbreservation_id"),
+                Map.entry("agent_context_epoch_binding", "CHECKmetadata->'leaseEpoch'=to_jsonblease_epoch"),
+                Map.entry("agent_context_window_object", "CHECKjsonb_typeofmetadata->'window'='object'"),
+                Map.entry("agent_context_sources_array", "CHECKjsonb_typeofmetadata->'sources'='array'"),
+                Map.entry("agent_context_sources_size", "CHECKjsonb_array_lengthmetadata->'sources'>=1ANDjsonb_array_lengthmetadata->'sources'<=128"),
+                Map.entry("agent_context_trims_array", "CHECKjsonb_typeofmetadata->'trims'='array'"),
+                Map.entry("agent_context_trims_size", "CHECKjsonb_array_lengthmetadata->'trims'<=128"));
     }
 
     private void verifyServiceGrantColumns() {

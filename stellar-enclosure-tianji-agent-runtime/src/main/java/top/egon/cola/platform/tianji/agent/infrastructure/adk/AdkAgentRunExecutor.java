@@ -17,6 +17,7 @@ import io.reactivex.rxjava3.schedulers.Schedulers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties;
@@ -78,6 +79,7 @@ public final class AdkAgentRunExecutor {
     private final DataSource sessionDataSource;
     private final boolean typedSessionWrites;
     private final DefaultContextAssembler contextAssembler;
+    private final boolean contextSnapshots;
     private final ObjectMapper mapper = new ObjectMapper();
     private final AdkEventProjector projector = new AdkEventProjector();
 
@@ -124,6 +126,16 @@ public final class AdkAgentRunExecutor {
                                ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
                                DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
                                DefaultContextAssembler contextAssembler) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, typedSessionWrites, authorizer, contextAssembler, false);
+    }
+
+    public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
+                               DefaultContextAssembler contextAssembler, boolean contextSnapshots) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -133,11 +145,13 @@ public final class AdkAgentRunExecutor {
         this.budgetEstimator = Objects.requireNonNull(budgetEstimator, "budgetEstimator");
         this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
         this.contextAssembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
+        this.contextSnapshots = contextSnapshots;
         if (sessionDataSource != null && !ledger.usesDataSource(sessionDataSource)) {
             throw new IllegalArgumentException("Agent sessions and runs require the same DataSource");
         }
         this.sessionDataSource = sessionDataSource;
         this.typedSessionWrites = typedSessionWrites;
+        if (contextSnapshots) ledger.verifyContextSnapshotStorage();
     }
 
     /** Lets a host verify that its dispatcher uses the intended authorization boundary. */
@@ -150,6 +164,7 @@ public final class AdkAgentRunExecutor {
     public AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(query, "query");
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Agent execution cannot run inside a database transaction");
         Map<String, String> previous = MDC.getCopyOfContextMap();
         try {
             MDC.put("tenantId", Long.toString(actor.tenantId()));
@@ -228,7 +243,7 @@ public final class AdkAgentRunExecutor {
             BaseAgent root = buildRoot(snapshot.definition());
             requireNoTools(root);
             AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
-                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization());
+                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextSnapshots);
             String userId;
             String sessionId;
             if (running.sessionId() == null) {

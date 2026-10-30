@@ -30,6 +30,8 @@ import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
@@ -116,6 +118,24 @@ public final class AgentLedgerService {
 
     public AgentBudgetService budgets() {
         return budgetService;
+    }
+
+    /** Optional capture is provisioned by an operator and must be ready before execution starts. */
+    public void verifyContextSnapshotStorage() {
+        new AgentStorageVerifier(dataSource).verifyContextSnapshots();
+    }
+
+    /** Historical metadata gives neither source bodies nor a capability to reuse an old authorization. */
+    public AgentContextSnapshotPageDTO contextSnapshots(TrustedAgentActor actor, AgentContextSnapshotsQuery query) {
+        Objects.requireNonNull(actor, "actor"); Objects.requireNonNull(query, "query");
+        return Objects.requireNonNull(transaction.execute(status -> {
+            if (!repository.ownedRunExists(actor, query.runId())) throw new AgentLedgerException(
+                    AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "Agent run was not found");
+            var rows = repository.contextSnapshots(actor, query);
+            boolean more = rows.size() > query.limit();
+            var items = rows.stream().limit(query.limit()).map(JdbcAgentLedgerRepository.ContextRow::snapshot).toList();
+            return new AgentContextSnapshotPageDTO(items, more ? items.getLast().modelCallNumber() : null);
+        }));
     }
 
     /** Session and run fencing must use the exact same transaction-bound DataSource. */

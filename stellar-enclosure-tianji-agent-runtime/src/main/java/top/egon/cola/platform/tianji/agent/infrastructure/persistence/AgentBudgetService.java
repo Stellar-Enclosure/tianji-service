@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -10,6 +11,7 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -21,6 +23,7 @@ public final class AgentBudgetService {
     private final AgentLedgerService ledger;
     private final JdbcAgentLedgerRepository repository;
     private final TransactionTemplate transaction;
+    private final AgentContextJsonCodec contexts = new AgentContextJsonCodec();
 
     AgentBudgetService(AgentLedgerService ledger, JdbcAgentLedgerRepository repository, TransactionTemplate transaction) {
         this.ledger = ledger;
@@ -31,11 +34,37 @@ public final class AgentBudgetService {
     /** Atomically reserves a trusted upper bound before a model or tool call starts. */
     public AgentBudgetReservation reserveBudget(TrustedAgentActor actor, AgentRunLease lease,
                                                  AgentBudgetRequest request) {
+        return reserveBudget(actor, lease, request, null);
+    }
+
+    /** A model context and its budget commit together before transport is opened; old callers do not query the optional table. */
+    public AgentBudgetReservation reserveBudget(TrustedAgentActor actor, AgentRunLease lease,
+                                                 AgentBudgetRequest request, AgentContextMetadataDTO context) {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(lease, "lease");
         Objects.requireNonNull(request, "request");
+        if (context != null && (request.kind() != AgentBudgetRequest.Kind.MODEL || "LEGACY".equals(actor.issuerFingerprint())
+                || !context.ownerSha256().equals(actor.identityFingerprint()) || !context.runId().equals(lease.runId())
+                || !context.reservationId().equals(request.reservationId()) || context.leaseEpoch() != lease.epoch()
+                || context.estimatedInputTokens() != request.inputTokens() || context.effectiveOutputLimit() != request.outputTokens())) {
+            throw invalid("model context does not match its scoped reservation");
+        }
+        if (context != null && TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Model context preparation must own its commit transaction");
+        }
+        String payload = context == null ? null : contexts.write(context);
+        String fingerprint = context == null ? null : contexts.fingerprint(context);
         return transaction.execute(status -> {
-            ExecutionPolicyDTO policy = ledger.snapshot(actor, new GetAgentRunQuery(lease.runId())).effectivePolicy();
+            var material = context == null ? null : ledger.executionMaterial(actor, new GetAgentRunQuery(lease.runId()));
+            ExecutionPolicyDTO policy = material == null ? ledger.snapshot(actor, new GetAgentRunQuery(lease.runId())).effectivePolicy() : material.snapshot().effectivePolicy();
+            if (context != null && (!context.definitionContentSha256().equals(material.authorization().definitionSha256())
+                    || !context.requestSha256().equals(material.authorization().requestSha256())
+                    || !context.executionSnapshotSha256().equals(material.authorization().snapshotSha256())
+                    || material.run().sessionId() != null && !material.run().sessionId().equals(context.nativeSessionId())
+                    || !context.window().modelRouteRef().equals(material.snapshot().definition().dependencies().modelRouteRef())
+                    || !context.window().policyVersionRef().equals(material.authorization().policyVersionRef()))) {
+                throw invalid("model context does not match the immutable execution snapshot");
+            }
             if (request.kind() == AgentBudgetRequest.Kind.TOOL
                     && !policy.allowedToolVersions().contains(request.toolVersion())) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED,
@@ -56,6 +85,10 @@ public final class AgentBudgetService {
                 if (!repository.validLease(actor, lease)) {
                     throw leaseLost();
                 }
+                if (context != null && !repository.contextSnapshot(actor, lease.runId(), request.reservationId())
+                        .map(value -> value.fingerprint().equals(fingerprint)).orElse(false)) {
+                    throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "model context reservation is missing or changed");
+                }
                 return existing;
             }
             if (repository.reserveBudget(actor, lease, request, policy) != 1) {
@@ -67,6 +100,11 @@ public final class AgentBudgetService {
                 }
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED,
                         "Agent run parallel capacity is temporarily unavailable");
+            }
+            if (context != null) {
+                if (!repository.contextPolicyMatches(actor, lease.runId(), context, payload)) throw new AgentLedgerException(
+                        AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "model context policy changed during the run");
+                if (repository.insertContextSnapshot(actor, lease, request.reservationId(), payload, fingerprint) != 1) throw leaseLost();
             }
             AgentBudgetReservation stored = repository.budgetReservation(actor, lease.runId(),
                     request.reservationId(), false).orElseThrow();

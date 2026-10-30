@@ -27,6 +27,23 @@ final class ContractChecks {
         return value == null ? null : required(value, name, maxLength);
     }
 
+    static String contextIdentifier(String value, String name, int maximum) {
+        if (!required(value, name, maximum).equals(value)) throw new IllegalArgumentException(name + " must be exact");
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (Character.isISOControl(c) || Character.isLowSurrogate(c) || Character.isHighSurrogate(c)
+                    && (i + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++i)))) {
+                throw new IllegalArgumentException(name + " contains invalid characters");
+            }
+        }
+        return value;
+    }
+
+    static String contextHash(String value) {
+        if (value == null || !value.matches("[0-9a-f]{64}")) throw new IllegalArgumentException("context SHA-256 is invalid");
+        return value;
+    }
+
     static String sessionId(String value) {
         String id = required(value, "sessionId", 128);
         for (int i = 0; i < id.length(); i++) {

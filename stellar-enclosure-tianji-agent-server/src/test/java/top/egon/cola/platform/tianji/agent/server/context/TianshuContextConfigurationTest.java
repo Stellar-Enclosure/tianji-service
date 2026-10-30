@@ -78,6 +78,7 @@ class TianshuContextConfigurationTest {
             new ApplicationContextRunner().withUserConfiguration(TianshuContextConfiguration.class)
                     .withBean(TrustedIssuerRegistry.class, TianshuContextProviderTest::issuers)
                     .withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "stellar.tianji.agent.storage.enabled=true",
+                            "stellar.tianji.agent.context.snapshots.enabled=true",
                             "stellar.tianji.agent.context.tianshu.enabled=true",
                             "stellar.tianji.agent.context.tianshu.connections[0].id=library",
                             "stellar.tianji.agent.context.tianshu.connections[0].tianshu-tenant-id=101",

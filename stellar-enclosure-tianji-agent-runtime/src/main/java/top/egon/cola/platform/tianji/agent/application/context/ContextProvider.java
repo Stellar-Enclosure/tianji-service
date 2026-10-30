@@ -16,6 +16,11 @@ public interface ContextProvider {
     /** Rechecks the exact previously resolved sources; it must throw on revocation, deletion, drift or unavailable authority. */
     void revalidate(Request request, List<Fragment> fragments);
 
+    /** Local immutable configuration identity, excluding credentials, current ACL state and retrieval results. */
+    default String policyFingerprint(Request request) {
+        throw new UnsupportedOperationException("versioned context source policy is unavailable");
+    }
+
     enum Kind { PROMPT, SKILL, RAG, MEMORY }
 
     record Request(AgentRunAuthorization.Request authorization, AgentExecutionSnapshot snapshot, long leaseEpoch, Duration timeout) {

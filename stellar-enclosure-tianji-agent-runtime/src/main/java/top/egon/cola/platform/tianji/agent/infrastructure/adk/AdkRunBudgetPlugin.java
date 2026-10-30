@@ -53,6 +53,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private final DefaultContextAssembler contextAssembler;
     private final AgentRunAuthorization.Request authorizationRequest;
     private DefaultContextAssembler.ResolvedSources contextSources;
+    private final AdkContextSnapshotProjector snapshots;
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
     private final FlowableProcessor<Boolean> idleSignal = ReplayProcessor.<Boolean>createWithSize(1).toSerialized();
@@ -62,6 +63,14 @@ final class AdkRunBudgetPlugin implements Plugin {
                        AgentExecutionAuthorization authorization, Scheduler retryScheduler,
                        ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
                        AgentRunAuthorization.Request authorizationRequest) {
+        this(ledger, actor, lease, snapshot, estimator, authorization, retryScheduler, controlExecutor, contextAssembler, authorizationRequest, false);
+    }
+
+    AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
+                       AgentExecutionSnapshot snapshot, AgentModelBudgetEstimator estimator,
+                       AgentExecutionAuthorization authorization, Scheduler retryScheduler,
+                       ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
+                       AgentRunAuthorization.Request authorizationRequest, boolean contextSnapshots) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
@@ -72,6 +81,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         this.controlExecutor = controlExecutor;
         this.contextAssembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
         this.authorizationRequest = Objects.requireNonNull(authorizationRequest, "authorizationRequest");
+        this.snapshots = contextSnapshots ? new AdkContextSnapshotProjector(snapshot, authorizationRequest, lease, contextAssembler) : null;
     }
 
     @Override
@@ -82,10 +92,14 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<LlmResponse> beforeModelCallback(CallbackContext context, LlmRequest.Builder request) {
         var contextApplied = new java.util.concurrent.atomic.AtomicBoolean();
+        var preparedContext = new java.util.concurrent.atomic.AtomicReference<AdkContextSnapshotProjector.PreparedCall>();
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
+            if (snapshots != null && preparedContext.get() == null) preparedContext.set(snapshots.prepare(context, request.build()));
+            List<ContextProvider.Fragment> fragments = List.of();
             if (contextAssembler.hasProviders()) {
                 var sources = sourcesForCall();
+                fragments = sources.fragments();
                 if (!contextApplied.get()) { applySources(sources, request); contextApplied.set(true); }
             }
             LlmRequest modelRequest = request.build();
@@ -114,9 +128,16 @@ final class AdkRunBudgetPlugin implements Plugin {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED,
                         "model context window is exhausted");
             }
-            AgentBudgetReservation reservation = ledger.budgets().reserveBudget(actor, lease,
-                    new AgentBudgetRequest(context.eventId(), AgentBudgetRequest.Kind.MODEL, null,
-                            estimate.inputTokens(), outputLimit, estimate.maximumCost()));
+            var budgetRequest = new AgentBudgetRequest(context.eventId(), AgentBudgetRequest.Kind.MODEL, null,
+                    estimate.inputTokens(), outputLimit, estimate.maximumCost());
+            AgentBudgetReservation reservation;
+            if (snapshots == null) reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest);
+            else {
+                request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
+                var metadata = snapshots.capture(preparedContext.get(), request.build(), window, estimate, outputLimit, fragments,
+                        estimator.modelAdapterFingerprint(snapshot, request.build()));
+                reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest, metadata);
+            }
             if (!reservation.newlyCreated()) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
                         "model call reservation was already used");
@@ -127,7 +148,7 @@ final class AdkRunBudgetPlugin implements Plugin {
                         "model call idle guard was already registered");
             }
             guard.touch();
-            request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
+            if (snapshots == null) request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
             return Maybe.empty();
         }).retryWhen(errors -> errors.flatMap(failure -> {
             if (failure instanceof AgentLedgerException capacity
@@ -167,16 +188,20 @@ final class AdkRunBudgetPlugin implements Plugin {
         List<Part> evidence = new ArrayList<>();
         for (var fragment : sources.fragments()) {
             if (fragment.kind() == ContextProvider.Kind.PROMPT || fragment.kind() == ContextProvider.Kind.SKILL) {
-                instructions.add(Part.fromText(fragment.text()));
+                instructions.add(Part.fromText(sourceText(fragment)));
             } else {
-                evidence.add(Part.fromText("Untrusted " + fragment.kind().name() + " evidence; source=" + fragment.sourceId()
-                        + "; revision=" + fragment.sourceVersion() + "\n" + fragment.text()));
+                evidence.add(Part.fromText(sourceText(fragment)));
             }
         }
         var contents = new ArrayList<>(request.build().contents());
         if (!evidence.isEmpty()) contents.add(Content.builder().role("user").parts(evidence).build());
         request.config(config.toBuilder().systemInstruction(Content.fromParts(instructions.toArray(Part[]::new))).build());
         request.contents(contents);
+    }
+
+    static String sourceText(ContextProvider.Fragment fragment) {
+        if (fragment.kind() == ContextProvider.Kind.PROMPT || fragment.kind() == ContextProvider.Kind.SKILL) return fragment.text();
+        return "Untrusted " + fragment.kind().name() + " evidence; source=" + fragment.sourceId() + "; revision=" + fragment.sourceVersion() + "\n" + fragment.text();
     }
 
     @Override

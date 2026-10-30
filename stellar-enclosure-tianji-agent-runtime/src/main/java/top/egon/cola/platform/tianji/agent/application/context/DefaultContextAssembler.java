@@ -36,6 +36,19 @@ public final class DefaultContextAssembler {
 
     public boolean hasProviders() { return !providers.isEmpty(); }
 
+    public String policyFingerprint(ContextProvider.Request request) {
+        noTransaction();
+        StringBuilder policy = new StringBuilder("TIANJI_CONTEXT_SOURCE_ORDER_V1:");
+        for (var provider : providers) {
+            String fingerprint;
+            try { fingerprint = provider.policyFingerprint(request); }
+            catch (RuntimeException failure) { throw unavailable(); }
+            if (fingerprint == null || !fingerprint.matches("[0-9a-f]{64}")) throw unavailable();
+            policy.append(fingerprint.length()).append(':').append(fingerprint);
+        }
+        return source("POLICY", policy.toString()).contentSha256();
+    }
+
     /** Resolves one attempt in explicit host order. No provider is allowed to replace or invent a published dependency. */
     public ResolvedSources resolve(ContextProvider.Request request) {
         noTransaction(); Objects.requireNonNull(request, "request");

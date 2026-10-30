@@ -39,8 +39,9 @@ public class TianshuContextConfiguration {
     static BeanFactoryPostProcessor tianshuContextPrerequisites(Environment environment) {
         return ignored -> {
             if (!environment.getProperty("stellar.tianji.agent.runtime.enabled", Boolean.class, false)
-                    || !environment.getProperty("stellar.tianji.agent.storage.enabled", Boolean.class, false)) {
-                throw new IllegalStateException("Tianshu context sources require the governed durable Agent runtime");
+                    || !environment.getProperty("stellar.tianji.agent.storage.enabled", Boolean.class, false)
+                    || !environment.getProperty("stellar.tianji.agent.context.snapshots.enabled", Boolean.class, false)) {
+                throw new IllegalStateException("Tianshu context sources require the governed durable Agent runtime and context snapshots");
             }
         };
     }

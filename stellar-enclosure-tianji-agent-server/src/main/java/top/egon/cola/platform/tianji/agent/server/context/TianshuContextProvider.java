@@ -67,6 +67,30 @@ public final class TianshuContextProvider implements ContextProvider {
         return List.copyOf(fragments);
     }
 
+    @Override public String policyFingerprint(Request request) {
+        requireNoTransaction();
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            try (var output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
+                write(output, "TIANJI_TIANSHU_LITERAL_CONTEXT_V1");
+                var declared = new ArrayList<Map.Entry<Kind, DefinitionResourceRef>>();
+                request.snapshot().definition().dependencies().prompts().forEach(reference -> declared.add(Map.entry(Kind.PROMPT, reference)));
+                request.snapshot().definition().dependencies().skills().forEach(reference -> declared.add(Map.entry(Kind.SKILL, reference)));
+                output.writeInt(declared.size());
+                for (var item : declared) {
+                    var actor = request.authorization().actor();
+                    var binding = bindings.get(new Key(actor.tenantId(), actor.issuerFingerprint(), item.getKey(), item.getValue().key()));
+                    if (binding == null) throw denied();
+                    write(output, item.getKey().name()); write(output, item.getValue().key());
+                    write(output, Long.toString(actor.tenantId())); write(output, actor.issuerFingerprint());
+                    write(output, binding.connectionId());
+                    for (var coordinate : coordinates(connections.get(binding.connectionId()).scope, binding)) write(output, coordinate);
+                }
+            }
+            return HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException | IOException failure) { throw unavailable(); }
+    }
+
     @Override public void revalidate(Request request, List<Fragment> fragments) {
         requireNoTransaction();
         long deadline = System.nanoTime() + request.timeout().toNanos();
@@ -157,11 +181,15 @@ public final class TianshuContextProvider implements ContextProvider {
     }
     private static String provenance(DdcAiClientScope scope, TianshuContextProperties.Binding binding, long versionId, long version) {
         var value = new StringBuilder("tianshu:v1:");
-        for (var field : List.of(Long.toString(scope.tenantId()), scope.bizCode(), scope.env(), scope.appCode(), binding.namespace(),
-                binding.resourceKey(), Long.toString(binding.resourceId()), Long.toString(versionId), Long.toString(version))) {
+        var fields = new ArrayList<>(coordinates(scope, binding));
+        fields.add(Long.toString(versionId)); fields.add(Long.toString(version));
+        for (var field : fields) {
             value.append(field.length()).append(':').append(field);
         }
         return value.toString();
+    }
+    private static List<String> coordinates(DdcAiClientScope scope, TianshuContextProperties.Binding binding) {
+        return List.of(Long.toString(scope.tenantId()), scope.bizCode(), scope.env(), scope.appCode(), binding.namespace(), binding.resourceKey(), Long.toString(binding.resourceId()));
     }
 
     public static final class Ports {
