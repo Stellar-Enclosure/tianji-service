@@ -75,6 +75,8 @@ class MemoryPreferenceIntentStoreTest {
             var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
             assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class, () -> transaction.executeWithoutResult(status -> store.verifyFence(stale))).code());
             var current = new MemoryPreferenceIntent.Lease(evidence, "worker", 2, NOW.plusSeconds(30), "event", 0, 2, HASH, 3);
+            assertEquals(current, store.currentLease(current));
+            assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class, () -> store.currentLease(stale)).code());
             assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> store.sealCommands(current, 2, "b".repeat(64))).code());
             verify(jdbc.get(), never()).update(anyString(), any(Object[].class));
         }

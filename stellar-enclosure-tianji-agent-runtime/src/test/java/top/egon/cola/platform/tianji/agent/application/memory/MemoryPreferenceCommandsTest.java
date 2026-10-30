@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryExtractionPolicy;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceExtraction;
+import top.egon.cola.platform.tianji.agent.infrastructure.memory.PostgresMemoryService;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
@@ -42,6 +43,21 @@ class MemoryPreferenceCommandsTest {
         assertThrows(IllegalArgumentException.class, () -> MemoryPreferenceCommands.create(ACTOR, request(policy), policy, duplicate));
         var empty = new MemoryPreferenceExtraction().evaluate(new MemoryPreferenceExtraction.Source(AgentRunStatusEnum.COMPLETED, MemoryPreferenceExtraction.SourceKind.USER_INPUT, true, "no declaration"), policy);
         assertTrue(MemoryPreferenceCommands.create(ACTOR, request(policy), policy, empty).isEmpty());
+    }
+
+    @Test void durable_command_list_hash_freezes_full_receipt_bytes_and_order_without_allowing_duplicate_commands() {
+        var policy = policy(1); var original = MemoryPreferenceCommands.create(ACTOR, request(policy), policy, prepared(policy));
+        var changedPolicy = policy(2); var changed = MemoryPreferenceCommands.create(ACTOR, request(changedPolicy), changedPolicy, prepared(changedPolicy));
+        var hash = PostgresMemoryService.preferenceCommandListSha256(original);
+        assertEquals(hash, PostgresMemoryService.preferenceCommandListSha256(List.copyOf(original)));
+        assertNotEquals(hash, PostgresMemoryService.preferenceCommandListSha256(changed));
+        assertNotEquals(hash, PostgresMemoryService.preferenceCommandListSha256(List.of()));
+        var otherRequest = new ExtractMemoryPreferencesCommand(request(policy).owner(), "research", "run", "another-terminal", "source", policy.reference());
+        var other = MemoryPreferenceCommands.create(ACTOR, otherRequest, policy, prepared(policy)).getFirst();
+        assertNotEquals(PostgresMemoryService.preferenceCommandListSha256(List.of(original.getFirst(), other)), PostgresMemoryService.preferenceCommandListSha256(List.of(other, original.getFirst())));
+        assertThrows(IllegalArgumentException.class, () -> PostgresMemoryService.preferenceCommandListSha256(List.of(original.getFirst(), changed.getFirst())));
+        assertThrows(IllegalArgumentException.class, () -> PostgresMemoryService.preferenceCommandListSha256(java.util.Collections.nCopies(33, other)));
+        assertThrows(IllegalArgumentException.class, () -> PostgresMemoryService.preferenceCommandListSha256(null));
     }
 
     private static MemoryExtractionPolicy policy(long version) { return new MemoryExtractionPolicy("preferences", version, Map.of("language", Set.of("zh-CN")), new BigDecimal("0.5"), MemorySensitivityEnum.CONFIDENTIAL, RETENTION, 3); }

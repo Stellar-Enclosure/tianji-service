@@ -397,7 +397,7 @@ class MemoryPostgresTest {
         var lease = store.claim(20, ALICE.issuerFingerprint(), first.intentId(), "worker-a", Duration.ofSeconds(30)).orElseThrow();
         var extracted = new MemoryPreferenceExtraction().evaluate(new MemoryPreferenceExtraction.Source(AgentRunStatusEnum.COMPLETED, MemoryPreferenceExtraction.SourceKind.USER_INPUT, true, material.snapshot().input().text()), policy);
         var commands = MemoryPreferenceCommands.create(ALICE, new ExtractMemoryPreferencesCommand(OWNER, "background", run.runId(), event.eventId(), binding.id(), policy.reference()), policy, extracted);
-        var commandHash = MemoryJsonCodec.sha256(String.join(":", commands.stream().map(command -> new MemoryJsonCodec().commandSha256(command)).toList()));
+        var commandHash = PostgresMemoryService.preferenceCommandListSha256(commands);
         lease = store.sealCommands(lease, commands.size(), commandHash);
         var originalReceipt = memory.upsert(preferenceContext(source, store, lease, commands.getFirst()), commands.getFirst());
         assertEquals(originalReceipt, memory.upsert(preferenceContext(source, store, lease, commands.getFirst()), commands.getFirst()));

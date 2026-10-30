@@ -101,6 +101,18 @@ public final class PostgresMemoryService {
     public List<String> policyReferences() { return policies.keySet().stream().sorted().toList(); }
     public MemoryIndexPublication.Binding indexBinding() { return binding; }
 
+    /** The durable extraction cursor freezes the same canonical command bytes used by fact receipts, including their order. */
+    public static String preferenceCommandListSha256(List<UpsertMemoryCommand> commands) {
+        if (commands == null || commands.size() > 32) throw new IllegalArgumentException("Memory preference command list is invalid");
+        var codec = new MemoryJsonCodec(); var identifiers = new java.util.HashSet<String>();
+        var data = new StringBuilder("TIANJI_MEMORY_PREFERENCE_COMMAND_LIST_V1:").append(commands.size()).append(':');
+        for (var command : commands) {
+            if (command == null || !identifiers.add(command.commandId())) throw new IllegalArgumentException("Memory preference command list is invalid");
+            data.append(codec.commandSha256(command));
+        }
+        return MemoryJsonCodec.sha256(data.toString());
+    }
+
     public MemoryMutationResultDTO upsert(MemoryOperationContext context, UpsertMemoryCommand command) {
         Objects.requireNonNull(command, "command");
         if (context != null && context.preferenceWrite() != null) {

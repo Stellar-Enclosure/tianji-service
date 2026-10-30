@@ -207,6 +207,11 @@ public final class MemoryPreferenceIntentStore {
         transact(status -> { var row = requireLease(lease, true); closeRow(row, state, reasonCode, databaseNow(), null, null); return Boolean.TRUE; });
     }
 
+    /** Recheck the exact lease before and after network authorization, without carrying a transaction over that call. */
+    public MemoryPreferenceIntent.Lease currentLease(MemoryPreferenceIntent.Lease lease) {
+        return transact(status -> requireLease(lease, false).lease());
+    }
+
     /** The issued permit invokes this within the existing fact transaction, holding its share fence until that transaction ends. */
     public void verifyFence(MemoryPreferenceIntent.Lease lease) {
         if (!verified.get() || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)) throw new IllegalStateException("Preference fencing requires the verified fact DataSource transaction");
