@@ -40,6 +40,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Start an Agent run with a session"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read an Agent run"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.contextSnapshots", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read prepared Agent context metadata"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.list", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "List owned Agent runs"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.result", defaultLocale = "en-US",
@@ -75,6 +77,7 @@ public final class TianjiAgentPermissions {
     public static final String START_API = "tianji.api.agent.start";
     public static final String SESSION_START_API = "tianji.api.agent.startSession";
     public static final String GET_API = "tianji.api.agent.get";
+    public static final String CONTEXT_SNAPSHOTS_API = "tianji.api.agent.contextSnapshots";
     public static final String LIST_API = "tianji.api.agent.list";
     public static final String RESULT_API = "tianji.api.agent.result";
     public static final String EVENTS_API = "tianji.api.agent.events";

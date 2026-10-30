@@ -3,6 +3,8 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -481,10 +483,11 @@ final class JdbcAgentLedgerRepository {
         return (rs, row) -> {
             String fingerprint = rs.getString("metadata_sha256");
             if (!"MODEL".equals(rs.getString("budget_kind")) || rs.getLong("budget_lease_epoch") != rs.getLong("lease_epoch")) {
-                throw new IllegalStateException("Context snapshot budget link is inconsistent");
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Context snapshot budget link is inconsistent");
             }
             var metadata = contexts.read(rs.getString("metadata"), fingerprint);
-            if (!metadata.ownerSha256().equals(actor.identityFingerprint())) throw new IllegalStateException("Context snapshot owner is inconsistent");
+            if (!metadata.ownerSha256().equals(actor.identityFingerprint())) throw new AgentLedgerException(
+                    AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Context snapshot owner is inconsistent");
             return new ContextRow(new AgentContextSnapshotDTO(rs.getString("run_id"), rs.getString("reservation_id"), rs.getInt("model_call_number"),
                     rs.getInt("attempt"), rs.getLong("lease_epoch"), metadata, rs.getTimestamp("captured_at").toInstant()), fingerprint);
         };

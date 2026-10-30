@@ -23,6 +23,14 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextRoleEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotPageDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextWindowDTO;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -449,6 +457,52 @@ class HttpAgentClientTest {
         assertNull(error.getCause());
         assertThrows(IllegalArgumentException.class,
                 () -> client(Duration.ofSeconds(1), 0).get(new GetAgentRunQuery("..")));
+    }
+
+    @Test
+    void context_metadata_uses_an_exclusive_bounded_query_and_preserves_the_prepared_snapshot_contract() {
+        var page = new AgentContextSnapshotPageDTO(List.of(contextSnapshot("run-1", 7)), 7);
+        handler.set(exchange -> {
+            assertEquals("GET", exchange.getRequestMethod());
+            assertEquals("/api/tianji/v1/agent-runs/run-1/context-snapshots", exchange.getRequestURI().getPath());
+            assertEquals("afterModelCall=5&limit=1", exchange.getRequestURI().getRawQuery());
+            assertEquals("Bearer " + TOKEN, exchange.getRequestHeaders().getFirst("Authorization"));
+            respond(exchange, 200, "application/json", mapper.writeValueAsBytes(page));
+        });
+        assertEquals(page, client(Duration.ofSeconds(3), 0).contextSnapshots(new AgentContextSnapshotsQuery("run-1", 5, 1)));
+    }
+
+    @Test
+    void context_metadata_rejects_wrong_run_stale_or_oversized_pages_and_scalar_enum_coercion_without_echoing_the_body() {
+        var page = new AgentContextSnapshotPageDTO(List.of(contextSnapshot("run-1", 7)), null);
+        var encoded = mapper.writeValueAsString(page);
+        var response = new AtomicReference<>(encoded);
+        handler.set(exchange -> respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8)));
+        List<String> invalid = new ArrayList<>();
+        invalid.add(encoded.replace("run-1", "other-run"));
+        invalid.add(mapper.writeValueAsString(new AgentContextSnapshotPageDTO(List.of(contextSnapshot("run-1", 7), contextSnapshot("run-1", 8)), null)));
+        invalid.add(encoded.replace("\"role\":\"SYSTEM\"", "\"role\":0"));
+        invalid.add(encoded.replace("\"modelName\":\"model\"", "\"modelName\":123"));
+        invalid.add(encoded.replace("\"estimatedInputTokens\":20", "\"estimatedInputTokens\":\"20\""));
+        invalid.add(encoded.replace("\"schemaVersion\":1", "\"schemaVersion\":2"));
+        invalid.add(encoded.substring(0, encoded.length() - 1) + ",\"privateBody\":\"private-detail\"}");
+        for (var body : invalid) {
+            response.set(body);
+            var failure = assertThrows(AgentClientException.class,
+                    () -> client(Duration.ofSeconds(3), 0).contextSnapshots(new AgentContextSnapshotsQuery("run-1", 5, 1)));
+            assertEquals("TIANJI_INVALID_RESPONSE", failure.code()); assertFalse(failure.toString().contains("private-detail"));
+        }
+        response.set(encoded);
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class,
+                () -> client(Duration.ofSeconds(3), 0).contextSnapshots(new AgentContextSnapshotsQuery("run-1", 7, 1))).code());
+    }
+
+    private static AgentContextSnapshotDTO contextSnapshot(String run, int number) {
+        String hash = "a".repeat(64); String call = "call-" + number;
+        var metadata = new AgentContextMetadataDTO(1, AgentContextMetadataDTO.PROJECTION_V1, hash, run, call, 1, "writer", "invocation", "session", 0, hash, null,
+                hash, hash, hash, hash, hash, hash, hash, new AgentContextWindowDTO("model", "route", "policy", 100, 5), 20, 10,
+                List.of(new AgentContextSourceDTO(AgentContextSourceKindEnum.DEFINITION, AgentContextRoleEnum.SYSTEM, "definition", "1", "published-version", hash, hash, 1, null)), List.of());
+        return new AgentContextSnapshotDTO(run, call, number, 1, 1, metadata, NOW);
     }
 
     private HttpAgentClient client(Duration timeout, int reconnects) {

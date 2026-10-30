@@ -101,6 +101,7 @@ class TianjiPermissionIntegrationTest {
             if (policyUnavailable.get()) throw new Rbac3AuthorizationClient.AuthorizationUnavailableException("private-backend-detail");
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(),
                     Set.of(TianjiAgentPermissions.GET_API, TianjiAgentPermissions.LIST_API, TianjiAgentPermissions.EVENTS_API,
+                            TianjiAgentPermissions.CONTEXT_SNAPSHOTS_API,
                             TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
                             TianjiAgentPermissions.SESSION_START_API, TianjiAgentPermissions.LINKED_SUBMIT_API,
                             TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API),
@@ -201,6 +202,18 @@ class TianjiPermissionIntegrationTest {
         MethodInvocation invocation = mock(MethodInvocation.class);
         when(invocation.getMethod()).thenReturn(top.egon.cola.platform.tianji.agent.server.api.LinkedAgentDispatchController.class
                 .getMethod("resolve", top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery.class));
+        var manager = new Rbac3MethodAuthorizationManager(mock(AuthorizationService.class), permissionGuard());
+        assertTrue(manager.check(() -> SecurityContextHolder.getContext().getAuthentication(), invocation).isGranted());
+    }
+
+    @Test
+    void context_metadata_method_uses_the_current_read_scope_and_compiled_resource_policy() throws Exception {
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id", URI.create("https://api.example/tianji"), 1,
+                Set.of(TianjiAgentPermissions.READ_SCOPE), "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(), URI.create("https://idp.example/tenants/20")));
+        assertNotNull(access().require(TianjiAgentPermissions.CONTEXT_SNAPSHOTS_API));
+        var invocation = mock(MethodInvocation.class);
+        when(invocation.getMethod()).thenReturn(top.egon.cola.platform.tianji.agent.server.api.AgentContextSnapshotController.class.getMethod("list", String.class, int.class, int.class));
         var manager = new Rbac3MethodAuthorizationManager(mock(AuthorizationService.class), permissionGuard());
         assertTrue(manager.check(() -> SecurityContextHolder.getContext().getAuthentication(), invocation).isGranted());
     }
@@ -511,6 +524,11 @@ class TianjiPermissionIntegrationTest {
                 List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE),
                 List.of(TianjiAgentPermissions.READ_SCOPE),
                 new PermissionManifest.I18nReference("tianji.permissions", "api.agent.events"), DefinitionLifecycle.ACTIVE);
+        var contexts = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.CONTEXT_SNAPSHOTS_API, ResourceType.API,
+                Map.of("methods", List.of("GET"), "paths", List.of("/api/tianji/v1/agent-runs/{runId}/context-snapshots")),
+                ResourceAccess.PROTECTED, requirement, null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE), List.of(TianjiAgentPermissions.READ_SCOPE),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.agent.contextSnapshots"), DefinitionLifecycle.ACTIVE);
         var list = new PermissionManifest.ResourceDefinition(TianjiAgentPermissions.LIST_API, ResourceType.API,
                 Map.of("methods", List.of("GET"), "paths", List.of("/api/tianji/v1/agent-runs")),
                 ResourceAccess.PROTECTED, requirement, null,
@@ -566,7 +584,7 @@ class TianjiPermissionIntegrationTest {
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
                 List.of(), List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START, TianjiAgentPermissions.SESSION_DELETE,
                         TianjiAgentPermissions.LINKED_SUBMIT, TianjiAgentPermissions.LINKED_RESOLVE, TianjiAgentPermissions.LINKED_CLOSE),
-                List.of(resource, events, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete,
+                List.of(resource, events, contexts, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete,
                         linkedSubmit, linkedResolve, linkedClose), List.of(), List.of());
     }
 

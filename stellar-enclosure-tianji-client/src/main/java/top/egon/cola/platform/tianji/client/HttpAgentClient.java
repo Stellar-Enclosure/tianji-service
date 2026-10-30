@@ -2,6 +2,8 @@ package top.egon.cola.platform.tianji.client;
 
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotPageDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
@@ -36,6 +38,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral Agent contract. It does not initiate write retries. */
 public final class HttpAgentClient implements AgentClient, AgentSessionClient {
@@ -47,6 +50,7 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     private final int maxReconnects;
     private final Duration reconnectDelay;
     private final JsonMapper mapper = JsonMapper.builder().build();
+    private final AgentContextResponseCodec contexts = new AgentContextResponseCodec();
 
     public HttpAgentClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier,
                            Duration requestTimeout, int maxReconnects, Duration reconnectDelay) {
@@ -92,6 +96,17 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     @Override
     public AgentRunDTO get(GetAgentRunQuery query) {
         return call("GET", path(segment(Objects.requireNonNull(query, "query").runId())), null, AgentRunDTO.class);
+    }
+
+    @Override
+    public AgentContextSnapshotPageDTO contextSnapshots(AgentContextSnapshotsQuery query) {
+        Objects.requireNonNull(query, "query");
+        URI uri = URI.create(path(segment(query.runId()) + "/context-snapshots").toString()
+                + "?afterModelCall=" + query.afterModelCall() + "&limit=" + query.limit());
+        var page = call("GET", uri, null, AgentContextSnapshotPageDTO.class, null, contexts::read);
+        if (page.items().size() > query.limit() || page.items().stream().anyMatch(item -> !item.runId().equals(query.runId())
+                || item.modelCallNumber() <= query.afterModelCall())) throw new AgentClientException(200, "TIANJI_INVALID_RESPONSE", null, null);
+        return page;
     }
 
     @Override
@@ -141,6 +156,10 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     }
 
     private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId) {
+        return call(method, uri, body, type, expectedSessionId, bytes -> mapper.readValue(bytes, type));
+    }
+
+    private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId, Function<byte[], T> decoder) {
         byte[] bytes = body == null ? null : mapper.writeValueAsBytes(body);
         if (bytes != null && bytes.length > MAX_JSON_BYTES) {
             throw new IllegalArgumentException("Agent request exceeds its size limit");
@@ -162,7 +181,7 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
                 return null;
             }
             try {
-                T value = mapper.readValue(response.body(), type);
+                T value = decoder.apply(response.body());
                 if (expectedSessionId != null && (!(value instanceof AgentSessionDTO session)
                         || !expectedSessionId.equals(session.sessionId()))) {
                     throw new AgentClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);

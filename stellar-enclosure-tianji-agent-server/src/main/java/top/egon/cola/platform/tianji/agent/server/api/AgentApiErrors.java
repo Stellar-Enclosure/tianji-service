@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.api;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -47,6 +48,11 @@ public final class AgentApiErrors {
 
     @ExceptionHandler(Rbac3AuthorizationClient.AuthorizationUnavailableException.class)
     ResponseEntity<AgentErrorDTO> authorizationUnavailable() {
+        return error(HttpStatus.SERVICE_UNAVAILABLE, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
+    }
+
+    @ExceptionHandler(DataAccessException.class)
+    ResponseEntity<AgentErrorDTO> storageUnavailable() {
         return error(HttpStatus.SERVICE_UNAVAILABLE, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
     }
 
