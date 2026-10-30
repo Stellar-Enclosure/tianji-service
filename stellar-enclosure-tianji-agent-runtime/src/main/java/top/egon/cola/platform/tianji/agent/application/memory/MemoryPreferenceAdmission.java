@@ -15,6 +15,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionItemDTO;
+import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
@@ -65,24 +67,12 @@ public final class MemoryPreferenceAdmission {
 
     public MemoryPreferenceExtractionResultDTO extract(MemoryOperationContext context, ExtractMemoryPreferencesCommand command) {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(command, "command");
-        if (TransactionSynchronizationManager.isActualTransactionActive() || context.runAuthorization() != null || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
         var binding = bindings.get(command.bindingId());
         if (binding == null || !binding.accepts(context.actor(), command)) throw denied();
-        requireCurrent(context, command);
-        var material = ledger.executionMaterial(context.actor(), new GetAgentRunQuery(command.runId()));
-        boolean matches;
-        try { matches = binding.matches(material.authorization()); }
-        catch (IllegalArgumentException drift) { throw unavailable(); }
-        if (!command.runId().equals(material.run().runId()) || !context.actor().equals(material.authorization().actor()) || !matches
-                || material.snapshot().processLink() != null) throw denied();
-        requireCurrent(context, command);
+        var loaded = source(context, command.sourceQuery());
+        if (!binding.equals(loaded.binding())) throw denied();
+        var material = loaded.material();
         if (material.run().status() != AgentRunStatusEnum.COMPLETED) return result(command, MemoryPreferenceExtractionOutcomeEnum.RUN_NOT_COMPLETED, List.of());
-        if (material.run().lastEventSequence() < 1 || material.run().finishedAt() == null) throw unavailable();
-        var events = ledger.events(context.actor(), new AgentEventsQuery(command.runId(), material.run().lastEventSequence() - 1, 1));
-        if (events.size() != 1 || !command.sourceEventId().equals(events.getFirst().eventId()) || !command.runId().equals(events.getFirst().runId())
-                || events.getFirst().sequence() != material.run().lastEventSequence() || !"RUN_STATUS_CHANGED".equals(events.getFirst().type())
-                || !"COMPLETED".equals(events.getFirst().payload().get("status"))) throw denied();
-        requireCurrent(context, command);
         var policy = policies.get(binding.policyRef());
         var prepared = extraction.evaluate(new MemoryPreferenceExtraction.Source(material.run().status(), MemoryPreferenceExtraction.SourceKind.USER_INPUT, true,
                 material.snapshot().input().text() == null ? "" : material.snapshot().input().text()), policy);
@@ -101,10 +91,51 @@ public final class MemoryPreferenceAdmission {
         return result(command, MemoryPreferenceExtractionOutcomeEnum.valueOf(prepared.outcome().name()), receipts);
     }
 
-    private void requireCurrent(MemoryOperationContext context, ExtractMemoryPreferencesCommand command) {
+    public MemoryPreferencePreparationDTO prepare(MemoryOperationContext context, PrepareMemoryPreferencesQuery query) {
+        Objects.requireNonNull(context, "context"); Objects.requireNonNull(query, "query");
+        var loaded = source(context, query); var material = loaded.material(); var selected = loaded.binding();
+        var command = new ExtractMemoryPreferencesCommand(query.owner(), query.scopeId(), query.runId(), query.sourceEventId(), selected.id(), selected.policyRef());
+        var policy = policies.get(selected.policyRef());
+        var prepared = extraction.evaluate(new MemoryPreferenceExtraction.Source(material.run().status(), MemoryPreferenceExtraction.SourceKind.USER_INPUT, true,
+                material.snapshot().input().text() == null ? "" : material.snapshot().input().text()), policy);
+        var keys = prepared.proposals().stream().map(proposal -> proposal.content().facts().keySet().iterator().next()).toList();
+        requireCurrent(context, query);
+        return new MemoryPreferencePreparationDTO(command, MemoryPreferenceExtractionOutcomeEnum.valueOf(prepared.outcome().name()), keys.size(), keys, policy.sensitivity());
+    }
+
+    private PreferenceSource source(MemoryOperationContext context, PrepareMemoryPreferencesQuery query) {
+        if (TransactionSynchronizationManager.isActualTransactionActive() || context.runAuthorization() != null || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
+        if (bindings.values().stream().noneMatch(binding -> binding.acceptsScope(context.actor(), query.owner(), query.scopeId()))) throw denied();
+        requireCurrent(context, query);
+        var material = ledger.executionMaterial(context.actor(), new GetAgentRunQuery(query.runId()));
+        if (!query.runId().equals(material.run().runId()) || !context.actor().equals(material.authorization().actor()) || material.snapshot().processLink() != null) throw denied();
+        MemoryPreferenceSourceBinding selected = null;
+        for (var binding : bindings.values()) {
+            if (!binding.acceptsScope(context.actor(), query.owner(), query.scopeId())) continue;
+            boolean matches;
+            try { matches = binding.matches(material.authorization()); }
+            catch (IllegalArgumentException drift) { throw unavailable(); }
+            if (matches) { if (selected != null) throw unavailable(); selected = binding; }
+        }
+        if (selected == null) throw denied();
+        requireCurrent(context, query);
+        if (material.run().status() == AgentRunStatusEnum.COMPLETED) {
+            if (material.run().lastEventSequence() < 1 || material.run().finishedAt() == null) throw unavailable();
+            var events = ledger.events(context.actor(), new AgentEventsQuery(query.runId(), material.run().lastEventSequence() - 1, 1));
+            if (events.size() != 1 || !query.sourceEventId().equals(events.getFirst().eventId()) || !query.runId().equals(events.getFirst().runId())
+                    || events.getFirst().sequence() != material.run().lastEventSequence() || !"RUN_STATUS_CHANGED".equals(events.getFirst().type())
+                    || !"COMPLETED".equals(events.getFirst().payload().get("status"))) throw denied();
+            requireCurrent(context, query);
+        }
+        return new PreferenceSource(material, selected);
+    }
+
+    private record PreferenceSource(AgentLedgerService.ExecutionMaterial material, MemoryPreferenceSourceBinding binding) { }
+
+    private void requireCurrent(MemoryOperationContext context, PrepareMemoryPreferencesQuery query) {
         if (!clock.instant().isBefore(context.deadlineAt())) throw unavailable();
-        var access = authorization.authorize(new MemoryAuthorization.Request(context, command.owner(), command.scopeId(), MemoryAuthorization.Operation.UPSERT,
-                command.itemCommandId("admission"), 0, command.runId(), command.sourceEventId()));
+        var access = authorization.authorize(new MemoryAuthorization.Request(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.UPSERT,
+                query.admissionId(), 0, query.runId(), query.sourceEventId()));
         if (access == MemoryAuthorization.Decision.DENY) throw denied(); if (access != MemoryAuthorization.Decision.ALLOW || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
     }
 

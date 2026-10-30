@@ -14,6 +14,8 @@ import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCom
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionItemDTO;
+import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -634,6 +636,24 @@ class HttpAgentClientTest {
         }
         calls.set(0); handler.set(exchange -> { calls.incrementAndGet(); respond(exchange, 503, "application/json", "{}".getBytes(StandardCharsets.UTF_8)); });
         assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 2).extractMemoryPreferences(command)); assertEquals(1, calls.get());
+    }
+
+    @Test
+    void preference_preparation_selects_only_server_owned_configuration_and_checks_the_original_source() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var query = new PrepareMemoryPreferencesQuery(owner, "research", "run", "terminal");
+        var command = new ExtractMemoryPreferencesCommand(owner, "research", "run", "terminal", "source", "preferences@1#" + "a".repeat(64));
+        var prepared = new MemoryPreferencePreparationDTO(command, MemoryPreferenceExtractionOutcomeEnum.ELIGIBLE, 1, List.of("language"), MemorySensitivityEnum.CONFIDENTIAL);
+        var encoded = mapper.writeValueAsString(prepared); var response = new AtomicReference<>(encoded);
+        handler.set(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/prepare-preferences", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), PrepareMemoryPreferencesQuery.class));
+            respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(prepared, client(Duration.ofSeconds(3), 0).prepareMemoryPreferences(query));
+        for (var invalid : List.of(encoded.replace("alice", "other"), encoded.replace("terminal", "other"), encoded.replace("\"candidateCount\":1", "\"candidateCount\":\"1\""),
+                encoded.replace("\"language\"", "123"), encoded.replace("CONFIDENTIAL", "PUBLIC"), encoded.substring(0, encoded.length() - 1) + ",\"text\":\"unrequested-body\"}")) {
+            response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).prepareMemoryPreferences(query)).code());
+        }
     }
 
     private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {

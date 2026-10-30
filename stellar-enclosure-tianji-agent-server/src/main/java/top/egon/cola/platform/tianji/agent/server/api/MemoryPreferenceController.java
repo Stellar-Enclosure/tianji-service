@@ -15,6 +15,8 @@ import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermission
 import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
 import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionResource;
@@ -31,6 +33,17 @@ public class MemoryPreferenceController {
     private final TianjiAgentAccess access;
 
     public MemoryPreferenceController(MemoryPreferenceAdmission admission, TianjiAgentAccess access) { this.admission = Objects.requireNonNull(admission, "admission"); this.access = Objects.requireNonNull(access, "access"); }
+
+    @PermissionResource(key = TianjiAgentPermissions.MEMORY_PREPARE_PREFERENCES_API, type = ResourceType.API,
+            labelPage = "tianji.permissions", labelKey = "api.memory.preparePreferences", allowedPrincipals = PermissionManifest.PrincipalType.USER,
+            oauthScopes = {TianjiAgentPermissions.MEMORY_WRITE_SCOPE, "tianji:agent:read"})
+    @RequiresPermissions(codes = {TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.READ})
+    @PostMapping("/prepare-preferences")
+    public ResponseEntity<MemoryPreferencePreparationDTO> prepare(@RequestBody PrepareMemoryPreferencesQuery request) {
+        var current = access.require(TianjiAgentPermissions.MEMORY_PREPARE_PREFERENCES_API); Instant maximum = Instant.now().plusSeconds(30);
+        var context = new MemoryOperationContext(current.actor(), current.expiresAt().isBefore(maximum) ? current.expiresAt() : maximum, null);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(admission.prepare(context, request));
+    }
 
     @PermissionResource(key = TianjiAgentPermissions.MEMORY_EXTRACT_PREFERENCES_API, type = ResourceType.API,
             labelPage = "tianji.permissions", labelKey = "api.memory.extractPreferences",

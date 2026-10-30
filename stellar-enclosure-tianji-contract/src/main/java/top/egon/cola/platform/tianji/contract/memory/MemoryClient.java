@@ -11,6 +11,7 @@ public interface MemoryClient {
     MemoryRetrievalPageDTO retrieveMemory(MemoryRetrievalQuery query);
     default MemoryCandidatePageDTO memoryCandidates(MemoryCandidateQuery query) { throw new UnsupportedOperationException("Candidate review is unavailable in this client"); }
     default MemoryPreferenceExtractionResultDTO extractMemoryPreferences(ExtractMemoryPreferencesCommand command) { throw new UnsupportedOperationException("Preference extraction is unavailable in this client"); }
+    default MemoryPreferencePreparationDTO prepareMemoryPreferences(PrepareMemoryPreferencesQuery query) { throw new UnsupportedOperationException("Preference preparation is unavailable in this client"); }
     MemoryMutationResultDTO upsertMemory(UpsertMemoryCommand command);
     MemoryMutationResultDTO correctMemory(CorrectMemoryCommand command);
     MemoryMutationResultDTO forgetMemory(ForgetMemoryCommand command);

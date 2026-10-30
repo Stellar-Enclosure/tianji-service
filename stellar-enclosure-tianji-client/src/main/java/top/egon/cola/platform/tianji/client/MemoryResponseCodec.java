@@ -11,6 +11,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 
 /** Memory responses have a closed typed decoder without changing existing Agent/Session wire compatibility. */
 final class MemoryResponseCodec {
@@ -29,6 +30,13 @@ final class MemoryResponseCodec {
         if (!node.path("items").isArray() || node.path("items").size() > 32) throw invalid();
         for (var item : node.path("items")) { strings(item, "preferenceKey"); mutation(item.path("receipt")); }
         return mapper.treeToValue(node, MemoryPreferenceExtractionResultDTO.class);
+    }
+    MemoryPreferencePreparationDTO preparation(byte[] bytes) {
+        var node = mapper.readTree(bytes); var command = node.path("command"); owner(command.path("owner"));
+        strings(command, "scopeId", "runId", "sourceEventId", "bindingId", "policyRef"); strings(node, "outcome", "sensitivity"); integers(node, "candidateCount");
+        if (!node.path("preferenceKeys").isArray() || node.path("preferenceKeys").size() > 32) throw invalid();
+        for (var value : node.path("preferenceKeys")) if (!value.isString()) throw invalid();
+        return mapper.treeToValue(node, MemoryPreferencePreparationDTO.class);
     }
     private static void mutation(JsonNode node) {
         owner(node.path("owner")); strings(node, "commandId", "scopeId", "memoryId", "outcome", "stateAtMutation", "occurredAt"); integers(node, "revision");

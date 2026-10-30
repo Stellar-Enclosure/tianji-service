@@ -4,6 +4,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -19,9 +20,12 @@ public record MemoryPreferenceSourceBinding(String id, long tenantId, String iss
     }
 
     public boolean accepts(TrustedAgentActor actor, ExtractMemoryPreferencesCommand request) {
+        return acceptsScope(actor, request.owner(), request.scopeId()) && id.equals(request.bindingId()) && policyRef.equals(request.policyRef());
+    }
+
+    public boolean acceptsScope(TrustedAgentActor actor, MemoryOwnerDTO owner, String scope) {
         return actor.subjectType() == TrustedAgentActor.SubjectType.USER && actor.tenantId() == tenantId && issuerFingerprint.equals(actor.issuerFingerprint())
-                && id.equals(request.bindingId()) && scopeId.equals(request.scopeId()) && policyRef.equals(request.policyRef())
-                && request.owner().type() == MemoryOwnerTypeEnum.USER && request.owner().id().equals(actor.subjectId());
+                && scopeId.equals(scope) && owner.type() == MemoryOwnerTypeEnum.USER && owner.id().equals(actor.subjectId());
     }
 
     public boolean matches(AgentRunAuthorization.Request run) {

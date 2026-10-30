@@ -15,6 +15,7 @@ import tools.jackson.databind.cfg.EnumFeature;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCommand;
+import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
@@ -32,7 +33,7 @@ import java.util.Set;
 @ConditionalOnProperty(prefix = "stellar.tianji.agent", name = {"api.enabled", "memory.enabled", "memory.http.enabled"}, havingValue = "true")
 public final class MemoryRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 131_072;
-    private static final Set<Type> TYPES = Set.of(GetMemoryQuery.class, MemoryRetrievalQuery.class, MemoryCandidateQuery.class, UpsertMemoryCommand.class, CorrectMemoryCommand.class, ForgetMemoryCommand.class, ExtractMemoryPreferencesCommand.class);
+    private static final Set<Type> TYPES = Set.of(GetMemoryQuery.class, MemoryRetrievalQuery.class, MemoryCandidateQuery.class, UpsertMemoryCommand.class, CorrectMemoryCommand.class, ForgetMemoryCommand.class, ExtractMemoryPreferencesCommand.class, PrepareMemoryPreferencesQuery.class);
     private static final JsonMapper JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS, DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
             .disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).build();
@@ -46,6 +47,7 @@ public final class MemoryRequestBodyAdvice extends RequestBodyAdviceAdapter {
             var root = JSON.readTree(body); if (root == null || !root.isObject()) throw new IllegalArgumentException();
             strings(root.path("owner"), "type", "id"); strings(root, "scopeId");
             if (type == ExtractMemoryPreferencesCommand.class) strings(root, "runId", "sourceEventId", "bindingId", "policyRef");
+            else if (type == PrepareMemoryPreferencesQuery.class) strings(root, "runId", "sourceEventId");
             else if (type != MemoryRetrievalQuery.class && type != MemoryCandidateQuery.class) strings(root, "memoryId");
             if (type == UpsertMemoryCommand.class || type == CorrectMemoryCommand.class || type == ForgetMemoryCommand.class) {
                 strings(root, "commandId");

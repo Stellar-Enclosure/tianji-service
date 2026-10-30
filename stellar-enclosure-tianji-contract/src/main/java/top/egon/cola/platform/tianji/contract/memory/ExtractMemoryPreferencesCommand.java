@@ -1,8 +1,6 @@
 package top.egon.cola.platform.tianji.contract.memory;
 
-import java.nio.charset.StandardCharsets;
 import java.util.Objects;
-import java.util.UUID;
 
 /** Explicit request-time candidate extraction from one owned completed run; no text, tenant or approval claims are accepted. */
 public record ExtractMemoryPreferencesCommand(MemoryOwnerDTO owner, String scopeId, String runId,
@@ -17,10 +15,8 @@ public record ExtractMemoryPreferencesCommand(MemoryOwnerDTO owner, String scope
 
     /** A source preference owns one durable write key, including when content deduplication returns another canonical entry. */
     public String itemCommandId(String preferenceKey) {
-        if (preferenceKey == null || !preferenceKey.matches("[a-z][a-z0-9_.-]{0,63}")) throw MemoryChecks.invalid();
-        var data = new StringBuilder("TIANJI_MEMORY_PREFERENCE_COMMAND_V1:");
-        for (var field : new String[]{owner.type().name(), owner.id(), scopeId, runId, sourceEventId, preferenceKey}) data.append(field.getBytes(StandardCharsets.UTF_8).length).append(':').append(field);
-        return UUID.nameUUIDFromBytes(data.toString().getBytes(StandardCharsets.UTF_8)).toString();
+        return MemoryChecks.sourceCommandId(owner, scopeId, runId, sourceEventId, preferenceKey);
     }
+    public PrepareMemoryPreferencesQuery sourceQuery() { return new PrepareMemoryPreferencesQuery(owner, scopeId, runId, sourceEventId); }
     @Override public String toString() { return "ExtractMemoryPreferencesCommand[redacted]"; }
 }

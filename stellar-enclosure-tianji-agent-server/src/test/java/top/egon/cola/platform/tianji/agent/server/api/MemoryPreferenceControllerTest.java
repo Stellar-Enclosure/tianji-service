@@ -13,6 +13,8 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
 
 import java.time.Instant;
 import java.util.List;
@@ -43,5 +45,13 @@ class MemoryPreferenceControllerTest {
             mvc.perform(post("/api/tianji/v1/memories/extract-preferences").contentType(MediaType.APPLICATION_JSON).content(invalid)).andExpect(status().isBadRequest());
         mvc.perform(post("/api/tianji/v1/memories/extract-preferences").contentType(MediaType.APPLICATION_JSON).content(" ".repeat(131_073))).andExpect(status().isPayloadTooLarge());
         verify(admission, times(1)).extract(any(), any()); verify(access, times(1)).require(TianjiAgentPermissions.MEMORY_EXTRACT_PREFERENCES_API);
+        when(access.require(TianjiAgentPermissions.MEMORY_PREPARE_PREFERENCES_API)).thenReturn(new TianjiAgentAccess.Authorized(actor, expiry));
+        when(admission.prepare(any(), eq(request.sourceQuery()))).thenReturn(new MemoryPreferencePreparationDTO(request, MemoryPreferenceExtractionOutcomeEnum.ELIGIBLE, 1, List.of("language"), MemorySensitivityEnum.CONFIDENTIAL));
+        String query = JsonMapper.builder().build().writeValueAsString(request.sourceQuery());
+        mvc.perform(post("/api/tianji/v1/memories/prepare-preferences").contentType(MediaType.APPLICATION_JSON).content(query)).andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("command.bindingId").value("source")).andExpect(jsonPath("candidateCount").value(1)).andExpect(jsonPath("preferenceKeys[0]").value("language"));
+        for (var invalid : List.of(query.substring(0, query.length() - 1) + ",\"policyRef\":\"caller-policy\"}", query.replace("\"terminal\"", "123"), query.substring(0, query.length() - 1) + ",\"approved\":true}"))
+            mvc.perform(post("/api/tianji/v1/memories/prepare-preferences").contentType(MediaType.APPLICATION_JSON).content(invalid)).andExpect(status().isBadRequest());
+        verify(admission, times(1)).prepare(any(), any()); verify(access).require(TianjiAgentPermissions.MEMORY_PREPARE_PREFERENCES_API);
     }
 }

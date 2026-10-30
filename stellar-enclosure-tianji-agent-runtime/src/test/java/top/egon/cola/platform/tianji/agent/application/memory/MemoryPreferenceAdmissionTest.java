@@ -32,6 +32,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
 
 import java.math.BigDecimal;
 import java.time.Clock;
@@ -82,6 +83,18 @@ class MemoryPreferenceAdmissionTest {
         order.verify(ledger).executionMaterial(eq(ACTOR), eq(new GetAgentRunQuery("run")));
         order.verify(authorization).authorize(any()); order.verify(ledger).events(eq(ACTOR), eq(new AgentEventsQuery("run", 4, 1)));
         order.verify(authorization).authorize(any()); order.verify(memory).upsert(eq(context()), any());
+    }
+
+    @Test void preparation_selects_the_approved_definition_policy_without_returning_source_values_or_writing() {
+        var query = new PrepareMemoryPreferencesQuery(OWNER, "research", "run", "terminal");
+        var service = admission(policy()); var prepared = service.prepare(context(), query);
+        assertEquals(command(policy()), prepared.command()); assertEquals(1, prepared.candidateCount()); assertEquals(List.of("language"), prepared.preferenceKeys());
+        assertEquals(MemoryPreferenceExtractionOutcomeEnum.ELIGIBLE, prepared.outcome()); assertEquals(MemorySensitivityEnum.CONFIDENTIAL, prepared.sensitivity());
+        assertFalse(prepared.toString().contains("zh-CN")); assertTrue(writes.isEmpty()); verify(memory, never()).upsert(any(), any());
+        when(ledger.executionMaterial(any(), any())).thenReturn(material(AgentRunStatusEnum.FAILED, "memory.preference.language=zh-CN", HASH));
+        var failed = service.prepare(context(), query); assertEquals(0, failed.candidateCount()); assertEquals(MemoryPreferenceExtractionOutcomeEnum.RUN_NOT_COMPLETED, failed.outcome());
+        when(authorization.authorize(any())).thenReturn(MemoryAuthorization.Decision.DENY);
+        assertThrows(AgentLedgerException.class, () -> service.prepare(context(), query)); assertTrue(writes.isEmpty());
     }
 
     @Test void deny_unavailable_and_current_revocation_never_become_an_empty_or_writable_source() {
