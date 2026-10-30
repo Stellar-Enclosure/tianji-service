@@ -16,6 +16,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryPreferenceAdmission;
+import top.egon.cola.platform.tianji.agent.application.memory.MemoryPreferenceCommands;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -26,9 +27,13 @@ import top.egon.cola.platform.tianji.agent.domain.memory.MemoryReadGrant;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryRetentionPolicy;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryExtractionPolicy;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceSourceBinding;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceExtraction;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceIntent;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceWritePermit;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryReadGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryStorageVerifier;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryPreferenceIntentStore;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
@@ -138,6 +143,7 @@ class MemoryPostgresTest {
             retention(source, jdbc, memory, work, publication, events, failPublication);
             grants(ledger, source);
             serviceGrantCorrection(ledger, source, jdbc); memory.verifyStorage(2, version);
+            preferenceIntents(ledger, source, memory, jdbc); memory.verifyStorage(2, version);
             jdbc.execute("ALTER TABLE tianji_agent.agent_memory_entry DROP CONSTRAINT memory_entry_confirmation");
             assertThrows(AgentLedgerException.class, () -> memory.verifyStorage(2, version));
             assertThrows(AgentLedgerException.class, () -> memory.get(context(), new GetMemoryQuery(OWNER, "research", "main")));
@@ -366,6 +372,64 @@ class MemoryPostgresTest {
         assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("UPDATE tianji_agent.agent_memory_run_grant SET grant_id=? WHERE tenant_id=20 AND run_id=?", "9" + "1".repeat(62), run.runId()));
         assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("UPDATE tianji_agent.agent_memory_run_grant SET grant_id=? WHERE actor_type='USER'", "8" + "1".repeat(62)));
         assertEquals(ticket.grantId(), store.currentEvidence(request, resource, scope).orElseThrow().grantId());
+    }
+
+    private static void preferenceIntents(AgentLedgerService ledger, DriverManagerDataSource source, PostgresMemoryService memory, JdbcTemplate jdbc) throws Exception {
+        var history = jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version IS NOT NULL ORDER BY installed_rank");
+        var migration = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").target("12")
+                .placeholders(Map.of("tianjiMemoryDimensions", "2")).cleanDisabled(true).load();
+        assertEquals(1, migration.migrate().migrationsExecuted); migration.validate();
+        assertEquals(history, jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version<>'12' AND version IS NOT NULL ORDER BY installed_rank"));
+        var store = new MemoryPreferenceIntentStore(source, ledger); store.verifyStorage();
+        var run = ledger.start(ALICE, new StartAgentRunCommand("preference-source", 1, null, "background-preferences", null, null,
+                new AgentInputDTO("memory.preference.language=zh-CN\nmemory.preference.timezone=UTC", null, null), null));
+        var query = new GetAgentRunQuery(run.runId()); var material = ledger.executionMaterial(ALICE, query);
+        var policy = new MemoryExtractionPolicy("background", 1, Map.of("language", Set.of("zh-CN"), "timezone", Set.of("UTC")), new BigDecimal("0.5"), MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), 3);
+        var binding = new MemoryPreferenceSourceBinding("background", 20, ALICE.issuerFingerprint(), material.run().definitionKey(), material.run().definitionVersion(), material.snapshot().definitionContentSha256(), "background", policy.reference());
+        var resource = URI.create("https://agent.example/api"); var deadline = Instant.now().plusSeconds(300).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        var first = store.reserve(material.authorization(), binding, resource, deadline, 5).orElseThrow(); var second = store.reserve(material.authorization(), binding, resource, deadline.plusSeconds(10), 5).orElseThrow();
+        var ticket = new AgentExecutionGrant.Ticket("9" + "2".repeat(62), "ENC:v1:test:A:A", deadline.minusSeconds(30));
+        assertFalse(store.complete(first, ticket)); assertTrue(store.complete(second, ticket)); assertEquals(second.deadlineAt(), first.deadlineAt());
+        var claimedRun = ledger.claim(ALICE, query, run.revision(), "background-source", Duration.ofSeconds(30));
+        var finished = ledger.finish(ALICE, claimedRun.lease(), claimedRun.run().revision(), new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED, Map.of(), null, "1", null, null, null));
+        var event = ledger.events(ALICE, new AgentEventsQuery(run.runId(), finished.lastEventSequence() - 1, 1)).getFirst();
+        assertTrue(store.candidates(20, ALICE.issuerFingerprint(), 10).contains(first.intentId()));
+        var lease = store.claim(20, ALICE.issuerFingerprint(), first.intentId(), "worker-a", Duration.ofSeconds(30)).orElseThrow();
+        var extracted = new MemoryPreferenceExtraction().evaluate(new MemoryPreferenceExtraction.Source(AgentRunStatusEnum.COMPLETED, MemoryPreferenceExtraction.SourceKind.USER_INPUT, true, material.snapshot().input().text()), policy);
+        var commands = MemoryPreferenceCommands.create(ALICE, new ExtractMemoryPreferencesCommand(OWNER, "background", run.runId(), event.eventId(), binding.id(), policy.reference()), policy, extracted);
+        var commandHash = MemoryJsonCodec.sha256(String.join(":", commands.stream().map(command -> new MemoryJsonCodec().commandSha256(command)).toList()));
+        lease = store.sealCommands(lease, commands.size(), commandHash);
+        var originalReceipt = memory.upsert(preferenceContext(source, store, lease, commands.getFirst()), commands.getFirst());
+        assertEquals(originalReceipt, memory.upsert(preferenceContext(source, store, lease, commands.getFirst()), commands.getFirst()));
+        lease = store.acknowledge(lease).orElseThrow(); assertEquals(1, lease.nextIndex());
+        memory.upsert(preferenceContext(source, store, lease, commands.get(1)), commands.get(1)); assertTrue(store.acknowledge(lease).isEmpty());
+        assertEquals(MemoryPreferenceIntent.State.APPLIED, store.view(ALICE, run.runId(), "background").orElseThrow().state());
+        assertNull(jdbc.queryForObject("SELECT ciphertext FROM tianji_agent.agent_memory_preference_intent WHERE intent_id=?", String.class, first.intentId()));
+
+        var cancelBinding = new MemoryPreferenceSourceBinding("cancel-background", 20, ALICE.issuerFingerprint(), binding.definitionKey(), binding.definitionVersion(), binding.definitionSha256(), "background-cancel", policy.reference());
+        var cancelReservation = store.reserve(material.authorization(), cancelBinding, resource, deadline, 5).orElseThrow(); assertTrue(store.complete(cancelReservation, ticket));
+        var old = store.claim(20, ALICE.issuerFingerprint(), cancelReservation.intentId(), "old-worker", Duration.ofSeconds(30)).orElseThrow();
+        jdbc.update("UPDATE tianji_agent.agent_memory_preference_intent SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE intent_id=?", cancelReservation.intentId());
+        var current = store.claim(20, ALICE.issuerFingerprint(), cancelReservation.intentId(), "new-worker", Duration.ofSeconds(30)).orElseThrow(); assertTrue(current.epoch() > old.epoch());
+        var transaction = new org.springframework.transaction.support.TransactionTemplate(new org.springframework.jdbc.datasource.DataSourceTransactionManager(source));
+        assertThrows(AgentLedgerException.class, () -> transaction.executeWithoutResult(status -> store.verifyFence(old)));
+        var cancelled = store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "cancel-background", "c".repeat(64));
+        assertEquals(MemoryPreferenceIntent.State.CANCELLED, cancelled.state()); assertEquals(cancelled, store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "cancel-background", "c".repeat(64)));
+        assertThrows(AgentLedgerException.class, () -> transaction.executeWithoutResult(status -> store.verifyFence(current)));
+        assertFalse(store.complete(cancelReservation, ticket));
+        jdbc.execute("ALTER TABLE tianji_agent.agent_memory_preference_intent DROP CONSTRAINT preference_intent_actor_type");
+        assertThrows(AgentLedgerException.class, store::verifyStorage);
+    }
+
+    private static MemoryOperationContext preferenceContext(DriverManagerDataSource source, MemoryPreferenceIntentStore store, MemoryPreferenceIntent.Lease lease, UpsertMemoryCommand command) {
+        var permit = new MemoryPreferenceWritePermit() {
+            @Override public TrustedAgentActor actor() { return ALICE; }
+            @Override public UpsertMemoryCommand command() { return command; }
+            @Override public Instant expiresAt() { return lease.expiresAt(); }
+            @Override public boolean usesDataSource(javax.sql.DataSource candidate) { return candidate == source; }
+            @Override public void verifyTransaction() { store.verifyFence(lease); }
+        };
+        var deadline = Instant.now().plusSeconds(5); if (lease.expiresAt().isBefore(deadline)) deadline = lease.expiresAt(); return new MemoryOperationContext(ALICE, deadline, null, permit);
     }
 
     private static UpsertMemoryCommand upsert(String command, String id, String text) { return new UpsertMemoryCommand(command, OWNER, "research", id, MemoryKindEnum.PREFERENCE, 0,
