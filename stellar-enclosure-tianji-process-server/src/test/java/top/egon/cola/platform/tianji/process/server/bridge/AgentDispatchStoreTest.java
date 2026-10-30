@@ -1,18 +1,41 @@
 package top.egon.cola.platform.tianji.process.server.bridge;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.List;
+import javax.sql.DataSource;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class AgentDispatchStoreTest {
     static final Instant NOW = Instant.parse("2026-10-29T00:00:00Z");
     static final ProcessActor ACTOR = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "process-worker", "https://idp.example/20");
+
+    @Test
+    void startup_guards_reject_schema_and_registry_or_dispatch_instance_drift_without_ddl() {
+        var source = mock(DataSource.class);
+        var manager = new DataSourceTransactionManager(source);
+        try (var verification = mockConstruction(ProcessApiSchemaVerifier.class)) {
+            var dispatches = new AgentDispatchStore(source, manager, "tianji_process");
+            assertDoesNotThrow(() -> dispatches.requireStorage(source, manager, "tianji_process"));
+            assertThrows(IllegalArgumentException.class, () -> dispatches.requireStorage(source, manager, "other_schema"));
+            var registry = new AgentResultProducerRegistry(List.of(new AgentResultProducerRegistry.Registration(ACTOR, "agent", "process-east", ACTOR)));
+            var inbox = new AgentResultInbox(source, manager, "tianji_process", dispatches, registry, Duration.ofDays(1));
+            assertDoesNotThrow(() -> inbox.requireBindings(dispatches, registry));
+            assertThrows(IllegalArgumentException.class, () -> inbox.requireBindings(mock(AgentDispatchStore.class), registry));
+            assertThrows(IllegalArgumentException.class, () -> inbox.requireBindings(dispatches, mock(AgentResultProducerRegistry.class)));
+            assertThrows(IllegalArgumentException.class, () -> new AgentResultInbox(source, manager, "other_schema", dispatches, registry, Duration.ofDays(1)));
+            verifyNoInteractions(source);
+        }
+    }
 
     static AgentDispatchBinding binding() {
         return new AgentDispatchBinding(ACTOR, "process-east", "agent-start", "1", "research", 2,

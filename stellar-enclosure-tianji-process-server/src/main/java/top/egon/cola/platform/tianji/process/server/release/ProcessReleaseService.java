@@ -41,6 +41,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.BooleanSupplier;
 
 /** Internal release transaction; callers must authorize the trusted actor before invoking it. */
 public final class ProcessReleaseService {
@@ -58,6 +59,7 @@ public final class ProcessReleaseService {
     private final boolean decisionTasksEnabled;
     private final WorkerTopicRegistry workerTopics;
     private final boolean agentMessageWaitsEnabled;
+    private final BooleanSupplier agentMaintenanceReady;
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
@@ -77,6 +79,12 @@ public final class ProcessReleaseService {
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
                                  boolean agentMessageWaitsEnabled) {
+        this(process, dmn, validator, decisionTasksEnabled, workerTopics, agentMessageWaitsEnabled, () -> true);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
+                                 boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady) {
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -93,6 +101,7 @@ public final class ProcessReleaseService {
         this.decisionTasksEnabled = decisionTasksEnabled;
         this.workerTopics = workerTopics;
         this.agentMessageWaitsEnabled = agentMessageWaitsEnabled;
+        this.agentMaintenanceReady = Objects.requireNonNull(agentMaintenanceReady, "agentMaintenanceReady");
         this.schema = process.getDatabaseSchema();
         if (workerTopics != null) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
         if (agentMessageWaitsEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyAgentDispatch();
@@ -240,6 +249,9 @@ public final class ProcessReleaseService {
             }
             var waits = processModel.model().messageWaits();
             if (!waits.isEmpty() && !agentMessageWaitsEnabled) throw invalid();
+            if (!waits.isEmpty() && !agentMaintenanceReady.getAsBoolean()) {
+                throw new IllegalStateException("Agent wait publication requires running bridge maintenance");
+            }
             for (var wait : waits.values()) {
                 if (wait.statusVariable() == null || workerTopics == null || !workerTopics.isInternalAgentDispatch(tenantId,
                         processModel.model().workerTasks().get(wait.workerElementId()))) throw invalid();

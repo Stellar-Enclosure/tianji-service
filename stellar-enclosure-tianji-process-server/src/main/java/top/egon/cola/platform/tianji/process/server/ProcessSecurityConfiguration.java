@@ -34,6 +34,7 @@ import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgePoller;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
@@ -137,12 +138,18 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessReleaseService processReleaseService(ProcessEngine process, DmnEngine dmn,
                                                  ProcessModelValidator validator, Environment environment,
-                                                 ObjectProvider<WorkerTopicRegistry> registries) {
+                                                 ObjectProvider<WorkerTopicRegistry> registries,
+                                                 ObjectProvider<ProcessAgentBridgePoller> bridges) {
         boolean decisionTasksEnabled = environment.getProperty("stellar.tianji.process.decision-tasks.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         WorkerTopicRegistry registry = workerEnabled ? registries.getIfAvailable() : null;
         if (workerEnabled && registry == null) throw new IllegalStateException("Worker API requires an operator-owned topic registry");
-        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry);
+        boolean bridgeEnabled = environment.getProperty("stellar.tianji.process.agent-bridge.enabled", Boolean.class, false);
+        return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry,
+                bridgeEnabled, () -> {
+                    var bridge = bridges.getIfAvailable();
+                    return bridge != null && bridge.isRunning();
+                });
     }
 
     @Bean

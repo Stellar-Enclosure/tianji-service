@@ -141,7 +141,7 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
                     synchronized (monitor) { if (!enabled(current, job.kind() == Kind.DISPATCH)) return; }
                     switch (job.kind()) {
                         case DISPATCH -> workers.get(job.index()).runOnce(() -> { synchronized (monitor) { return enabled(current, true); } });
-                        case CLOSE -> workers.get(job.index()).reconcileOnce(1, interval);
+                        case CLOSE -> workers.get(job.index()).reconcileOnce(1, interval.compareTo(Duration.ofSeconds(1)) < 0 ? Duration.ofSeconds(1) : interval);
                         case INBOX -> results.reconcile(producers.get(job.index()), batchSize);
                     }
                 } catch (RuntimeException failure) {

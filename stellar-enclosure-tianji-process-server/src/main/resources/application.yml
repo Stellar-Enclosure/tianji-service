@@ -56,3 +56,9 @@ egon:
               TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]
               TIANJI_WORKER_ACQUIRE: ["tianji:worker:acquire"]
               TIANJI_WORKER_REPORT: ["tianji:worker:report"]
+
+stellar:
+  tianji:
+    process:
+      agent-bridge:
+        enabled: false

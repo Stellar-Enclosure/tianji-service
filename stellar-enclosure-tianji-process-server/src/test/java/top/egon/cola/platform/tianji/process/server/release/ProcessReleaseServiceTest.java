@@ -4,6 +4,10 @@ import org.flowable.dmn.api.DmnRepositoryService;
 import org.flowable.dmn.api.DmnHistoryService;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.RepositoryService;
+import org.flowable.engine.HistoryService;
+import org.flowable.common.engine.impl.history.HistoryLevel;
+import org.flowable.job.service.impl.asyncexecutor.AsyncExecutor;
+import org.flowable.job.service.impl.asyncexecutor.AsyncJobExecutorConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -11,10 +15,16 @@ import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
+import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 
 import javax.sql.DataSource;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.time.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -115,6 +125,42 @@ class ProcessReleaseServiceTest {
         var wrongInputs = new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", bpmn, Map.of("amount", ValueType.STRING));
         assertThrows(IllegalArgumentException.class, () -> enabled.publish(actor, "release", List.of(wrongInputs, rules)));
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
+    }
+
+    @Test
+    void agent_wait_publication_requires_current_maintenance_readiness_but_not_new_dispatch_admission() throws Exception {
+        DataSource source = mock(DataSource.class);
+        var process = process(source);
+        var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        var executor = mock(AsyncExecutor.class);
+        var jobs = mock(AsyncJobExecutorConfiguration.class);
+        when(process.isAsyncExecutorActivate()).thenReturn(true);
+        when(process.getAsyncExecutor()).thenReturn(executor);
+        when(executor.isActive()).thenReturn(true);
+        when(process.getAsyncExecutorConfiguration()).thenReturn(jobs);
+        when(jobs.isAsyncJobAcquisitionEnabled()).thenReturn(true);
+        when(jobs.isResetExpiredJobEnabled()).thenReturn(true);
+        when(process.getHistoryService()).thenReturn(mock(HistoryService.class));
+        when(process.isDbHistoryUsed()).thenReturn(true);
+        when(process.getHistoryLevel()).thenReturn(HistoryLevel.ACTIVITY);
+        var registration = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker", "agentStart", "1",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("runId", ValueType.STRING), Map.of("requestedAmount", Set.of("amount")),
+                Map.of("runId", Set.of("agentRunId")), 1, Duration.ofSeconds(15), Duration.ZERO, WorkerEffect.EXTERNAL_IDEMPOTENT, true);
+        var ready = new AtomicBoolean();
+        try (var verification = mockConstruction(ProcessApiSchemaVerifier.class);
+             var input = getClass().getResourceAsStream("/fixtures/agent-dispatch-wait.bpmn20.xml")) {
+            assertNotNull(input);
+            var service = new ProcessReleaseService(process, decision, new ProcessModelValidator(), false,
+                    new WorkerTopicRegistry(List.of(registration)), true, ready::get);
+            var model = new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", input.readAllBytes(), Map.of("amount", ValueType.INTEGER));
+            var actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp.example/20");
+            assertThrows(IllegalStateException.class, () -> service.publish(actor, "release", List.of(model)));
+            verifyNoInteractions(source, process.getRepositoryService());
+            ready.set(true);
+            assertThrows(org.springframework.transaction.CannotCreateTransactionException.class, () -> service.publish(actor, "release", List.of(model)));
+            verify(source).getConnection();
+            verifyNoInteractions(process.getRepositoryService());
+        }
     }
 
     private static SpringProcessEngineConfiguration process(DataSource source) {

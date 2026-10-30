@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.LocalizedText;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionDefinition;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionMessage;
@@ -90,9 +91,9 @@ public final class TianjiAgentPermissions {
     public static final String READ_SCOPE = "tianji:agent:read";
     public static final String CANCEL_SCOPE = "tianji:agent:cancel";
     public static final String SESSION_DELETE_SCOPE = "tianji:session:delete";
-    public static final String LINKED_SUBMIT_SCOPE = "tianji:agent:linked:submit";
-    public static final String LINKED_RESOLVE_SCOPE = "tianji:agent:linked:resolve";
-    public static final String LINKED_CLOSE_SCOPE = "tianji:agent:linked:close";
+    public static final String LINKED_SUBMIT_SCOPE = LinkedAgentClient.SUBMIT_SCOPE;
+    public static final String LINKED_RESOLVE_SCOPE = LinkedAgentClient.RESOLVE_SCOPE;
+    public static final String LINKED_CLOSE_SCOPE = LinkedAgentClient.CLOSE_SCOPE;
 
     private TianjiAgentPermissions() { }
 }

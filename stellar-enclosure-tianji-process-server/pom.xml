@@ -19,6 +19,10 @@
         </dependency>
         <dependency>
             <groupId>top.egon</groupId>
+            <artifactId>stellar-enclosure-tianji-client</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>top.egon</groupId>
             <artifactId>stellar-enclosure-tianquan-shoubing-starter</artifactId>
         </dependency>
         <dependency>

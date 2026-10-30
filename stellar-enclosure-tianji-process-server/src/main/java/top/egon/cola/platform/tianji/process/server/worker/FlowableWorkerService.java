@@ -214,9 +214,14 @@ public final class FlowableWorkerService {
         if (process != candidate || process.getTransactionManager() != manager) throw invalidConfiguration();
     }
 
+    public void requireStorage(SpringProcessEngineConfiguration candidate, DataSourceTransactionManager manager, WorkerTopicRegistry registry) {
+        requireStorage(candidate, manager);
+        if (this.registry != registry) throw invalidConfiguration();
+    }
+
     private void requireDispatchStorage(AgentDispatchStore dispatch) {
         if (dispatch == null || !(process.getTransactionManager() instanceof DataSourceTransactionManager manager)) throw invalidConfiguration();
-        dispatch.requireStorage(manager.getDataSource(), manager);
+        dispatch.requireStorage(manager.getDataSource(), manager, process.getDatabaseSchema());
     }
 
     public WorkerReceiptDTO fail(ProcessActor actor, FailWorkerTaskCommand command) {

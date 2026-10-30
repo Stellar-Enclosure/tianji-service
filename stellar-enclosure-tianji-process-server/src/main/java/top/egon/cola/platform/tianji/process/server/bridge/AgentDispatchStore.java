@@ -47,6 +47,7 @@ public final class AgentDispatchStore {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
     private final String table;
+    private final String schema;
 
     public AgentDispatchStore(DataSource source, DataSourceTransactionManager manager, String schema) {
         if (source == null || manager == null || manager.getDataSource() != source
@@ -57,10 +58,16 @@ public final class AgentDispatchStore {
         this.jdbc = new JdbcTemplate(source);
         this.transaction = new TransactionTemplate(manager);
         this.table = '"' + schema + "\".tianji_process_agent_dispatch";
+        this.schema = schema;
     }
 
     public void requireStorage(DataSource candidate, DataSourceTransactionManager transactionManager) {
         if (source != candidate || manager != transactionManager) throw invalid();
+    }
+
+    public void requireStorage(DataSource candidate, DataSourceTransactionManager transactionManager, String schema) {
+        requireStorage(candidate, transactionManager);
+        if (!this.schema.equals(schema)) throw invalid();
     }
 
     /** Ingress and result application lock the dispatch before any Inbox row. */

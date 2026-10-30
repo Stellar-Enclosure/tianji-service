@@ -46,6 +46,8 @@ public final class WorkerTopicRegistry {
         return result;
     }
 
+    public List<Registration> registrations() { return List.copyOf(registrations.values()); }
+
     public boolean acceptsModel(long tenantId, WorkerTask worker) {
         if (tenantId <= 0 || worker == null) return false;
         Schema expected = schemas.get(new TopicKey(tenantId, worker.topic(), worker.schemaVersion()));

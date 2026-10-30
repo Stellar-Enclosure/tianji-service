@@ -50,7 +50,7 @@ public final class AgentResultInbox {
                 || pendingRetention.compareTo(Duration.ofMinutes(1)) < 0 || pendingRetention.compareTo(Duration.ofDays(30)) > 0
                 || pendingRetention.toNanos() % 1_000_000 != 0) throw invalid();
         this.dispatches = Objects.requireNonNull(dispatches, "dispatches");
-        this.dispatches.requireStorage(source, manager);
+        this.dispatches.requireStorage(source, manager, schema);
         this.producers = Objects.requireNonNull(producers, "producers");
         new ProcessApiSchemaVerifier(source, schema).verifyAgentResultInbox();
         this.jdbc = new JdbcTemplate(source);
@@ -100,6 +100,10 @@ public final class AgentResultInbox {
 
     void requireStorage(DataSource candidate, DataSourceTransactionManager transactionManager, String schema) {
         if (source != candidate || manager != transactionManager || !this.schema.equals(schema)) throw invalid();
+    }
+
+    void requireBindings(AgentDispatchStore dispatches, AgentResultProducerRegistry producers) {
+        if (this.dispatches != dispatches || this.producers != producers) throw invalid();
     }
 
     AgentDispatchStore.Intent lockDispatch(AgentResultProducerRegistry.Registration registration, Entry entry) {

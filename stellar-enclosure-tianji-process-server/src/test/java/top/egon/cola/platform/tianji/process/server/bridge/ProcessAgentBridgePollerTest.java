@@ -96,6 +96,19 @@ class ProcessAgentBridgePollerTest {
     }
 
     @Test
+    void fast_polling_retains_the_minimum_durable_close_observation_interval() {
+        when(dispatchScheduler.scheduleWithFixedDelay(any(Runnable.class), eq(Duration.ofMillis(250)))).thenAnswer(call -> dispatchFuture);
+        when(maintenanceScheduler.scheduleWithFixedDelay(any(Runnable.class), eq(Duration.ofMillis(250)))).thenAnswer(call -> {
+            maintenance.set(call.getArgument(0)); return maintenanceFuture;
+        });
+        try (var poller = new ProcessAgentBridgePoller(List.of(first), List.of(producer), results, dispatchScheduler, maintenanceScheduler,
+                newWork::add, upkeep::add, 1, 1, 4, Duration.ofMillis(250), Duration.ZERO, false)) {
+            poller.start(); maintenance.get().run(); upkeep.remove().run();
+            verify(first).reconcileOnce(1, Duration.ofSeconds(1));
+        }
+    }
+
+    @Test
     void rejected_admission_releases_capacity_and_retries_the_same_worker() {
         var accepting = new java.util.concurrent.atomic.AtomicBoolean();
         try (var poller = new ProcessAgentBridgePoller(List.of(first), List.of(producer), results, dispatchScheduler, maintenanceScheduler,
