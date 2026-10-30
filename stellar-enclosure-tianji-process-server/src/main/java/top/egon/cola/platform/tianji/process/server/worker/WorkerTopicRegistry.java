@@ -59,6 +59,12 @@ public final class WorkerTopicRegistry {
                 && worker.outputs().stream().allMatch(item -> expected.outputTargets().get(item.source()).contains(item.target()));
     }
 
+    public boolean isInternalAgentDispatch(long tenantId, WorkerTask worker) {
+        if (worker == null || !acceptsModel(tenantId, worker)) return false;
+        Schema schema = schemas.get(new TopicKey(tenantId, worker.topic(), worker.schemaVersion()));
+        return schema != null && schema.internalAgentDispatch();
+    }
+
     private static Map<String, ValueType> schema(Map<String, ValueType> values) {
         if (values == null || values.size() > 16) throw invalid();
         Map<String, ValueType> copy = new HashMap<>();

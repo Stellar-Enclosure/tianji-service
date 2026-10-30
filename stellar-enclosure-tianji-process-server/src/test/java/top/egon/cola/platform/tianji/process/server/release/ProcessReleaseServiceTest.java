@@ -77,6 +77,12 @@ class ProcessReleaseServiceTest {
             var workerModel = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", worker.readAllBytes(), Map.of("amount", ValueType.INTEGER));
             assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(workerModel)));
         }
+        try (var wait = getClass().getResourceAsStream("/fixtures/agent-dispatch-wait.bpmn20.xml")) {
+            assertNotNull(wait);
+            var modelWithWait = new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", wait.readAllBytes(), Map.of("amount", ValueType.INTEGER));
+            assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(modelWithWait)));
+            assertThrows(IllegalArgumentException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, true));
+        }
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
     }
 

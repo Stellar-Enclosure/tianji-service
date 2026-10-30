@@ -9,6 +9,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerParameter;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerTask;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.MessageWait;
 
 import javax.xml.XMLConstants;
 import java.time.Duration;
@@ -36,18 +37,20 @@ public final class ProcessModelValidator {
     private static final Pattern ROUTE = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]{0,63}) == (" + STRING
             + "|" + INTEGER + "|true|false)\\}");
     private static final Map<String, Set<String>> BPMN_CHILDREN = Map.ofEntries(
-            Map.entry("definitions", Set.of("process")),
-            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "parallelGateway", "exclusiveGateway", "sequenceFlow")),
-            Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition")),
+            Map.entry("definitions", Set.of("process", "message")),
+            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow")),
+            Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition", "messageEventDefinition")),
             Map.entry("timerEventDefinition", Set.of("timeDuration")),
             Map.entry("serviceTask", Set.of("extensionElements")),
             Map.entry("extensionElements", Set.of("field", "externalWorkerInParameter", "externalWorkerOutParameter")),
             Map.entry("field", Set.of("string")), Map.entry("sequenceFlow", Set.of("conditionExpression")));
     private static final Map<String, Set<String>> BPMN_ATTRIBUTES = Map.ofEntries(
             Map.entry("definitions", Set.of("id", "name", "targetNamespace")),
+            Map.entry("message", Set.of("id", "name")), Map.entry("messageEventDefinition", Set.of("id", "messageRef")),
             Map.entry("process", Set.of("id", "name", "isExecutable")),
             Map.entry("startEvent", Set.of("id", "name")), Map.entry("endEvent", Set.of("id", "name")),
             Map.entry("userTask", Set.of("id", "name")), Map.entry("parallelGateway", Set.of("id", "name")),
+            Map.entry("eventBasedGateway", Set.of("id", "name")),
             Map.entry("serviceTask", Set.of("id", "name")), Map.entry("extensionElements", Set.of()),
             Map.entry("field", Set.of("name")), Map.entry("string", Set.of()),
             Map.entry("externalWorkerInParameter", Set.of("source", "target")),
@@ -83,6 +86,16 @@ public final class ProcessModelValidator {
         List<Element> flows = new ArrayList<>();
         Map<String, String> decisions = new LinkedHashMap<>();
         Map<String, WorkerTask> workers = new LinkedHashMap<>();
+        Map<String, String> messages = new LinkedHashMap<>();
+        Set<String> messageNames = new HashSet<>();
+        for (Element message : children(root, "message")) {
+            String id = required(message, "id");
+            String name = required(message, "name");
+            if (!IDENTIFIER.matcher(name).matches() || !messageNames.add(name) || messages.size() >= 16) throw invalid();
+            messages.put(id, name);
+        }
+        Map<String, String> messageRefs = new LinkedHashMap<>();
+        Map<String, Duration> timers = new LinkedHashMap<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
             if ("sequenceFlow".equals(kind)) {
@@ -109,15 +122,22 @@ public final class ProcessModelValidator {
                     } else throw invalid();
                 }
                 if ("intermediateCatchEvent".equals(kind)) {
-                    Element timer = only(element, "timerEventDefinition");
-                    Element duration = only(timer, "timeDuration");
-                    try {
-                        String literal = duration.getTextContent();
-                        if (!literal.equals(literal.trim())) throw invalid();
-                        Duration value = Duration.parse(literal);
-                        if (value.compareTo(Duration.ofSeconds(1)) < 0 || value.compareTo(Duration.ofDays(365)) > 0) throw invalid();
-                    } catch (RuntimeException badDuration) {
-                        throw invalid();
+                    if (children(element).size() != 1) throw invalid();
+                    if (!children(element, "messageEventDefinition").isEmpty()) {
+                        String ref = required(only(element, "messageEventDefinition"), "messageRef");
+                        if (!IDENTIFIER.matcher(ref).matches() || !messages.containsKey(ref) || messageRefs.containsValue(ref)
+                                || !IDENTIFIER.matcher(element.getAttributeNS(TIANJI_WORKER, "workerRef")).matches()) throw invalid();
+                        messageRefs.put(id, ref);
+                    } else {
+                        if (element.hasAttributeNS(TIANJI_WORKER, "workerRef")) throw invalid();
+                        Element duration = only(only(element, "timerEventDefinition"), "timeDuration");
+                        try {
+                            String literal = duration.getTextContent();
+                            if (!literal.equals(literal.trim())) throw invalid();
+                            Duration value = Duration.parse(literal);
+                            if (value.compareTo(Duration.ofSeconds(1)) < 0 || value.compareTo(Duration.ofDays(365)) > 0) throw invalid();
+                            timers.put(id, value);
+                        } catch (RuntimeException badDuration) { throw invalid(); }
                     }
                 }
             }
@@ -148,6 +168,12 @@ public final class ProcessModelValidator {
                 case "endEvent" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing != 0) throw invalid(); }
                 case "userTask", "serviceTask", "intermediateCatchEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
                 case "parallelGateway" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing < 1 || outgoing > 4) throw invalid(); }
+                case "eventBasedGateway" -> {
+                    if (node.incoming != 1 || outgoing != 2 || !workers.containsKey(node.previous.getFirst().element.getAttribute("id"))
+                            || node.next.stream().anyMatch(next -> !"intermediateCatchEvent".equals(next.kind))
+                            || node.next.stream().filter(next -> messageRefs.containsKey(next.element.getAttribute("id"))).count() != 1
+                            || node.next.stream().filter(next -> timers.containsKey(next.element.getAttribute("id"))).count() != 1) throw invalid();
+                }
                 case "exclusiveGateway" -> {
                     if (node.incoming == 1 && outgoing >= 2 && outgoing <= 4) {
                         if (++splits > 1 || !decisions.containsKey(node.previous.getFirst().element.getAttribute("id"))) throw invalid();
@@ -159,6 +185,19 @@ public final class ProcessModelValidator {
             if (!"exclusiveGateway".equals(node.kind) || outgoing == 1) {
                 for (Element flow : node.flows) if (!children(flow, "conditionExpression").isEmpty()) throw invalid();
             }
+        }
+        if (messages.size() != messageRefs.size()) throw invalid();
+        Map<String, MessageWait> waits = new LinkedHashMap<>();
+        Set<String> waitingWorkers = new HashSet<>();
+        for (var entry : messageRefs.entrySet()) {
+            FlowNode message = nodes.get(entry.getKey());
+            FlowNode gateway = message.previous.getFirst();
+            String worker = message.element.getAttributeNS(TIANJI_WORKER, "workerRef");
+            if (!"eventBasedGateway".equals(gateway.kind) || !worker.equals(gateway.previous.getFirst().element.getAttribute("id"))
+                    || !waitingWorkers.add(worker)) throw invalid();
+            String timer = gateway.next.stream().map(next -> next.element.getAttribute("id")).filter(timers::containsKey)
+                    .findFirst().orElseThrow(ProcessModelValidator::invalid);
+            waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer)));
         }
         if (start == null) throw invalid();
         ArrayDeque<FlowNode> ready = new ArrayDeque<>();
@@ -179,7 +218,7 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers);
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits);
     }
 
     private static WorkerTask workerTask(Element task, Element extension) {
@@ -378,10 +417,12 @@ public final class ProcessModelValidator {
                     && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && Set.of("topic", "schemaVersion", "effectSafety").contains(attribute.getLocalName());
             boolean workerType = BPMN.equals(namespace) && Set.of("externalWorkerInParameter", "externalWorkerOutParameter").contains(kind)
                     && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "type".equals(attribute.getLocalName());
+            boolean workerWait = BPMN.equals(namespace) && "intermediateCatchEvent".equals(kind)
+                    && TIANJI_WORKER.equals(attribute.getNamespaceURI()) && "workerRef".equals(attribute.getLocalName());
             boolean expressionType = BPMN.equals(namespace) && "conditionExpression".equals(kind)
                     && XMLConstants.W3C_XML_SCHEMA_INSTANCE_NS_URI.equals(attribute.getNamespaceURI())
                     && "type".equals(attribute.getLocalName()) && "tFormalExpression".equals(attribute.getNodeValue());
-            if (!flowableType && !flowableWorkerAttribute && !workerVersion && !workerType && !expressionType
+            if (!flowableType && !flowableWorkerAttribute && !workerVersion && !workerType && !workerWait && !expressionType
                     && (attribute.getNamespaceURI() != null || !attributes.get(kind).contains(attribute.getNodeName()))) throw invalid();
             String value = attribute.getNodeValue();
             if (value.length() > 512 || value.contains("${") || value.contains("#{")) throw invalid();

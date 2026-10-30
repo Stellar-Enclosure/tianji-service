@@ -279,6 +279,8 @@ public final class FlowableWorkerService {
         var worker = model.workerTasks().get(job.elementId());
         if (worker == null || !registration.topic().equals(worker.topic()) || !registration.schemaVersion().equals(worker.schemaVersion())
                 || !registry.acceptsModel(tenantId, worker)) throw unavailable();
+        boolean linkedWait = model.messageWaits().values().stream().anyMatch(wait -> wait.workerElementId().equals(job.elementId()));
+        if (linkedWait != registration.internalAgentDispatch()) throw unavailable();
         ValidatedProcessModel decision = null;
         if (!model.decisionTasks().isEmpty()) {
             String key = model.decisionTasks().values().iterator().next();

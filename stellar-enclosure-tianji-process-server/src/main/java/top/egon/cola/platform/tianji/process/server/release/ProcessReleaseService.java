@@ -56,6 +56,7 @@ public final class ProcessReleaseService {
     private final String schema;
     private final boolean decisionTasksEnabled;
     private final WorkerTopicRegistry workerTopics;
+    private final boolean agentMessageWaitsEnabled;
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
@@ -69,6 +70,12 @@ public final class ProcessReleaseService {
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics) {
+        this(process, dmn, validator, decisionTasksEnabled, workerTopics, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
+                                 boolean agentMessageWaitsEnabled) {
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -79,12 +86,15 @@ public final class ProcessReleaseService {
                 || process.getBeans() == null || !process.getBeans().isEmpty() || dmn.getBeans() == null || !dmn.getBeans().isEmpty()
                 || process.getDatabaseSchema() == null || !process.getDatabaseSchema().matches("[a-z_][a-z0-9_]{0,62}")
                 || !process.getDatabaseSchema().equals(dmn.getDatabaseSchema())
+                || agentMessageWaitsEnabled && workerTopics == null
                 || decisionTasksEnabled && (!(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || !dmn.isHistoryEnabled() || dmn.getDmnHistoryService() == null)) throw invalidConfiguration();
         this.decisionTasksEnabled = decisionTasksEnabled;
         this.workerTopics = workerTopics;
+        this.agentMessageWaitsEnabled = agentMessageWaitsEnabled;
         this.schema = process.getDatabaseSchema();
         if (workerTopics != null) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
+        if (agentMessageWaitsEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyAgentDispatch();
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);
@@ -225,6 +235,16 @@ public final class ProcessReleaseService {
                 WorkerNativeAvailability.require(process);
                 validator.validateWorkerBindings(processModel.model(), processModel.inputs(), decision == null ? null : decision.model());
                 if (processModel.model().workerTasks().values().stream().anyMatch(worker -> !workerTopics.acceptsModel(tenantId, worker))) throw invalid();
+            }
+            var waits = processModel.model().messageWaits();
+            if (!waits.isEmpty() && !agentMessageWaitsEnabled) throw invalid();
+            for (var wait : waits.values()) {
+                if (workerTopics == null || !workerTopics.isInternalAgentDispatch(tenantId,
+                        processModel.model().workerTasks().get(wait.workerElementId()))) throw invalid();
+            }
+            for (var entry : processModel.model().workerTasks().entrySet()) {
+                if (workerTopics.isInternalAgentDispatch(tenantId, entry.getValue())
+                        && (!agentMessageWaitsEnabled || waits.values().stream().noneMatch(wait -> wait.workerElementId().equals(entry.getKey())))) throw invalid();
             }
         }
         prepared.sort(Comparator.comparing((PreparedModel item) -> item.model().type().name())

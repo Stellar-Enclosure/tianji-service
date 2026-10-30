@@ -647,16 +647,12 @@ class ProcessServerPostgresTest {
                 Map.of("requestedAmount", Set.of("amount")), Map.of("runId", Set.of("agentRunId")), 1,
                 Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.EXTERNAL_IDEMPOTENT, true);
         var registry = new WorkerTopicRegistry(List.of(registration));
-        var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry, true);
         var runs = new ProcessExecutionService(process, dmn, validator);
         var workers = new FlowableWorkerService(process, dmn, validator, registry);
         var owner = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/20");
         var actor = registration.actor();
-        byte[] model = new String(new ClassPathResource("fixtures/worker-mapping.bpmn20.xml").getContentAsByteArray(), StandardCharsets.UTF_8)
-                .replace("workerMapping", "agentDispatch").replace("riskCheck", "agentStart")
-                .replace("TRANSACTIONAL_RECEIPT", "EXTERNAL_IDEMPOTENT")
-                .replace("source=\"approved\" target=\"approved\" tianji:type=\"BOOLEAN\"",
-                        "source=\"runId\" target=\"agentRunId\" tianji:type=\"STRING\"").getBytes(StandardCharsets.UTF_8);
+        byte[] model = new ClassPathResource("fixtures/agent-dispatch-wait.bpmn20.xml").getContentAsByteArray();
         releases.publish(owner, "agent-dispatch", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", model,
                 Map.of("amount", ValueType.INTEGER))));
         var instance = runs.start(owner, new ProcessExecutionService.StartCommand("agent-dispatch", "agentDispatch", "business-one",
@@ -666,6 +662,11 @@ class ProcessServerPostgresTest {
         var manager = (DataSourceTransactionManager) process.getTransactionManager();
         var store = new AgentDispatchStore(manager.getDataSource(), manager, SCHEMA);
         assertThrows(ProcessResourceNotFoundException.class, () -> workers.acquire(actor, new AcquireWorkerTaskCommand("agentStart", "1")));
+        var publicRegistration = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-service", "agentStart", "1",
+                registration.inputs(), registration.outputs(), registration.inputSources(), registration.outputTargets(),
+                registration.maxConcurrent(), registration.leaseDuration(), registration.retryDelay(), registration.effectSafety());
+        var drifted = new FlowableWorkerService(process, dmn, validator, new WorkerTopicRegistry(List.of(publicRegistration)));
+        assertThrows(ProcessResourceNotFoundException.class, () -> drifted.acquire(actor, new AcquireWorkerTaskCommand("agentStart", "1")));
         var task = workers.acquireAgentDispatch(binding).task();
         assertNotNull(task);
         var intent = workers.prepareAgentDispatch(actor, task, binding, store);
@@ -696,7 +697,26 @@ class ProcessServerPostgresTest {
         assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, workers.completeAgentDispatch(actor, task, binding, store, "probe-run").outcome());
         assertEquals(AgentDispatchStore.State.ACKNOWLEDGED,
                 store.refresh(intent.seed().key(), true).state());
-        await().atMost(Duration.ofSeconds(10)).until(() -> process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count() == 1);
+        await().atMost(Duration.ofSeconds(10)).until(() -> process.getRuntimeService().createEventSubscriptionQuery()
+                .processInstanceId(instance.instanceId()).eventType("message").eventName("TianjiAgentFinishedV1").count() == 1);
+        var subscription = process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(instance.instanceId())
+                .eventType("message").eventName("TianjiAgentFinishedV1").singleResult();
+        assertEquals("waitResult", subscription.getActivityId());
+        assertEquals("20", subscription.getTenantId());
+        assertEquals(1, process.getManagementService().createTimerJobQuery().processInstanceId(instance.instanceId()).count());
+        assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count());
+        var ownerTransaction = new TransactionTemplate(manager);
+        assertThrows(IllegalStateException.class, () -> ownerTransaction.execute(status -> {
+            process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId());
+            throw new IllegalStateException("controlled rollback after message delivery");
+        }));
+        assertEquals(1, process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(instance.instanceId()).eventType("message").count());
+        assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count());
+        process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId());
+        assertEquals(1, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).taskDefinitionKey("review").count());
+        assertEquals(0, process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(instance.instanceId()).count());
+        assertEquals(0, process.getManagementService().createTimerJobQuery().processInstanceId(instance.instanceId()).count());
+        assertThrows(RuntimeException.class, () -> process.getRuntimeService().messageEventReceived("TianjiAgentFinishedV1", subscription.getExecutionId()));
         assertEquals("probe-run", process.getRuntimeService().getVariable(instance.instanceId(), "agentRunId"));
         process.getRuntimeService().deleteProcessInstance(instance.instanceId(), "controlled cancellation");
         var client = mock(LinkedAgentClient.class);

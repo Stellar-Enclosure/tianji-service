@@ -1,7 +1,14 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
+import org.flowable.bpmn.converter.BpmnXMLConverter;
+import org.flowable.bpmn.model.EventGateway;
+import org.flowable.bpmn.model.IntermediateCatchEvent;
+import org.flowable.bpmn.model.MessageEventDefinition;
+import org.flowable.bpmn.model.TimerEventDefinition;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.time.Duration;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 
@@ -12,6 +19,49 @@ import static top.egon.cola.platform.tianji.process.server.release.ValidatedProc
 
 class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
+
+    @Test
+    void fixed_flowable_converter_retains_the_literal_subscription_and_competing_timer() throws Exception {
+        byte[] xml = fixture("agent-dispatch-wait.bpmn20.xml");
+        var nativeModel = new BpmnXMLConverter().convertToBpmnModel(
+                () -> new ByteArrayInputStream(xml), true, true);
+        var process = nativeModel.getMainProcess();
+        assertInstanceOf(EventGateway.class, process.getFlowElement("resultGateway"));
+        var message = assertInstanceOf(IntermediateCatchEvent.class, process.getFlowElement("waitResult"));
+        var definition = assertInstanceOf(MessageEventDefinition.class, message.getEventDefinitions().getFirst());
+        assertEquals("TianjiAgentFinishedV1", nativeModel.getMessage(definition.getMessageRef()).getName());
+        assertNull(definition.getMessageExpression());
+        var timer = assertInstanceOf(IntermediateCatchEvent.class, process.getFlowElement("waitTimeout"));
+        var timerDefinition = assertInstanceOf(TimerEventDefinition.class, timer.getEventDefinitions().getFirst());
+        assertEquals("PT5M", timerDefinition.getTimeDuration());
+    }
+
+    @Test
+    void message_waits_bind_one_worker_to_a_literal_message_and_a_competing_bounded_timer() throws Exception {
+        String xml = new String(fixture("agent-dispatch-wait.bpmn20.xml"), StandardCharsets.UTF_8);
+        var model = validator.validateBpmn(bytes(xml), "agentDispatch");
+        assertEquals(Map.of("waitResult", new ValidatedProcessModel.MessageWait("TianjiAgentFinishedV1", "worker", "waitTimeout",
+                Duration.ofMinutes(5))), model.messageWaits());
+        validator.validateWorkerBindings(model, Map.of("amount", INTEGER), null);
+        assertThrows(UnsupportedOperationException.class, () -> model.messageWaits().clear());
+        for (String unsafe : new String[] {
+                xml.replace("name=\"TianjiAgentFinishedV1\"", "name=\"${execution.tenantId}\""),
+                xml.replace("messageRef=\"agentFinished\"", "messageRef=\"other:agentFinished\""),
+                xml.replace("messageRef=\"agentFinished\"", "messageRef=\"missing\""),
+                xml.replace("tianji:workerRef=\"worker\"", "tianji:workerRef=\"review\""),
+                xml.replace("tianji:workerRef=\"worker\"", ""),
+                xml.replace("<eventBasedGateway id=\"resultGateway\"/>", "<parallelGateway id=\"resultGateway\"/>"),
+                xml.replace("targetRef=\"worker\"", "targetRef=\"resultGateway\""),
+                xml.replace("<timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>",
+                        "<messageEventDefinition messageRef=\"agentFinished\"/>"),
+                xml.replace("<messageEventDefinition messageRef=\"agentFinished\"/>",
+                        "<messageEventDefinition messageRef=\"agentFinished\" flowable:messageExpression=\"evil\"/>"),
+                xml.replace("<message id=\"agentFinished\"", "<message id=\"unused\" name=\"Unused\"/><message id=\"agentFinished\""),
+                xml.replace("PT5M", "PT0.01S"), xml.replace("PT5M", "${timeout}"),
+                xml.replace("<messageEventDefinition messageRef=\"agentFinished\"/>",
+                        "<messageEventDefinition messageRef=\"agentFinished\"/><timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>")
+        }) assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(unsafe), "agentDispatch"));
+    }
 
     @Test
     void accepts_packaged_bpmn_and_dmn_and_retains_only_defensive_copies() throws Exception {
