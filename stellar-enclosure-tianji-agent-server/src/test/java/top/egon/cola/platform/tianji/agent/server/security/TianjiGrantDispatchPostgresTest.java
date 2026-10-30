@@ -50,7 +50,7 @@ class TianjiGrantDispatchPostgresTest {
             throw new IllegalStateException("dispatch tests require a fresh Agent database");
         }
         var flyway = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         flyway.migrate(); flyway.validate();
         var ledger = new AgentLedgerService(source); var store = new AgentExecutionGrantStore(source, ledger);
         URI issuer = URI.create("https://idp.example/tenants/88"), resource = URI.create("https://api.example/tianji");

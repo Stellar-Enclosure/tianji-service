@@ -109,6 +109,10 @@ public final class VersionedMemoryEmbeddingModel implements EmbeddingModel {
         return call(new EmbeddingRequest(List.of(document.getText()), EmbeddingOptions.builder().build())).getResult().getOutput();
     }
 
+    @Override public String getEmbeddingContent(Document document) {
+        if (document == null || document.getText() == null) throw unsupported(); return document.getText();
+    }
+
     private void current() { if (!defaultsSha256.equals(optionsFingerprint())) throw unavailable(); }
 
     private String optionsFingerprint() {

@@ -53,7 +53,7 @@ class AgentContextSnapshotPostgresTest {
         var checksums = jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version IS NOT NULL ORDER BY installed_rank");
         assertThrows(AgentLedgerException.class, () -> new AgentStorageVerifier(source).verifyContextSnapshots());
         var after = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         assertEquals(1, after.migrate().migrationsExecuted); after.validate();
         assertEquals(checksums, jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version IN ('1','2','3','4','5','6','7','8') ORDER BY installed_rank"));
         var ledger = new AgentLedgerService(source); ledger.verifyContextSnapshotStorage();

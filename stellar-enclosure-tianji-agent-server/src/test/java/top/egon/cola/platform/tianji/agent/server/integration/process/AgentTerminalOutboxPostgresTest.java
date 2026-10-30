@@ -67,7 +67,7 @@ class AgentTerminalOutboxPostgresTest {
         var jdbc = new JdbcTemplate(source);
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='tianji_agent'", Integer.class));
         var agent = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         agent.migrate(); agent.validate();
         var component = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
                 .table("tianji_agent_outbox_schema_history").baselineOnMigrate(true).baselineVersion("0")

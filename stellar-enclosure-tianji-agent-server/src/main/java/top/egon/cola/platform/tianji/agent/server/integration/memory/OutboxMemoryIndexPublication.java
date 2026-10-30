@@ -1,0 +1,42 @@
+package top.egon.cola.platform.tianji.agent.server.integration.memory;
+
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import top.egon.cola.component.outbox.api.OutboxMessage;
+import top.egon.cola.component.outbox.api.TransactionalOutbox;
+import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
+import top.egon.cola.component.outbox.transaction.OutboxTransactionGuard;
+import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
+
+import javax.sql.DataSource;
+import java.util.Map;
+import java.util.Objects;
+
+/** Enlists reference-only build/deletion intentions in the exact transaction that changes Memory facts. */
+public final class OutboxMemoryIndexPublication implements MemoryIndexPublication {
+    public static final String CHANNEL = "tianji-memory-index";
+    public static final String DESTINATION = "agent-memory";
+    static final String FINGERPRINT = "tianji-memory-index-fingerprint";
+    private final DataSource source;
+    private final Binding binding;
+    private final TransactionalOutbox outbox;
+    private final OutboxTransactionGuard guard;
+
+    public OutboxMemoryIndexPublication(DataSource source, OutboxInfrastructure infrastructure, TransactionalOutbox outbox, Binding binding) {
+        if (source == null || infrastructure == null || infrastructure.dataSource() != source
+                || !(infrastructure.transactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() != source) {
+            throw new IllegalArgumentException("Memory Outbox requires the selected fact DataSource and JDBC manager");
+        }
+        this.source = source; this.binding = Objects.requireNonNull(binding, "binding"); this.outbox = Objects.requireNonNull(outbox, "outbox");
+        guard = new OutboxTransactionGuard(source);
+    }
+    @Override public boolean usesDataSource(DataSource candidate) { return candidate == source; }
+    @Override public Binding binding() { return binding; }
+
+    @Override public void publish(Event event) {
+        guard.requireSelectedTransaction(); Objects.requireNonNull(event, "event");
+        if (event.action() == Action.BUILD && !binding.modelRef().equals(event.modelRef())) throw new IllegalArgumentException("Memory event model does not match its publication binding");
+        var receipt = outbox.enqueue(OutboxMessage.builder().messageId(event.eventId()).idempotencyKey(event.eventId()).channel(CHANNEL).destination(DESTINATION)
+                .schemaVersion("1").contentType("application/json").payload(MemoryIndexEventJson.encode(event)).headers(Map.of(FINGERPRINT, event.fingerprint())).build());
+        if (receipt == null || !event.eventId().equals(receipt.messageId()) || !event.eventId().equals(receipt.idempotencyKey())) throw new IllegalStateException("Memory index Outbox receipt does not match its intention");
+    }
+}

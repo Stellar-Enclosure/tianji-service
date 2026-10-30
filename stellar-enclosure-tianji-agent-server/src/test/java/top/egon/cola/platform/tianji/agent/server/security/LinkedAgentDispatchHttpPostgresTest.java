@@ -68,7 +68,7 @@ class LinkedAgentDispatchHttpPostgresTest {
             throw new IllegalStateException("linked HTTP test schema already exists");
         }
         var flyway = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         flyway.migrate(); flyway.validate();
         var ledger = new AgentLedgerService(source); var submissions = new AgentLinkedSubmissionService(source, ledger);
         URI issuer = URI.create("https://idp.example/tenant/20");

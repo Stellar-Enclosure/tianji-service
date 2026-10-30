@@ -23,7 +23,7 @@ class TianjiAgentStoragePostgresTest {
         var jdbc = new JdbcTemplate(migrationSource);
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='tianji_agent'", Integer.class));
         var flyway = Flyway.configure().dataSource(migrationSource).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         flyway.migrate(); flyway.validate();
 
         runner(url).run(context -> {

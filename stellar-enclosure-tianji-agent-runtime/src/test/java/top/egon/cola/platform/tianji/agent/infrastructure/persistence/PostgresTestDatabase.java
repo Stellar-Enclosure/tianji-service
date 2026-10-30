@@ -29,7 +29,7 @@ final class PostgresTestDatabase {
             throw new IllegalStateException("integration tests require a fresh database without a Tianji schema");
         }
         Flyway flyway = Flyway.configure().dataSource(candidate).schemas("tianji_agent")
-                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent")
+                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").target("9")
                 .cleanDisabled(true).load();
         flyway.migrate();
         flyway.validate();

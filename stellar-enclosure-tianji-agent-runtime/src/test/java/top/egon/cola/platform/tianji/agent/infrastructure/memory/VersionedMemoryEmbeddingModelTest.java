@@ -15,6 +15,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -44,9 +45,10 @@ class VersionedMemoryEmbeddingModelTest {
     void the_vectorstore_document_batch_path_reaches_one_explicit_model_call() {
         var delegate = mock(EmbeddingModel.class); when(delegate.call(any(EmbeddingRequest.class))).thenReturn(response(MODEL, new float[]{1, 0}, 0));
         var model = new VersionedMemoryEmbeddingModel(profile(8191), delegate, VersionedMemoryEmbeddingModelTest::defaults);
-        var result = model.embed(List.of(new Document("private fact")), EmbeddingOptions.builder().build(), documents -> List.of(documents));
+        var result = model.embed(List.of(new Document("private fact", Map.of("ownerId", "private-owner-id"))), EmbeddingOptions.builder().build(), documents -> List.of(documents));
         assertEquals(1, result.size()); assertArrayEquals(new float[]{1, 0}, result.getFirst());
         verify(delegate, times(1)).call(any(EmbeddingRequest.class)); verify(delegate, never()).dimensions();
+        verify(delegate).call(argThat((EmbeddingRequest value) -> value.getInstructions().equals(List.of("private fact"))));
     }
 
     @Test

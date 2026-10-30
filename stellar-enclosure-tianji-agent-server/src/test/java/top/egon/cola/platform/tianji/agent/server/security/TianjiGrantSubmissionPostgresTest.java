@@ -82,7 +82,7 @@ class TianjiGrantSubmissionPostgresTest {
             throw new IllegalStateException("grant HTTP tests require a fresh Agent database");
         }
         var flyway = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         flyway.migrate(); flyway.validate(); ledger = new AgentLedgerService(source); store = new AgentExecutionGrantStore(source, ledger);
         var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(20), Duration.ofSeconds(10),
                 5, 0, 1000, 500, new BigDecimal("2.00"), "USD", 2, Set.of(), null, null);

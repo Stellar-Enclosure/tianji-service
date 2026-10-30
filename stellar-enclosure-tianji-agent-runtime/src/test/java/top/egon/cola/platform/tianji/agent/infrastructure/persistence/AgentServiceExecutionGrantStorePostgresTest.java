@@ -234,7 +234,7 @@ class AgentServiceExecutionGrantStorePostgresTest {
     }
     private static Flyway flyway(String target) {
         var config = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent")
-                .locations("classpath:db/tianji-agent").cleanDisabled(true);
+                .locations("classpath:db/tianji-agent").target("9").cleanDisabled(true);
         if (target != null) config.target(target);
         return config.load();
     }

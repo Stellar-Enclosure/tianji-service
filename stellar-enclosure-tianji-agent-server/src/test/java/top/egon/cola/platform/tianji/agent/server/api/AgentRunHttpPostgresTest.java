@@ -77,7 +77,7 @@ class AgentRunHttpPostgresTest {
             throw new IllegalStateException("HTTP integration tests require an empty database");
         }
         var flyway = Flyway.configure().dataSource(dataSource).schemas("tianji_agent")
-                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").cleanDisabled(true).load();
+                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").target("9").cleanDisabled(true).load();
         flyway.migrate();
         flyway.validate();
         ledger = new AgentLedgerService(dataSource);
