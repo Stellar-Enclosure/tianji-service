@@ -57,6 +57,11 @@ public class ProcessStorageConfiguration {
                     || !(context instanceof WebApplicationContext))) {
                 throw new IllegalStateException("Worker API requires an enabled servlet Process API");
             }
+            if (environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false)
+                    && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false)
+                    || !(context instanceof WebApplicationContext))) {
+                throw new IllegalStateException("Agent result Inbox requires an enabled servlet Process API");
+            }
         };
     }
 

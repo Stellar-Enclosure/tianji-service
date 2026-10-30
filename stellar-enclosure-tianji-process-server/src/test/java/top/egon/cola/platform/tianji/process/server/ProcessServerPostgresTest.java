@@ -51,6 +51,8 @@ import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRe
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultCorrelationService;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
+import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
@@ -83,6 +85,7 @@ import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
+import top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
@@ -809,7 +812,15 @@ class ProcessServerPostgresTest {
         releases.publish(owner, "inbox-release", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "inboxProcess", model, Map.of("amount", ValueType.INTEGER))));
         var first = prepareInboxProbe(runs, workers, dispatches, binding, owner, "inbox-release", "first");
         var event = inboxEvent(first, binding, AgentRunStatusEnum.COMPLETED);
-        var received = inbox.receive(producer, event);
+        var receiverAccess = mock(TianjiProcessAccess.class);
+        when(receiverAccess.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API)).thenReturn(producer);
+        var receiver = MockMvcBuilders.standaloneSetup(new AgentResultInboxController(inbox, receiverAccess))
+                .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
+        var receiverJson = JsonMapper.builder().build();
+        byte[] receivedBytes = receiver.perform(post("/api/tianji/v1/agent-result-inbox").contentType(MediaType.APPLICATION_JSON)
+                        .content(receiverJson.writeValueAsBytes(event))).andExpect(status().isAccepted())
+                .andExpect(header().string("Cache-Control", "no-store")).andReturn().getResponse().getContentAsByteArray();
+        var received = receiverJson.readValue(receivedBytes, AgentResultReceipt.class);
         assertEquals(AgentResultReceiptStateEnum.RECEIVED, results.apply(grant, event.eventId()).state());
         assertNull(dispatches.refresh(first.intent().seed().key(), true).runId());
         dispatches.record(first.intent().seed().key(), first.intent().query(), new LinkedAgentSubmissionDTO(false, first.run()));

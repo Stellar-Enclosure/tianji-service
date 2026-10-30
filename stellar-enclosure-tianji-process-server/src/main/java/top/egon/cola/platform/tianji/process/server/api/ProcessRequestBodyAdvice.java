@@ -8,14 +8,20 @@ import org.springframework.http.converter.HttpMessageConverter;
 import org.springframework.web.bind.annotation.ControllerAdvice;
 import org.springframework.web.servlet.mvc.method.annotation.RequestBodyAdviceAdapter;
 import tools.jackson.core.StreamReadFeature;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.json.JsonFactory;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.MapperFeature;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.cfg.EnumFeature;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -29,23 +35,31 @@ import java.util.Set;
 public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 9 * 1_048_576;
     static final int MAX_WORKER_BYTES = 256 * 1024;
+    static final int MAX_AGENT_RESULT_BYTES = 64 * 1024;
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
+    private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
+                    .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(8).maxStringLength(4096)
+                            .maxNameLength(64).maxNumberLength(20).maxTokenCount(256).build()).build())
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
 
     @Override
     public boolean supports(MethodParameter parameter, Type type, Class<? extends HttpMessageConverter<?>> converter) {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
-                || workerCommand(type);
+                || workerCommand(type) || type == AgentTerminalEvent.class;
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
-        int maxBytes = workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
+        int maxBytes = type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
         if (input.getHeaders().getContentLength() > maxBytes) throw new TooLarge();
         byte[] body = input.getBody().readNBytes(maxBytes + 1);
         if (body.length > maxBytes) throw new TooLarge();
         if (workerCommand(type)) validateWorkerBody(body, type);
+        if (type == AgentTerminalEvent.class) validateAgentResult(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -69,6 +83,34 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             throw new IllegalArgumentException("Worker request is invalid");
         }
     }
+
+    private static void validateAgentResult(byte[] body) {
+        Set<String> required = Set.of("schemaVersion", "producerId", "eventId", "tenantId", "ownerIssuerSha256", "ownerSubjectId",
+                "idempotencyKey", "link", "definitionKey", "definitionVersion", "runId", "terminalRevision", "status", "finishedAt",
+                "resultSha256", "sideEffectOutcome");
+        Set<String> linkFields = Set.of("sourceId", "scopeType", "scopeInstanceId", "activityOccurrenceId", "definitionContentSha256", "dispatchNotAfter");
+        try {
+            var root = STRICT_AGENT_RESULT_JSON.readTree(body);
+            if (root == null || !root.isObject()) throw invalidAgentResult();
+            var fields = Set.copyOf(root.propertyNames());
+            if (!fields.containsAll(required) || fields.stream().anyMatch(name -> !required.contains(name) && !"errorCode".equals(name))) throw invalidAgentResult();
+            for (String name : Set.of("schemaVersion", "tenantId", "definitionVersion", "terminalRevision")) {
+                if (!root.get(name).isIntegralNumber() || !root.get(name).canConvertToLong()) throw invalidAgentResult();
+            }
+            strings(root, Set.of("producerId", "eventId", "ownerIssuerSha256", "ownerSubjectId", "idempotencyKey", "definitionKey", "runId",
+                    "status", "finishedAt", "resultSha256", "sideEffectOutcome"));
+            if (root.get("errorCode") != null && !root.get("errorCode").isNull() && !root.get("errorCode").isString()) throw invalidAgentResult();
+            var link = root.get("link");
+            if (link == null || !link.isObject() || !Set.copyOf(link.propertyNames()).equals(linkFields)) throw invalidAgentResult();
+            strings(link, linkFields);
+            STRICT_AGENT_RESULT_JSON.readValue(body, AgentTerminalEvent.class);
+        } catch (RuntimeException invalid) { throw invalidAgentResult(); }
+    }
+
+    private static void strings(JsonNode node, Set<String> names) {
+        for (String name : names) if (node.get(name) == null || !node.get(name).isString()) throw invalidAgentResult();
+    }
+    private static IllegalArgumentException invalidAgentResult() { return new IllegalArgumentException("Agent result event is invalid"); }
 
     static final class TooLarge extends RuntimeException { }
 }

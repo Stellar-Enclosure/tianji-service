@@ -51,7 +51,8 @@ public final class ProcessApiErrors {
     @ExceptionHandler(AccessDeniedException.class)
     ResponseEntity<OrchestrationErrorDTO> denied() { return error(HttpStatus.FORBIDDEN, "TIANJI_PERMISSION_DENIED"); }
 
-    @ExceptionHandler({DataAccessException.class, IllegalStateException.class})
+    @ExceptionHandler({DataAccessException.class, IllegalStateException.class,
+            top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient.AuthorizationUnavailableException.class})
     ResponseEntity<OrchestrationErrorDTO> unavailable(RuntimeException failure) {
         log.warn("Process API dependency failure: type={}", failure.getClass().getName());
         return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");

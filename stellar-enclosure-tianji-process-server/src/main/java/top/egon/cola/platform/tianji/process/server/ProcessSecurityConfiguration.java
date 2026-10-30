@@ -15,6 +15,7 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.web.filter.RequestContextFilter;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
@@ -29,6 +30,10 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
@@ -49,7 +54,9 @@ public class ProcessSecurityConfiguration {
             ObjectProvider<PermissionExecutionGuard> policies) throws Exception {
         boolean enabled = environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
+        boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
+        if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -59,6 +66,7 @@ public class ProcessSecurityConfiguration {
                             "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                             "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**").authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
+                    if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     authorize.anyRequest().denyAll();
                 });
         if (enabled) {
@@ -95,7 +103,7 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy processEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
-                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**"),
+                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox"),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**"), true);
@@ -170,6 +178,38 @@ public class ProcessSecurityConfiguration {
             var configuration = processConfiguration(process);
             WorkerNativeAvailability.requireConfigured(configuration);
             return new FlowableWorkerService(configuration, decisionConfiguration(dmn), validator, registry);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "agent-results.enabled"}, havingValue = "true")
+    @EnableConfigurationProperties(AgentResultInboxProperties.class)
+    static class AgentResultConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(AgentResultProducerRegistry.class)
+        AgentResultProducerRegistry agentResultProducerRegistry(AgentResultInboxProperties properties) {
+            return new AgentResultProducerRegistry(properties.registrations());
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(AgentDispatchStore.class)
+        AgentDispatchStore agentDispatchStore(ProcessEngine engine) {
+            var configuration = processConfiguration(engine);
+            if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) {
+                throw new IllegalStateException("Agent result Inbox requires shared JDBC storage");
+            }
+            return new AgentDispatchStore(manager.getDataSource(), manager, configuration.getDatabaseSchema());
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(AgentResultInbox.class)
+        AgentResultInbox agentResultInbox(ProcessEngine engine, AgentDispatchStore dispatches, AgentResultProducerRegistry producers,
+                                           AgentResultInboxProperties properties) {
+            var configuration = processConfiguration(engine);
+            if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) {
+                throw new IllegalStateException("Agent result Inbox requires shared JDBC storage");
+            }
+            return new AgentResultInbox(manager.getDataSource(), manager, configuration.getDatabaseSchema(), dispatches, producers, properties.pendingRetention());
         }
     }
 

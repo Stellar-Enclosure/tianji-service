@@ -9,6 +9,9 @@ import org.springframework.security.config.annotation.web.configuration.EnableWe
 import org.springframework.web.servlet.config.annotation.EnableWebMvc;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.WorkerController;
+import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
@@ -38,10 +41,15 @@ class ProcessApiConfigurationTest {
             assertThat(context).hasNotFailed();
             assertThat(context).doesNotHaveBean(ProcessController.class);
             assertThat(context).doesNotHaveBean(WorkerController.class);
+            assertThat(context).doesNotHaveBean(AgentResultInboxController.class);
         });
         runner.withPropertyValues("stellar.tianji.process.worker.enabled=true").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseMessage("Worker API requires the Process API security boundary");
+        });
+        runner.withPropertyValues("stellar.tianji.process.agent-results.enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Agent result Inbox requires the Process API security boundary");
         });
         runner.withPropertyValues("stellar.tianji.process.api.enabled=true")
                 .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
@@ -53,6 +61,24 @@ class ProcessApiConfigurationTest {
                     assertThat(context).hasFailed();
                     assertThat(context.getStartupFailure()).hasRootCauseMessage(
                             "Tianji Process API requires both identity and permission filters in its security chain");
+                });
+    }
+
+    @Test
+    void inbox_enablement_requires_an_operator_owned_producer_registry() {
+        runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.agent-results.enabled=true")
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean(AgentDispatchStore.class, () -> mock(AgentDispatchStore.class))
+                .withBean(AgentResultInbox.class, () -> mock(AgentResultInbox.class))
+                .run(context -> {
+                    assertThat(context).hasFailed();
+                    assertThat(context.getStartupFailure()).hasRootCauseMessage("Agent result producer binding is invalid");
                 });
     }
 
@@ -110,6 +136,8 @@ class ProcessApiConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("POST", "/api/tianji/v1/worker-tasks/complete")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
+        assertThat(policy.requirement(new MockHttpServletRequest("POST", "/api/tianji/v1/agent-result-inbox")))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
     }
@@ -117,6 +145,6 @@ class ProcessApiConfigurationTest {
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class})
     static class TestWeb { }
 }

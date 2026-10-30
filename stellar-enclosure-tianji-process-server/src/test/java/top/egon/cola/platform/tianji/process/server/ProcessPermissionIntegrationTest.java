@@ -19,6 +19,16 @@ import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
 import top.egon.cola.platform.tianji.process.server.api.WorkerController;
+import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -79,6 +89,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.Base64;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -99,10 +110,12 @@ class ProcessPermissionIntegrationTest {
     private final AtomicReference<Set<String>> granted = new AtomicReference<>(Set.of(TianjiProcessPermissions.READ));
     private final AtomicReference<String> snapshotIssuer = new AtomicReference<>("https://idp.example/tenants/20");
     private final AtomicReference<Set<String>> serviceGranted = new AtomicReference<>(resources());
+    private final AtomicBoolean serviceAvailable = new AtomicBoolean(true);
     private final PermissionManifest manifest = manifest();
     private final Rbac3AuthorizationClient client = new Rbac3AuthorizationClient() {
         @Override public SystemAuthorizationSnapshot fetch(String system, IdentityPrincipal principal) { return snapshot(granted.get()); }
         @Override public ServicePolicySnapshot fetchPolicy(String system, ServiceIdentityPrincipal principal) {
+            if (!serviceAvailable.get()) throw new AuthorizationUnavailableException("private-backend-details");
             return new ServicePolicySnapshot(SCOPE, "1", "3", binding(), serviceGranted.get(), NOW.plusSeconds(30));
         }
     };
@@ -280,6 +293,89 @@ class ProcessPermissionIntegrationTest {
     }
 
     @Test
+    void inbox_http_requires_current_service_scope_policy_and_the_registered_dispatch_owner() {
+        var verifier = mock(IdpJwtVerifier.class);
+        URI issuer = URI.create("https://idp.example/tenants/20");
+        var service = new ServiceIdentityPrincipal("agent-result-service", "20", "agent-result-service", "result-token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_SCOPE),
+                "xingyuan", "agent", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        var noScope = new ServiceIdentityPrincipal("agent-result-service", "20", "agent-result-service", "result-token-id",
+                URI.create("https://api.example/tianji"), 1, Set.of(TianjiProcessPermissions.READ_SCOPE),
+                "xingyuan", "agent", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        when(verifier.verifyService("result-token")).thenReturn(new AccessTokenVerification.Valid<>(service,
+                Set.of(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_SCOPE), null, issuer));
+        when(verifier.verifyService("no-result-scope")).thenReturn(new AccessTokenVerification.Valid<>(noScope,
+                Set.of(TianjiProcessPermissions.READ_SCOPE), null, issuer));
+        when(verifier.verifyService("result-user-token")).thenReturn(new AccessTokenVerification.Invalid<>("PRINCIPAL_TYPE_MISMATCH"));
+        var policy = new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy();
+        var identity = IdpBearerAuthenticationFilter.create(new UserAccessTokenVerifier(verifier), new ServiceAccessTokenVerifier(verifier), policy,
+                new com.fasterxml.jackson.databind.ObjectMapper(), new VerifiedTenantContextFilter(), verifier);
+        var authorization = new Rbac3BearerAuthenticationFilter(new AuthorizationSnapshotLoader(client, "tianji", CLOCK), new com.fasterxml.jackson.databind.ObjectMapper());
+        var actor = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "agent-result-service", issuer.toString());
+        var owner = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "process-worker", issuer.toString());
+        var producerRegistry = new AgentResultProducerRegistry(List.of(new AgentResultProducerRegistry.Registration(actor, "agent-east", "process-east", owner)));
+        var inbox = mock(AgentResultInbox.class);
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "occurrence", DIGEST,
+                NOW.plusSeconds(60).truncatedTo(java.time.temporal.ChronoUnit.MICROS));
+        var event = new AgentTerminalEvent(1, "agent-east", AgentTerminalEvent.eventIdFor("agent-east", 20, owner.issuerFingerprint(), owner.subjectId(), "run-one", 3),
+                20, owner.issuerFingerprint(), owner.subjectId(), "intent", link, "review", 1, "run-one", 3, AgentRunStatusEnum.COMPLETED,
+                NOW.truncatedTo(java.time.temporal.ChronoUnit.MICROS), DIGEST, null, "UNKNOWN");
+        when(inbox.receive(eq(actor), any(AgentTerminalEvent.class))).thenAnswer(call -> {
+            AgentTerminalEvent accepted = call.getArgument(1);
+            producerRegistry.require(actor, accepted);
+            return new AgentResultReceipt(accepted.eventId(), accepted.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, accepted.finishedAt());
+        });
+        new WebApplicationContextRunner().withUserConfiguration(TestWeb.class)
+                .withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.agent-results.enabled=true",
+                        "egon.cola.platform.tianquan.shoubing.register-filter=false", "egon.cola.platform.tianquan.jianshen.register-filter=false")
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean(AgentDispatchStore.class, () -> mock(AgentDispatchStore.class))
+                .withBean(AgentResultProducerRegistry.class, () -> producerRegistry)
+                .withBean(AgentResultInbox.class, () -> inbox)
+                .withBean(PermissionExecutionGuard.class, this::guard)
+                .withBean(IdpBearerAuthenticationFilter.class, () -> identity)
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> authorization)
+                .run(context -> assertDoesNotThrow(() -> {
+                    assertNull(context.getStartupFailure());
+                    var mvc = MockMvcBuilders.webAppContextSetup((WebApplicationContext) context.getSourceApplicationContext()).apply(springSecurity()).build();
+                    byte[] body = tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsBytes(event);
+                    String path = "/api/tianji/v1/agent-result-inbox";
+                    mvc.perform(post(path).contentType("application/json").content(body)).andExpect(status().isUnauthorized());
+                    var response = mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer result-token"))
+                            .andExpect(status().isAccepted()).andExpect(jsonPath("$.state").value("RECEIVED")).andReturn();
+                    assertNull(response.getRequest().getAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer"));
+                    assertNull(SecurityContextHolder.getContext().getAuthentication());
+                    mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer result-user-token"))
+                            .andExpect(status().isUnauthorized());
+                    mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer no-result-scope"))
+                            .andExpect(status().isForbidden());
+                    mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer result-token")
+                            .header("X-Egon-Tianji-Tenant", "21")).andExpect(status().isConflict());
+                    var otherOwner = new AgentTerminalEvent(1, "agent-east", AgentTerminalEvent.eventIdFor("agent-east", 20, owner.issuerFingerprint(), "another-worker", "run-one", 3),
+                            20, owner.issuerFingerprint(), "another-worker", "intent", link, "review", 1, "run-one", 3, event.status(), event.finishedAt(), DIGEST, null, "UNKNOWN");
+                    mvc.perform(post(path).contentType("application/json").content(tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsBytes(otherOwner))
+                            .header("Authorization", "Bearer result-token")).andExpect(status().isNotFound());
+                    var otherTenant = new AgentTerminalEvent(1, "agent-east", AgentTerminalEvent.eventIdFor("agent-east", 21, owner.issuerFingerprint(), owner.subjectId(), "run-one", 3),
+                            21, owner.issuerFingerprint(), owner.subjectId(), "intent", link, "review", 1, "run-one", 3, event.status(), event.finishedAt(), DIGEST, null, "UNKNOWN");
+                    mvc.perform(post(path).contentType("application/json").content(tools.jackson.databind.json.JsonMapper.builder().build().writeValueAsBytes(otherTenant))
+                            .header("Authorization", "Bearer result-token")).andExpect(status().isNotFound());
+                    serviceAvailable.set(false);
+                    var unavailable = mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer result-token"))
+                            .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE")).andReturn();
+                    assertFalse(unavailable.getResponse().getContentAsString().contains("private-backend-details"));
+                    serviceAvailable.set(true);
+                    var reduced = new java.util.HashSet<>(resources()); reduced.remove(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API);
+                    serviceGranted.set(Set.copyOf(reduced));
+                    mvc.perform(post(path).contentType("application/json").content(body).header("Authorization", "Bearer result-token"))
+                            .andExpect(status().isForbidden());
+                    verify(inbox, times(1)).receive(actor, event);
+                }));
+    }
+
+    @Test
     void each_resource_requires_its_current_permission_and_matching_user_scope() {
         var request = new MockHttpServletRequest();
         VerifiedUserTokenCarrier.set(request, "verified-test-token");
@@ -361,7 +457,9 @@ class ProcessPermissionIntegrationTest {
                 workerResource(TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_REPORT,
                         TianjiProcessPermissions.WORKER_REPORT_SCOPE, "/api/tianji/v1/worker-tasks/complete", "api.worker.complete"),
                 workerResource(TianjiProcessPermissions.WORKER_FAIL_API, TianjiProcessPermissions.WORKER_REPORT,
-                        TianjiProcessPermissions.WORKER_REPORT_SCOPE, "/api/tianji/v1/worker-tasks/fail", "api.worker.fail"));
+                        TianjiProcessPermissions.WORKER_REPORT_SCOPE, "/api/tianji/v1/worker-tasks/fail", "api.worker.fail"),
+                workerResource(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API, TianjiProcessPermissions.AGENT_RESULT_RECEIVE,
+                        TianjiProcessPermissions.AGENT_RESULT_RECEIVE_SCOPE, "/api/tianji/v1/agent-result-inbox", "api.agent.result.receive"));
         return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
                 new PermissionManifest.Producer("tianji-process-java", PermissionManifest.ProducerKind.JAVA,
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji.api.process."), List.of("process-server"),
@@ -369,7 +467,7 @@ class ProcessPermissionIntegrationTest {
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
                 List.of(), List.of(TianjiProcessPermissions.READ, TianjiProcessPermissions.START, TianjiProcessPermissions.RELEASE_READ,
                 TianjiProcessPermissions.RELEASE_PUBLISH, TianjiProcessPermissions.DECISION_EXECUTE,
-                TianjiProcessPermissions.WORKER_ACQUIRE, TianjiProcessPermissions.WORKER_REPORT), resources, List.of(), List.of());
+                TianjiProcessPermissions.WORKER_ACQUIRE, TianjiProcessPermissions.WORKER_REPORT, TianjiProcessPermissions.AGENT_RESULT_RECEIVE), resources, List.of(), List.of());
     }
 
     private static PermissionManifest.ResourceDefinition resource(String key, String permission, String scope,
@@ -391,7 +489,8 @@ class ProcessPermissionIntegrationTest {
     private static Set<String> resources() {
         return Set.of(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
                 TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API,
-                TianjiProcessPermissions.WORKER_ACQUIRE_API, TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_FAIL_API);
+                TianjiProcessPermissions.WORKER_ACQUIRE_API, TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_FAIL_API,
+                TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API);
     }
 
     private RuntimePolicyBinding binding() {
@@ -411,6 +510,6 @@ class ProcessPermissionIntegrationTest {
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, ProcessApiErrors.class, ProcessRequestBodyAdvice.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, ProcessApiErrors.class, ProcessRequestBodyAdvice.class})
     static class TestWeb { }
 }
