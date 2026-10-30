@@ -133,6 +133,16 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         });
     }
 
+    /** Rechecks both live database fences before a model can reuse loaded history. It neither renews nor changes the Session. */
+    public void verifySessionLease(SessionLease existing) {
+        requireLeaseScope(existing);
+        var verification = new TransactionTemplate(write.getTransactionManager()); verification.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        verification.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED); verification.setTimeout(5);
+        verification.executeWithoutResult(status -> {
+            if (!repository.liveFences(existing.sessionId, existing.runLease, existing.owner, existing.epoch)) throw leaseExpired();
+        });
+    }
+
     /** Releases only this lease epoch, including after the run has stopped. */
     public boolean releaseSessionLease(SessionLease existing) {
         requireLeaseScope(existing);

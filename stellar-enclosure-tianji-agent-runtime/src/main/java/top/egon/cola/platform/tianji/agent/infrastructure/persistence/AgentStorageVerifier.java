@@ -437,7 +437,7 @@ public final class AgentStorageVerifier {
         if (count == null || count != 1) throw invalid();
     }
 
-    private static int checksum(String file) {
+    static int checksum(String file) {
         try (InputStream stream = AgentStorageVerifier.class.getClassLoader().getResourceAsStream("db/tianji-agent/" + file)) {
             if (stream == null) throw invalid();
             CRC32 crc = new CRC32();

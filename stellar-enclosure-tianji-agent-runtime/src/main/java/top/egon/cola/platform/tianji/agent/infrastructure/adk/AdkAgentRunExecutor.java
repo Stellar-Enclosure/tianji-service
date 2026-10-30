@@ -283,6 +283,7 @@ public final class AdkAgentRunExecutor {
                     .flatMap(ignored -> Flowable.error(new TimeoutException("Agent deadline elapsed")));
             PostgresAdkSessionService durableSessions = sessions;
             SessionLease durableLease = sessionLease;
+            if (durableSessions != null) budget.bindSessionFence(() -> durableSessions.verifySessionLease(durableLease));
             Flowable<Long> control = Flowable.interval(HEARTBEAT_SECONDS, TimeUnit.SECONDS,
                             Schedulers.from(controlExecutor))
                     .concatMap(ignored -> switch (ledger.heartbeat(actor, lease, LEASE_DURATION)) {

@@ -32,6 +32,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -77,7 +78,8 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
     }
 
     @Override public List<Fragment> provide(Request request) {
-        var selected = selected(request); if (selected.isEmpty()) return List.of(); long deadline = deadline(request);
+        var selected = selected(request); if (selected.isEmpty()) return List.of();
+        if (request.authorization().sessionRequired() && !request.historyValidated()) throw unsupported(); long deadline = deadline(request);
         return bounded(deadline, () -> {
             var fragments = new ArrayList<Fragment>(); long bytes = 0;
             for (var binding : selected) {
@@ -102,51 +104,66 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
     }
 
     @Override public void revalidate(Request request, List<Fragment> fragments) {
-        selected(request); long deadline = deadline(request);
+        if (!selected(request).isEmpty() && request.authorization().sessionRequired() && !request.historyValidated()) throw unsupported(); long deadline = deadline(request);
         if (fragments.size() > 64) throw unavailable(); var sources = new ArrayList<Expected>();
         for (var fragment : List.copyOf(fragments)) {
             if (fragment.kind() != Kind.MEMORY) throw unavailable();
-            sources.add(new Expected(fragment.sourceId(), fragment.sourceVersion(), fragment.sourceSha256(), fragment.provenanceId(), MemoryJsonCodec.sha256(fragment.text())));
+            sources.add(new Expected(fragment.sourceId(), fragment.sourceVersion(), fragment.sourceSha256(), fragment.provenanceId(), MemoryJsonCodec.sha256(fragment.text()), false, -1));
         }
-        bounded(deadline, () -> { verify(context(request, deadline), sources); return Boolean.TRUE; });
+        bounded(deadline, () -> { verify(context(request, deadline), sources, false); return Boolean.TRUE; });
+    }
+
+    @Override public Set<Kind> historicalKinds() { return Set.of(Kind.MEMORY); }
+    @Override public void revalidateHistory(Request request, List<AgentContextSourceDTO> sources) {
+        if (!request.historyValidated()) throw unavailable(); selected(request); revalidateReferences(context(request, deadline(request)), sources);
     }
 
     /** Saved metadata contains no body; a current HTTP caller or current-run grant must independently authorize its exact facts. */
     public void revalidateReferences(MemoryOperationContext context, List<AgentContextSourceDTO> metadata) {
-        noTransaction(); Objects.requireNonNull(context, "context"); if (metadata.size() > 64) throw unavailable(); var sources = new ArrayList<Expected>();
+        noTransaction(); Objects.requireNonNull(context, "context"); if (metadata.size() > 256) throw unavailable(); var sources = new ArrayList<Expected>();
         var remaining = Duration.between(clock.instant(), context.deadlineAt()); if (remaining.isNegative() || remaining.isZero() || remaining.compareTo(Duration.ofSeconds(30)) > 0) throw unavailable();
         for (var source : List.copyOf(metadata)) {
             if (source.kind() != AgentContextSourceKindEnum.MEMORY || source.role() != AgentContextRoleEnum.USER) throw unavailable();
-            sources.add(new Expected(source.sourceId(), source.sourceVersion(), source.sourceSha256(), source.provenanceId(), source.modelTextSha256()));
+            sources.add(new Expected(source.sourceId(), source.sourceVersion(), source.sourceSha256(), source.provenanceId(), source.modelTextSha256(), true, source.utf8Bytes()));
         }
         // HTTP authority stays on its authenticated request thread; run authority carries its own sealed evidence.
-        if (context.runAuthorization() == null) verify(context, sources);
+        if (context.runAuthorization() == null) verify(context, sources, true);
         else {
             long nanos = Duration.between(clock.instant(), context.deadlineAt()).toNanos(); if (nanos < 1_000_000 || nanos > TimeUnit.SECONDS.toNanos(30)) throw unavailable();
-            bounded(System.nanoTime() + nanos, () -> { verify(context, sources); return Boolean.TRUE; });
+            bounded(System.nanoTime() + nanos, () -> { verify(context, sources, true); return Boolean.TRUE; });
         }
     }
 
-    private void verify(MemoryOperationContext context, List<Expected> supplied) {
-        noTransaction(); if (calls.isShutdown() || supplied.size() > 64 || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
+    private void verify(MemoryOperationContext context, List<Expected> supplied, boolean historical) {
+        noTransaction(); if (calls.isShutdown() || supplied.size() > (historical ? 256 : 64) || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
         var grouped = new LinkedHashMap<MemoryContextBinding, List<Source>>(); var unique = new HashSet<String>();
+        var expectations = new HashMap<String, Expected>();
         for (var item : supplied) {
             var source = decode(item.reference()); var binding = references.get(source.binding());
             if (binding == null || !unique.add(item.reference()) || !sourceId(item.reference()).equals(item.id()) || !Long.toString(source.revision()).equals(item.version())
-                    || !source.content().equals(item.content()) || !source.modelText().equals(item.modelText()) || !ownerHash(context, binding).equals(source.owner())
+                    || !source.content().equals(item.content()) || !item.wrapped() && !source.modelText().equals(item.modelText()) || !ownerHash(context, binding).equals(source.owner())
                     || context.runAuthorization() != null && !binding.matches(context.runAuthorization())) throw unavailable();
             new GetMemoryQuery(binding.owner(context.actor()), binding.scopeId(), source.memoryId());
             grouped.computeIfAbsent(binding, ignored -> new ArrayList<>()).add(source);
+            expectations.put(item.reference(), item);
         }
         for (var group : grouped.entrySet()) {
-            var binding = group.getKey(); if (group.getValue().size() > binding.limit()) throw unavailable();
-            var entries = memory.contextEntries(context, binding.owner(context.actor()), binding.scopeId(), group.getValue().stream().map(Source::memoryId).toList());
-            var current = new HashMap<String, MemoryEntryDTO>(); for (var entry : entries) if (current.putIfAbsent(entry.memoryId(), entry) != null) throw unavailable();
-            if (current.size() != group.getValue().size()) throw unavailable();
+            var binding = group.getKey(); if (!historical && group.getValue().size() > binding.limit()) throw unavailable();
+            var ids = group.getValue().stream().map(Source::memoryId).distinct().toList(); var current = new HashMap<String, MemoryEntryDTO>();
+            for (int offset = 0; offset < ids.size(); offset += 32) {
+                var entries = memory.contextEntries(context, binding.owner(context.actor()), binding.scopeId(), ids.subList(offset, Math.min(ids.size(), offset + 32)));
+                for (var entry : entries) if (current.putIfAbsent(entry.memoryId(), entry) != null) throw unavailable();
+            }
+            if (current.size() != ids.size()) throw unavailable();
             for (var source : group.getValue()) {
                 var entry = current.get(source.memoryId());
                 if (entry == null || !binding.owner(context.actor()).equals(entry.owner()) || !eligible(binding, entry) || entry.revision() != source.revision() || !entry.contentSha256().equals(source.content())
                         || !MemoryJsonCodec.sha256(entry.retentionPolicyRef()).equals(source.retention()) || !MemoryJsonCodec.sha256(codec.modelContext(entry)).equals(source.modelText())) throw unavailable();
+                var expected = expectations.get(encode(source));
+                if (expected.wrapped()) {
+                    String actual = new Fragment(Kind.MEMORY, expected.id(), expected.version(), source.content(), expected.reference(), codec.modelContext(entry), clock.instant()).modelText();
+                    if (!MemoryJsonCodec.sha256(actual).equals(expected.modelText()) || actual.getBytes(StandardCharsets.UTF_8).length != expected.bytes()) throw unavailable();
+                }
             }
         }
         if (!clock.instant().isBefore(context.deadlineAt()) || Thread.currentThread().isInterrupted()) throw unavailable();
@@ -163,7 +180,7 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
     private List<MemoryContextBinding> selected(Request request) {
         noTransaction(); Objects.requireNonNull(request, "request"); if (calls.isShutdown()) throw unavailable();
         var selected = bindings.stream().filter(binding -> binding.matches(request.authorization())).toList();
-        if (!selected.isEmpty() && request.authorization().sessionRequired()) throw unsupported(); return selected;
+        return selected;
     }
     @Override public String policyFingerprint(Request request) { selected(request); return policy; }
     @Override public void close() { calls.shutdownNow(); }
@@ -218,7 +235,7 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
     private static String sourceId(String reference) { return "memory:" + MemoryJsonCodec.sha256(reference); }
     private static void noTransaction() { if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Memory context requires no ambient transaction"); }
     private record Source(String binding, String owner, String memoryId, long revision, String content, String retention, String modelText) { }
-    private record Expected(String id, String version, String content, String reference, String modelText) { }
+    private record Expected(String id, String version, String content, String reference, String modelText, boolean wrapped, long bytes) { }
     private static AgentLedgerException tooLarge() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "Memory context capacity is unavailable"); }
     private static AgentLedgerException unsupported() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Memory context requires reviewed text input and session lineage"); }
     private static AgentLedgerException unavailable() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Current Memory context source is unavailable or changed"); }

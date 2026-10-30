@@ -19,6 +19,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextRoleEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
@@ -86,6 +89,22 @@ class TianshuContextProviderTest {
         when(prompt.scope()).thenReturn(new DdcAiClientScope(202, "xingyuan", "test", "tianji"));
         assertThrows(AgentLedgerException.class, () -> provider.provide(request(20, ISSUER, true, false)));
         verify(prompt, never()).get(any());
+    }
+
+    @Test
+    void historical_prompt_metadata_is_reloaded_under_current_scope_and_revocation_blocks_reuse() throws Exception {
+        var provider = provider(); var original = request(20, ISSUER, true, false); var fragment = provider.provide(original).getFirst();
+        byte[] text = fragment.modelText().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        var source = new AgentContextSourceDTO(AgentContextSourceKindEnum.PROMPT, AgentContextRoleEnum.SYSTEM, fragment.sourceId(), fragment.sourceVersion(), fragment.provenanceId(), fragment.sourceSha256(),
+                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(text)), text.length, NOW);
+        var authorization = original.authorization();
+        var current = new AgentRunAuthorization.Request(authorization.actor(), "new-run", authorization.definitionKey(), authorization.definitionVersion(), authorization.definitionSha256(),
+                authorization.requestSha256(), authorization.snapshotSha256(), authorization.policyVersionRef(), true, authorization.deadlineAt());
+        var verified = new ContextProvider.Request(current, original.snapshot(), original.leaseEpoch(), original.timeout(), true);
+        assertDoesNotThrow(() -> provider.revalidateHistory(verified, List.of(source)));
+        verify(prompt, times(2)).get(new DdcAiResourceQuery("prompts", "review", 2L, 10L));
+        doThrow(new DdcException(56307, "TIANSHU_AI_SCOPE_FORBIDDEN", "private-denial-detail")).when(prompt).get(any());
+        assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> provider.revalidateHistory(verified, List.of(source))).code());
     }
 
     @Test

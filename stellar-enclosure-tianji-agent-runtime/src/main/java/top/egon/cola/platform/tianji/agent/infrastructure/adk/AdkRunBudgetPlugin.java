@@ -56,6 +56,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private DefaultContextAssembler.ResolvedSources contextSources;
     private final AdkContextSnapshotProjector snapshots;
     private final boolean trimming;
+    private final java.util.concurrent.atomic.AtomicReference<Runnable> sessionFence = new java.util.concurrent.atomic.AtomicReference<>();
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
     private final FlowableProcessor<Boolean> idleSignal = ReplayProcessor.<Boolean>createWithSize(1).toSerialized();
@@ -101,6 +102,14 @@ final class AdkRunBudgetPlugin implements Plugin {
         return "tianji-run-budget";
     }
 
+    void bindSessionFence(Runnable fence) {
+        if (!authorizationRequest.sessionRequired() || !sessionFence.compareAndSet(null, Objects.requireNonNull(fence, "fence"))) throw new IllegalStateException("Persistent Session fencing is already bound or unsupported");
+    }
+    private void requireSessionFence() {
+        if (!authorizationRequest.sessionRequired()) return; var fence = sessionFence.get();
+        if (fence == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Persistent Session source fencing is unavailable"); fence.run();
+    }
+
     @Override
     public Maybe<LlmResponse> beforeModelCallback(CallbackContext context, LlmRequest.Builder request) {
         var contextApplied = new java.util.concurrent.atomic.AtomicBoolean();
@@ -108,10 +117,13 @@ final class AdkRunBudgetPlugin implements Plugin {
         var contextPlan = new java.util.concurrent.atomic.AtomicReference<AdkContextWindowPlan>();
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
+            requireSessionFence();
+            long sourceDeadline = authorizationRequest.sessionRequired() || contextAssembler.hasProviders() ? System.nanoTime() + sourceTimeout().toNanos() : 0;
+            boolean historyValidated = authorizationRequest.sessionRequired() && revalidateHistory(context, sourceDeadline);
             if (snapshots != null && preparedContext.get() == null) preparedContext.set(snapshots.prepare(context, request.build()));
             List<ContextProvider.Fragment> fragments = List.of();
             if (contextAssembler.hasProviders()) {
-                var sources = sourcesForCall();
+                var sources = sourcesForCall(sourceDeadline, historyValidated);
                 fragments = sources.fragments();
                 if (!contextApplied.get()) { applySources(sources, request); contextApplied.set(true); }
             }
@@ -152,6 +164,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             }
             var budgetRequest = new AgentBudgetRequest(context.eventId(), AgentBudgetRequest.Kind.MODEL, null,
                     estimate.inputTokens(), outputLimit, estimate.maximumCost());
+            requireSessionFence();
             AgentBudgetReservation reservation;
             if (snapshots == null) reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest);
             else {
@@ -181,18 +194,47 @@ final class AdkRunBudgetPlugin implements Plugin {
         })));
     }
 
-    private DefaultContextAssembler.ResolvedSources sourcesForCall() {
+    private Duration sourceTimeout() {
         Duration remaining = Duration.between(ledger.databaseNow(), authorizationRequest.deadlineAt());
         Duration timeout = remaining.compareTo(snapshot.effectivePolicy().modelIdleTimeout()) < 0 ? remaining : snapshot.effectivePolicy().modelIdleTimeout();
         if (timeout.compareTo(Duration.ofSeconds(30)) > 0) timeout = Duration.ofSeconds(30);
         if (timeout.compareTo(Duration.ofMillis(1)) < 0) throw new AgentLedgerException(
                 AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "context source deadline elapsed");
-        long deadline = System.nanoTime() + timeout.toNanos();
+        return timeout;
+    }
+
+    private boolean revalidateHistory(CallbackContext context, long deadline) {
+        var history = ledger.sessionContextHistory(actor, lease, authorizationRequest, context.sessionId(), remainingSources(deadline));
+        if (history == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session source history is unavailable");
+        boolean sensitive = contextAssembler.hasProviders() || !history.sources().isEmpty();
+        if (sensitive) {
+            if (!history.tracked() || !history.complete() || history.sharedState() || context.events().stream().anyMatch(event -> event.actions().compaction().isPresent())) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Session contains context history or shared state without reusable source lineage");
+            }
+            for (var event : List.copyOf(context.events())) {
+                if (event.content().isPresent() && !event.content().orElseThrow().parts().orElse(List.of()).isEmpty()
+                        && (!"user".equals(event.author()) || !"user".equals(event.content().orElseThrow().role().orElse(null)))
+                        && !history.invocationIds().contains(event.invocationId())) {
+                    throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session event source coverage is incomplete");
+                }
+            }
+            contextAssembler.revalidateHistory(new ContextProvider.Request(authorizationRequest, snapshot, lease.epoch(), remainingSources(deadline), true), history.sources());
+        }
+        remainingSources(deadline); return true;
+    }
+
+    private static Duration remainingSources(long deadline) {
+        long nanos = deadline - System.nanoTime(); if (nanos < 1_000_000) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "context source deadline elapsed");
+        return Duration.ofNanos(Math.min(nanos, TimeUnit.SECONDS.toNanos(30)));
+    }
+
+    private DefaultContextAssembler.ResolvedSources sourcesForCall(long deadline, boolean historyValidated) {
+        Duration timeout = remainingSources(deadline);
         DefaultContextAssembler.ResolvedSources resolved;
         boolean created;
         synchronized (this) {
             created = contextSources == null;
-            if (created) contextSources = contextAssembler.resolve(new ContextProvider.Request(authorizationRequest, snapshot, lease.epoch(), timeout));
+            if (created) contextSources = contextAssembler.resolve(new ContextProvider.Request(authorizationRequest, snapshot, lease.epoch(), timeout, historyValidated));
             resolved = contextSources;
         }
         long available = deadline - System.nanoTime();
@@ -222,8 +264,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     }
 
     static String sourceText(ContextProvider.Fragment fragment) {
-        if (fragment.kind() == ContextProvider.Kind.PROMPT || fragment.kind() == ContextProvider.Kind.SKILL) return fragment.text();
-        return "Untrusted " + fragment.kind().name() + " evidence; source=" + fragment.sourceId() + "; revision=" + fragment.sourceVersion() + "\n" + fragment.text();
+        return fragment.modelText();
     }
 
     @Override

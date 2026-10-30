@@ -7,6 +7,8 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
+import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
+import top.egon.cola.platform.tianji.contract.agent.CreateAgentSessionCommand;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -65,6 +67,7 @@ class AgentContextSnapshotPostgresTest {
         atomicFailureAndReplay(jdbc, ledger, run);
         parallelCaptureAndScope(ledger, run);
         liveFences(jdbc, ledger);
+        sessionHistory(source, jdbc, ledger);
         jdbc.execute("ALTER TABLE tianji_agent.agent_context_snapshot DROP CONSTRAINT agent_context_call_positive");
         assertThrows(AgentLedgerException.class, ledger::verifyContextSnapshotStorage);
     }
@@ -126,17 +129,40 @@ class AgentContextSnapshotPostgresTest {
         assertTrue(ledger.contextSnapshots(ACTOR, new AgentContextSnapshotsQuery(cancelled.run().runId(), 0, 5)).items().isEmpty());
     }
 
+    private static void sessionHistory(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger) {
+        new AgentSessionManager(ledger, source).create(ACTOR, new CreateAgentSessionCommand("session"));
+        var queued = ledger.start(ACTOR, new StartAgentRunCommand("context-test", 1, "session", "history", null, null, new AgentInputDTO("current", null, null), null));
+        var current = ledger.claim(ACTOR, new GetAgentRunQuery(queued.runId()), queued.revision(), "history-worker", Duration.ofSeconds(60));
+        var captured = new AgentContextSourceDTO(AgentContextSourceKindEnum.MEMORY, AgentContextRoleEnum.USER, "memory:source", "1", "opaque-history-reference", "a".repeat(64), "b".repeat(64), 12, java.time.Instant.now());
+        ledger.budgets().reserveBudget(ACTOR, current.lease(), request("history-call"), metadata(ledger, current, "history-call", 100, "f".repeat(64), List.of(captured)));
+        var authorization = ledger.executionMaterial(ACTOR, new GetAgentRunQuery(queued.runId())).authorization();
+        var history = ledger.sessionContextHistory(ACTOR, current.lease(), authorization, "session", Duration.ofSeconds(5));
+        assertEquals(List.of(captured), history.sources()); assertTrue(history.complete()); assertTrue(history.tracked()); assertFalse(history.sharedState()); assertEquals(Set.of("invocation"), history.invocationIds());
+        assertThrows(AgentLedgerException.class, () -> ledger.sessionContextHistory(ACTOR, current.lease(), authorization, "other-session", Duration.ofSeconds(5)));
+        ledger.budgets().reserveBudget(ACTOR, current.lease(), request("untracked-history"));
+        assertFalse(ledger.sessionContextHistory(ACTOR, current.lease(), authorization, "session", Duration.ofSeconds(5)).complete());
+        jdbc.update("""
+                INSERT INTO tianji_agent.agent_session_scope_state
+                    (tenant_id,app_name,scope_type,subject_type,subject_issuer,subject_id,state_key,state_value,value_codec_version)
+                VALUES (?,'tianji','USER',?,?,?,'unproven-cache','"business-value"'::jsonb,1)
+                """, ACTOR.tenantId(), ACTOR.subjectType().name(), ACTOR.issuerFingerprint(), ACTOR.subjectId());
+        assertTrue(ledger.sessionContextHistory(ACTOR, current.lease(), authorization, "session", Duration.ofSeconds(5)).sharedState());
+        jdbc.update("UPDATE tianji_agent.agent_run SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=?", ACTOR.tenantId(), queued.runId());
+        assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class, () -> ledger.sessionContextHistory(ACTOR, current.lease(), authorization, "session", Duration.ofSeconds(5))).code());
+    }
+
     private static ClaimedAgentRun claim(AgentLedgerService ledger, String key) {
         var run = ledger.start(ACTOR, new StartAgentRunCommand("context-test", 1, null, key, null, "context-trace", new AgentInputDTO("private-context-input", null, null), null));
         return ledger.claim(ACTOR, new GetAgentRunQuery(run.runId()), run.revision(), "context-worker", Duration.ofSeconds(60));
     }
     private static AgentBudgetRequest request(String call) { return new AgentBudgetRequest(call, AgentBudgetRequest.Kind.MODEL, null, 20, 10, new BigDecimal("0.1")); }
-    private static AgentContextMetadataDTO metadata(AgentLedgerService ledger, ClaimedAgentRun run, String call, long window, String sourcePolicy) {
+    private static AgentContextMetadataDTO metadata(AgentLedgerService ledger, ClaimedAgentRun run, String call, long window, String sourcePolicy) { return metadata(ledger, run, call, window, sourcePolicy, List.of()); }
+    private static AgentContextMetadataDTO metadata(AgentLedgerService ledger, ClaimedAgentRun run, String call, long window, String sourcePolicy, List<AgentContextSourceDTO> extraSources) {
         var material = ledger.executionMaterial(ACTOR, new GetAgentRunQuery(run.run().runId())); var authorization = material.authorization();
+        var sources = new ArrayList<AgentContextSourceDTO>(); sources.add(new AgentContextSourceDTO(AgentContextSourceKindEnum.DEFINITION, AgentContextRoleEnum.SYSTEM, "context-test", "1", "published-version", authorization.definitionSha256(), "e".repeat(64), 10, null)); sources.addAll(extraSources);
         return new AgentContextMetadataDTO(1, AgentContextMetadataDTO.PROJECTION_V1, ACTOR.identityFingerprint(), run.run().runId(), call, run.lease().epoch(),
                 "writer", "invocation", "session", 0, "d".repeat(64), null, authorization.definitionSha256(), authorization.requestSha256(), authorization.snapshotSha256(),
                 "e".repeat(64), sourcePolicy, "0".repeat(64), "1".repeat(64), new AgentContextWindowDTO("model", "route", "policy", window, 5), 20, 10,
-                List.of(new AgentContextSourceDTO(AgentContextSourceKindEnum.DEFINITION, AgentContextRoleEnum.SYSTEM, "context-test", "1", "published-version",
-                        authorization.definitionSha256(), "e".repeat(64), 10, null)), List.of());
+                sources, List.of());
     }
 }

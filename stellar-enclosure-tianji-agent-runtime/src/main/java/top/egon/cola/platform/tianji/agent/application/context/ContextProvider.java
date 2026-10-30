@@ -2,12 +2,14 @@ package top.egon.cola.platform.tianji.agent.application.context;
 
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /** Host-ordered, bounded source access. Both methods must enforce current tenant, owner and resource authorization. */
 public interface ContextProvider {
@@ -22,9 +24,16 @@ public interface ContextProvider {
         throw new UnsupportedOperationException("versioned context source policy is unavailable");
     }
 
+    /** Only a provider that understands the saved reference format may revalidate its historical source kind. */
+    default Set<Kind> historicalKinds() { return Set.of(); }
+    default void revalidateHistory(Request request, List<AgentContextSourceDTO> sources) {
+        if (!sources.isEmpty()) throw new UnsupportedOperationException("Historical context source validation is unavailable");
+    }
+
     enum Kind { PROMPT, SKILL, RAG, MEMORY }
 
-    record Request(AgentRunAuthorization.Request authorization, AgentExecutionSnapshot snapshot, long leaseEpoch, Duration timeout) {
+    record Request(AgentRunAuthorization.Request authorization, AgentExecutionSnapshot snapshot, long leaseEpoch, Duration timeout, boolean historyValidated) {
+        public Request(AgentRunAuthorization.Request authorization, AgentExecutionSnapshot snapshot, long leaseEpoch, Duration timeout) { this(authorization, snapshot, leaseEpoch, timeout, false); }
         public Request {
             Objects.requireNonNull(authorization, "authorization"); Objects.requireNonNull(snapshot, "snapshot");
             var definition = snapshot.definition();
@@ -46,6 +55,11 @@ public interface ContextProvider {
                     || text.length() > 1_048_576 || !StandardCharsets.UTF_8.newEncoder().canEncode(text)) throw invalid();
         }
         @Override public String toString() { return "ContextFragment[redacted]"; }
+        /** Exact role-neutral text supplied to ADK; published instructions and evidence still receive distinct roles. */
+        public String modelText() {
+            if (kind == Kind.PROMPT || kind == Kind.SKILL) return text;
+            return "Untrusted " + kind.name() + " evidence; source=" + sourceId + "; revision=" + sourceVersion + "\n" + text;
+        }
     }
 
     private static boolean identifier(String value, int maximum) {

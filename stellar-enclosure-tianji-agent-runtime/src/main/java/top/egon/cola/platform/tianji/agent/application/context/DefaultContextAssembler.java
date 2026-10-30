@@ -7,6 +7,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -36,9 +37,30 @@ public final class DefaultContextAssembler {
 
     public boolean hasProviders() { return !providers.isEmpty(); }
 
+    /** Old source metadata is data; only the current run's authority may authorize its reuse. */
+    public void revalidateHistory(ContextProvider.Request request, List<AgentContextSourceDTO> sources) {
+        noTransaction(); if (!request.historyValidated() || sources.size() > 256) throw unavailable();
+        long deadline = System.nanoTime() + request.timeout().toNanos();
+        var grouped = new java.util.LinkedHashMap<ContextProvider.Kind, List<AgentContextSourceDTO>>();
+        for (var source : List.copyOf(sources)) {
+            ContextProvider.Kind kind;
+            try { kind = ContextProvider.Kind.valueOf(source.kind().name()); }
+            catch (IllegalArgumentException internal) { throw unavailable(); }
+            grouped.computeIfAbsent(kind, ignored -> new ArrayList<>()).add(source);
+        }
+        for (var group : grouped.entrySet()) {
+            var owners = providers.stream().filter(provider -> provider.historicalKinds().contains(group.getKey())).toList();
+            if (owners.size() != 1) throw unavailable();
+            try { owners.getFirst().revalidateHistory(remaining(request, deadline), List.copyOf(group.getValue())); }
+            catch (AgentLedgerException rejected) { throw rejected; }
+            catch (RuntimeException failure) { throw unavailable(); }
+        }
+    }
+
     public String policyFingerprint(ContextProvider.Request request) {
         noTransaction();
         StringBuilder policy = new StringBuilder("TIANJI_CONTEXT_SOURCE_ORDER_V1:");
+        if (request.authorization().sessionRequired()) policy.append("TIANJI_SESSION_SOURCE_LINEAGE_V1:");
         for (var provider : providers) {
             String fingerprint;
             try { fingerprint = provider.policyFingerprint(request); }
@@ -165,7 +187,7 @@ public final class DefaultContextAssembler {
     private static ContextProvider.Request remaining(ContextProvider.Request request, long deadline) {
         long nanos = deadline - System.nanoTime();
         if (nanos < 1_000_000) throw unavailable();
-        return new ContextProvider.Request(request.authorization(), request.snapshot(), request.leaseEpoch(), Duration.ofNanos(nanos));
+        return new ContextProvider.Request(request.authorization(), request.snapshot(), request.leaseEpoch(), Duration.ofNanos(nanos), request.historyValidated());
     }
     private static AgentLedgerException unavailable() {
         return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "exact published context sources are unavailable");

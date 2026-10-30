@@ -150,6 +150,8 @@ class AdkSessionPostgresTest {
         AgentRunLease secondRun = claim(second, "same-session", "second-issuer");
         SessionLease firstLease = firstStore.acquireSessionLease("same-session", firstRun, Duration.ofSeconds(30));
         SessionLease secondLease = secondStore.acquireSessionLease("same-session", secondRun, Duration.ofSeconds(30));
+        assertDoesNotThrow(() -> firstStore.verifySessionLease(firstLease));
+        assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class, () -> secondStore.verifySessionLease(firstLease)).code());
         assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class,
                 () -> secondStore.withLease(firstLease)).code());
         assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class,

@@ -92,7 +92,7 @@ class MemoryContextProviderTest {
         try (var provider = provider(memory)) {
             var fragment = provider.provide(request(ACTOR, false, Duration.ofSeconds(2), "private task")).getFirst();
             var metadata = new AgentContextSourceDTO(AgentContextSourceKindEnum.MEMORY, AgentContextRoleEnum.USER, fragment.sourceId(), fragment.sourceVersion(), fragment.provenanceId(),
-                    fragment.sourceSha256(), MemoryJsonCodec.sha256(fragment.text()), fragment.text().getBytes(StandardCharsets.UTF_8).length, NOW);
+                    fragment.sourceSha256(), MemoryJsonCodec.sha256(fragment.modelText()), fragment.modelText().getBytes(StandardCharsets.UTF_8).length, NOW);
             long caller = Thread.currentThread().threadId();
             doAnswer(call -> { assertEquals(caller, Thread.currentThread().threadId()); assertNull(((MemoryOperationContext) call.getArgument(0)).runAuthorization()); return List.of(entry); })
                     .when(memory).contextEntries(any(), any(), anyString(), anyList());
@@ -111,6 +111,20 @@ class MemoryContextProviderTest {
             assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, denied.code()); assertFalse(denied.toString().contains("private policy detail"));
             doThrow(new IllegalStateException("private storage detail")).when(memory).retrieveContext(any(), any(), anySet());
             assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class, () -> provider.provide(request(ACTOR, false, Duration.ofSeconds(1), "private task"))).code());
+        }
+    }
+
+    @Test void a_validated_persistent_request_rechecks_saved_model_text_and_forget_blocks_its_reuse() {
+        var memory = memory(); var entry = entry("memory", 1, MemorySensitivityEnum.CONFIDENTIAL); configure(memory, entry);
+        try (var provider = provider(memory)) {
+            var ordinary = request(ACTOR, false, Duration.ofSeconds(1), "private task"); var fragment = provider.provide(ordinary).getFirst();
+            var persistent = request(ACTOR, true, Duration.ofSeconds(1), "private task");
+            var verified = new ContextProvider.Request(persistent.authorization(), persistent.snapshot(), persistent.leaseEpoch(), persistent.timeout(), true);
+            var metadata = new AgentContextSourceDTO(AgentContextSourceKindEnum.MEMORY, AgentContextRoleEnum.USER, fragment.sourceId(), fragment.sourceVersion(), fragment.provenanceId(), fragment.sourceSha256(),
+                    MemoryJsonCodec.sha256(fragment.modelText()), fragment.modelText().getBytes(StandardCharsets.UTF_8).length, NOW);
+            assertDoesNotThrow(() -> provider.revalidateHistory(verified, List.of(metadata))); assertEquals(1, provider.provide(verified).size());
+            doReturn(List.of()).when(memory).contextEntries(any(), any(), anyString(), anyList());
+            assertThrows(AgentLedgerException.class, () -> provider.revalidateHistory(verified, List.of(metadata)));
         }
     }
 

@@ -15,6 +15,7 @@ import top.egon.cola.component.tianshu.model.ai.validation.AiContentValidator;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 
@@ -34,6 +35,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Semaphore;
 
 /** Adapter for literal published text and Skill files. It neither evaluates templates nor executes package assets. */
@@ -45,6 +47,21 @@ public final class TianshuContextProvider implements ContextProvider {
     private final Map<String, Ports> connections;
     private final TrustedIssuerRegistry issuers;
     private final Clock clock;
+
+    @Override public Set<Kind> historicalKinds() { return Set.of(Kind.PROMPT, Kind.SKILL); }
+    @Override public void revalidateHistory(Request request, List<AgentContextSourceDTO> sources) {
+        if (!request.historyValidated() || sources.size() > 256) throw unavailable(); var current = provide(request);
+        for (var source : List.copyOf(sources)) {
+            var matching = current.stream().filter(fragment -> fragment.kind().name().equals(source.kind().name()) && fragment.sourceId().equals(source.sourceId())
+                    && fragment.sourceVersion().equals(source.sourceVersion()) && fragment.sourceSha256().equals(source.sourceSha256()) && fragment.provenanceId().equals(source.provenanceId())).toList();
+            if (matching.size() != 1 || !modelTextHash(matching.getFirst().modelText()).equals(source.modelTextSha256())
+                    || matching.getFirst().modelText().getBytes(StandardCharsets.UTF_8).length != source.utf8Bytes()) throw unavailable();
+        }
+    }
+    private static String modelTextHash(String text) {
+        try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8))); }
+        catch (NoSuchAlgorithmException unavailable) { throw unavailable(); }
+    }
 
     public TianshuContextProvider(TianshuContextProperties properties, Map<String, Ports> connections, TrustedIssuerRegistry issuers, Clock clock) {
         this.connections = Map.copyOf(connections);

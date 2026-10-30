@@ -479,6 +479,39 @@ final class JdbcAgentLedgerRepository {
                 query.runId(), query.afterModelCall(), query.limit() + 1);
     }
 
+    ContextHistoryRows sessionContextHistory(TrustedAgentActor actor, String sessionId) {
+        var generations = jdbc.query("SELECT created_at FROM tianji_agent.agent_session WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name='tianji' AND session_id=?",
+                (rs, row) -> rs.getTimestamp(1), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), sessionId);
+        if (generations.size() != 1) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "The current owned Session is unavailable");
+        boolean present = Boolean.TRUE.equals(jdbc.queryForObject("SELECT to_regclass('tianji_agent.agent_context_snapshot') IS NOT NULL", Boolean.class));
+        var installed = jdbc.query("SELECT success,checksum,type FROM tianji_agent.flyway_schema_history WHERE version='9'", (rs, row) -> rs.getBoolean("success")
+                && "SQL".equals(rs.getString("type")) && rs.getObject("checksum") != null && rs.getInt("checksum") == AgentStorageVerifier.checksum("V9__add_context_snapshots.sql"));
+        if (!present && installed.isEmpty()) return new ContextHistoryRows(List.of(), false, false, false, generations.getFirst().toInstant());
+        if (!present || installed.size() != 1 || !installed.getFirst()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session source history storage is inconsistent");
+        boolean shared = Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM tianji_agent.agent_session_scope_state WHERE tenant_id=? AND app_name='tianji'
+                    AND ((scope_type='APP' AND subject_type='' AND subject_issuer='LEGACY' AND subject_id='')
+                         OR (scope_type='USER' AND subject_type=? AND subject_issuer=? AND subject_id=?)))
+                """, Boolean.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId()));
+        var parameters = new java.util.ArrayList<Object>(List.of(actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId()));
+        String scope = "r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.session_id IS NOT NULL";
+        if (!shared) { scope += " AND r.session_id=? AND r.created_at>=?"; parameters.add(sessionId); parameters.add(generations.getFirst()); }
+        String from = " FROM tianji_agent.agent_context_snapshot c JOIN tianji_agent.agent_run r ON r.tenant_id=c.tenant_id AND r.run_id=c.run_id"
+                + " JOIN tianji_agent.agent_budget_reservation b ON b.tenant_id=c.tenant_id AND b.run_id=c.run_id AND b.reservation_id=c.reservation_id WHERE " + scope;
+        long[] bounds = jdbc.queryForObject("SELECT count(*),COALESCE(sum(octet_length(c.metadata::text)),0)" + from, (rs, row) -> new long[]{rs.getLong(1), rs.getLong(2)}, parameters.toArray());
+        if (bounds == null || bounds[0] > 4096 || bounds[1] > 16_777_216) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REQUEST_TOO_LARGE, "Session source history exceeds its bounded validation window");
+        boolean complete = !Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM tianji_agent.agent_budget_reservation b
+                JOIN tianji_agent.agent_run r ON r.tenant_id=b.tenant_id AND r.run_id=b.run_id
+                LEFT JOIN tianji_agent.agent_context_snapshot c ON c.tenant_id=b.tenant_id AND c.run_id=b.run_id AND c.reservation_id=b.reservation_id
+                WHERE b.kind='MODEL' AND c.reservation_id IS NULL AND %s)
+                """.formatted(scope), Boolean.class, parameters.toArray()));
+        var rows = jdbc.query("SELECT c.*,b.kind AS budget_kind,b.lease_epoch AS budget_lease_epoch" + from + " ORDER BY c.captured_at,c.run_id,c.model_call_number LIMIT 4097", contextMapper(actor), parameters.toArray());
+        if (rows.size() != bounds[0]) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session source history changed during validation");
+        if (!shared && rows.stream().anyMatch(row -> !sessionId.equals(row.snapshot().metadata().nativeSessionId()))) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session source history is not bound to the current Session");
+        return new ContextHistoryRows(rows, complete, shared, true, generations.getFirst().toInstant());
+    }
+
     private RowMapper<ContextRow> contextMapper(TrustedAgentActor actor) {
         return (rs, row) -> {
             String fingerprint = rs.getString("metadata_sha256");
@@ -494,6 +527,7 @@ final class JdbcAgentLedgerRepository {
     }
 
     record ContextRow(AgentContextSnapshotDTO snapshot, String fingerprint) { }
+    record ContextHistoryRows(List<ContextRow> rows, boolean complete, boolean sharedState, boolean tracked, Instant generation) { }
 
     boolean lockLeaseForSettlement(TrustedAgentActor actor, AgentRunLease lease) {
         return !jdbc.query("""

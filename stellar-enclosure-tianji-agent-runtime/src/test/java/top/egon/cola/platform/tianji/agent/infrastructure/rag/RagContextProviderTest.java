@@ -23,6 +23,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextRoleEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -202,6 +205,19 @@ class RagContextProviderTest {
     }
 
     private static RagContextProvider provider(RagRetrievalService retrieval, RagContextAuthority authority) { return new RagContextProvider(retrieval, authority, List.of(BINDING), 1, CLOCK); }
+    @Test
+    void persistent_history_revalidates_exact_references_with_current_authority_without_a_second_search() throws Exception {
+        var authority = authority(); var retrieval = mock(RagRetrievalService.class); when(retrieval.retrieve(any())).thenReturn(List.of(chunk(attributes())));
+        try (var provider = provider(retrieval, authority)) {
+            var fragment = provider.provide(request(false, Duration.ofSeconds(1))).getFirst();
+            var metadata = new AgentContextSourceDTO(AgentContextSourceKindEnum.RAG, AgentContextRoleEnum.USER, fragment.sourceId(), fragment.sourceVersion(), fragment.provenanceId(),
+                    fragment.sourceSha256(), hash(fragment.modelText()), fragment.modelText().getBytes(StandardCharsets.UTF_8).length, NOW);
+            var persistent = request(true, Duration.ofSeconds(1)); var verified = new ContextProvider.Request(persistent.authorization(), persistent.snapshot(), persistent.leaseEpoch(), persistent.timeout(), true);
+            assertDoesNotThrow(() -> provider.revalidateHistory(verified, List.of(metadata))); verify(retrieval, times(1)).retrieve(any());
+            doThrow(denied()).when(authority).revalidate(any(), any(), any(), anyList());
+            assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> provider.revalidateHistory(verified, List.of(metadata))).code());
+        }
+    }
     private static RagContextAuthority authority() {
         var authority = mock(RagContextAuthority.class); when(authority.policyFingerprint()).thenReturn("d".repeat(64));
         when(authority.authorize(any(), any())).thenReturn(scope()); return authority;

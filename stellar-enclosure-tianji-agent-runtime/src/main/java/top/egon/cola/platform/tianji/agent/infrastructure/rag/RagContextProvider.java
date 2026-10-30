@@ -10,6 +10,8 @@ import top.egon.cola.component.rag.model.RagRetrievalQuery;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -25,6 +27,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -78,6 +81,7 @@ public final class RagContextProvider implements ContextProvider, AutoCloseable 
 
     @Override public List<Fragment> provide(Request request) {
         var binding = binding(request); if (binding == null) return List.of();
+        if (request.authorization().sessionRequired() && !request.historyValidated()) throw unsupported();
         String query = request.snapshot().input().text();
         if (query == null || query.isBlank() || query.length() > 2000 || !StandardCharsets.UTF_8.newEncoder().canEncode(query)) throw unsupported();
         long deadline = deadline(request);
@@ -113,6 +117,7 @@ public final class RagContextProvider implements ContextProvider, AutoCloseable 
     @Override public void revalidate(Request request, List<Fragment> fragments) {
         var binding = binding(request);
         if (binding == null) { if (!fragments.isEmpty()) throw unavailable(); return; }
+        if (request.authorization().sessionRequired() && !request.historyValidated()) throw unsupported();
         long deadline = deadline(request);
         bounded(deadline, () -> {
             var scope = scope(remaining(request, deadline), binding);
@@ -132,6 +137,27 @@ public final class RagContextProvider implements ContextProvider, AutoCloseable 
         });
     }
 
+    @Override public Set<Kind> historicalKinds() { return Set.of(Kind.RAG); }
+    @Override public void revalidateHistory(Request request, List<AgentContextSourceDTO> metadata) {
+        if (!request.historyValidated() || metadata.size() > 256) throw unavailable(); var binding = binding(request);
+        if (binding == null) { if (!metadata.isEmpty()) throw unavailable(); return; } long deadline = deadline(request);
+        bounded(deadline, () -> {
+            var scope = scope(remaining(request, deadline), binding); var sources = new ArrayList<RagContextAuthority.Source>(); var seen = new HashSet<String>();
+            for (var item : List.copyOf(metadata)) {
+                var source = decode(item.provenanceId());
+                if (item.kind() != AgentContextSourceKindEnum.RAG || !seen.add(item.provenanceId()) || !item.sourceId().equals(sourceId(item.provenanceId()))
+                        || !scope.ownerSha256().equals(source.ownerSha256()) || !binding.id().equals(source.bindingId()) || !binding.collectionId().equals(source.collectionId())
+                        || !binding.logicalModelName().equals(source.logicalModelName()) || !scope.aclRevision().equals(source.aclRevision())
+                        || !item.sourceVersion().equals(source.documentRevision()) || !item.sourceSha256().equals(source.contentSha256())) throw unavailable();
+                sources.add(source);
+            }
+            // The ledger validates the saved metadata digest; the business authority checks current access and exact document/chunk hashes.
+            for (int offset = 0; offset < sources.size(); offset += 32) authority.revalidate(remaining(request, deadline), binding, scope,
+                    List.copyOf(sources.subList(offset, Math.min(sources.size(), offset + 32))));
+            remaining(request, deadline); return Boolean.TRUE;
+        });
+    }
+
     @Override public String policyFingerprint(Request request) { binding(request); return policy; }
     @Override public void close() { calls.shutdownNow(); }
 
@@ -140,7 +166,6 @@ public final class RagContextProvider implements ContextProvider, AutoCloseable 
         Objects.requireNonNull(request, "request");
         var actor = request.authorization().actor(); var definition = request.snapshot().definition();
         var binding = bindings.get(new Key(actor.tenantId(), actor.issuerFingerprint(), definition.definitionKey(), definition.version()));
-        if (binding != null && request.authorization().sessionRequired()) throw unsupported();
         try { if (!authorityPolicy.equals(authority.policyFingerprint()) || calls.isShutdown()) throw unavailable(); }
         catch (RuntimeException failure) { throw unavailable(); }
         return binding;
@@ -184,7 +209,7 @@ public final class RagContextProvider implements ContextProvider, AutoCloseable 
     }
     private static Request remaining(Request request, long deadline) {
         long nanos = deadline - System.nanoTime(); if (nanos < 1_000_000 || Thread.currentThread().isInterrupted()) throw unavailable();
-        return new Request(request.authorization(), request.snapshot(), request.leaseEpoch(), Duration.ofNanos(nanos));
+        return new Request(request.authorization(), request.snapshot(), request.leaseEpoch(), Duration.ofNanos(nanos), request.historyValidated());
     }
     private static String encode(RagContextAuthority.Source source) {
         try {

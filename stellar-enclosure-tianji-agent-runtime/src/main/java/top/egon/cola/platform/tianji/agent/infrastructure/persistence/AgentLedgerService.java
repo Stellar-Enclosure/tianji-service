@@ -21,6 +21,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -49,6 +51,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.UUID;
 import java.util.Base64;
 import java.nio.charset.StandardCharsets;
@@ -136,6 +141,40 @@ public final class AgentLedgerService {
             var items = rows.stream().limit(query.limit()).map(JdbcAgentLedgerRepository.ContextRow::snapshot).toList();
             return new AgentContextSnapshotPageDTO(items, more ? items.getLast().modelCallNumber() : null);
         }));
+    }
+
+    /** Reads provenance under the current run fence; it does not reuse an older run's permission or hold locks during source I/O. */
+    public ContextHistory sessionContextHistory(TrustedAgentActor actor, AgentRunLease lease, AgentRunAuthorization.Request current, String sessionId, Duration timeout) {
+        Objects.requireNonNull(current, "current"); new top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery(sessionId);
+        if (TransactionSynchronizationManager.isActualTransactionActive() || !actor.equals(current.actor()) || !lease.runId().equals(current.runId()) || !current.sessionRequired()
+                || timeout == null || timeout.compareTo(Duration.ofMillis(1)) < 0 || timeout.compareTo(Duration.ofSeconds(30)) > 0) throw new IllegalArgumentException("Session source history request is invalid");
+        var read = new TransactionTemplate(transaction.getTransactionManager()); read.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        read.setTimeout(Math.max(1, (int) ((timeout.toNanos() + 999_999_999) / 1_000_000_000)));
+        return Objects.requireNonNull(read.execute(status -> {
+            if (!repository.lockLeaseForSettlement(actor, lease)) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Session source history requires the current run lease");
+            var material = executionMaterial(actor, new GetAgentRunQuery(current.runId()));
+            if (!current.equals(material.authorization()) || !sessionId.equals(material.run().sessionId()) || !current.deadlineAt().isAfter(now())) throw new AgentLedgerException(
+                    AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Session source history does not match the current run");
+            var history = repository.sessionContextHistory(actor, sessionId); var sources = new LinkedHashMap<List<String>, AgentContextSourceDTO>(); var invocations = new HashSet<String>();
+            var external = Set.of(AgentContextSourceKindEnum.PROMPT, AgentContextSourceKindEnum.SKILL, AgentContextSourceKindEnum.RAG, AgentContextSourceKindEnum.MEMORY);
+            for (var row : history.rows()) {
+                var metadata = row.snapshot().metadata();
+                if (sessionId.equals(metadata.nativeSessionId()) && !row.snapshot().capturedAt().isBefore(history.generation())) invocations.add(metadata.nativeInvocationId());
+                for (var source : metadata.sources()) if (external.contains(source.kind())) {
+                    var key = List.of(source.kind().name(), source.provenanceId()); var previous = sources.putIfAbsent(key, source);
+                    if (previous != null && (!previous.sourceId().equals(source.sourceId()) || !previous.sourceVersion().equals(source.sourceVersion()) || !previous.sourceSha256().equals(source.sourceSha256())
+                            || !previous.modelTextSha256().equals(source.modelTextSha256()) || previous.utf8Bytes() != source.utf8Bytes())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Historical source projections conflict");
+                    if (sources.size() > 256) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REQUEST_TOO_LARGE, "Session has too many historical context sources");
+                }
+            }
+            if (!repository.lockLeaseForSettlement(actor, lease) || !current.deadlineAt().isAfter(now())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Session source history lost its run fence");
+            return new ContextHistory(List.copyOf(sources.values()), Set.copyOf(invocations), history.complete(), history.sharedState(), history.tracked());
+        }));
+    }
+
+    public record ContextHistory(List<AgentContextSourceDTO> sources, Set<String> invocationIds, boolean complete, boolean sharedState, boolean tracked) {
+        public ContextHistory { sources = List.copyOf(sources); invocationIds = Set.copyOf(invocationIds); if (sources.size() > 256 || invocationIds.size() > 4096) throw new IllegalArgumentException("Session context history is invalid"); }
+        @Override public String toString() { return "SessionContextHistory[redacted]"; }
     }
 
     /** Session and run fencing must use the exact same transaction-bound DataSource. */
