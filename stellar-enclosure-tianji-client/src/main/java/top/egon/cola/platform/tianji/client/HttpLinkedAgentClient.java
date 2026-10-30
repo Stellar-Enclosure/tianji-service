@@ -6,18 +6,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
@@ -47,10 +41,7 @@ public final class HttpLinkedAgentClient implements LinkedAgentClient, AutoClose
     private final HttpClient http;
     private final Function<Operation, String> tokens;
     private final Duration timeout;
-    private final ThreadPoolExecutor tokenExecutor;
-    private final Object lifecycle = new Object();
-    private final Set<Future<?>> active = new HashSet<>();
-    private boolean closed;
+    private final BoundedServiceCalls calls;
     private final JsonMapper mapper = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
@@ -77,9 +68,7 @@ public final class HttpLinkedAgentClient implements LinkedAgentClient, AutoClose
         if (timeout == null || timeout.compareTo(Duration.ofMillis(100)) < 0 || timeout.compareTo(Duration.ofSeconds(60)) > 0
                 || maxTokenCalls < 1 || maxTokenCalls > 8) throw new IllegalArgumentException("Linked Agent client settings are invalid");
         this.timeout = timeout;
-        this.tokenExecutor = new ThreadPoolExecutor(0, maxTokenCalls, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
-                Thread.ofVirtual().inheritInheritableThreadLocals(false).name("linked-agent-token-", 0).factory(),
-                new ThreadPoolExecutor.AbortPolicy());
+        this.calls = new BoundedServiceCalls(timeout, maxTokenCalls, "linked-agent-token-", HttpLinkedAgentClient::unavailable);
     }
 
     @Override
@@ -112,22 +101,22 @@ public final class HttpLinkedAgentClient implements LinkedAgentClient, AutoClose
     }
 
     private <T> T call(Operation operation, String path, Object body, Class<T> type, int expectedStatus, int maxRequestBytes) {
-        long started = System.nanoTime();
-        String token = token(operation, started);
+        long started = calls.begin();
+        String token = calls.token(() -> tokens.apply(operation), started);
         byte[] bytes;
         try { bytes = mapper.writeValueAsBytes(body); }
         catch (RuntimeException invalid) { throw new IllegalArgumentException("Linked Agent request is invalid"); }
         if (bytes.length > maxRequestBytes) throw new IllegalArgumentException("Linked Agent request exceeds its size limit");
-        long remaining = remaining(started);
+        long remaining = calls.remaining(started);
         HttpRequest request = HttpRequest.newBuilder(baseUri.resolve("api/tianji/v1/agent-process-dispatches/" + path))
                 .timeout(Duration.ofNanos(remaining)).header("Authorization", "Bearer " + token)
                 .header("Accept", "application/json").header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
         java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> pending;
-        try { pending = track(http.sendAsync(request, ignored -> new BoundedBodySubscriber(MAX_RESPONSE_BYTES))); }
+        try { pending = calls.track(http.sendAsync(request, ignored -> new BoundedBodySubscriber(MAX_RESPONSE_BYTES))); }
         catch (RuntimeException failure) { throw unavailable(); }
         try {
-            HttpResponse<byte[]> response = pending.get(remaining(started), TimeUnit.NANOSECONDS);
+            HttpResponse<byte[]> response = pending.get(calls.remaining(started), TimeUnit.NANOSECONDS);
             if (response.statusCode() != expectedStatus) throw error(response.statusCode(), response.body(), token);
             try {
                 if (type == LinkedAgentLookupResult.class) {
@@ -147,42 +136,8 @@ public final class HttpLinkedAgentClient implements LinkedAgentClient, AutoClose
             if (BoundedBodySubscriber.tooLarge(failure)) throw new AgentClientException(0, "TIANJI_RESPONSE_TOO_LARGE", null, null);
             throw unavailable();
         } catch (CancellationException cancelled) { throw unavailable(); }
-        finally { untrack(pending); }
+        finally { calls.untrack(pending); }
     }
-
-    private String token(Operation operation, long started) {
-        Future<String> pending;
-        try { pending = track(tokenExecutor.submit(() -> tokens.apply(operation))); }
-        catch (RejectedExecutionException unavailable) { throw unavailable(); }
-        try {
-            String value = pending.get(remaining(started), TimeUnit.NANOSECONDS);
-            if (value == null || value.length() > 16_384 || !value.matches("[A-Za-z0-9._~+/-]+=*")) throw unavailable();
-            return value;
-        } catch (AgentClientException expired) {
-            pending.cancel(true); throw expired;
-        } catch (InterruptedException interrupted) {
-            pending.cancel(true); Thread.currentThread().interrupt(); throw unavailable();
-        } catch (TimeoutException timedOut) {
-            pending.cancel(true); throw unavailable();
-        } catch (ExecutionException | CancellationException failure) { throw unavailable(); }
-        finally { untrack(pending); }
-    }
-
-    private long remaining(long started) {
-        long remaining = timeout.toNanos() - (System.nanoTime() - started);
-        if (remaining <= 0) throw unavailable();
-        return remaining;
-    }
-
-    private <T extends Future<?>> T track(T pending) {
-        synchronized (lifecycle) {
-            if (closed) { pending.cancel(true); throw unavailable(); }
-            active.add(pending);
-            return pending;
-        }
-    }
-
-    private void untrack(Future<?> pending) { synchronized (lifecycle) { active.remove(pending); } }
 
     private AgentClientException error(int status, byte[] body, String token) {
         String code = null;
@@ -229,14 +184,6 @@ public final class HttpLinkedAgentClient implements LinkedAgentClient, AutoClose
     private static AgentClientException invalidResponse() { return new AgentClientException(0, "TIANJI_INVALID_RESPONSE", null, null); }
     private static AgentClientException unavailable() { return new AgentClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null); }
 
-    @Override public void close() {
-        List<Future<?>> pending;
-        synchronized (lifecycle) {
-            if (closed) return;
-            closed = true;
-            pending = List.copyOf(active);
-        }
-        tokenExecutor.shutdownNow();
-        pending.forEach(call -> call.cancel(true));
-    }
+    public Duration timeout() { return timeout; }
+    @Override public void close() { calls.close(); }
 }
