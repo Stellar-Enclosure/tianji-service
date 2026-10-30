@@ -16,6 +16,26 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class WorkerTopicRegistryTest {
     @Test
+    void internal_agent_topics_cannot_share_a_public_registration_or_an_unrelated_result_contract() {
+        var internal = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-a", "agentStart", "1",
+                Map.of("amount", ValueType.INTEGER), Map.of("runId", ValueType.STRING),
+                Map.of("amount", Set.of("amount")), Map.of("runId", Set.of("agentRunId")), 2,
+                Duration.ofSeconds(30), Duration.ofSeconds(5), WorkerEffect.EXTERNAL_IDEMPOTENT, true);
+        assertTrue(internal.internalAgentDispatch());
+        var external = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-b", "agentStart", "1",
+                internal.inputs(), internal.outputs(), internal.inputSources(), internal.outputTargets(), 2,
+                internal.leaseDuration(), internal.retryDelay(), internal.effectSafety());
+        assertFalse(external.internalAgentDispatch());
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry(List.of(internal, external)));
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-a", "agentStart", "1",
+                internal.inputs(), Map.of("approved", ValueType.BOOLEAN), internal.inputSources(), Map.of("approved", Set.of("approved")),
+                2, internal.leaseDuration(), internal.retryDelay(), WorkerEffect.EXTERNAL_IDEMPOTENT, true));
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-a", "agentStart", "1",
+                internal.inputs(), internal.outputs(), internal.inputSources(), internal.outputTargets(), 2,
+                internal.leaseDuration(), internal.retryDelay(), WorkerEffect.READ_ONLY, true));
+    }
+
+    @Test
     void operator_grants_are_exactly_scoped_and_models_must_match_the_registered_schema() throws Exception {
         var first = registration("https://idp.example/20", "worker-a", "1", Map.of("requestedAmount", ValueType.INTEGER));
         var second = registration("https://idp.example/20", "worker-b", "1", Map.of("requestedAmount", ValueType.INTEGER));

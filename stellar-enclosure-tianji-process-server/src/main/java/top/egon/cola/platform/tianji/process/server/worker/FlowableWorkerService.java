@@ -19,6 +19,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
@@ -77,8 +79,18 @@ public final class FlowableWorkerService {
     }
 
     public AcquireWorkerTaskResult acquire(ProcessActor actor, AcquireWorkerTaskCommand command) {
+        return acquire(actor, command, false);
+    }
+
+    public AcquireWorkerTaskResult acquireAgentDispatch(AgentDispatchBinding binding) {
+        Objects.requireNonNull(binding, "binding");
+        return acquire(binding.actor(), new AcquireWorkerTaskCommand(binding.topic(), binding.schemaVersion()), true);
+    }
+
+    private AcquireWorkerTaskResult acquire(ProcessActor actor, AcquireWorkerTaskCommand command, boolean agentDispatch) {
         Objects.requireNonNull(command, "command");
         var registration = registry.require(actor, command.topic(), command.schemaVersion());
+        requireMode(registration, agentDispatch);
         WorkerNativeAvailability.require(process);
         return Objects.requireNonNull(transaction.execute(status -> {
             if (!leases.hasCapacity(actor, command.topic(), command.schemaVersion(), registration.maxConcurrent())) return empty();
@@ -118,6 +130,10 @@ public final class FlowableWorkerService {
     }
 
     public WorkerReceiptDTO complete(ProcessActor actor, CompleteWorkerTaskCommand command) {
+        return complete(actor, command, false);
+    }
+
+    private WorkerReceiptDTO complete(ProcessActor actor, CompleteWorkerTaskCommand command, boolean agentDispatch) {
         Objects.requireNonNull(command, "command");
         String hash = WorkerLeaseStore.tokenHash(command.leaseToken());
         String resultHash = ProcessRequestDigest.hash(List.of("worker-complete-v1", command.taskId(), command.activityOccurrenceId(),
@@ -126,6 +142,7 @@ public final class FlowableWorkerService {
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
+            requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();
             if (!"LEASED".equals(current.state())) return receipt(leases.finish(actor, command.taskId(), hash, finish));
             NativeJob nativeJob = lockNative(actor.tenantId(), command.taskId());
@@ -139,7 +156,69 @@ public final class FlowableWorkerService {
         }));
     }
 
+    /** Internal AgentStartWorker seam; it derives the occurrence and input from the verified native lease. */
+    public AgentDispatchStore.Intent prepareAgentDispatch(ProcessActor actor, WorkerTaskDTO task,
+                                                         AgentDispatchBinding binding, AgentDispatchStore dispatch) {
+        requireDispatchStorage(dispatch);
+        if (task == null || binding == null || !binding.actor().equals(actor) || task.tenantId() != actor.tenantId()) throw unavailable();
+        String hash = WorkerLeaseStore.tokenHash(task.leaseToken());
+        return Objects.requireNonNull(transaction.execute(status -> {
+            NativeJob job = lockNative(actor.tenantId(), task.taskId());
+            var lease = leases.lock(actor, task.taskId(), hash);
+            var registration = registry.require(actor, lease.topic(), lease.schemaVersion());
+            requireMode(registration, true);
+            if (!"LEASED".equals(lease.state()) || !lease.occurrenceId().equals(task.activityOccurrenceId())) throw lost();
+            if (!binding.topic().equals(lease.topic()) || !binding.schemaVersion().equals(lease.schemaVersion())
+                    || registration.effectSafety() != ValidatedProcessModel.WorkerEffect.EXTERNAL_IDEMPOTENT
+                    || !registration.outputs().equals(Map.of("runId", ValidatedProcessModel.ValueType.STRING))) throw unavailable();
+            VerifiedJob verified = verifyLease(actor, lease, job, registration);
+            if (!lease.inputSha256().equals(inputHash(job, registration, verified.inputs()))) throw conflict();
+            var intent = dispatch.prepare(new AgentDispatchStore.Seed(binding, lease.scopeId(), lease.occurrenceId(), lease.releaseKey(),
+                    lease.definitionId(), lease.modelSha256(), lease.elementId(), lease.inputSha256(),
+                    verified.businessKey(), verified.correlationId(), verified.inputs()));
+            NativeJob rechecked = lockNative(actor.tenantId(), task.taskId());
+            if (rechecked == null || !rechecked.live() || !lease.nativeOwner().equals(rechecked.owner())
+                    || !leases.isLive(actor, lease.jobId(), hash)) throw lost();
+            return intent;
+        }));
+    }
+
+    /** Correlation, Worker receipt and native completion either all commit or all roll back. */
+    public WorkerReceiptDTO completeAgentDispatch(ProcessActor actor, WorkerTaskDTO task, AgentDispatchBinding binding,
+                                                  AgentDispatchStore dispatch, String runId) {
+        requireDispatchStorage(dispatch);
+        return Objects.requireNonNull(transaction.execute(status -> {
+            // Preserve the native-job -> lease -> dispatch lock order used by prepare.
+            var intent = prepareAgentDispatch(actor, task, binding, dispatch);
+            dispatch.markAcknowledged(intent.seed().key(), runId);
+            return complete(actor, new CompleteWorkerTaskCommand(task.taskId(), task.activityOccurrenceId(), task.leaseToken(),
+                    "agent-" + runId, Map.of("runId", runId)), true);
+        }));
+    }
+
+    /** Read-only liveness observation; reconciliation repeats it and never locks Flowable around a network call. */
+    public boolean isAgentDispatchActive(AgentDispatchStore.Intent intent) {
+        Objects.requireNonNull(intent, "intent");
+        var seed = intent.seed();
+        return process.getRuntimeService().createProcessInstanceQuery().processInstanceId(seed.instanceId())
+                .processInstanceTenantId(Long.toString(seed.binding().actor().tenantId()))
+                .processDefinitionId(seed.processDefinitionId()).count() == 1;
+    }
+
+    private void requireDispatchStorage(AgentDispatchStore dispatch) {
+        if (dispatch == null || !(process.getTransactionManager() instanceof DataSourceTransactionManager manager)) throw invalidConfiguration();
+        dispatch.requireStorage(manager.getDataSource(), manager);
+    }
+
     public WorkerReceiptDTO fail(ProcessActor actor, FailWorkerTaskCommand command) {
+        return fail(actor, command, false);
+    }
+
+    public WorkerReceiptDTO failAgentDispatch(ProcessActor actor, FailWorkerTaskCommand command) {
+        return fail(actor, command, true);
+    }
+
+    private WorkerReceiptDTO fail(ProcessActor actor, FailWorkerTaskCommand command, boolean agentDispatch) {
         Objects.requireNonNull(command, "command");
         String hash = WorkerLeaseStore.tokenHash(command.leaseToken());
         String resultHash = ProcessRequestDigest.hash(List.of("worker-fail-v1", command.taskId(), command.activityOccurrenceId(),
@@ -147,6 +226,7 @@ public final class FlowableWorkerService {
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
+            requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();
             if (!"LEASED".equals(current.state())) return replayFailure(actor, command, hash, resultHash, current);
             NativeJob nativeJob = lockNative(actor.tenantId(), command.taskId());
@@ -243,6 +323,7 @@ public final class FlowableWorkerService {
                 Long.toString(registration.leaseDuration().toMillis()), Long.toString(registration.retryDelay().toMillis())));
         addPolicy(fields, registration.inputs(), registration.inputSources());
         addPolicy(fields, registration.outputs(), registration.outputTargets());
+        if (registration.internalAgentDispatch()) fields.add("internal-agent-dispatch-v1");
         return ProcessRequestDigest.hash(fields, inputs);
     }
 
@@ -262,6 +343,9 @@ public final class FlowableWorkerService {
         }
     }
     private static AcquireWorkerTaskResult empty() { return new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, null); }
+    private static void requireMode(WorkerTopicRegistry.Registration registration, boolean agentDispatch) {
+        if (registration.internalAgentDispatch() != agentDispatch) throw unavailable();
+    }
     private static WorkerReceiptDTO receipt(WorkerLeaseStore.Lease lease) {
         return new WorkerReceiptDTO(lease.jobId(), lease.occurrenceId(), WorkerReceiptOutcomeEnum.valueOf(lease.state()), lease.decidedAt());
     }

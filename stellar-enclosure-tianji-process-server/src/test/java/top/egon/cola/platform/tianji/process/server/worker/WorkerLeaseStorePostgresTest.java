@@ -57,7 +57,7 @@ class WorkerLeaseStorePostgresTest {
         var verifier = new ProcessApiSchemaVerifier(source, "tianji_process");
         verifier.verify();
         assertThrows(IllegalStateException.class, verifier::verifyWorker);
-        Flyway next = flyway(source, null);
+        Flyway next = flyway(source, "4");
         assertEquals(1, next.migrate().migrationsExecuted);
         next.validate();
         assertEquals(checksums, jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history "

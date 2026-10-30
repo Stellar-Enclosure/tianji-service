@@ -43,6 +43,14 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.scheduling.TaskScheduler;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentStartWorker;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentCloseResult;
 import top.egon.cola.component.outbox.api.OutboxMessage;
 import top.egon.cola.component.outbox.api.TenantScopedOutboxKey;
 import top.egon.cola.component.outbox.api.TransactionalOutbox;
@@ -56,6 +64,7 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
@@ -212,9 +221,14 @@ class ProcessServerPostgresTest {
         Integer version3Checksum = jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class);
         Flyway workerSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
                 .table("tianji_process_schema_history").baselineVersion("0")
-                .locations("classpath:db/tianji-process").cleanDisabled(true).load();
+                .locations("classpath:db/tianji-process").target("4").cleanDisabled(true).load();
         assertEquals(1, workerSchema.migrate().migrationsExecuted);
         workerSchema.validate();
+        Flyway dispatchSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").target("5").cleanDisabled(true).load();
+        assertEquals(1, dispatchSchema.migrate().migrationsExecuted);
+        dispatchSchema.validate();
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
         assertEquals(version2Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class));
         assertEquals(version3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class));
@@ -606,6 +620,7 @@ class ProcessServerPostgresTest {
                     .processInstanceId(processId).finished().singleResult());
             verifyNativeWorkerReset(app, workerProbe);
             verifyWorkerAdapter(app, jdbc);
+            verifyAgentDispatchAdapter(app, jdbc);
         }
         assertFalse(executor.isActive());
     }
@@ -621,6 +636,76 @@ class ProcessServerPostgresTest {
         var model = new ProcessReleaseService.ModelResource(Type.BPMN, "workerMapping", xml, Map.of("amount", ValueType.INTEGER));
         var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
         assertThrows(IllegalStateException.class, () -> releases.publish(worker, "worker-disabled", List.of(model)));
+    }
+
+    private static void verifyAgentDispatchAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var validator = new ProcessModelValidator();
+        var registration = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-service", "agentStart", "1",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("runId", ValueType.STRING),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("runId", Set.of("agentRunId")), 1,
+                Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.EXTERNAL_IDEMPOTENT, true);
+        var registry = new WorkerTopicRegistry(List.of(registration));
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
+        var runs = new ProcessExecutionService(process, dmn, validator);
+        var workers = new FlowableWorkerService(process, dmn, validator, registry);
+        var owner = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/20");
+        var actor = registration.actor();
+        byte[] model = new String(new ClassPathResource("fixtures/worker-mapping.bpmn20.xml").getContentAsByteArray(), StandardCharsets.UTF_8)
+                .replace("workerMapping", "agentDispatch").replace("riskCheck", "agentStart")
+                .replace("TRANSACTIONAL_RECEIPT", "EXTERNAL_IDEMPOTENT")
+                .replace("source=\"approved\" target=\"approved\" tianji:type=\"BOOLEAN\"",
+                        "source=\"runId\" target=\"agentRunId\" tianji:type=\"STRING\"").getBytes(StandardCharsets.UTF_8);
+        releases.publish(owner, "agent-dispatch", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", model,
+                Map.of("amount", ValueType.INTEGER))));
+        var instance = runs.start(owner, new ProcessExecutionService.StartCommand("agent-dispatch", "agentDispatch", "business-one",
+                "dispatch-start", "dispatch-correlation", Map.of("amount", 10L)));
+        var binding = new AgentDispatchBinding(actor, "process-east", "agentStart", "1",
+                "research", 2, "a".repeat(64), "Summarize the task", Duration.ofMinutes(1));
+        var manager = (DataSourceTransactionManager) process.getTransactionManager();
+        var store = new AgentDispatchStore(manager.getDataSource(), manager, SCHEMA);
+        assertThrows(ProcessResourceNotFoundException.class, () -> workers.acquire(actor, new AcquireWorkerTaskCommand("agentStart", "1")));
+        var task = workers.acquireAgentDispatch(binding).task();
+        assertNotNull(task);
+        var intent = workers.prepareAgentDispatch(actor, task, binding, store);
+        assertEquals(Map.of("requestedAmount", 10L), intent.command().start().input().taskData());
+        assertEquals(instance.instanceId(), intent.query().link().scopeInstanceId());
+        var run = new AgentRunDTO("probe-run", "research", 2, null,
+                AgentRunStatusEnum.QUEUED, null, false, 0, 1, 0,
+                Instant.now().plusSeconds(600), Instant.now(), null);
+        store.record(intent.seed().key(), intent.query(), new LinkedAgentSubmissionDTO(false, run));
+        assertThrows(ProcessResourceNotFoundException.class, () -> workers.complete(actor,
+                new CompleteWorkerTaskCommand(task.taskId(), task.activityOccurrenceId(), task.leaseToken(), "forged-receipt", Map.of("runId", "probe-run"))));
+        bootstrap.execute("""
+                CREATE FUNCTION tianji_process.test_agent_ack_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.business_receipt_id='agent-probe-run' THEN RAISE EXCEPTION 'forced Agent ack failure'; END IF;
+                  RETURN NEW;
+                END $$
+                """);
+        bootstrap.execute("CREATE TRIGGER test_agent_ack_failure BEFORE UPDATE ON tianji_process.tianji_worker_lease_receipt "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_agent_ack_failure()");
+        assertThrows(RuntimeException.class, () -> workers.completeAgentDispatch(actor, task, binding, store, "probe-run"));
+        assertEquals(AgentDispatchStore.State.SUBMITTED,
+                store.refresh(intent.seed().key(), true).state());
+        assertEquals("LEASED", bootstrap.queryForObject("SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?",
+                String.class, WorkerLeaseStore.tokenHash(task.leaseToken())));
+        assertEquals(1, process.getManagementService().createExternalWorkerJobQuery().jobId(task.taskId()).count());
+        bootstrap.execute("DROP TRIGGER test_agent_ack_failure ON tianji_process.tianji_worker_lease_receipt");
+        assertEquals(WorkerReceiptOutcomeEnum.COMPLETED, workers.completeAgentDispatch(actor, task, binding, store, "probe-run").outcome());
+        assertEquals(AgentDispatchStore.State.ACKNOWLEDGED,
+                store.refresh(intent.seed().key(), true).state());
+        await().atMost(Duration.ofSeconds(10)).until(() -> process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).count() == 1);
+        assertEquals("probe-run", process.getRuntimeService().getVariable(instance.instanceId(), "agentRunId"));
+        process.getRuntimeService().deleteProcessInstance(instance.instanceId(), "controlled cancellation");
+        var client = mock(LinkedAgentClient.class);
+        when(client.close(intent.query())).thenReturn(new LinkedAgentCloseResult(intent.query(),
+                new LinkedAgentSubmissionDTO(true, run)));
+        var reconciler = new AgentStartWorker(binding, workers, store, client);
+        assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
+        assertEquals(AgentDispatchStore.State.CLOSED,
+                store.refresh(intent.seed().key(), false).state());
     }
 
     private static void verifyWorkerAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {

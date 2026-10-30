@@ -30,7 +30,7 @@ public final class WorkerTopicRegistry {
             if (entries.putIfAbsent(key, registration) != null) throw invalid();
             var topic = new TopicKey(actor.tenantId(), registration.topic(), registration.schemaVersion());
             var schema = new Schema(registration.inputs(), registration.outputs(), registration.inputSources(),
-                    registration.outputTargets(), registration.effectSafety());
+                    registration.outputTargets(), registration.effectSafety(), registration.internalAgentDispatch());
             Schema previous = topics.putIfAbsent(topic, schema);
             if (previous != null && !previous.equals(schema)) throw invalid();
         }
@@ -91,7 +91,15 @@ public final class WorkerTopicRegistry {
     public record Registration(long tenantId, String issuer, String subjectId, String topic, String schemaVersion,
                                Map<String, ValueType> inputs, Map<String, ValueType> outputs,
                                Map<String, Set<String>> inputSources, Map<String, Set<String>> outputTargets, int maxConcurrent,
-                               Duration leaseDuration, Duration retryDelay, WorkerEffect effectSafety) {
+                               Duration leaseDuration, Duration retryDelay, WorkerEffect effectSafety, boolean internalAgentDispatch) {
+        public Registration(long tenantId, String issuer, String subjectId, String topic, String schemaVersion,
+                            Map<String, ValueType> inputs, Map<String, ValueType> outputs,
+                            Map<String, Set<String>> inputSources, Map<String, Set<String>> outputTargets, int maxConcurrent,
+                            Duration leaseDuration, Duration retryDelay, WorkerEffect effectSafety) {
+            this(tenantId, issuer, subjectId, topic, schemaVersion, inputs, outputs, inputSources, outputTargets, maxConcurrent,
+                    leaseDuration, retryDelay, effectSafety, false);
+        }
+
         public Registration {
             ProcessActor.verified(tenantId, ProcessActor.SubjectType.SERVICE, subjectId, issuer);
             ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
@@ -103,6 +111,8 @@ public final class WorkerTopicRegistry {
                     || leaseDuration.compareTo(Duration.ofSeconds(1)) < 0 || leaseDuration.compareTo(Duration.ofMinutes(15)) > 0
                     || retryDelay == null || retryDelay.isNegative() || retryDelay.compareTo(Duration.ofHours(1)) > 0
                     || !wholeMillis(leaseDuration) || !wholeMillis(retryDelay) || effectSafety == null) throw invalid();
+            if (internalAgentDispatch && (effectSafety != WorkerEffect.EXTERNAL_IDEMPOTENT
+                    || !outputs.equals(Map.of("runId", ValueType.STRING)))) throw invalid();
         }
 
         public ProcessActor actor() { return ProcessActor.verified(tenantId, ProcessActor.SubjectType.SERVICE, subjectId, issuer); }
@@ -111,7 +121,8 @@ public final class WorkerTopicRegistry {
     private record Key(long tenantId, String issuer, String subject, String topic, String version) { }
     private record TopicKey(long tenantId, String topic, String version) { }
     private record Schema(Map<String, ValueType> inputs, Map<String, ValueType> outputs,
-                          Map<String, Set<String>> inputSources, Map<String, Set<String>> outputTargets, WorkerEffect effectSafety) {
+                          Map<String, Set<String>> inputSources, Map<String, Set<String>> outputTargets, WorkerEffect effectSafety,
+                          boolean internalAgentDispatch) {
         private Schema {
             inputs = Map.copyOf(inputs);
             outputs = Map.copyOf(outputs);
