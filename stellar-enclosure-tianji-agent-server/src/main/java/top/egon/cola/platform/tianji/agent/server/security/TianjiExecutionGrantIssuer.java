@@ -29,25 +29,39 @@ public final class TianjiExecutionGrantIssuer {
     private final URI resource;
     private final TrustedIssuerRegistry issuers;
     private final Map<URI, HttpExecutionGrantClient> clients;
+    private final TianjiMemoryGrantIssuer memory;
 
     public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper) {
+        this(ledger, store, starter, authority, issuers, oauth, mapper, null);
+    }
+
+    public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, TianjiMemoryGrantIssuer memory) {
         this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), issuers,
-                clients(starter, authority, issuers, oauth, mapper));
+                clients(starter, authority, issuers, oauth, mapper), memory);
     }
 
     TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
             TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients) {
+        this(ledger, store, resource, issuers, clients, null);
+    }
+
+    TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
+            TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients, TianjiMemoryGrantIssuer memory) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.issuers = Objects.requireNonNull(issuers, "issuers");
         this.clients = Map.copyOf(clients);
+        if (memory != null && (!memory.usesLedger(ledger) || !memory.usesIssuerRegistry(issuers) || !memory.usesResource(resource))) throw new IllegalArgumentException("Memory issue authority does not match the run issuer");
+        this.memory = memory;
         if (this.clients.isEmpty()) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_REQUIRED");
     }
 
     /** A failed or uncertain issue leaves the run queued; a repeated start with the same key can retry. */
     public AgentRunDTO ensure(TianjiAgentAccess.Authorized authorized, AgentRunDTO run) {
-        try { return ensureInternal(authorized, run); }
+        try { var current = ensureInternal(authorized, run); return memory == null ? current : memory.ensure(authorized, current); }
         catch (AgentLedgerException failure) { throw failure; }
         catch (RuntimeException failure) { throw unavailable(); }
     }

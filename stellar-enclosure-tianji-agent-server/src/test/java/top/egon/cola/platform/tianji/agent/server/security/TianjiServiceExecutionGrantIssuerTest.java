@@ -105,6 +105,18 @@ class TianjiServiceExecutionGrantIssuerTest {
 
     @AfterEach void clear() { SecurityContextHolder.clearContext(); RequestContextHolder.resetRequestAttributes(); }
 
+    @Test void memory_scopes_are_ensured_after_service_issue_and_also_when_the_ordinary_ticket_is_reused() throws Exception {
+        var memory = mock(TianjiMemoryGrantIssuer.class); when(memory.usesLedger(ledger)).thenReturn(true);
+        when(memory.usesIssuerRegistry(issuers)).thenReturn(true); when(memory.usesResource(RESOURCE)).thenReturn(true); when(memory.ensure(authorized, run)).thenReturn(run);
+        issuer = new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, RESOURCE, issuers, Map.of(ISSUER, client), clock, memory);
+        withRequest(request -> issuer.ensure(authorized, principal, binding, command, run));
+        var order = inOrder(store, memory); order.verify(store).current(authorization, RESOURCE, subject); order.verify(store).reserve(actor, RUN, RESOURCE, subject);
+        order.verify(store).complete(eq(reservation), any()); order.verify(memory).ensure(authorized, run);
+        when(store.current(authorization, RESOURCE, subject)).thenReturn(Optional.of(new AgentServiceExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:existing", NOW.plusSeconds(60))));
+        withRequest(request -> issuer.ensure(authorized, principal, binding, command, run));
+        verify(memory, times(2)).ensure(authorized, run); verify(client, times(1)).issueService(any());
+    }
+
     @Test void issues_the_verified_request_token_for_the_exact_reserved_run() throws Exception {
         withRequest(request -> issuer.ensure(authorized, principal, binding, command, run));
         var sent = org.mockito.ArgumentCaptor.forClass(ServiceExecutionGrantContract.IssueRequest.class);

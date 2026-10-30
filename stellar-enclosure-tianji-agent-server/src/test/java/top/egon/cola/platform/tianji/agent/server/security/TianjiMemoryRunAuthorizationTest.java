@@ -157,6 +157,10 @@ class TianjiMemoryRunAuthorizationTest {
         assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(query)); verify(client, never()).decideScopes(any(), any());
         doReturn(subject, new AgentServiceExecutionGrant.Subject("client", "other-app", "business", "source", "test", RESOURCE)).when(services).require(eq(serviceRun), any());
         assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(query));
+        var changedResource = new AgentServiceExecutionGrant.Subject("client", "application", "business", "source", "test", URI.create("https://AGENT.example"));
+        assertEquals(subject, changedResource);
+        doReturn(subject, changedResource).when(services).require(eq(serviceRun), any());
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(query));
     }
 
     @Test void ambient_transactions_and_closed_authorities_do_not_issue_network_or_storage_calls() {

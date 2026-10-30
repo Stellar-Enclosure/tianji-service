@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.server.security;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import javax.sql.DataSource;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -34,7 +35,9 @@ public class TianjiExecutionGrantConfiguration {
             @Qualifier("identityAuthorityProperties") IdentityAuthorityProperties authority,
             @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers,
             @Qualifier("idpServiceOAuth2Client") IdpServiceOAuth2Client oauth,
-            @Qualifier("jacksonObjectMapper") ObjectMapper mapper) {
-        return new TianjiExecutionGrantIssuer(ledger, store, starter, authority, issuers, oauth, mapper);
+            @Qualifier("jacksonObjectMapper") ObjectMapper mapper, Environment environment, ObjectProvider<TianjiMemoryGrantIssuer> memoryIssuers) {
+        var memory = environment.getProperty("stellar.tianji.agent.context.memory.enabled", Boolean.class, false) ? memoryIssuers.getIfAvailable() : null;
+        if (environment.getProperty("stellar.tianji.agent.context.memory.enabled", Boolean.class, false) && memory == null) throw new IllegalStateException("TIANJI_MEMORY_GRANT_ISSUER_REQUIRED");
+        return new TianjiExecutionGrantIssuer(ledger, store, starter, authority, issuers, oauth, mapper, memory);
     }
 }

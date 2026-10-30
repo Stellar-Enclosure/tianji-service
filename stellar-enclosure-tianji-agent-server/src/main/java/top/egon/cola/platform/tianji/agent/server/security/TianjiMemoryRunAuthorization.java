@@ -156,7 +156,8 @@ public final class TianjiMemoryRunAuthorization implements MemoryAuthorization, 
     }
     private boolean unchanged(AgentRunAuthorization.Request run, MemoryContextBinding binding, MemoryReadGrant.Scope scope, TianjiExecutionGrantAuthorizer.BoundClient client,
                               TrustedIssuerRegistry.TrustedIssuerVO trust, MemoryReadGrant.Ticket ticket) {
-        return issuers.findByIssuer(client.issuer().toASCIIString()).filter(trust::equals).isPresent() && binding.scope(run, subject(run)).equals(scope)
+        return issuers.findByIssuer(client.issuer().toASCIIString()).filter(trust::equals).isPresent()
+                && MemoryReadGrant.fingerprint(run, resource, binding.scope(run, subject(run))).equals(MemoryReadGrant.fingerprint(run, resource, scope))
                 && store.currentEvidence(run, resource, scope).filter(ticket::equals).isPresent() && run.deadlineAt().isAfter(ledger.databaseNow()) && ticket.expiresAt().isAfter(ledger.databaseNow());
     }
     private boolean team(Request request, URI issuer, ExecutionScopeAuthorizationContract.Decision decision) {
