@@ -11,6 +11,7 @@ import java.util.Objects;
 
 /** Host-ordered, bounded source access. Both methods must enforce current tenant, owner and resource authorization. */
 public interface ContextProvider {
+    /** Within explicit provider order, return optional evidence from highest to lowest retention priority. */
     List<Fragment> provide(Request request);
 
     /** Rechecks the exact previously resolved sources; it must throw on revocation, deletion, drift or unavailable authority. */

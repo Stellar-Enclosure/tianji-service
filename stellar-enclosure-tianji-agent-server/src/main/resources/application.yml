@@ -38,6 +38,8 @@ stellar:
   tianji:
     agent:
       context:
+        trimming:
+          enabled: false
         snapshots:
           enabled: false
         tianshu:

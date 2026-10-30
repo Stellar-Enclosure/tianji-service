@@ -28,6 +28,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextTrimDecisionDTO;
 
 import java.util.Map;
 import java.util.List;
@@ -54,6 +55,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private final AgentRunAuthorization.Request authorizationRequest;
     private DefaultContextAssembler.ResolvedSources contextSources;
     private final AdkContextSnapshotProjector snapshots;
+    private final boolean trimming;
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
     private final FlowableProcessor<Boolean> idleSignal = ReplayProcessor.<Boolean>createWithSize(1).toSerialized();
@@ -71,6 +73,15 @@ final class AdkRunBudgetPlugin implements Plugin {
                        AgentExecutionAuthorization authorization, Scheduler retryScheduler,
                        ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
                        AgentRunAuthorization.Request authorizationRequest, boolean contextSnapshots) {
+        this(ledger, actor, lease, snapshot, estimator, authorization, retryScheduler, controlExecutor, contextAssembler, authorizationRequest,
+                new AgentContextRuntimeOptions(contextSnapshots, false));
+    }
+
+    AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
+                       AgentExecutionSnapshot snapshot, AgentModelBudgetEstimator estimator,
+                       AgentExecutionAuthorization authorization, Scheduler retryScheduler,
+                       ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
+                       AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
@@ -81,7 +92,8 @@ final class AdkRunBudgetPlugin implements Plugin {
         this.controlExecutor = controlExecutor;
         this.contextAssembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
         this.authorizationRequest = Objects.requireNonNull(authorizationRequest, "authorizationRequest");
-        this.snapshots = contextSnapshots ? new AdkContextSnapshotProjector(snapshot, authorizationRequest, lease, contextAssembler) : null;
+        this.snapshots = contextOptions.snapshots() ? new AdkContextSnapshotProjector(snapshot, authorizationRequest, lease, contextAssembler) : null;
+        this.trimming = contextOptions.trimming();
     }
 
     @Override
@@ -93,6 +105,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     public Maybe<LlmResponse> beforeModelCallback(CallbackContext context, LlmRequest.Builder request) {
         var contextApplied = new java.util.concurrent.atomic.AtomicBoolean();
         var preparedContext = new java.util.concurrent.atomic.AtomicReference<AdkContextSnapshotProjector.PreparedCall>();
+        var contextPlan = new java.util.concurrent.atomic.AtomicReference<AdkContextWindowPlan>();
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
             if (snapshots != null && preparedContext.get() == null) preparedContext.set(snapshots.prepare(context, request.build()));
@@ -104,9 +117,9 @@ final class AdkRunBudgetPlugin implements Plugin {
             }
             LlmRequest modelRequest = request.build();
             AgentModelBudgetEstimator.Estimate estimate = estimate(modelRequest);
+            int estimatedOutputLimit = estimate.maxOutputTokens();
             GenerateContentConfig config = request.config().orElseGet(() -> GenerateContentConfig.builder().build());
-            int outputLimit = config.maxOutputTokens().map(existing -> Math.min(existing, estimate.maxOutputTokens()))
-                    .orElse(estimate.maxOutputTokens());
+            int outputLimit = config.maxOutputTokens().map(existing -> Math.min(existing, estimatedOutputLimit)).orElse(estimatedOutputLimit);
             if (outputLimit < 1) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_INVALID_COMMAND, "model output limit is invalid");
             }
@@ -123,6 +136,15 @@ final class AdkRunBudgetPlugin implements Plugin {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
                         "model context policy changed during the run");
             }
+            List<AgentContextTrimDecisionDTO> trimDecisions = List.of();
+            String trimmingPolicy = snapshots == null ? null : AdkContextSnapshotProjector.NO_TRIM_POLICY;
+            if (trimming) {
+                if (contextPlan.get() == null) contextPlan.set(new AdkContextWindowPlan(preparedContext.get().original(), fragments, estimator.contextPolicy(snapshot, modelRequest)));
+                var selection = contextPlan.get().fit(request, snapshot, estimator, window, estimate, outputLimit);
+                estimate = selection.estimate(); outputLimit = selection.outputLimit(); fragments = selection.sources();
+                trimDecisions = selection.decisions(); trimmingPolicy = selection.policySha256();
+                config = request.config().orElseGet(() -> GenerateContentConfig.builder().build());
+            }
             long available = window.windowTokens() - window.safetyMarginTokens();
             if (outputLimit > available || estimate.inputTokens() > available - outputLimit) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED,
@@ -135,7 +157,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             else {
                 request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
                 var metadata = snapshots.capture(preparedContext.get(), request.build(), window, estimate, outputLimit, fragments,
-                        estimator.modelAdapterFingerprint(snapshot, request.build()));
+                        estimator.modelAdapterFingerprint(snapshot, request.build()), trimDecisions, trimmingPolicy);
                 reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest, metadata);
             }
             if (!reservation.newlyCreated()) {

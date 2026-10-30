@@ -153,6 +153,32 @@ class AdkRunContextTest {
         verifyNoInteractions(budgets);
     }
 
+    @Test
+    void trimming_records_actual_selection_and_capacity_retries_do_not_restore_removed_evidence_or_history() {
+        plugin.close().blockingAwait();
+        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
+                new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
+                Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization, new AgentContextRuntimeOptions(true, true));
+        var policy = new AgentModelBudgetEstimator.ContextPolicy("policy-v1", 8, 1, true, true);
+        when(estimator.contextPolicy(eq(snapshot), any())).thenReturn(policy);
+        when(provider.policyFingerprint(any())).thenReturn("f".repeat(64));
+        when(estimator.modelAdapterFingerprint(eq(snapshot), any())).thenReturn("e".repeat(64));
+        when(estimator.estimate(eq(snapshot), any())).thenAnswer(call ->
+                new AgentModelBudgetEstimator.Estimate(((LlmRequest) call.getArgument(1)).contents().size() * 30L, 10, BigDecimal.ONE));
+        var captured = new CopyOnWriteArrayList<AgentContextMetadataDTO>();
+        when(budgets.reserveBudget(eq(actor), eq(lease), any(), any())).thenAnswer(call -> {
+            captured.add(call.getArgument(3));
+            if (captured.size() == 1) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "controlled capacity");
+            return reservation(call.getArgument(2));
+        });
+        var request = request(); plugin.beforeModelCallback(callback("call-one"), request).blockingGet();
+        assertEquals(1, request.build().contents().size()); assertEquals("current task", text(request.build().contents().getFirst()));
+        assertEquals(2, captured.size()); assertEquals(captured.getFirst(), captured.getLast());
+        assertEquals(2, captured.getLast().trims().size()); assertEquals(policy.fingerprint(), captured.getLast().trimmingPolicySha256());
+        assertTrue(captured.getLast().sources().stream().noneMatch(source -> source.kind() == top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum.RAG));
+        assertTrue(text(request.build().config().flatMap(GenerateContentConfig::systemInstruction).orElseThrow()).contains("published instruction"));
+    }
+
     private void snapshots() {
         plugin.close().blockingAwait();
         plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,

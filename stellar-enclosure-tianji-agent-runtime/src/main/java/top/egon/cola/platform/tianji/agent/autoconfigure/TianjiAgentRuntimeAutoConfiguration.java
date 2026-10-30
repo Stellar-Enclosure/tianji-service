@@ -23,6 +23,7 @@ import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAss
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 
@@ -58,10 +59,12 @@ public class TianjiAgentRuntimeAutoConfiguration {
         }
         validateControlExecutor(control);
         boolean snapshots = environment.getProperty("stellar.tianji.agent.context.snapshots.enabled", Boolean.class, false);
+        boolean trimming = environment.getProperty("stellar.tianji.agent.context.trimming.enabled", Boolean.class, false);
+        var contextOptions = new AgentContextRuntimeOptions(snapshots, trimming);
         if (!snapshots) new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
         return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
-                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), snapshots);
+                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), contextOptions);
     }
 
     @Bean(destroyMethod = "close")

@@ -17,6 +17,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextWindowDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextTrimDecisionDTO;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -51,6 +52,13 @@ final class AdkContextSnapshotProjector {
     AgentContextMetadataDTO capture(PreparedCall call, LlmRequest request, AgentModelBudgetEstimator.ContextWindow window,
                                     AgentModelBudgetEstimator.Estimate estimate, int outputLimit,
                                     List<ContextProvider.Fragment> fragments, String adapterFingerprint) {
+        return capture(call, request, window, estimate, outputLimit, fragments, adapterFingerprint, List.of(), NO_TRIM_POLICY);
+    }
+
+    AgentContextMetadataDTO capture(PreparedCall call, LlmRequest request, AgentModelBudgetEstimator.ContextWindow window,
+                                    AgentModelBudgetEstimator.Estimate estimate, int outputLimit,
+                                    List<ContextProvider.Fragment> fragments, String adapterFingerprint,
+                                    List<AgentContextTrimDecisionDTO> decisions, String trimmingPolicy) {
         try {
             var contents = AdkSemanticJsonDigest.contents(request.contents());
             var originalSystem = system(call.original());
@@ -73,21 +81,27 @@ final class AdkContextSnapshotProjector {
                     AgentContextMetadataDTO.PROJECTION_V1, nativeReference, contents.sha256(), contents.sha256(), contents.utf8Bytes(), null));
             sources.add(new AgentContextSourceDTO(AgentContextSourceKindEnum.ADK_SYSTEM, AgentContextRoleEnum.SYSTEM, "adk-system",
                     AgentContextMetadataDTO.PROJECTION_V1, nativeReference, system.sha256(), system.sha256(), system.utf8Bytes(), null));
-            String requestHash = AdkSemanticJsonDigest.fingerprint(AgentContextMetadataDTO.PROJECTION_V1, List.of(request.model().orElseThrow(),
+            String requestHash = nativeFingerprint(request, contents);
+            String policy = assembler.policyFingerprint(new ContextProvider.Request(authorization, snapshot, lease.epoch(), Duration.ofSeconds(30)));
+            return new AgentContextMetadataDTO(1, AgentContextMetadataDTO.PROJECTION_V1, authorization.actor().identityFingerprint(), authorization.runId(),
+                    call.reservationId(), lease.epoch(), call.agentName(), call.invocationId(), call.sessionId(), call.historyCount(), call.historySha256(), call.lastHistoryId(),
+                    authorization.definitionSha256(), authorization.requestSha256(), authorization.snapshotSha256(), requestHash, policy, adapterFingerprint, trimmingPolicy,
+                    new AgentContextWindowDTO(window.modelName(), window.modelRouteRef(), window.policyVersionRef(), window.windowTokens(), window.safetyMarginTokens()),
+                    estimate.inputTokens(), outputLimit, sources, decisions);
+        } catch (AgentLedgerException failure) { throw failure; }
+        catch (RuntimeException failure) { throw invalid(); }
+    }
+
+    static String nativeFingerprint(LlmRequest request) { return nativeFingerprint(request, AdkSemanticJsonDigest.contents(request.contents())); }
+
+    private static String nativeFingerprint(LlmRequest request, AdkSemanticJsonDigest.Value contents) {
+        return AdkSemanticJsonDigest.fingerprint(AgentContextMetadataDTO.PROJECTION_V1, List.of(request.model().orElseThrow(),
                     contents.sha256(), request.config().map(config -> AdkSemanticJsonDigest.json(config.toJson(), true).sha256()).orElseGet(() -> AdkSemanticJsonDigest.json("null", false).sha256()),
                     request.liveConnectConfig() == null ? AdkSemanticJsonDigest.json("null", false).sha256() : AdkSemanticJsonDigest.json(request.liveConnectConfig().toJson(), true).sha256(),
                     request.cacheConfig().map(value -> AdkSemanticJsonDigest.json(JsonBaseModel.toJsonString(value), true).sha256()).orElseGet(() -> AdkSemanticJsonDigest.json("null", false).sha256()),
                     request.cacheMetadata().map(value -> AdkSemanticJsonDigest.json(value.toJson(), true).sha256()).orElseGet(() -> AdkSemanticJsonDigest.json("null", false).sha256()),
                     AdkSemanticJsonDigest.fingerprint("ADK_NATIVE_TOOL_NAMES_V1", request.tools().keySet().stream().sorted().toList()),
                     request.cacheableContentsTokenCount().map(Object::toString).orElse("NONE")));
-            String policy = assembler.policyFingerprint(new ContextProvider.Request(authorization, snapshot, lease.epoch(), Duration.ofSeconds(30)));
-            return new AgentContextMetadataDTO(1, AgentContextMetadataDTO.PROJECTION_V1, authorization.actor().identityFingerprint(), authorization.runId(),
-                    call.reservationId(), lease.epoch(), call.agentName(), call.invocationId(), call.sessionId(), call.historyCount(), call.historySha256(), call.lastHistoryId(),
-                    authorization.definitionSha256(), authorization.requestSha256(), authorization.snapshotSha256(), requestHash, policy, adapterFingerprint, NO_TRIM_POLICY,
-                    new AgentContextWindowDTO(window.modelName(), window.modelRouteRef(), window.policyVersionRef(), window.windowTokens(), window.safetyMarginTokens()),
-                    estimate.inputTokens(), outputLimit, sources, List.of());
-        } catch (AgentLedgerException failure) { throw failure; }
-        catch (RuntimeException failure) { throw invalid(); }
     }
 
     private static AdkSemanticJsonDigest.Value system(LlmRequest request) {

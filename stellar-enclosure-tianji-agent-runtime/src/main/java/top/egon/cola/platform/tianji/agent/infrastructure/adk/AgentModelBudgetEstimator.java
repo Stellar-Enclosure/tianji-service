@@ -29,6 +29,23 @@ public interface AgentModelBudgetEstimator {
         throw new UnsupportedOperationException("versioned model adapter identity is unavailable");
     }
 
+    /** Optional request trimming uses immutable data rules selected by the same published policy reference. */
+    default ContextPolicy contextPolicy(AgentExecutionSnapshot snapshot, LlmRequest request) {
+        throw new UnsupportedOperationException("versioned context selection policy is unavailable");
+    }
+
+    record ContextPolicy(String policyVersionRef, int maxTrimSteps, int retainRecentUserTurns,
+                          boolean trimEvidence, boolean trimHistory) {
+        public ContextPolicy {
+            if (!ContextWindow.valid(policyVersionRef, 256) || maxTrimSteps < 1 || maxTrimSteps > 64
+                    || retainRecentUserTurns < 1 || retainRecentUserTurns > 32) throw new IllegalArgumentException("context selection policy is invalid");
+        }
+        public String fingerprint() {
+            return AdkSemanticJsonDigest.fingerprint("TIANJI_CONTEXT_SELECTION_V1", java.util.List.of(policyVersionRef,
+                    Integer.toString(maxTrimSteps), Integer.toString(retainRecentUserTurns), Boolean.toString(trimEvidence), Boolean.toString(trimHistory)));
+        }
+    }
+
     record Estimate(long inputTokens, int maxOutputTokens, BigDecimal maximumCost) {
         public Estimate {
             if (inputTokens < 0 || maxOutputTokens < 1) {
