@@ -17,6 +17,7 @@ import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActiv
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
+import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -95,6 +96,7 @@ public final class ProcessReleaseService {
         this.schema = process.getDatabaseSchema();
         if (workerTopics != null) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
         if (agentMessageWaitsEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyAgentDispatch();
+        if (agentMessageWaitsEnabled) FlowableAgentWaitInspector.requireHistory(process);
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);

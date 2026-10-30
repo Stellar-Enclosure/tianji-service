@@ -21,6 +21,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
@@ -56,6 +57,7 @@ public final class FlowableWorkerService {
     private final WorkerTopicRegistry registry;
     private final ProcessReleaseService releases;
     private final VerifiedProcessModels models;
+    private final FlowableAgentWaitInspector agentWaits;
     private final WorkerLeaseStore leases;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
@@ -69,6 +71,7 @@ public final class FlowableWorkerService {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.releases = new ProcessReleaseService(process, dmn, validator);
         this.models = new VerifiedProcessModels(process, dmn, validator);
+        this.agentWaits = new FlowableAgentWaitInspector(process, releases, models);
         if (!(process.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null
                 || process.getManagementService() == null || process.getRuntimeService() == null) throw invalidConfiguration();
         this.schema = process.getDatabaseSchema();
@@ -84,6 +87,7 @@ public final class FlowableWorkerService {
 
     public AcquireWorkerTaskResult acquireAgentDispatch(AgentDispatchBinding binding) {
         Objects.requireNonNull(binding, "binding");
+        FlowableAgentWaitInspector.requireHistory(process);
         return acquire(binding.actor(), new AcquireWorkerTaskCommand(binding.topic(), binding.schemaVersion()), true);
     }
 
@@ -160,6 +164,7 @@ public final class FlowableWorkerService {
     public AgentDispatchStore.Intent prepareAgentDispatch(ProcessActor actor, WorkerTaskDTO task,
                                                          AgentDispatchBinding binding, AgentDispatchStore dispatch) {
         requireDispatchStorage(dispatch);
+        FlowableAgentWaitInspector.requireHistory(process);
         if (task == null || binding == null || !binding.actor().equals(actor) || task.tenantId() != actor.tenantId()) throw unavailable();
         String hash = WorkerLeaseStore.tokenHash(task.leaseToken());
         return Objects.requireNonNull(transaction.execute(status -> {
@@ -198,12 +203,12 @@ public final class FlowableWorkerService {
 
     /** Read-only liveness observation; reconciliation repeats it and never locks Flowable around a network call. */
     public boolean isAgentDispatchActive(AgentDispatchStore.Intent intent) {
-        Objects.requireNonNull(intent, "intent");
-        var seed = intent.seed();
-        return process.getRuntimeService().createProcessInstanceQuery().processInstanceId(seed.instanceId())
-                .processInstanceTenantId(Long.toString(seed.binding().actor().tenantId()))
-                .processDefinitionId(seed.processDefinitionId()).count() == 1;
+        var observation = inspectAgentDispatch(intent);
+        return observation.state() != FlowableAgentWaitInspector.State.PROCESS_ENDED
+                && observation.state() != FlowableAgentWaitInspector.State.TIMER_WON;
     }
+
+    public FlowableAgentWaitInspector.Observation inspectAgentDispatch(AgentDispatchStore.Intent intent) { return agentWaits.inspect(intent); }
 
     private void requireDispatchStorage(AgentDispatchStore dispatch) {
         if (dispatch == null || !(process.getTransactionManager() instanceof DataSourceTransactionManager manager)) throw invalidConfiguration();

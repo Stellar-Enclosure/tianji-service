@@ -726,6 +726,25 @@ class ProcessServerPostgresTest {
         assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
         assertEquals(AgentDispatchStore.State.CLOSED,
                 store.refresh(intent.seed().key(), false).state());
+        byte[] timeoutModel = new String(model, StandardCharsets.UTF_8).replace("PT5M", "PT1S").getBytes(StandardCharsets.UTF_8);
+        releases.publish(owner, "agent-dispatch-timeout", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch",
+                timeoutModel, Map.of("amount", ValueType.INTEGER))));
+        var timedInstance = runs.start(owner, new ProcessExecutionService.StartCommand("agent-dispatch-timeout", "agentDispatch", "business-timeout",
+                "dispatch-timeout-start", "dispatch-timeout-correlation", Map.of("amount", 10L)));
+        var timedTask = workers.acquireAgentDispatch(binding).task();
+        assertNotNull(timedTask);
+        var timedIntent = workers.prepareAgentDispatch(actor, timedTask, binding, store);
+        var timedRun = new AgentRunDTO("probe-timer-run", "research", 2, null, AgentRunStatusEnum.QUEUED, null, false,
+                0, 1, 0, Instant.now().plusSeconds(600), Instant.now(), null);
+        store.record(timedIntent.seed().key(), timedIntent.query(), new LinkedAgentSubmissionDTO(false, timedRun));
+        workers.completeAgentDispatch(actor, timedTask, binding, store, timedRun.runId());
+        await().atMost(Duration.ofSeconds(15)).until(() -> process.getTaskService().createTaskQuery()
+                .processInstanceId(timedInstance.instanceId()).taskDefinitionKey("timeoutReview").count() == 1);
+        assertEquals(1, process.getRuntimeService().createProcessInstanceQuery().processInstanceId(timedInstance.instanceId()).count());
+        assertFalse(workers.isAgentDispatchActive(store.refresh(timedIntent.seed().key(), true)));
+        when(client.close(timedIntent.query())).thenReturn(new LinkedAgentCloseResult(timedIntent.query(), new LinkedAgentSubmissionDTO(true, timedRun)));
+        assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
+        assertEquals(AgentDispatchStore.State.CLOSED, store.refresh(timedIntent.seed().key(), true).state());
     }
 
     private static void verifyWorkerAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
