@@ -16,6 +16,10 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionR
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionItemDTO;
 import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeHitDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeRelationEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -654,6 +658,32 @@ class HttpAgentClientTest {
                 encoded.replace("\"language\"", "123"), encoded.replace("CONFIDENTIAL", "PUBLIC"), encoded.substring(0, encoded.length() - 1) + ",\"text\":\"unrequested-body\"}")) {
             response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).prepareMemoryPreferences(query)).code());
         }
+    }
+
+    @Test
+    void memory_comparison_checks_candidate_revision_scope_mode_and_scan_progress_without_replaying_posts() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var active = memoryEntry("z", owner); var base = memoryEntry("candidate", owner);
+        var candidate = new MemoryEntryDTO(owner, base.scopeId(), base.memoryId(), base.kind(), base.revision(), base.supersedesRevision(), MemoryStateEnum.CANDIDATE, base.content(), base.contentSha256(), base.source(), base.confidence(), false,
+                base.sensitivity(), base.retentionPolicyRef(), base.effectiveAt(), base.expiresAt(), base.createdAt(), base.updatedAt());
+        var page = new MemoryMergePageDTO(candidate, false, List.of(new MemoryMergeHitDTO(new MemoryHitDTO(active, null), MemoryMergeRelationEnum.SHARED_VALUES)), "z");
+        var encoded = mapper.writeValueAsString(page); var response = new AtomicReference<>(encoded); var calls = new AtomicInteger();
+        var query = new MemoryMergeQuery(owner, "research", "candidate", 1, false, "before", 1, null);
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/merge-suggestions", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), MemoryMergeQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(page, client(Duration.ofSeconds(3), 2).memoryMergeSuggestions(query));
+        for (var invalid : List.of(encoded.replace("alice", "other"), encoded.replace("\"revision\":1", "\"revision\":2"), encoded.replace("\"semantic\":false", "\"semantic\":\"false\""),
+                encoded.replace("\"CANDIDATE\"", "\"ACTIVE\"").replace("\"confirmed\":false", "\"confirmed\":true"), encoded.replace("\"nextAfterMemoryId\":\"z\"", "\"nextAfterMemoryId\":\"before\""),
+                encoded.replace(",\"nextAfterMemoryId\":\"z\"", ""), encoded.substring(0, encoded.length() - 1) + ",\"unrequested\":true}")) {
+            response.set(invalid); int before = calls.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 2).memoryMergeSuggestions(query)).code()); assertEquals(before + 1, calls.get());
+        }
+        response.set(mapper.writeValueAsString(new MemoryMergePageDTO(candidate, false, List.of(), "before")));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 2).memoryMergeSuggestions(query)).code());
+        var semantic = new MemoryMergePageDTO(candidate, true, List.of(new MemoryMergeHitDTO(new MemoryHitDTO(active, 0.6), MemoryMergeRelationEnum.RELATED_CONTENT)), null);
+        response.set(mapper.writeValueAsString(semantic));
+        handler.set(exchange -> respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8)));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).memoryMergeSuggestions(new MemoryMergeQuery(owner, "research", "candidate", 1, true, null, 1, 0.8))).code());
     }
 
     private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {

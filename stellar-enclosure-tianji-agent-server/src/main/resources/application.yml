@@ -45,6 +45,9 @@ stellar:
         extraction:
           http:
             enabled: false
+        merge-suggestions:
+          http:
+            enabled: false
         retention:
           enabled: false
         http:

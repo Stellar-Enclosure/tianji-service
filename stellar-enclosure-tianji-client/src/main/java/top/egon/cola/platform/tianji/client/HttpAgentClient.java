@@ -9,6 +9,8 @@ import top.egon.cola.platform.tianji.contract.memory.ExtractMemoryPreferencesCom
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
@@ -204,6 +206,23 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
             if (query.kind() != null && query.kind() != entry.kind() || previous != null && java.util.Arrays.compareUnsigned(previous.getBytes(StandardCharsets.UTF_8), entry.memoryId().getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse();
             previous = entry.memoryId();
         }
+        return page;
+    }
+
+    @Override
+    public MemoryMergePageDTO memoryMergeSuggestions(MemoryMergeQuery query) {
+        Objects.requireNonNull(query, "query");
+        var page = call("POST", memoryPath("merge-suggestions"), query, MemoryMergePageDTO.class, null, memories::merge);
+        var candidate = page.candidate(); requireMemoryScope(query.owner(), query.scopeId(), candidate.owner(), candidate.scopeId());
+        if (!query.memoryId().equals(candidate.memoryId()) || query.expectedRevision() != candidate.revision() || query.semantic() != page.semantic() || page.items().size() > query.limit()) throw invalidMemoryResponse();
+        String previous = query.afterMemoryId();
+        for (var item : page.items()) {
+            if (query.semantic()) { if (item.hit().score() < query.minimumScore()) throw invalidMemoryResponse(); }
+            else {
+                String id = item.hit().entry().memoryId(); if (previous != null && java.util.Arrays.compareUnsigned(previous.getBytes(StandardCharsets.UTF_8), id.getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse(); previous = id;
+            }
+        }
+        if (page.nextAfterMemoryId() != null && query.afterMemoryId() != null && java.util.Arrays.compareUnsigned(query.afterMemoryId().getBytes(StandardCharsets.UTF_8), page.nextAfterMemoryId().getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse();
         return page;
     }
 

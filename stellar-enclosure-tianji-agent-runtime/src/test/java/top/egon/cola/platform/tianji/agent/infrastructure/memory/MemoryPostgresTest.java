@@ -54,6 +54,8 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeRelationEnum;
 import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
 import java.math.BigDecimal;
@@ -69,6 +71,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -127,6 +130,7 @@ class MemoryPostgresTest {
             lifecycle(jdbc, memory, work, events);
             contextSelection(memory, work, events);
             candidates(memory);
+            mergeSuggestions(jdbc, memory, work, events, delegate);
             preferenceAdmission(ledger, memory, authority, jdbc);
             rollback(jdbc, memory, failPublication);
             concurrency(memory);
@@ -258,6 +262,41 @@ class MemoryPostgresTest {
         assertThrows(AgentLedgerException.class, () -> changedAdmission.extract(context(), new ExtractMemoryPreferencesCommand(OWNER, "extraction-alias", run.runId(), event.eventId(), changedBinding.id(), changedPolicy.reference())));
         assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_entry WHERE scope_id='extraction-alias'", Integer.class));
         assertTrue(memory.candidates(context(), new MemoryCandidateQuery(OWNER, "extraction-alias", null, null, 5)).items().isEmpty());
+    }
+
+    private static void mergeSuggestions(JdbcTemplate jdbc, PostgresMemoryService memory, MemoryIndexWork work,
+                                         Map<String, MemoryIndexPublication.Event> events, EmbeddingModel delegate) throws Exception {
+        memory.upsert(context(), new UpsertMemoryCommand("merge-candidate-create", OWNER, "merge-review", "merge-candidate", MemoryKindEnum.PREFERENCE, 0,
+                new MemoryContentDTO(null, Map.of("language", "zh-CN")), PROVENANCE, new BigDecimal("0.5"), false, MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), null, null));
+        for (var id : List.of("merge-a", "merge-b", "merge-c")) {
+            var facts = id.equals("merge-a") ? Map.of("language", "zh-CN", "format", "short") : id.equals("merge-b") ? Map.of("language", "en-US") : Map.of("timezone", "UTC");
+            memory.upsert(context(), new UpsertMemoryCommand("create-" + id, OWNER, "merge-review", id, MemoryKindEnum.PREFERENCE, 0, new MemoryContentDTO(null, facts), PROVENANCE,
+                    BigDecimal.ONE, true, MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), null, null));
+        }
+        var query = new MemoryMergeQuery(OWNER, "merge-review", "merge-candidate", 1, false, null, 1, null);
+        int before = jdbc.queryForObject("SELECT count(*) FROM tianji_agent.memory_test_outbox", Integer.class);
+        var first = memory.mergeSuggestions(context(), query); assertEquals("merge-a", first.items().getFirst().hit().entry().memoryId()); assertEquals("merge-a", first.nextAfterMemoryId());
+        var second = memory.mergeSuggestions(context(), new MemoryMergeQuery(OWNER, "merge-review", "merge-candidate", 1, false, first.nextAfterMemoryId(), 1, null));
+        assertEquals("merge-b", second.items().getFirst().hit().entry().memoryId()); assertEquals(MemoryMergeRelationEnum.DIFFERING_FIELDS, second.items().getFirst().relation()); assertNull(second.nextAfterMemoryId());
+        assertEquals(before, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.memory_test_outbox", Integer.class));
+        assertEquals(MemoryStateEnum.CANDIDATE, memory.get(context(), new GetMemoryQuery(OWNER, "merge-review", "merge-candidate")).state());
+        for (var id : List.of("merge-a", "merge-b", "merge-c")) work.apply(build(events, id, 1), Instant.now().plusSeconds(10));
+        var semantic = new MemoryMergeQuery(OWNER, "merge-review", "merge-candidate", 1, true, null, 5, 0.0);
+        assertEquals(3, memory.mergeSuggestions(context(), semantic).items().size());
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+        doAnswer(call -> { assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); entered.countDown(); assertTrue(release.await(5, TimeUnit.SECONDS)); return response(); })
+                .when(delegate).call(any(EmbeddingRequest.class));
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            try {
+                var future = executor.submit(() -> memory.mergeSuggestions(context(), semantic)); assertTrue(entered.await(5, TimeUnit.SECONDS));
+                memory.forget(context(), new ForgetMemoryCommand("forget-merge-source", OWNER, "merge-review", "merge-candidate", 1, "USER_REJECTED_CANDIDATE")); release.countDown();
+                var failure = assertThrows(ExecutionException.class, () -> future.get(5, TimeUnit.SECONDS));
+                assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertInstanceOf(AgentLedgerException.class, failure.getCause()).code());
+            } finally { release.countDown(); }
+        } finally {
+            doAnswer(call -> { assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); return response(); }).when(delegate).call(any(EmbeddingRequest.class));
+        }
+        assertThrows(AgentLedgerException.class, () -> memory.mergeSuggestions(context(), query));
     }
 
     private static void candidates(PostgresMemoryService memory) {

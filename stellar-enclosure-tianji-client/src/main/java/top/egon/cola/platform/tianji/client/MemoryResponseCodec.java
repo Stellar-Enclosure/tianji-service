@@ -12,6 +12,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
 
 /** Memory responses have a closed typed decoder without changing existing Agent/Session wire compatibility. */
 final class MemoryResponseCodec {
@@ -37,6 +38,16 @@ final class MemoryResponseCodec {
         if (!node.path("preferenceKeys").isArray() || node.path("preferenceKeys").size() > 32) throw invalid();
         for (var value : node.path("preferenceKeys")) if (!value.isString()) throw invalid();
         return mapper.treeToValue(node, MemoryPreferencePreparationDTO.class);
+    }
+    MemoryMergePageDTO merge(byte[] bytes) {
+        var node = mapper.readTree(bytes); entry(node.path("candidate"));
+        if (!node.path("semantic").isBoolean() || !node.path("items").isArray() || node.path("items").size() > 10 || node.path("nextAfterMemoryId").isMissingNode()) throw invalid();
+        optional(node.path("nextAfterMemoryId"), true);
+        for (var item : node.path("items")) {
+            strings(item, "relation"); var hit = item.path("hit"); entry(hit.path("entry")); var score = hit.path("score");
+            if (!score.isMissingNode() && !score.isNull() && !score.isNumber()) throw invalid();
+        }
+        return mapper.treeToValue(node, MemoryMergePageDTO.class);
     }
     private static void mutation(JsonNode node) {
         owner(node.path("owner")); strings(node, "commandId", "scopeId", "memoryId", "outcome", "stateAtMutation", "occurredAt"); integers(node, "revision");

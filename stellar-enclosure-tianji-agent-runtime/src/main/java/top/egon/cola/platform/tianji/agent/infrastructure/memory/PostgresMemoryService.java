@@ -29,6 +29,11 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeHitDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMergeRelationEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
 import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
 import javax.sql.DataSource;
@@ -195,6 +200,56 @@ public final class PostgresMemoryService {
             var items = found.stream().limit(query.limit()).map(StoredMemory::entry).toList();
             return new MemoryCandidatePageDTO(query.owner(), query.scopeId(), items, more ? items.getLast().memoryId() : null);
         });
+    }
+
+    /** Human comparison only. Candidate egress is separately approved; similarity never mutates or confirms a fact. */
+    public MemoryMergePageDTO mergeSuggestions(MemoryOperationContext context, MemoryMergeQuery query) {
+        Objects.requireNonNull(context, "context"); Objects.requireNonNull(query, "query"); noTransaction();
+        if (context.runAuthorization() != null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Candidate comparison requires a current request");
+        var original = mergeCandidate(get(context, new GetMemoryQuery(query.owner(), query.scopeId(), query.memoryId())), query);
+        String text = null;
+        if (query.semantic()) {
+            var policy = policy(original.retentionPolicyRef());
+            if (!policy.semanticQueryAllowed() || !policy.embeddingAllowed().contains(original.sensitivity())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Candidate semantic egress is outside the fixed policy");
+            text = codec.content(original.content());
+            if (text.length() > 2000 || text.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 8000) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REQUEST_TOO_LARGE, "Candidate exceeds the semantic comparison input limit");
+        }
+        var page = retrieve(context, new MemoryRetrievalQuery(query.owner(), query.scopeId(), original.kind(), text, query.afterMemoryId(), query.semantic() ? query.limit() : 50));
+        var related = new ArrayList<MemoryMergeHitDTO>();
+        for (var hit : page.items()) {
+            if (query.semantic() && hit.score() == null) throw unavailable();
+            if (query.semantic() && hit.score() < query.minimumScore()) continue;
+            var relation = mergeRelation(original.content(), hit.entry().content(), query.semantic());
+            if (relation == null) continue;
+            related.add(new MemoryMergeHitDTO(hit, relation));
+            if (related.size() > query.limit()) break;
+        }
+        boolean more = related.size() > query.limit();
+        var selected = related.stream().limit(query.limit()).toList();
+        String cursor = query.semantic() ? null : more ? selected.getLast().hit().entry().memoryId() : page.nextAfterMemoryId();
+        var current = mergeCandidate(get(context, new GetMemoryQuery(query.owner(), query.scopeId(), query.memoryId())), query);
+        if (!original.equals(current)) throw revisionConflict();
+        Instant now = clock.instant();
+        selected = selected.stream().filter(item -> !item.hit().entry().effectiveAt().isAfter(now)
+                && (item.hit().entry().expiresAt() == null || item.hit().entry().expiresAt().isAfter(now))).toList();
+        return new MemoryMergePageDTO(current, query.semantic(), selected, cursor);
+    }
+
+    private MemoryEntryDTO mergeCandidate(MemoryEntryDTO candidate, MemoryMergeQuery query) {
+        if (candidate.state() != MemoryStateEnum.CANDIDATE || candidate.confirmed() || candidate.revision() != query.expectedRevision()
+                || candidate.expiresAt() != null && !candidate.expiresAt().isAfter(clock.instant())) throw revisionConflict();
+        return candidate;
+    }
+
+    private static MemoryMergeRelationEnum mergeRelation(MemoryContentDTO candidate, MemoryContentDTO active, boolean semantic) {
+        boolean shared = candidate.text() != null && candidate.text().equals(active.text()); boolean different = false;
+        for (var fact : candidate.facts().entrySet()) {
+            if (!active.facts().containsKey(fact.getKey())) continue;
+            if (fact.getValue().equals(active.facts().get(fact.getKey()))) shared = true; else different = true;
+        }
+        if (different) return MemoryMergeRelationEnum.DIFFERING_FIELDS;
+        if (shared) return MemoryMergeRelationEnum.SHARED_VALUES;
+        return semantic ? MemoryMergeRelationEnum.RELATED_CONTENT : null;
     }
 
     /** Model-egress policy is forced before SQL/native-vector topK, so excluded facts cannot crowd approved evidence. */
