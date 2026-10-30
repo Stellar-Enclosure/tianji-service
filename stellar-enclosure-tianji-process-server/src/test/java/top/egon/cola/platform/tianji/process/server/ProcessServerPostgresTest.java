@@ -46,6 +46,11 @@ import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentStartWorker;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultCorrelationService;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
@@ -229,6 +234,11 @@ class ProcessServerPostgresTest {
                 .locations("classpath:db/tianji-process").target("5").cleanDisabled(true).load();
         assertEquals(1, dispatchSchema.migrate().migrationsExecuted);
         dispatchSchema.validate();
+        Flyway inboxSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").target("6").cleanDisabled(true).load();
+        assertEquals(1, inboxSchema.migrate().migrationsExecuted);
+        inboxSchema.validate();
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
         assertEquals(version2Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class));
         assertEquals(version3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class));
@@ -621,6 +631,7 @@ class ProcessServerPostgresTest {
             verifyNativeWorkerReset(app, workerProbe);
             verifyWorkerAdapter(app, jdbc);
             verifyAgentDispatchAdapter(app, jdbc);
+            verifyAgentInboxApplication(app, jdbc);
         }
         assertFalse(executor.isActive());
     }
@@ -771,6 +782,125 @@ class ProcessServerPostgresTest {
             assertEquals(1, reconciler.reconcileOnce(32, Duration.ofSeconds(1)).closed());
         }
     }
+
+    private static void verifyAgentInboxApplication(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var validator = new ProcessModelValidator();
+        var registration = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "inbox-worker", "agentInbox", "1",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("runId", ValueType.STRING),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("runId", Set.of("agentRunId")), 4,
+                Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.EXTERNAL_IDEMPOTENT, true);
+        var registry = new WorkerTopicRegistry(List.of(registration));
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry, true);
+        var runs = new ProcessExecutionService(process, dmn, validator);
+        var workers = new FlowableWorkerService(process, dmn, validator, registry);
+        var owner = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "process-owner", "https://idp.example/20");
+        var producer = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "agent-result-service", "https://idp.example/20");
+        var manager = (DataSourceTransactionManager) process.getTransactionManager();
+        var dispatches = new AgentDispatchStore(manager.getDataSource(), manager, SCHEMA);
+        var binding = new AgentDispatchBinding(registration.actor(), "process-inbox-tests", "agentInbox", "1", "research", 2,
+                "a".repeat(64), "Summarize the task", Duration.ofMinutes(1));
+        var grant = new AgentResultProducerRegistry.Registration(producer, "agent-inbox-tests", binding.sourceId(), binding.actor());
+        var inbox = new AgentResultInbox(manager.getDataSource(), manager, SCHEMA, dispatches, new AgentResultProducerRegistry(List.of(grant)), Duration.ofDays(1));
+        var results = new AgentResultCorrelationService(process, workers, inbox, Duration.ofMillis(200), 10);
+        byte[] model = new String(new ClassPathResource("fixtures/agent-dispatch-wait.bpmn20.xml").getContentAsByteArray(), StandardCharsets.UTF_8)
+                .replace("agentDispatch", "inboxProcess").replace("agentStart", "agentInbox").getBytes(StandardCharsets.UTF_8);
+        releases.publish(owner, "inbox-release", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "inboxProcess", model, Map.of("amount", ValueType.INTEGER))));
+        var first = prepareInboxProbe(runs, workers, dispatches, binding, owner, "inbox-release", "first");
+        var event = inboxEvent(first, binding, AgentRunStatusEnum.COMPLETED);
+        var received = inbox.receive(producer, event);
+        assertEquals(AgentResultReceiptStateEnum.RECEIVED, results.apply(grant, event.eventId()).state());
+        assertNull(dispatches.refresh(first.intent().seed().key(), true).runId());
+        dispatches.record(first.intent().seed().key(), first.intent().query(), new LinkedAgentSubmissionDTO(false, first.run()));
+        workers.completeAgentDispatch(binding.actor(), first.task(), binding, dispatches, first.run().runId());
+        await().atMost(Duration.ofSeconds(10)).until(() -> process.getRuntimeService().createEventSubscriptionQuery()
+                .processInstanceId(first.instance().instanceId()).eventName("TianjiAgentFinishedV1").count() == 1);
+        String executionId = process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(first.instance().instanceId())
+                .eventName("TianjiAgentFinishedV1").singleResult().getExecutionId();
+        bootstrap.execute("""
+                CREATE FUNCTION tianji_process.test_agent_inbox_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.state='APPLIED' THEN RAISE EXCEPTION 'controlled Inbox application failure'; END IF;
+                  RETURN NEW;
+                END $$
+                """);
+        bootstrap.execute("CREATE TRIGGER test_agent_inbox_failure BEFORE UPDATE ON tianji_process.tianji_process_agent_result_inbox "
+                + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_agent_inbox_failure()");
+        assertThrows(RuntimeException.class, () -> results.apply(grant, event.eventId()));
+        assertEquals(AgentResultReceiptStateEnum.RECEIVED, inbox.receive(producer, event).state());
+        assertEquals(0, process.getTaskService().createTaskQuery().processInstanceId(first.instance().instanceId()).count());
+        assertEquals(1, process.getRuntimeService().createEventSubscriptionQuery().processInstanceId(first.instance().instanceId()).eventName("TianjiAgentFinishedV1").count());
+        assertEquals(0, bootstrap.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE command_type='AGENT_RESULT' AND command_id=?", Integer.class, event.eventId()));
+        bootstrap.execute("DROP TRIGGER test_agent_inbox_failure ON tianji_process.tianji_process_agent_result_inbox");
+        var start = new CountDownLatch(1);
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            var futures = java.util.stream.IntStream.range(0, 20).mapToObj(index -> pool.submit(() -> {
+                assertTrue(start.await(5, TimeUnit.SECONDS));
+                return results.apply(grant, event.eventId());
+            })).toList();
+            start.countDown();
+            for (var future : futures) assertEquals(AgentResultReceiptStateEnum.APPLIED, future.get(20, TimeUnit.SECONDS).state());
+        }
+        assertEquals(1, process.getTaskService().createTaskQuery().processInstanceId(first.instance().instanceId()).taskDefinitionKey("review").count());
+        assertEquals("COMPLETED", process.getRuntimeService().getVariable(first.instance().instanceId(), "agentStatus"));
+        assertEquals(executionId, bootstrap.queryForObject("SELECT resource_id FROM tianji_process.tianji_process_command_receipt "
+                + "WHERE command_type='AGENT_RESULT' AND command_id=?", String.class, event.eventId()));
+        assertEquals(received.receivedAt(), inbox.receive(producer, event).receivedAt());
+        assertEquals(AgentResultReceiptStateEnum.APPLIED, results.apply(grant, event.eventId()).state());
+
+        var cancelled = prepareInboxProbe(runs, workers, dispatches, binding, owner, "inbox-release", "cancelled");
+        var cancelledEvent = inboxEvent(cancelled, binding, AgentRunStatusEnum.CANCELLED);
+        inbox.receive(producer, cancelledEvent);
+        process.getRuntimeService().deleteProcessInstance(cancelled.instance().instanceId(), "controlled early cancellation");
+        assertEquals(AgentResultReceiptStateEnum.IGNORED_LATE, results.apply(grant, cancelledEvent.eventId()).state());
+        assertEquals(AgentDispatchStore.State.CLOSING, dispatches.refresh(cancelled.intent().seed().key(), false).state());
+
+        var failed = prepareInboxProbe(runs, workers, dispatches, binding, owner, "inbox-release", "failed");
+        var failedEvent = inboxEvent(failed, binding, AgentRunStatusEnum.FAILED);
+        inbox.receive(producer, failedEvent);
+        dispatches.record(failed.intent().seed().key(), failed.intent().query(), new LinkedAgentSubmissionDTO(false, failed.run()));
+        workers.completeAgentDispatch(binding.actor(), failed.task(), binding, dispatches, failed.run().runId());
+        await().atMost(Duration.ofSeconds(10)).until(() -> process.getRuntimeService().createEventSubscriptionQuery()
+                .processInstanceId(failed.instance().instanceId()).eventName("TianjiAgentFinishedV1").count() == 1);
+        assertEquals(AgentResultReceiptStateEnum.APPLIED, results.apply(grant, failedEvent.eventId()).state());
+        assertEquals(1, process.getTaskService().createTaskQuery().processInstanceId(failed.instance().instanceId()).taskDefinitionKey("failureReview").count());
+
+        releases.publish(owner, "inbox-timeout", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "inboxProcess",
+                new String(model, StandardCharsets.UTF_8).replace("PT5M", "PT1S").getBytes(StandardCharsets.UTF_8), Map.of("amount", ValueType.INTEGER))));
+        var timed = prepareInboxProbe(runs, workers, dispatches, binding, owner, "inbox-timeout", "timed");
+        var timedEvent = inboxEvent(timed, binding, AgentRunStatusEnum.COMPLETED);
+        inbox.receive(producer, timedEvent);
+        dispatches.record(timed.intent().seed().key(), timed.intent().query(), new LinkedAgentSubmissionDTO(false, timed.run()));
+        workers.completeAgentDispatch(binding.actor(), timed.task(), binding, dispatches, timed.run().runId());
+        await().atMost(Duration.ofSeconds(10)).until(() -> process.getTaskService().createTaskQuery()
+                .processInstanceId(timed.instance().instanceId()).taskDefinitionKey("timeoutReview").count() == 1);
+        assertEquals(AgentResultReceiptStateEnum.IGNORED_LATE, results.apply(grant, timedEvent.eventId()).state());
+        assertEquals(AgentDispatchStore.State.CLOSING, dispatches.refresh(timed.intent().seed().key(), true).state());
+    }
+
+    private static InboxProbe prepareInboxProbe(ProcessExecutionService runs, FlowableWorkerService workers, AgentDispatchStore dispatches,
+                                                AgentDispatchBinding binding, ProcessActor owner, String release, String suffix) {
+        var instance = runs.start(owner, new ProcessExecutionService.StartCommand(release, "inboxProcess", "inbox-business-" + suffix,
+                "inbox-start-" + suffix, "inbox-correlation-" + suffix, Map.of("amount", 10L)));
+        var task = workers.acquireAgentDispatch(binding).task();
+        assertNotNull(task);
+        var intent = workers.prepareAgentDispatch(binding.actor(), task, binding, dispatches);
+        var run = new AgentRunDTO("inbox-run-" + suffix, "research", 2, null, AgentRunStatusEnum.QUEUED, null, false, 0, 1, 0,
+                Instant.now().plusSeconds(600), Instant.now(), null);
+        return new InboxProbe(instance, task, intent, run);
+    }
+
+    private static AgentTerminalEvent inboxEvent(InboxProbe probe, AgentDispatchBinding binding, AgentRunStatusEnum terminal) {
+        return new AgentTerminalEvent(1, "agent-inbox-tests", AgentTerminalEvent.eventIdFor("agent-inbox-tests", binding.actor().tenantId(),
+                binding.actor().issuerFingerprint(), binding.actor().subjectId(), probe.run().runId(), 3), binding.actor().tenantId(),
+                binding.actor().issuerFingerprint(), binding.actor().subjectId(), probe.intent().query().idempotencyKey(), probe.intent().query().link(),
+                binding.definitionKey(), binding.definitionVersion(), probe.run().runId(), 3, terminal,
+                Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS), "b".repeat(64), terminal == AgentRunStatusEnum.FAILED ? "TIANJI_DEPENDENCY_UNAVAILABLE" : null, "UNKNOWN");
+    }
+
+    private record InboxProbe(ProcessExecutionService.Snapshot instance, WorkerTaskDTO task, AgentDispatchStore.Intent intent, AgentRunDTO run) { }
 
     private static void verifyWorkerAdapter(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
         var process = app.getBean(SpringProcessEngineConfiguration.class);

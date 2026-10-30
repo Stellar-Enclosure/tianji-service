@@ -23,6 +23,8 @@ import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
 import java.util.Objects;
 
 /** Trusted ingress authenticates and authorizes the SERVICE actor before this owner-local transaction. */
@@ -37,6 +39,9 @@ public final class AgentResultInbox {
     private final TransactionTemplate transaction;
     private final Duration pendingRetention;
     private final String table;
+    private final DataSource source;
+    private final DataSourceTransactionManager manager;
+    private final String schema;
 
     public AgentResultInbox(DataSource source, DataSourceTransactionManager manager, String schema, AgentDispatchStore dispatches,
                              AgentResultProducerRegistry producers, Duration pendingRetention) {
@@ -52,6 +57,9 @@ public final class AgentResultInbox {
         this.transaction = new TransactionTemplate(manager);
         this.pendingRetention = pendingRetention;
         this.table = '"' + schema + "\".tianji_process_agent_result_inbox";
+        this.source = source;
+        this.manager = manager;
+        this.schema = schema;
     }
 
     /** RECEIVED means the exact payload is durable; this method never advances Flowable or claims an unknown run ID. */
@@ -90,7 +98,108 @@ public final class AgentResultInbox {
         }));
     }
 
-    private static Stored read(ResultSet rs) throws SQLException {
+    void requireStorage(DataSource candidate, DataSourceTransactionManager transactionManager, String schema) {
+        if (source != candidate || manager != transactionManager || !this.schema.equals(schema)) throw invalid();
+    }
+
+    AgentDispatchStore.Intent lockDispatch(AgentResultProducerRegistry.Registration registration, Entry entry) {
+        requireTransaction();
+        requireEntry(registration, entry);
+        var link = entry.event().link();
+        return dispatches.lockForResult(new AgentDispatchStore.Key(registration.owner(), registration.sourceId(), link.scopeInstanceId(), link.activityOccurrenceId()));
+    }
+
+    AgentDispatchStore.Intent refreshDispatch(AgentDispatchStore.Intent dispatch, boolean active) {
+        requireTransaction();
+        return dispatches.refresh(dispatch.seed().key(), active);
+    }
+
+    Entry find(AgentResultProducerRegistry.Registration registration, String eventId, boolean lock) {
+        requireTransaction();
+        producers.require(registration);
+        if (eventId == null || !eventId.matches("[0-9a-f]{64}")) throw invalid();
+        var actor = registration.producer();
+        var rows = jdbc.query("SELECT * FROM " + table + " WHERE tenant_id=? AND event_id=? AND producer_issuer=? AND producer_subject=? "
+                        + "AND producer_id=? AND source_id=? AND owner_issuer=? AND owner_subject=?" + (lock ? " FOR UPDATE" : ""), (rs, row) -> read(rs),
+                actor.tenantId(), eventId, actor.issuerFingerprint(), actor.subjectId(), registration.producerId(), registration.sourceId(),
+                registration.owner().issuerFingerprint(), registration.owner().subjectId());
+        if (rows.size() != 1) throw conflict();
+        var entry = rows.getFirst();
+        if (!registration.equals(producers.require(entry.producer(), entry.event()))) throw conflict();
+        return entry;
+    }
+
+    /** Observation claims release their row locks before native application begins. */
+    List<Entry> due(AgentResultProducerRegistry.Registration registration, int limit, Duration interval) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Inbox discovery must own its short transaction");
+        producers.require(registration);
+        delay(interval);
+        if (limit < 1 || limit > 64) throw invalid();
+        var actor = registration.producer();
+        return Objects.requireNonNull(transaction.execute(status -> jdbc.query("WITH candidates AS (SELECT tenant_id,event_id FROM " + table
+                        + " WHERE tenant_id=? AND producer_issuer=? AND producer_subject=? AND producer_id=? AND source_id=? AND owner_issuer=? AND owner_subject=? "
+                        + "AND state='PENDING' AND next_attempt_at<=clock_timestamp() ORDER BY next_attempt_at,event_id LIMIT ? FOR UPDATE SKIP LOCKED) "
+                        + "UPDATE " + table + " i SET next_attempt_at=clock_timestamp() + (? * interval '1 millisecond') FROM candidates c "
+                        + "WHERE i.tenant_id=c.tenant_id AND i.event_id=c.event_id RETURNING i.*", (rs, row) -> read(rs), actor.tenantId(), actor.issuerFingerprint(),
+                actor.subjectId(), registration.producerId(), registration.sourceId(), registration.owner().issuerFingerprint(), registration.owner().subjectId(),
+                limit, interval.toMillis())));
+    }
+
+    AgentResultReceipt finish(AgentResultProducerRegistry.Registration registration, Entry entry, AgentResultReceiptStateEnum state, String code) {
+        return finish(registration, entry, state, code, entry.failures());
+    }
+
+    private AgentResultReceipt finish(AgentResultProducerRegistry.Registration registration, Entry entry, AgentResultReceiptStateEnum state,
+                                      String code, int failures) {
+        requireTransaction();
+        requireEntry(registration, entry);
+        if (state == null || state == AgentResultReceiptStateEnum.RECEIVED || code == null || !code.matches("[A-Z][A-Z0-9_]{0,63}")
+                || failures < 0 || failures > 1000) throw invalid();
+        var event = entry.event();
+        if (jdbc.update("UPDATE " + table + " SET state=?,decided_at=clock_timestamp(),decision_code=?,attempt_count=? "
+                        + "WHERE tenant_id=? AND event_id=? AND event_sha256=? AND state='PENDING'", state.name(), code, failures,
+                event.tenantId(), event.eventId(), event.fingerprint()) != 1) throw conflict();
+        return find(registration, event.eventId(), true).receipt();
+    }
+
+    /** Normal wait observations retain the failure budget and the originally committed retry deadline. */
+    AgentResultReceipt reschedule(AgentResultProducerRegistry.Registration registration, Entry entry, Duration interval, int maxFailures, boolean failed) {
+        requireTransaction();
+        requireEntry(registration, entry);
+        delay(interval);
+        if (maxFailures < 1 || maxFailures > 1000) throw invalid();
+        int failures = Math.min(1000, entry.failures() + (failed ? 1 : 0));
+        if (!entry.retryNotAfter().isAfter(databaseNow())) return finish(registration, entry, AgentResultReceiptStateEnum.DEAD, "RETRY_DEADLINE", failures);
+        if (failures >= maxFailures) return finish(registration, entry, AgentResultReceiptStateEnum.DEAD, "RETRY_EXHAUSTED", failures);
+        var event = entry.event();
+        if (jdbc.update("UPDATE " + table + " SET next_attempt_at=clock_timestamp() + (? * interval '1 millisecond'),attempt_count=? "
+                        + "WHERE tenant_id=? AND event_id=? AND event_sha256=? AND state='PENDING'", interval.toMillis(), failures,
+                event.tenantId(), event.eventId(), event.fingerprint()) != 1) throw conflict();
+        return find(registration, event.eventId(), true).receipt();
+    }
+
+    Instant databaseNow() {
+        requireTransaction();
+        return jdbc.queryForObject("SELECT clock_timestamp()", (rs, row) -> rs.getTimestamp(1).toInstant());
+    }
+
+    private void requireTransaction() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)) {
+            throw new IllegalStateException("Inbox application requires the owning Process JDBC transaction");
+        }
+    }
+
+    private void requireEntry(AgentResultProducerRegistry.Registration registration, Entry entry) {
+        producers.require(registration);
+        if (entry == null || !registration.equals(producers.require(entry.producer(), entry.event()))) throw conflict();
+    }
+
+    private static void delay(Duration delay) {
+        if (delay == null || delay.compareTo(Duration.ofMillis(100)) < 0 || delay.compareTo(Duration.ofHours(1)) > 0
+                || delay.toNanos() % 1_000_000 != 0) throw invalid();
+    }
+
+    private static Entry read(ResultSet rs) throws SQLException {
         AgentTerminalEvent event = decode(rs.getString("event_payload"));
         if (event.tenantId() != rs.getLong("tenant_id") || !event.eventId().equals(rs.getString("event_id"))
                 || !event.producerId().equals(rs.getString("producer_id")) || !event.fingerprint().equals(rs.getString("event_sha256"))
@@ -110,7 +219,7 @@ public final class AgentResultInbox {
                 : decided == null || code == null || !code.matches("[A-Z][A-Z0-9_]{0,63}"))) throw conflict();
         var receipt = new AgentResultReceipt(event.eventId(), event.fingerprint(), "PENDING".equals(state)
                 ? AgentResultReceiptStateEnum.RECEIVED : AgentResultReceiptStateEnum.valueOf(state), received);
-        return new Stored(actor, event, receipt);
+        return new Entry(actor, event, receipt, expires, attempts);
     }
 
     private static String encode(AgentTerminalEvent event) {
@@ -127,5 +236,7 @@ public final class AgentResultInbox {
     }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Agent result Inbox configuration or payload is invalid"); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
-    private record Stored(ProcessActor producer, AgentTerminalEvent event, AgentResultReceipt receipt) { }
+    record Entry(ProcessActor producer, AgentTerminalEvent event, AgentResultReceipt receipt, Instant retryNotAfter, int failures) {
+        @Override public String toString() { return "AgentResultInbox.Entry[state=" + receipt.state() + "]"; }
+    }
 }

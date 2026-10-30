@@ -171,6 +171,22 @@ class FlowableAgentWaitInspectorTest {
         verifyNoInteractions(releases);
     }
 
+    @Test
+    void schema_drift_cannot_turn_the_terminal_status_target_into_a_process_input() throws Exception {
+        prepare();
+        var release = releases.getForProcessDefinition(20, intent.seed().processDefinitionId());
+        var original = release.definitions().getFirst();
+        var model = models.runningProcess(20, original);
+        var changed = new ProcessReleaseService.Definition(original.type(), original.definitionKey(), original.engineDefinitionId(),
+                original.engineDeploymentId(), original.engineVersion(), original.modelSha256(),
+                Map.of("amount", ValidatedProcessModel.ValueType.INTEGER, "agentStatus", ValidatedProcessModel.ValueType.STRING));
+        when(releases.getForProcessDefinition(20, intent.seed().processDefinitionId())).thenReturn(
+                new ProcessReleaseService.Release(release.releaseKey(), release.manifestSha256(), release.createdAt(), List.of(changed)));
+        when(models.runningProcess(20, changed)).thenReturn(model);
+        assertThrows(IllegalArgumentException.class, () -> inspector.inspect(intent));
+        verify(runtime, never()).createProcessInstanceQuery();
+    }
+
     private HistoricActivityInstance completed(String activity, String reason) {
         var value = mock(HistoricActivityInstance.class);
         when(value.getTenantId()).thenReturn("20");

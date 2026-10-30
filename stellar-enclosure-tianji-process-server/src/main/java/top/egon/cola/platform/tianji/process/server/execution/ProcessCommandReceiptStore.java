@@ -9,7 +9,7 @@ import java.util.List;
 
 /** Local transaction participant for scoped idempotency receipts. */
 public final class ProcessCommandReceiptStore {
-    public enum Kind { START, DECISION }
+    public enum Kind { START, DECISION, AGENT_RESULT }
 
     private final JdbcTemplate jdbc;
     private final String table;
@@ -53,7 +53,7 @@ public final class ProcessCommandReceiptStore {
     }
 
     public void apply(ProcessActor actor, Kind kind, String commandId, String resourceId, String decisionResult) {
-        if ((kind == Kind.START) != (decisionResult == null)) throw new IllegalArgumentException("Process receipt result is invalid");
+        if (kind == null || (kind == Kind.DECISION) != (decisionResult != null)) throw new IllegalArgumentException("Process receipt result is invalid");
         String resultAssignment = kind == Kind.DECISION ? ", decision_result=CAST(? AS jsonb)" : "";
         Object[] parameters = kind == Kind.DECISION
                 ? new Object[] {resourceId, decisionResult, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), kind.name(), commandId}

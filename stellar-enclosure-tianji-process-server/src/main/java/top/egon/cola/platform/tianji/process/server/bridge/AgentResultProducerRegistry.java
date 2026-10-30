@@ -31,6 +31,11 @@ public final class AgentResultProducerRegistry {
         return registration;
     }
 
+    public void require(Registration registration) {
+        if (registration == null || !registration.equals(registrations.get(key(registration.producer(), registration.producerId(),
+                registration.sourceId(), registration.owner())))) throw new ProcessResourceNotFoundException();
+    }
+
     private static Key key(ProcessActor producer, String producerId, String source, ProcessActor owner) {
         return new Key(producer, producerId, source, owner);
     }

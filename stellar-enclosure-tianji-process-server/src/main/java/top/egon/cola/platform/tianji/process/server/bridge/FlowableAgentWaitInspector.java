@@ -5,6 +5,7 @@ import org.flowable.engine.history.HistoricActivityInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
+import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 
@@ -15,12 +16,19 @@ public final class FlowableAgentWaitInspector {
     private final SpringProcessEngineConfiguration process;
     private final ProcessReleaseService releases;
     private final VerifiedProcessModels models;
+    private final ProcessModelValidator validator;
 
     public FlowableAgentWaitInspector(SpringProcessEngineConfiguration process, ProcessReleaseService releases,
                                       VerifiedProcessModels models) {
+        this(process, releases, models, new ProcessModelValidator());
+    }
+
+    public FlowableAgentWaitInspector(SpringProcessEngineConfiguration process, ProcessReleaseService releases,
+                                      VerifiedProcessModels models, ProcessModelValidator validator) {
         this.process = Objects.requireNonNull(process, "process");
         this.releases = Objects.requireNonNull(releases, "releases");
         this.models = Objects.requireNonNull(models, "models");
+        this.validator = Objects.requireNonNull(validator, "validator");
     }
 
     public static void requireHistory(SpringProcessEngineConfiguration process) {
@@ -43,6 +51,15 @@ public final class FlowableAgentWaitInspector {
                 && item.engineDefinitionId().equals(seed.processDefinitionId())).findFirst().orElseThrow(FlowableAgentWaitInspector::conflict);
         if (!seed.processModelSha256().equals(definition.modelSha256())) throw conflict();
         var model = models.runningProcess(tenantId, definition);
+        ValidatedProcessModel decision = null;
+        if (!model.decisionTasks().isEmpty()) {
+            String key = model.decisionTasks().values().iterator().next();
+            var binding = release.definitions().stream().filter(item -> item.type() == ValidatedProcessModel.Type.DMN
+                    && item.definitionKey().equals(key)).findFirst().orElseThrow(FlowableAgentWaitInspector::conflict);
+            decision = models.decision(tenantId, binding);
+            validator.validateDecisionBinding(model, definition.inputs(), decision);
+        }
+        validator.validateWorkerBindings(model, definition.inputs(), decision);
         var waits = model.messageWaits().entrySet().stream().filter(entry -> entry.getValue().workerElementId().equals(seed.elementId())).toList();
         if (waits.size() != 1) throw conflict();
         String activity = waits.getFirst().getKey();

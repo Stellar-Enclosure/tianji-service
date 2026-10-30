@@ -80,11 +80,46 @@ class AgentResultInboxPostgresTest {
             for (var future : futures) assertEquals(first, future.get(20, TimeUnit.SECONDS));
         }
         assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_agent_result_inbox", Integer.class));
+        assertEquals(1, inbox.due(registration, 1, Duration.ofSeconds(30)).size());
+        assertTrue(inbox.due(registration, 1, Duration.ofSeconds(30)).isEmpty());
         assertThrows(ProcessConflictException.class, () -> inbox.receive(PRODUCER, event(intent, "run-one", 3, "c".repeat(64))));
         assertThrows(ProcessConflictException.class, () -> inbox.receive(PRODUCER, event(intent, "run-one", 4, "b".repeat(64))));
         assertThrows(ProcessResourceNotFoundException.class, () -> inbox.receive(
                 ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "agent-producer", "https://foreign.example/20"), event));
         assertEquals(first, new AgentResultInbox(source, manager, "tianji_process", dispatches, registry, Duration.ofDays(1)).receive(PRODUCER, event));
+        var retryIntent = transaction.execute(status -> dispatches.prepare(seed("job-retry")));
+        var retryEvent = event(retryIntent, "retry-run", 3, "b".repeat(64));
+        var retryReceipt = inbox.receive(PRODUCER, retryEvent);
+        transaction.executeWithoutResult(status -> {
+            var current = inbox.find(registration, retryEvent.eventId(), false);
+            inbox.lockDispatch(registration, current);
+            current = inbox.find(registration, retryEvent.eventId(), true);
+            assertEquals(AgentResultReceiptStateEnum.RECEIVED, inbox.reschedule(registration, current, Duration.ofSeconds(1), 3, false).state());
+            assertEquals(0, inbox.find(registration, retryEvent.eventId(), true).failures());
+        });
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            int expected = attempt;
+            transaction.executeWithoutResult(status -> {
+                var current = inbox.find(registration, retryEvent.eventId(), false);
+                inbox.lockDispatch(registration, current);
+                current = inbox.find(registration, retryEvent.eventId(), true);
+                var result = inbox.reschedule(registration, current, Duration.ofSeconds(1), 3, true);
+                assertEquals(expected == 3 ? AgentResultReceiptStateEnum.DEAD : AgentResultReceiptStateEnum.RECEIVED, result.state());
+                assertEquals(retryReceipt.receivedAt(), result.receivedAt());
+                assertEquals(expected, inbox.find(registration, retryEvent.eventId(), true).failures());
+            });
+        }
+        var expiredIntent = transaction.execute(status -> dispatches.prepare(seed("job-expired-result")));
+        var expiredEvent = event(expiredIntent, "expired-run", 3, "b".repeat(64));
+        inbox.receive(PRODUCER, expiredEvent);
+        jdbc.update("WITH observed AS (SELECT clock_timestamp() AS now) UPDATE tianji_process.tianji_process_agent_result_inbox "
+                + "SET received_at=observed.now-interval '2 minutes',retry_not_after=observed.now-interval '1 minute' FROM observed WHERE event_id=?", expiredEvent.eventId());
+        transaction.executeWithoutResult(status -> {
+            var current = inbox.find(registration, expiredEvent.eventId(), false);
+            inbox.lockDispatch(registration, current);
+            current = inbox.find(registration, expiredEvent.eventId(), true);
+            assertEquals(AgentResultReceiptStateEnum.DEAD, inbox.reschedule(registration, current, Duration.ofSeconds(1), 3, false).state());
+        });
         assertThrows(InjectedFailure.class, () -> transaction.execute(status -> {
             jdbc.execute("ALTER TABLE tianji_process.tianji_process_agent_result_inbox DROP CONSTRAINT tianji_agent_inbox_state_fields_check");
             assertThrows(IllegalStateException.class, verifier::verifyAgentResultInbox);

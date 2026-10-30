@@ -71,7 +71,7 @@ public final class FlowableWorkerService {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.releases = new ProcessReleaseService(process, dmn, validator);
         this.models = new VerifiedProcessModels(process, dmn, validator);
-        this.agentWaits = new FlowableAgentWaitInspector(process, releases, models);
+        this.agentWaits = new FlowableAgentWaitInspector(process, releases, models, validator);
         if (!(process.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null
                 || process.getManagementService() == null || process.getRuntimeService() == null) throw invalidConfiguration();
         this.schema = process.getDatabaseSchema();
@@ -209,6 +209,10 @@ public final class FlowableWorkerService {
     }
 
     public FlowableAgentWaitInspector.Observation inspectAgentDispatch(AgentDispatchStore.Intent intent) { return agentWaits.inspect(intent); }
+
+    public void requireStorage(SpringProcessEngineConfiguration candidate, DataSourceTransactionManager manager) {
+        if (process != candidate || process.getTransactionManager() != manager) throw invalidConfiguration();
+    }
 
     private void requireDispatchStorage(AgentDispatchStore dispatch) {
         if (dispatch == null || !(process.getTransactionManager() instanceof DataSourceTransactionManager manager)) throw invalidConfiguration();
