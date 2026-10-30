@@ -7,6 +7,24 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryContentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryHitDTO;
+import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
+import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
+import java.math.BigDecimal;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
@@ -495,6 +513,88 @@ class HttpAgentClientTest {
         response.set(encoded);
         assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class,
                 () -> client(Duration.ofSeconds(3), 0).contextSnapshots(new AgentContextSnapshotsQuery("run-1", 7, 1))).code());
+    }
+
+    @Test
+    void memory_operations_use_private_post_bodies_and_exact_owner_scoped_receipts() throws Exception {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var entry = memoryEntry("memory", owner);
+        var get = new GetMemoryQuery(owner, "research", "memory"); var query = new MemoryRetrievalQuery(owner, "research", null, "private preference", null, 5);
+        var upsert = new UpsertMemoryCommand("create", owner, "research", "memory", entry.kind(), 0, entry.content(), entry.source(), BigDecimal.ONE, true,
+                entry.sensitivity(), entry.retentionPolicyRef(), null, null);
+        var correct = new CorrectMemoryCommand("correct", owner, "research", "memory", 1, entry.content(), entry.source(), BigDecimal.ONE, "USER_CONFIRMED");
+        var forget = new ForgetMemoryCommand("forget", owner, "research", "memory", 2, "USER_FORGET");
+        var seen = new LinkedBlockingQueue<String>();
+        handler.set(exchange -> {
+            String operation = exchange.getRequestURI().getPath().substring("/api/tianji/v1/memories/".length());
+            assertEquals("POST", exchange.getRequestMethod()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals("Bearer " + TOKEN, exchange.getRequestHeaders().getFirst("Authorization"));
+            byte[] body = exchange.getRequestBody().readAllBytes(); seen.add(operation);
+            Object result = switch (operation) {
+                case "get" -> { assertEquals(get, mapper.readValue(body, GetMemoryQuery.class)); yield entry; }
+                case "retrieve" -> { assertEquals(query, mapper.readValue(body, MemoryRetrievalQuery.class)); yield new MemoryRetrievalPageDTO(owner, "research", List.of(new MemoryHitDTO(entry, 0.9)), null); }
+                case "upsert" -> { assertEquals(upsert, mapper.readValue(body, UpsertMemoryCommand.class)); yield memoryReceipt("create", owner, "canonical-memory", 4, MemoryMutationOutcomeEnum.DEDUPLICATED); }
+                case "correct" -> { assertEquals(correct, mapper.readValue(body, CorrectMemoryCommand.class)); yield memoryReceipt("correct", owner, "memory", 2, MemoryMutationOutcomeEnum.CORRECTED); }
+                case "forget" -> { assertEquals(forget, mapper.readValue(body, ForgetMemoryCommand.class)); yield memoryReceipt("forget", owner, "memory", 3, MemoryMutationOutcomeEnum.FORGOTTEN); }
+                default -> throw new AssertionError(operation);
+            };
+            respond(exchange, 200, "application/json", mapper.writeValueAsBytes(result));
+        });
+        var client = client(Duration.ofSeconds(3), 3); assertEquals(entry, client.getMemory(get));
+        assertEquals(1, client.retrieveMemory(query).items().size()); assertEquals("canonical-memory", client.upsertMemory(upsert).memoryId());
+        assertEquals(2, client.correctMemory(correct).revision()); assertEquals(MemoryStateEnum.FORGOTTEN, client.forgetMemory(forget).stateAtMutation());
+        assertEquals(List.of("get", "retrieve", "upsert", "correct", "forget"), List.copyOf(seen));
+    }
+
+    @Test
+    void memory_response_decoder_rejects_wrong_scope_unknown_fields_missing_flags_and_type_coercion() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); String encoded = mapper.writeValueAsString(memoryEntry("memory", owner));
+        var response = new AtomicReference<>(encoded); handler.set(exchange -> respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8)));
+        for (String invalid : List.of(encoded.replace("alice", "bob"), encoded.replace("research", "foreign"), encoded.replace("\"memoryId\":\"memory\"", "\"memoryId\":\"other\""),
+                encoded.replace("\"revision\":1,", ""), encoded.replace("\"confirmed\":true,", ""), encoded.replace("\"confirmed\":true", "\"confirmed\":\"true\""),
+                encoded.replace("\"revision\":1", "\"revision\":1.1"), encoded.replace("\"kind\":\"PREFERENCE\"", "\"kind\":0"),
+                encoded.replace("\"effectiveAt\":\"" + NOW + "\"", "\"effectiveAt\":123"), encoded.replace("\"format\":\"short\"", "\"format\":123"),
+                encoded.replace("\"state\":\"ACTIVE\"", "\"state\":\"FORGOTTEN\""), encoded.substring(0, encoded.length() - 1) + ",\"tenantId\":20}", encoded + " {}")) {
+            response.set(invalid); var failure = assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).getMemory(new GetMemoryQuery(owner, "research", "memory")));
+            assertEquals("TIANJI_INVALID_RESPONSE", failure.code()); assertFalse(failure.toString().contains("private preference"));
+        }
+        response.set(encoded); assertEquals("memory", client(Duration.ofSeconds(3), 0).getMemory(new GetMemoryQuery(owner, "research", "memory")).memoryId());
+    }
+
+    @Test
+    void memory_mutation_replies_are_bound_to_command_operation_revision_and_scope_without_retries() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var entry = memoryEntry("memory", owner);
+        var command = new CorrectMemoryCommand("correct", owner, "research", "memory", 1, entry.content(), entry.source(), BigDecimal.ONE, "USER_CONFIRMED");
+        var response = new AtomicReference<>(memoryReceipt("correct", owner, "memory", 2, MemoryMutationOutcomeEnum.CORRECTED));
+        var calls = new AtomicInteger(); handler.set(exchange -> { calls.incrementAndGet(); respond(exchange, 200, "application/json", mapper.writeValueAsBytes(response.get())); });
+        for (var invalid : List.of(memoryReceipt("foreign", owner, "memory", 2, MemoryMutationOutcomeEnum.CORRECTED), memoryReceipt("correct", owner, "other", 2, MemoryMutationOutcomeEnum.CORRECTED),
+                memoryReceipt("correct", owner, "memory", 3, MemoryMutationOutcomeEnum.CORRECTED), memoryReceipt("correct", owner, "memory", 2, MemoryMutationOutcomeEnum.FORGOTTEN))) {
+            response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).correctMemory(command)).code());
+        }
+        assertEquals(4, calls.get());
+        handler.set(exchange -> { calls.incrementAndGet(); respond(exchange, 503, "application/json", "{\"code\":\"TIANJI_DEPENDENCY_UNAVAILABLE\"}".getBytes(StandardCharsets.UTF_8)); });
+        assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).correctMemory(command)).code()); assertEquals(5, calls.get());
+    }
+
+    @Test
+    void memory_fact_pagination_matches_postgres_utf8_c_order_and_the_original_query_bounds() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var entry = memoryEntry("😀", owner);
+        var response = new AtomicReference<>(new MemoryRetrievalPageDTO(owner, "research", List.of(new MemoryHitDTO(entry, null)), "😀"));
+        handler.set(exchange -> respond(exchange, 200, "application/json", mapper.writeValueAsBytes(response.get())));
+        var query = new MemoryRetrievalQuery(owner, "research", null, null, "\uE000", 1);
+        assertEquals("😀", client(Duration.ofSeconds(3), 0).retrieveMemory(query).nextAfterMemoryId());
+        response.set(new MemoryRetrievalPageDTO(owner, "research", List.of(new MemoryHitDTO(entry, null), new MemoryHitDTO(memoryEntry("other", owner), null)), null));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).retrieveMemory(query)).code());
+        response.set(new MemoryRetrievalPageDTO(owner, "research", List.of(new MemoryHitDTO(entry, 0.8)), null));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).retrieveMemory(query)).code());
+    }
+
+    private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {
+        return new MemoryEntryDTO(owner, "research", id, MemoryKindEnum.PREFERENCE, 1, null, MemoryStateEnum.ACTIVE, new MemoryContentDTO("private preference", Map.of("format", "short")),
+                "a".repeat(64), new MemorySourceDTO("explicit", "b".repeat(64), null, null), BigDecimal.ONE, true, MemorySensitivityEnum.CONFIDENTIAL,
+                "retention@1#" + "c".repeat(64), NOW, NOW.plusSeconds(300), NOW, NOW);
+    }
+    private static MemoryMutationResultDTO memoryReceipt(String command, MemoryOwnerDTO owner, String id, long revision, MemoryMutationOutcomeEnum outcome) {
+        return new MemoryMutationResultDTO(command, owner, "research", id, revision, outcome, outcome == MemoryMutationOutcomeEnum.FORGOTTEN ? MemoryStateEnum.FORGOTTEN : MemoryStateEnum.ACTIVE, NOW);
     }
 
     private static AgentContextSnapshotDTO contextSnapshot(String run, int number) {

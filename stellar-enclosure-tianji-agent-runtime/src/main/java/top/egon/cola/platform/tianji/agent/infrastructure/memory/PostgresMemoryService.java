@@ -196,8 +196,9 @@ public final class PostgresMemoryService {
         var prepared = transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> new SearchPreparation(now, allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding))));
         var candidates = index.search(context.actor().tenantId(), context.actor().issuerFingerprint(), query.owner(), query.scopeId(), query.kind(), query.text(), query.limit(),
                 prepared.allowed(), prepared.now(), context.deadlineAt());
-        return transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> {
-            allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding));
+        var currentContext = authorize(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.SEARCH, null, 0, null);
+        return transaction(currentContext, query.owner(), query.scopeId(), false, (repository, now) -> {
+            allowed(currentContext, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding));
             var found = new ArrayList<MemoryHitDTO>(); var seen = new HashSet<String>();
             for (var candidate : candidates) {
                 Object rawId = candidate.getMetadata().get("memoryId");
@@ -208,9 +209,9 @@ public final class PostgresMemoryService {
                 if (!live(entry, now) || entry.state() != MemoryStateEnum.ACTIVE || entry.effectiveAt().isAfter(now) || query.kind() != null && entry.kind() != query.kind()) continue;
                 var policy = policy(entry.retentionPolicyRef());
                 if (!policy.semanticQueryAllowed() || !policy.embeddingAllowed().contains(entry.sensitivity())) continue;
-                var expectedId = MemoryIndexPublication.vectorDocumentId(context.actor().tenantId(), context.actor().issuerFingerprint(), entry.owner(), entry.scopeId(), id, entry.revision(), binding.modelRef());
+                var expectedId = MemoryIndexPublication.vectorDocumentId(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), entry.owner(), entry.scopeId(), id, entry.revision(), binding.modelRef());
                 if (!expectedId.toString().equals(candidate.getId()) || !binding.modelRef().equals(row.indexModelRef())
-                        || !PgVectorMemoryIndex.metadata(context.actor().tenantId(), context.actor().issuerFingerprint(), row, binding).equals(candidate.getMetadata())) throw unavailable();
+                        || !PgVectorMemoryIndex.metadata(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), row, binding).equals(candidate.getMetadata())) throw unavailable();
                 found.add(new MemoryHitDTO(entry, candidate.getScore()));
             }
             return new MemoryRetrievalPageDTO(query.owner(), query.scopeId(), found, null);

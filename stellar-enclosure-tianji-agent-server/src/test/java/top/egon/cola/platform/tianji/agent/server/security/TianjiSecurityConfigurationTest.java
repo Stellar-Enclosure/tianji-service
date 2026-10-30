@@ -53,6 +53,8 @@ class TianjiSecurityConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("DELETE", "/api/tianji/v1/agent-sessions")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
+        assertThat(policy.requirement(new MockHttpServletRequest("POST", "/api/tianji/v1/memories/retrieve")))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/unclassified")))

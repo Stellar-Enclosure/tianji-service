@@ -4,7 +4,7 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 
 import java.util.Objects;
 
-/** Current Memory permission and owner/scope authority. TEAM operations require current verified membership, including reads. */
+/** Current Memory permission and owner/scope authority. TEAM operations require current verified IAM access scope, including reads. */
 @FunctionalInterface
 public interface MemoryAuthorization {
     /** Bounded by the context deadline and outside a database transaction; unavailable authority must never imply ALLOW. */

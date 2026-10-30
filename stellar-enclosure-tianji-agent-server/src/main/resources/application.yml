@@ -33,12 +33,17 @@ egon:
               TIANJI_AGENT_READ: ["tianji:agent:read"]
               TIANJI_AGENT_CANCEL: ["tianji:agent:cancel"]
               TIANJI_SESSION_DELETE: ["tianji:session:delete"]
+              TIANJI_MEMORY_READ: ["tianji:memory:read"]
+              TIANJI_MEMORY_WRITE: ["tianji:memory:write"]
+              TIANJI_MEMORY_FORGET: ["tianji:memory:forget"]
 
 stellar:
   tianji:
     agent:
       memory:
         enabled: false
+        http:
+          enabled: false
       model-budgets:
         enabled: false
       context:

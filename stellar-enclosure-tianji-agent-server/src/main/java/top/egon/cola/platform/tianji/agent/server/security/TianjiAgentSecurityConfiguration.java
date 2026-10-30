@@ -46,6 +46,7 @@ public class TianjiAgentSecurityConfiguration {
                             .authenticated()
                         .requestMatchers("/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**")
                             .authenticated()
+                        .requestMatchers("/api/tianji/v1/memories", "/api/tianji/v1/memories/**").authenticated()
                         .requestMatchers("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**")
                             .authenticated()
                         .anyRequest().denyAll())
@@ -85,7 +86,8 @@ public class TianjiAgentSecurityConfiguration {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
                 List.of("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**"),
                 List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**",
-                        "/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**"), true);
+                        "/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**",
+                        "/api/tianji/v1/memories", "/api/tianji/v1/memories/**"), true);
     }
 
     @Bean

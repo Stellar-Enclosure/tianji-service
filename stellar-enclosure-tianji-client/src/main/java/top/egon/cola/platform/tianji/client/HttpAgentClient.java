@@ -2,6 +2,18 @@ package top.egon.cola.platform.tianji.client;
 
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
+import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
+import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
+import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalQuery;
+import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
+import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
+
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
@@ -41,7 +53,7 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral Agent contract. It does not initiate write retries. */
-public final class HttpAgentClient implements AgentClient, AgentSessionClient {
+public final class HttpAgentClient implements AgentClient, AgentSessionClient, MemoryClient {
     private static final int MAX_JSON_BYTES = 2_097_152;
     private final URI baseUri;
     private final HttpClient http;
@@ -51,6 +63,7 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     private final Duration reconnectDelay;
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final AgentContextResponseCodec contexts = new AgentContextResponseCodec();
+    private final MemoryResponseCodec memories = new MemoryResponseCodec();
 
     public HttpAgentClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier,
                            Duration requestTimeout, int maxReconnects, Duration reconnectDelay) {
@@ -151,6 +164,69 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
         call("DELETE", sessionPath("", command.sessionId()), null, Void.class);
     }
 
+    @Override
+    public MemoryEntryDTO getMemory(GetMemoryQuery query) {
+        Objects.requireNonNull(query, "query");
+        var entry = call("POST", memoryPath("get"), query, MemoryEntryDTO.class, null, memories::entry);
+        requireMemoryScope(query.owner(), query.scopeId(), entry.owner(), entry.scopeId());
+        if (!query.memoryId().equals(entry.memoryId())) throw invalidMemoryResponse(); return entry;
+    }
+
+    @Override
+    public MemoryRetrievalPageDTO retrieveMemory(MemoryRetrievalQuery query) {
+        Objects.requireNonNull(query, "query");
+        var page = call("POST", memoryPath("retrieve"), query, MemoryRetrievalPageDTO.class, null, memories::page, 8_388_608);
+        requireMemoryScope(query.owner(), query.scopeId(), page.owner(), page.scopeId());
+        if (page.items().size() > query.limit() || query.text() != null && page.nextAfterMemoryId() != null) throw invalidMemoryResponse();
+        String previous = query.afterMemoryId();
+        for (var hit : page.items()) {
+            if (query.kind() != null && query.kind() != hit.entry().kind() || (query.text() == null) != (hit.score() == null)) throw invalidMemoryResponse();
+            if (query.text() == null) {
+                if (previous != null && java.util.Arrays.compareUnsigned(previous.getBytes(StandardCharsets.UTF_8), hit.entry().memoryId().getBytes(StandardCharsets.UTF_8)) >= 0) throw invalidMemoryResponse(); previous = hit.entry().memoryId();
+            }
+        }
+        return page;
+    }
+
+    @Override
+    public MemoryMutationResultDTO upsertMemory(UpsertMemoryCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", memoryPath("upsert"), command, MemoryMutationResultDTO.class, null, memories::mutation);
+        requireMemoryReceipt(command.commandId(), command.owner(), command.scopeId(), result);
+        if (result.outcome() != MemoryMutationOutcomeEnum.CREATED && result.outcome() != MemoryMutationOutcomeEnum.DEDUPLICATED
+                || result.outcome() == MemoryMutationOutcomeEnum.CREATED && (!command.memoryId().equals(result.memoryId()) || result.revision() != 1)) throw invalidMemoryResponse();
+        return result;
+    }
+
+    @Override
+    public MemoryMutationResultDTO correctMemory(CorrectMemoryCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", memoryPath("correct"), command, MemoryMutationResultDTO.class, null, memories::mutation);
+        requireMemoryReceipt(command.commandId(), command.owner(), command.scopeId(), result);
+        if (!command.memoryId().equals(result.memoryId()) || result.outcome() != MemoryMutationOutcomeEnum.CORRECTED
+                || result.revision() <= command.expectedRevision() || result.revision() - command.expectedRevision() != 1) throw invalidMemoryResponse();
+        return result;
+    }
+
+    @Override
+    public MemoryMutationResultDTO forgetMemory(ForgetMemoryCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", memoryPath("forget"), command, MemoryMutationResultDTO.class, null, memories::mutation);
+        requireMemoryReceipt(command.commandId(), command.owner(), command.scopeId(), result);
+        if (!command.memoryId().equals(result.memoryId()) || result.outcome() != MemoryMutationOutcomeEnum.FORGOTTEN
+                || result.revision() <= command.expectedRevision() || result.revision() - command.expectedRevision() != 1) throw invalidMemoryResponse();
+        return result;
+    }
+
+    private static void requireMemoryReceipt(String commandId, MemoryOwnerDTO owner, String scope, MemoryMutationResultDTO result) {
+        requireMemoryScope(owner, scope, result.owner(), result.scopeId()); if (!commandId.equals(result.commandId())) throw invalidMemoryResponse();
+    }
+    private static void requireMemoryScope(MemoryOwnerDTO expectedOwner, String expectedScope, MemoryOwnerDTO owner, String scope) {
+        if (!expectedOwner.equals(owner) || !expectedScope.equals(scope)) throw invalidMemoryResponse();
+    }
+    private static AgentClientException invalidMemoryResponse() { return new AgentClientException(200, "TIANJI_INVALID_RESPONSE", null, null); }
+    private URI memoryPath(String operation) { return baseUri.resolve(MemoryClient.PATH.substring(1) + "/" + operation); }
+
     private <T> T call(String method, URI uri, Object body, Class<T> type) {
         return call(method, uri, body, type, null);
     }
@@ -160,6 +236,10 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
     }
 
     private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId, Function<byte[], T> decoder) {
+        return call(method, uri, body, type, expectedSessionId, decoder, MAX_JSON_BYTES);
+    }
+
+    private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId, Function<byte[], T> decoder, int responseLimit) {
         byte[] bytes = body == null ? null : mapper.writeValueAsBytes(body);
         if (bytes != null && bytes.length > MAX_JSON_BYTES) {
             throw new IllegalArgumentException("Agent request exceeds its size limit");
@@ -168,7 +248,7 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient {
         HttpRequest request = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json")
                         .method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
-        var call = http.sendAsync(request, info -> new BoundedBodySubscriber(MAX_JSON_BYTES));
+        var call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
         try {
             HttpResponse<byte[]> response = call.get(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
             if (response.statusCode() < 200 || response.statusCode() >= 300) {

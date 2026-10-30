@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
+import top.egon.cola.platform.tianji.contract.memory.MemoryClient;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.LocalizedText;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionDefinition;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionMessage;
@@ -66,7 +67,41 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Resolve a linked Agent submission"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.linked.close", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Close a linked Agent submission"))
+@PermissionDefinition(code = TianjiAgentPermissions.MEMORY_READ, meaning = "Read current authorized Memory facts",
+        labelPage = "tianji.permissions", labelKey = "permission.memory.read")
+@PermissionMessage(pageCode = "tianji.permissions", key = "permission.memory.read", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read Memory"))
+@PermissionDefinition(code = TianjiAgentPermissions.MEMORY_WRITE, meaning = "Create and correct explicit authorized Memory facts",
+        labelPage = "tianji.permissions", labelKey = "permission.memory.write")
+@PermissionMessage(pageCode = "tianji.permissions", key = "permission.memory.write", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Create and correct Memory"))
+@PermissionDefinition(code = TianjiAgentPermissions.MEMORY_FORGET, meaning = "Forget authorized Memory facts and redact historical content",
+        labelPage = "tianji.permissions", labelKey = "permission.memory.forget")
+@PermissionMessage(pageCode = "tianji.permissions", key = "permission.memory.forget", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Forget Memory"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an authorized Memory fact"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.retrieve", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Retrieve authorized Memory facts"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.upsert", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Create or deduplicate a Memory fact"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.correct", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Confirm or correct a Memory fact"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.forget", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Forget a Memory fact"))
 public final class TianjiAgentPermissions {
+    public static final String MEMORY_READ = "TIANJI_MEMORY_READ";
+    public static final String MEMORY_READ_SCOPE = MemoryClient.READ_SCOPE;
+    public static final String MEMORY_WRITE = "TIANJI_MEMORY_WRITE";
+    public static final String MEMORY_WRITE_SCOPE = MemoryClient.WRITE_SCOPE;
+    public static final String MEMORY_FORGET = "TIANJI_MEMORY_FORGET";
+    public static final String MEMORY_FORGET_SCOPE = MemoryClient.FORGET_SCOPE;
+    public static final String MEMORY_GET_API = "tianji.api.memory.get";
+    public static final String MEMORY_RETRIEVE_API = "tianji.api.memory.retrieve";
+    public static final String MEMORY_UPSERT_API = "tianji.api.memory.upsert";
+    public static final String MEMORY_CORRECT_API = "tianji.api.memory.correct";
+    public static final String MEMORY_FORGET_API = "tianji.api.memory.forget";
+
     public static final String START = "TIANJI_AGENT_START";
     public static final String READ = "TIANJI_AGENT_READ";
     public static final String CANCEL = "TIANJI_AGENT_CANCEL";

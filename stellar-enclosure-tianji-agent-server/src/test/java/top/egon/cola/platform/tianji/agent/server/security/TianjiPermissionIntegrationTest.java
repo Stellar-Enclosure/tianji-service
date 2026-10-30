@@ -14,6 +14,13 @@ import org.springframework.web.context.WebApplicationContext;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryOperationContext;
+import top.egon.cola.platform.tianji.agent.server.integration.memory.TianjiMemoryAccessProperties;
+import top.egon.cola.platform.tianji.agent.server.integration.memory.TianjiMemoryHttpAuthorization;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.DataScopeDecision;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
@@ -91,6 +98,7 @@ class TianjiPermissionIntegrationTest {
             AuthenticationContext.of("PASSWORD", NOW.minusSeconds(60)));
     private final PermissionManifest manifest = manifest();
     private final AtomicReference<Set<String>> granted = new AtomicReference<>(Set.of(TianjiAgentPermissions.READ));
+    private final AtomicReference<Map<String, DataScopeDecision>> memoryScopes = new AtomicReference<>(Map.of());
     private final AtomicReference<String> snapshotIssuer = new AtomicReference<>("https://idp.example/tenants/20");
     private final java.util.concurrent.atomic.AtomicBoolean policyUnavailable = new java.util.concurrent.atomic.AtomicBoolean();
     private final Rbac3AuthorizationClient client = new Rbac3AuthorizationClient() {
@@ -104,7 +112,8 @@ class TianjiPermissionIntegrationTest {
                             TianjiAgentPermissions.CONTEXT_SNAPSHOTS_API,
                             TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_LIST_API,
                             TianjiAgentPermissions.SESSION_START_API, TianjiAgentPermissions.LINKED_SUBMIT_API,
-                            TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API),
+                            TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API,
+                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
                     NOW.plusSeconds(30));
         }
     };
@@ -489,6 +498,79 @@ class TianjiPermissionIntegrationTest {
         assertNull(SecurityContextHolder.getContext().getAuthentication());
     }
 
+    @Test
+    void memory_permission_scope_and_current_team_directory_proof_are_all_required() {
+        var request = new MockHttpServletRequest(); VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        request.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, snapshotIssuer.get()); RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_READ));
+        var scopes = List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_READ_SCOPE));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())), scopes));
+        var mapping = new TianjiMemoryAccessProperties(List.of(new TianjiMemoryAccessProperties.Team(20, URI.create(snapshotIssuer.get()), "researchers", "research",
+                TianjiMemoryAccessProperties.DirectoryType.ORGANIZATION, "10")));
+        var authority = new TianjiMemoryHttpAuthorization(access(), mapping, CLOCK);
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", snapshotIssuer.get());
+        var context = new MemoryOperationContext(actor, NOW.plusSeconds(5), null);
+        var query = new MemoryAuthorization.Request(context, new MemoryOwnerDTO(MemoryOwnerTypeEnum.TEAM, "researchers"), "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null);
+        assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 2)));
+        assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "11", 2)));
+        assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("alice", "10", 2)));
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 1)));
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 2)));
+        granted.set(Set.of()); assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_READ));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
+    }
+
+    @Test
+    void memory_service_uses_only_its_own_application_partition_and_never_a_user_or_team() {
+        var principal = new ServiceIdentityPrincipal("worker", "20", "worker", "token-id", URI.create("https://api.example/tianji"), 1,
+                Set.of(TianjiAgentPermissions.MEMORY_READ_SCOPE), "xingyuan", "worker", "test", "credential", NOW.minusSeconds(60), NOW.plusSeconds(300));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(), URI.create(snapshotIssuer.get())));
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", snapshotIssuer.get());
+        var authority = new TianjiMemoryHttpAuthorization(access(), new TianjiMemoryAccessProperties(List.of()), CLOCK);
+        for (var owner : List.of(new MemoryOwnerDTO(MemoryOwnerTypeEnum.APPLICATION, "worker"), new MemoryOwnerDTO(MemoryOwnerTypeEnum.APPLICATION, "other"),
+                new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "worker"), new MemoryOwnerDTO(MemoryOwnerTypeEnum.TEAM, "worker"))) {
+            var query = new MemoryAuthorization.Request(new MemoryOperationContext(actor, NOW.plusSeconds(5), null), owner, "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null);
+            assertEquals(owner.type() == MemoryOwnerTypeEnum.APPLICATION && owner.id().equals("worker") ? MemoryAuthorization.Decision.ALLOW : MemoryAuthorization.Decision.DENY, authority.authorize(query));
+        }
+        policyUnavailable.set(true);
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(new MemoryAuthorization.Request(new MemoryOperationContext(actor, NOW.plusSeconds(5), null),
+                new MemoryOwnerDTO(MemoryOwnerTypeEnum.APPLICATION, "worker"), "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null)));
+    }
+
+    @Test
+    void declared_run_provenance_needs_agent_read_and_an_ordinary_run_binding_cannot_authorize_memory() {
+        var servlet = new MockHttpServletRequest(); VerifiedUserTokenCarrier.set(servlet, "verified-test-token");
+        servlet.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, snapshotIssuer.get()); RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(servlet));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_WRITE));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_WRITE_SCOPE))));
+        var authority = new TianjiMemoryHttpAuthorization(access(), new TianjiMemoryAccessProperties(List.of()), CLOCK);
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", snapshotIssuer.get());
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice");
+        var request = new MemoryAuthorization.Request(new MemoryOperationContext(actor, NOW.plusSeconds(5), null), owner, "research", MemoryAuthorization.Operation.UPSERT, "memory", 0, "run", "event");
+        assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(request));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.READ));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_WRITE_SCOPE), new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(request));
+        var run = new top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Request(actor, "run", "definition", 1, DIGEST, DIGEST, DIGEST, "policy", false, NOW.plusSeconds(10));
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(new MemoryAuthorization.Request(new MemoryOperationContext(actor, NOW.plusSeconds(5), run),
+                owner, "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null)));
+    }
+
+    private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion) {
+        return new DataScopeDecision(top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW, "CURRENT", "20", rbacUser,
+                TianjiAgentPermissions.MEMORY_READ, "ORG", false, Set.of(org), true, Set.of(), false, Set.of(), false, null, "directory-1", 1, authVersion, 3, List.of("assignment-1"), NOW);
+    }
+
     private TianjiAgentAccess access() {
         return new TianjiAgentAccess(permissionGuard(), CLOCK);
     }
@@ -499,7 +581,10 @@ class TianjiPermissionIntegrationTest {
                 .setPermissionScopes(Map.of(TianjiAgentPermissions.READ, Set.of(TianjiAgentPermissions.READ_SCOPE),
                         TianjiAgentPermissions.START, Set.of(TianjiAgentPermissions.START_SCOPE),
                         TianjiAgentPermissions.SESSION_DELETE, Set.of(TianjiAgentPermissions.SESSION_DELETE_SCOPE),
-                        TianjiAgentPermissions.LINKED_RESOLVE, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE)));
+                        TianjiAgentPermissions.LINKED_RESOLVE, Set.of(TianjiAgentPermissions.LINKED_RESOLVE_SCOPE),
+                        TianjiAgentPermissions.MEMORY_READ, Set.of(TianjiAgentPermissions.MEMORY_READ_SCOPE),
+                        TianjiAgentPermissions.MEMORY_WRITE, Set.of(TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
+                        TianjiAgentPermissions.MEMORY_FORGET, Set.of(TianjiAgentPermissions.MEMORY_FORGET_SCOPE)));
         return new PermissionExecutionGuard(registry, new CurrentRbac3User(),
                 new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
                 new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
@@ -583,9 +668,23 @@ class TianjiPermissionIntegrationTest {
                         List.of("agent-server"), false),
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
                 List.of(), List.of(TianjiAgentPermissions.READ, TianjiAgentPermissions.START, TianjiAgentPermissions.SESSION_DELETE,
-                        TianjiAgentPermissions.LINKED_SUBMIT, TianjiAgentPermissions.LINKED_RESOLVE, TianjiAgentPermissions.LINKED_CLOSE),
+                        TianjiAgentPermissions.LINKED_SUBMIT, TianjiAgentPermissions.LINKED_RESOLVE, TianjiAgentPermissions.LINKED_CLOSE,
+                        TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_FORGET),
                 List.of(resource, events, contexts, list, current, start, sessionGet, sessionStart, sessionList, sessionDelete,
-                        linkedSubmit, linkedResolve, linkedClose), List.of(), List.of());
+                        linkedSubmit, linkedResolve, linkedClose,
+                        memoryResource("get", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
+                        memoryResource("retrieve", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
+                        memoryResource("upsert", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
+                        memoryResource("correct", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
+                        memoryResource("forget", TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.MEMORY_FORGET_SCOPE)), List.of(), List.of());
+    }
+
+    private static PermissionManifest.ResourceDefinition memoryResource(String operation, String permission, String scope) {
+        return new PermissionManifest.ResourceDefinition("tianji.api.memory." + operation, ResourceType.API,
+                Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/memories/" + operation)),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(permission)), null,
+                List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE), List.of(scope),
+                new PermissionManifest.I18nReference("tianji.permissions", "api.memory." + operation), DefinitionLifecycle.ACTIVE);
     }
 
     private static PermissionManifest.ResourceDefinition linkedResource(String key, String operation, String permission, String scope) {
@@ -610,8 +709,9 @@ class TianjiPermissionIntegrationTest {
                         TianjiAgentPermissions.EVENTS_API, TianjiAgentPermissions.CURRENT_AUTH_API,
                         TianjiAgentPermissions.START_API, TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_START_API,
                         TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API,
-                        TianjiAgentPermissions.LINKED_SUBMIT_API, TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API),
-                Map.of(), Map.of(), "checksum",
+                        TianjiAgentPermissions.LINKED_SUBMIT_API, TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API,
+                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
+                memoryScopes.get(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }
 }

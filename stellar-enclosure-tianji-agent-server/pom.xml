@@ -143,7 +143,7 @@
                                         <arg>-Apac.producer=tianji-agent-java</arg>
                                         <arg>-Apac.module=${project.artifactId}</arg>
                                         <arg>-Apac.expectedModules=stellar-enclosure-tianji-agent-server</arg>
-                                        <arg>-Apac.ownedKeyPrefixes=tianji.api.agent.,tianji.api.session.,tianji.api.authorization.</arg>
+                                        <arg>-Apac.ownedKeyPrefixes=tianji.api.agent.,tianji.api.session.,tianji.api.authorization.,tianji.api.memory.</arg>
                                         <arg>-Apac.managedPackages=top.egon.cola.platform.tianji.agent.server.api</arg>
                                         <arg>-Apac.repository=tianji-service</arg>
                                         <arg>-Apac.commit=${permission.commit}</arg>
