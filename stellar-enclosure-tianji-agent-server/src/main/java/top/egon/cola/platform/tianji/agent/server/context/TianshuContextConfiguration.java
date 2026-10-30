@@ -18,7 +18,6 @@ import top.egon.cola.component.tianshu.api.client.DdcSkillClient;
 import top.egon.cola.component.tianshu.autoconfigure.properties.DdcProperties;
 import top.egon.cola.component.tianshu.autoconfigure.properties.DdcTenantProperties;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
-import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 
 import java.time.Clock;
@@ -80,11 +79,6 @@ public class TianshuContextConfiguration {
     @Bean
     TianshuContextProvider tianjiTianshuContextProvider(TianshuContextProperties properties, OwnedClients clients, TrustedIssuerRegistry issuers) {
         return new TianshuContextProvider(properties, clients.ports, issuers, Clock.systemUTC());
-    }
-
-    @Bean
-    DefaultContextAssembler tianjiContextAssembler(TianshuContextProvider provider) {
-        return new DefaultContextAssembler(List.of(provider));
     }
 
     @Bean

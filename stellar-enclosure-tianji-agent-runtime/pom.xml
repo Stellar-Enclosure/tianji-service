@@ -23,6 +23,11 @@
             <version>${agent-flow.version}</version>
         </dependency>
         <dependency>
+            <groupId>top.egon</groupId>
+            <artifactId>stellar-enclosure-component-rag-starter</artifactId>
+            <version>0.0.1</version>
+        </dependency>
+        <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
         </dependency>

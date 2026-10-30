@@ -40,6 +40,8 @@ stellar:
       model-budgets:
         enabled: false
       context:
+        rag:
+          enabled: false
         trimming:
           enabled: false
         snapshots:

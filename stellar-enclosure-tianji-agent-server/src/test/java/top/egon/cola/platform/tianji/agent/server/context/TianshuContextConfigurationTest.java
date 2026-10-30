@@ -75,7 +75,7 @@ class TianshuContextConfigurationTest {
              var factories = mockConstruction(DdcRpcClientFactory.class, (factory, context) ->
                      when(factory.promptClient()).thenReturn(new DdcRpcClientHandle<>(prompt, closed::incrementAndGet)))) {
             ids.when(SnowflakeIdGenerator::nextId).thenReturn("1");
-            new ApplicationContextRunner().withUserConfiguration(TianshuContextConfiguration.class)
+            new ApplicationContextRunner().withUserConfiguration(TianshuContextConfiguration.class, TianjiContextAssemblyConfiguration.class)
                     .withBean(TrustedIssuerRegistry.class, TianshuContextProviderTest::issuers)
                     .withPropertyValues("stellar.tianji.agent.runtime.enabled=true", "stellar.tianji.agent.storage.enabled=true",
                             "stellar.tianji.agent.context.snapshots.enabled=true",
