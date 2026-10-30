@@ -9,6 +9,7 @@ import java.util.function.Function;
 import javax.sql.DataSource;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -18,6 +19,7 @@ import top.egon.cola.component.agentflow.autoconfigure.AgentFlowAutoConfiguratio
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
@@ -46,7 +48,8 @@ public class TianjiAgentRuntimeAutoConfiguration {
             @Qualifier("agentFlowChatModels") Map<String, ChatModel> chatModels,
             @Qualifier("tianjiAgentCodeFirstFactories") Map<String, Function<Scheduler, ? extends BaseAgent>> factories,
             @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control,
-            AgentModelBudgetEstimator estimator, AgentRunAuthorization authorizer, Environment environment) {
+            AgentModelBudgetEstimator estimator, AgentRunAuthorization authorizer, Environment environment,
+            ObjectProvider<DefaultContextAssembler> contexts) {
         if (!ledger.usesDataSource(dataSource)) throw new IllegalStateException("TIANJI_RUNTIME_DATA_SOURCE_MISMATCH");
         if (chatModels.isEmpty() && factories.isEmpty()) throw new IllegalStateException("TIANJI_RUNTIME_MODEL_REQUIRED");
         if (chatModels.keySet().stream().anyMatch(key -> key == null || key.isBlank())
@@ -57,7 +60,7 @@ public class TianjiAgentRuntimeAutoConfiguration {
         new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
         return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
-                dataSource, typedWrites, authorizer);
+                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new));
     }
 
     @Bean(destroyMethod = "close")

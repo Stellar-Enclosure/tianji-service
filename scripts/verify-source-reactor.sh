@@ -5,6 +5,7 @@ task_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd -P)
 task_components=${STELLAR_COMPONENTS_DIR:-"$task_root/../Stellar-Enclosure-Components"}
 task_shoubing=${STELLAR_SHOUBING_DIR:-"$task_root/../tianquan-shoubing-service"}
 task_jianshen=${STELLAR_JIANSHEN_DIR:-"$task_root/../tianquan-jianshen-service"}
+task_tianshu=${STELLAR_TIANSHU_DIR:-"$task_root/../tianshu-service"}
 task_goal=${STELLAR_VERIFY_GOAL:-test}
 case "$task_goal" in
     test|verify) ;;
@@ -14,7 +15,7 @@ task_projects=:stellar-enclosure-tianji-client,:stellar-enclosure-tianji-worker-
 if [ "$task_goal" = verify ]; then
     task_projects=$task_projects,:stellar-enclosure-tianquan-jianshen-processor,:stellar-enclosure-tianquan-jianshen-manifest-cli
 fi
-for source in "$task_components" "$task_shoubing" "$task_jianshen"; do
+for source in "$task_components" "$task_shoubing" "$task_jianshen" "$task_tianshu"; do
     if [ ! -f "$source/pom.xml" ]; then
         printf 'Required source repository not found: %s\n' "$source" >&2
         exit 1
@@ -29,7 +30,7 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-python3 - "$task_reactor_dir/pom.xml" "$task_components" "$task_shoubing" "$task_jianshen" "$task_root" <<'PY'
+python3 - "$task_reactor_dir/pom.xml" "$task_components" "$task_shoubing" "$task_jianshen" "$task_tianshu" "$task_root" <<'PY'
 import os
 import sys
 from pathlib import Path

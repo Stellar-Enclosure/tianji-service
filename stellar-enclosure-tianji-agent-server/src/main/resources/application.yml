@@ -4,6 +4,7 @@ spring:
   autoconfigure:
     exclude:
       - org.redisson.spring.starter.RedissonAutoConfigurationV4
+      - top.egon.cola.component.rpc.tianshu.autoconfigure.DdcRpcAutoConfiguration
   main:
     web-application-type: none
   flyway:
@@ -32,3 +33,10 @@ egon:
               TIANJI_AGENT_READ: ["tianji:agent:read"]
               TIANJI_AGENT_CANCEL: ["tianji:agent:cancel"]
               TIANJI_SESSION_DELETE: ["tianji:session:delete"]
+
+stellar:
+  tianji:
+    agent:
+      context:
+        tianshu:
+          enabled: false
