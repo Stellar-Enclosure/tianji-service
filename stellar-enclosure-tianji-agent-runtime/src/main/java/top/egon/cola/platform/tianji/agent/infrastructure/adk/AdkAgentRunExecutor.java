@@ -77,6 +77,7 @@ public final class AdkAgentRunExecutor {
     private final AgentRunAuthorization authorizer;
     private final DataSource sessionDataSource;
     private final boolean typedSessionWrites;
+    private final DefaultContextAssembler contextAssembler;
     private final ObjectMapper mapper = new ObjectMapper();
     private final AdkEventProjector projector = new AdkEventProjector();
 
@@ -112,6 +113,17 @@ public final class AdkAgentRunExecutor {
                                Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
                                ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
                                DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, typedSessionWrites, authorizer, new DefaultContextAssembler());
+    }
+
+    /** Context providers are selected by trusted host code and preserve the existing failure-closed default. */
+    public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
+                               DefaultContextAssembler contextAssembler) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -120,6 +132,7 @@ public final class AdkAgentRunExecutor {
         this.controlExecutor = Objects.requireNonNull(controlExecutor, "controlExecutor");
         this.budgetEstimator = Objects.requireNonNull(budgetEstimator, "budgetEstimator");
         this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
+        this.contextAssembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
         if (sessionDataSource != null && !ledger.usesDataSource(sessionDataSource)) {
             throw new IllegalArgumentException("Agent sessions and runs require the same DataSource");
         }
@@ -211,11 +224,11 @@ public final class AdkAgentRunExecutor {
         try {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
-            var input = new DefaultContextAssembler().assemble(snapshot.input());
+            var input = contextAssembler.assemble(snapshot.input());
             BaseAgent root = buildRoot(snapshot.definition());
             requireNoTools(root);
             AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
-                    authorization, Schedulers.from(controlExecutor), controlExecutor);
+                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization());
             String userId;
             String sessionId;
             if (running.sessionId() == null) {
@@ -396,7 +409,7 @@ public final class AdkAgentRunExecutor {
                     "persistent session storage is not configured");
         }
         var dependencies = snapshot.definition().dependencies();
-        if (!dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()) {
+        if ((!dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()) && !contextAssembler.hasProviders()) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "versioned prompt and skill resolution is not available");
         }
