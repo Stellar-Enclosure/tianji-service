@@ -136,6 +136,13 @@ final class AgentJsonCodec {
         return read(json, AgentExecutionResult.class);
     }
 
+    String resultHash(String result) {
+        if (result == null || result.getBytes(StandardCharsets.UTF_8).length > MAX_RESULT_BYTES) {
+            throw new IllegalArgumentException("Agent result exceeds its size limit");
+        }
+        return hash(result);
+    }
+
     AgentExecutionSnapshot readSnapshot(String json) {
         return read(json, AgentExecutionSnapshot.class);
     }

@@ -110,7 +110,8 @@ class TianjiServiceExecutionConfigurationTest {
 
     record TestFixtures(AgentServiceExecutionGrantStore store) { }
 
-    @org.springframework.context.annotation.Configuration(proxyBeanMethods = false)
+    @org.springframework.boot.test.context.TestConfiguration(proxyBeanMethods = false)
+    @org.springframework.boot.autoconfigure.condition.ConditionalOnBean(TestFixtures.class)
     @org.springframework.boot.context.properties.EnableConfigurationProperties({TianjiServiceExecutionProperties.class, TianjiLinkedDispatchProperties.class})
     static class TestServiceConfiguration extends TianjiServiceExecutionConfiguration {
         private final TestFixtures fixtures;

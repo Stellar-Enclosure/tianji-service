@@ -31,6 +31,9 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
+import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
@@ -95,6 +98,67 @@ class AgentLinkedSubmissionPostgresTest {
         assertTrue(submissions.close(service, query).closed());
         assertTrue(submissions.resolve(service, query).orElseThrow().closed());
         assertCode(AgentErrorCodeEnum.TIANJI_DISPATCH_CLOSED, () -> submissions.submit(service, command));
+    }
+
+    @Test void terminal_publication_shares_the_ledger_transaction_and_never_contains_result_output() {
+        jdbc.execute("CREATE TABLE tianji_agent.test_terminal_publication (event_id varchar(64) PRIMARY KEY, payload jsonb NOT NULL)");
+        var fail = new AtomicBoolean(true);
+        var codec = new AgentJsonCodec();
+        AgentTerminalEventPublisher publisher = new AgentTerminalEventPublisher() {
+            @Override public String producerId() { return "agent-east"; }
+            @Override public boolean usesDataSource(DataSource candidate) { return candidate == source; }
+            @Override public void publish(AgentTerminalEvent event) {
+                assertTrue(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive());
+                assertTrue(org.springframework.transaction.support.TransactionSynchronizationManager.hasResource(source));
+                jdbc.update("INSERT INTO tianji_agent.test_terminal_publication VALUES (?,CAST(? AS jsonb))", event.eventId(),
+                        codec.write(event, AgentJsonCodec.MAX_EVENT_BYTES));
+                if (fail.get()) throw new IllegalStateException("controlled terminal publication failure");
+            }
+        };
+        var publishingLedger = AgentLedgerService.withTerminalEvents(source, publisher);
+        var linked = new AgentLinkedSubmissionService(source, publishingLedger);
+        var cancelCommand = command("terminal-cancel", "occurrence-terminal-cancel", now().plusSeconds(60), "private input");
+        var queued = linked.submit(service, cancelCommand);
+        assertThrows(IllegalStateException.class, () -> linked.close(service, lookup(cancelCommand)));
+        assertEquals(AgentRunStatusEnum.QUEUED, publishingLedger.get(service, new GetAgentRunQuery(queued.runId())).status());
+        assertFalse(linked.resolve(service, lookup(cancelCommand)).orElseThrow().closed());
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.test_terminal_publication", Integer.class));
+        assertEquals(1, publishingLedger.events(service, new top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery(queued.runId(), 0, 20)).size());
+        fail.set(false);
+        assertEquals(AgentRunStatusEnum.CANCELLED, linked.close(service, lookup(cancelCommand)).run().status());
+        linked.close(service, lookup(cancelCommand));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.test_terminal_publication", Integer.class));
+        int number = 0;
+        for (AgentRunStatusEnum terminal : List.of(AgentRunStatusEnum.COMPLETED, AgentRunStatusEnum.FAILED,
+                AgentRunStatusEnum.CANCELLED, AgentRunStatusEnum.TIMED_OUT)) {
+            String suffix = Integer.toString(number++);
+            var command = command("terminal-finish-" + suffix, "occurrence-terminal-finish-" + suffix, now().plusSeconds(60), "private input");
+            var run = linked.submit(service, command);
+            var claimed = publishingLedger.claim(service, new GetAgentRunQuery(run.runId()), run.revision(), "terminal-worker", Duration.ofSeconds(30));
+            var current = claimed.run();
+            if (terminal == AgentRunStatusEnum.CANCELLED) {
+                current = publishingLedger.get(service, new GetAgentRunQuery(run.runId()));
+                publishingLedger.cancel(service, new top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand(current.runId(),
+                        "request-cancel-" + suffix, current.revision(), "controlled cancellation"));
+                current = publishingLedger.get(service, new GetAgentRunQuery(run.runId()));
+            }
+            var result = new AgentExecutionResult(run.runId(), terminal, Map.of("answer", "private result body"), null, "1", null,
+                    terminal == AgentRunStatusEnum.FAILED ? "TIANJI_DEPENDENCY_UNAVAILABLE" : null, "UNKNOWN");
+            var finished = publishingLedger.finish(service, claimed.lease(), current.revision(), result);
+            String eventId = AgentTerminalEvent.eventIdFor("agent-east", service.tenantId(), service.issuerFingerprint(), service.subjectId(), run.runId(), finished.revision());
+            String payload = jdbc.queryForObject("SELECT payload::text FROM tianji_agent.test_terminal_publication WHERE event_id=?", String.class, eventId);
+            assertFalse(payload.contains("private result body"));
+            assertFalse(payload.contains("private input"));
+            String storedResult = jdbc.queryForObject("SELECT result::text FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?",
+                    String.class, service.tenantId(), run.runId());
+            assertTrue(payload.contains(codec.resultHash(storedResult)));
+        }
+        var deadlineCommand = command("terminal-deadline", "occurrence-terminal-deadline", now().plusSeconds(60), "input");
+        var deadlineRun = linked.submit(service, deadlineCommand);
+        jdbc.update("UPDATE tianji_agent.agent_run SET deadline_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=?",
+                service.tenantId(), deadlineRun.runId());
+        assertEquals(AgentRunStatusEnum.TIMED_OUT, publishingLedger.expireDeadline(service, new GetAgentRunQuery(deadlineRun.runId()), deadlineRun.revision()).status());
+        assertEquals(6, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.test_terminal_publication", Integer.class));
     }
 
     @Test void a_closed_unknown_submission_is_a_durable_tombstone() {

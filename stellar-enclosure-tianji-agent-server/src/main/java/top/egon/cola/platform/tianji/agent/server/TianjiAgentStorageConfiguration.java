@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.server;
 
 import javax.sql.DataSource;
 import org.springframework.beans.factory.SmartInitializingSingleton;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
@@ -11,6 +12,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Lazy;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
+import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
 
 /** Opts the standalone host into a pre-provisioned Agent database. */
 @Configuration(proxyBeanMethods = false)
@@ -19,8 +21,9 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStora
 public class TianjiAgentStorageConfiguration {
     @Bean
     @ConditionalOnMissingBean(AgentLedgerService.class)
-    AgentLedgerService tianjiAgentServerLedgerService(DataSource dataSource) {
-        return new AgentLedgerService(dataSource);
+    AgentLedgerService tianjiAgentServerLedgerService(DataSource dataSource, ObjectProvider<AgentTerminalEventPublisher> publishers) {
+        AgentTerminalEventPublisher publisher = publishers.getIfAvailable();
+        return publisher == null ? new AgentLedgerService(dataSource) : AgentLedgerService.withTerminalEvents(dataSource, publisher);
     }
 
     @Bean

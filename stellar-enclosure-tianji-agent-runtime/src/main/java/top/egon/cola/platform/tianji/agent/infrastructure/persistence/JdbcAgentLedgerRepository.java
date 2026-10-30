@@ -38,6 +38,14 @@ final class JdbcAgentLedgerRepository {
         return jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
     }
 
+    Optional<String> linkedSubmissionKey(TrustedAgentActor actor, String runId, String linkSha256) {
+        List<String> keys = jdbc.query("SELECT idempotency_key FROM tianji_agent.agent_process_dispatch "
+                        + "WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND run_id=? AND link_sha256=?",
+                (rs, row) -> rs.getString(1), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), runId, linkSha256);
+        if (keys.size() > 1) throw new IllegalStateException("Linked terminal submission evidence is ambiguous");
+        return keys.stream().findFirst();
+    }
+
     void insertDefinitionFamily(TrustedAgentActor actor, String key, Instant now) {
         jdbc.update("""
                 INSERT INTO tianji_agent.agent_definition (tenant_id, definition_key, created_at)

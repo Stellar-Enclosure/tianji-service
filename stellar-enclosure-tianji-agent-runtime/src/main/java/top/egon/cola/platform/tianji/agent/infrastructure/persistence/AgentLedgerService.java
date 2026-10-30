@@ -6,6 +6,7 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -33,6 +34,8 @@ import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 
 import javax.sql.DataSource;
 import java.time.Clock;
@@ -59,12 +62,34 @@ public final class AgentLedgerService {
     private final AgentJsonCodec json = new AgentJsonCodec();
     private final TransactionTemplate transaction;
     private final AgentBudgetService budgetService;
+    private final AgentTerminalEventPublisher terminalPublisher;
+    private final String terminalProducerId;
+
     public AgentLedgerService(DataSource dataSource) {
+        this(dataSource, (AgentTerminalEventPublisher) null);
+    }
+
+    private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+        String producerId = terminalPublisher == null ? null : terminalPublisher.producerId();
+        if (terminalPublisher != null && (!terminalPublisher.usesDataSource(dataSource) || producerId == null
+                || !producerId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))) {
+            throw new IllegalArgumentException("Agent terminal publisher must use the ledger DataSource and a fixed producer");
+        }
+        this.terminalPublisher = terminalPublisher;
+        this.terminalProducerId = producerId;
         this.repository = new JdbcAgentLedgerRepository(new JdbcTemplate(dataSource), json);
         this.transaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         this.transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         this.budgetService = new AgentBudgetService(this, repository, transaction);
+    }
+
+    public static AgentLedgerService withTerminalEvents(DataSource dataSource, AgentTerminalEventPublisher publisher) {
+        return new AgentLedgerService(dataSource, Objects.requireNonNull(publisher, "publisher"));
+    }
+
+    public boolean hasTerminalPublisher(AgentTerminalEventPublisher publisher) {
+        return terminalPublisher != null && terminalPublisher == publisher;
     }
 
     /** Retained for existing callers; PostgreSQL is the authoritative clock for the ledger. */
@@ -558,6 +583,29 @@ public final class AgentLedgerService {
         repository.insertEvent(actor.tenantId(), new AgentEventDTO(UUID.randomUUID().toString(),
                 updated.run().runId(), updated.run().lastEventSequence(), "RUN_STATUS_CHANGED", null, null,
                 null, now(), previous.correlationId(), "1", payload));
+        if (terminalPublisher != null && AgentRunTransitions.terminal(to)) {
+            AgentExecutionSnapshot snapshot = verifiedSnapshot(actor, updated);
+            if (snapshot.processLink() != null) {
+                if (actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
+                        || !TransactionSynchronizationManager.isActualTransactionActive()
+                        || !TransactionSynchronizationManager.hasResource(dataSource)) {
+                    throw new IllegalStateException("Linked terminal publication requires the owning service transaction");
+                }
+                var run = updated.run();
+                AgentExecutionResult result = json.readResult(updated.resultJson());
+                if (!run.runId().equals(result.runId()) || result.status() != to || run.finishedAt() == null) {
+                    throw new IllegalStateException("Linked terminal result does not match its run");
+                }
+                String key = repository.linkedSubmissionKey(actor, run.runId(), json.processLinkHash(snapshot.processLink()))
+                        .orElseThrow(() -> new IllegalStateException("Linked terminal submission evidence is missing"));
+                var query = new LinkedAgentLookupQuery(key, snapshot.processLink());
+                terminalPublisher.publish(new AgentTerminalEvent(1, terminalProducerId,
+                        AgentTerminalEvent.eventIdFor(terminalProducerId, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(),
+                                run.runId(), run.revision()), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), query.idempotencyKey(),
+                        query.link(), run.definitionKey(), run.definitionVersion(), run.runId(), run.revision(), to, run.finishedAt(),
+                        json.resultHash(updated.resultJson()), result.errorCode(), result.sideEffectOutcome() == null ? "UNKNOWN" : result.sideEffectOutcome()));
+            }
+        }
     }
 
     private static long leaseMillis(Duration duration) {
