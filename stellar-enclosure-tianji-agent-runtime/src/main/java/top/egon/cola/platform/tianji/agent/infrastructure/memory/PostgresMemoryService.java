@@ -103,6 +103,10 @@ public final class PostgresMemoryService {
 
     public MemoryMutationResultDTO upsert(MemoryOperationContext context, UpsertMemoryCommand command) {
         Objects.requireNonNull(command, "command");
+        if (context != null && context.preferenceWrite() != null) {
+            if (!command.equals(context.preferenceWrite().command())) throw denied();
+            if (!context.preferenceWrite().usesDataSource(source)) throw unavailable();
+        }
         var authorized = authorize(context, command.owner(), command.scopeId(), MemoryAuthorization.Operation.UPSERT, command.memoryId(), 0, command.source());
         String requestHash = codec.commandSha256(command); String contentHash = codec.contentSha256(command.content());
         return transaction(authorized, command.owner(), command.scopeId(), true, (repository, now) -> {
@@ -205,7 +209,7 @@ public final class PostgresMemoryService {
     /** Human comparison only. Candidate egress is separately approved; similarity never mutates or confirms a fact. */
     public MemoryMergePageDTO mergeSuggestions(MemoryOperationContext context, MemoryMergeQuery query) {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(query, "query"); noTransaction();
-        if (context.runAuthorization() != null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Candidate comparison requires a current request");
+        if (context.runAuthorization() != null || context.preferenceWrite() != null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Candidate comparison requires a current request");
         var original = mergeCandidate(get(context, new GetMemoryQuery(query.owner(), query.scopeId(), query.memoryId())), query);
         String text = null;
         if (query.semantic()) {
@@ -377,11 +381,12 @@ public final class PostgresMemoryService {
 
     private MemoryOperationContext authorize(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, MemoryAuthorization.Operation operation, String id, long expected, MemorySourceDTO provenance) {
         Objects.requireNonNull(context, "context"); noTransaction(); if (!initialized.get()) throw unavailable();
+        if (context.preferenceWrite() != null && operation != MemoryAuthorization.Operation.UPSERT) throw denied();
         var actor = context.actor();
         if (owner.type() == MemoryOwnerTypeEnum.USER && (actor.subjectType() != TrustedAgentActor.SubjectType.USER || !owner.id().equals(actor.subjectId()))
                 || owner.type() == MemoryOwnerTypeEnum.APPLICATION && (actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || !owner.id().equals(actor.subjectId()))) throw denied();
         Instant maximum = clock.instant().plusSeconds(30); Instant deadline = context.deadlineAt().isBefore(maximum) ? context.deadlineAt() : maximum;
-        var bounded = new MemoryOperationContext(actor, deadline, context.runAuthorization()); checkDeadline(bounded, clock.instant());
+        var bounded = new MemoryOperationContext(actor, deadline, context.runAuthorization(), context.preferenceWrite()); checkDeadline(bounded, clock.instant());
         MemoryAuthorization.Decision decision;
         try { decision = authorization.authorize(new MemoryAuthorization.Request(bounded, owner, scope, operation, id, expected, provenance == null ? null : provenance.sourceRunId(), provenance == null ? null : provenance.sourceEventId())); }
         catch (RuntimeException unavailable) { throw unavailable(); }
@@ -400,6 +405,10 @@ public final class PostgresMemoryService {
                 var repository = new JdbcMemoryRepository(jdbc, context.actor().tenantId(), context.actor().issuerFingerprint(), owner, scope, codec);
                 if (write) repository.lockScope();
                 Instant now = repository.databaseNow(); checkDeadline(context, now);
+                if (context.preferenceWrite() != null) {
+                    if (!write || !context.preferenceWrite().usesDataSource(source)) throw unavailable();
+                    context.preferenceWrite().verifyTransaction(); checkDeadline(context, repository.databaseNow());
+                }
                 T value = action.apply(repository, now); checkDeadline(context, repository.databaseNow());
                 if (!binding.equals(publication.binding())) throw unavailable(); return value;
             });

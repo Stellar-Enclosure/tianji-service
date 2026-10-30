@@ -24,7 +24,7 @@ public final class TianjiMemoryHttpAuthorization implements MemoryAuthorization 
     }
 
     @Override public Decision authorize(Request request) {
-        if (request == null || request.context().runAuthorization() != null || !clock.instant().isBefore(request.context().deadlineAt())) return Decision.UNAVAILABLE;
+        if (request == null || request.context().runAuthorization() != null || request.context().preferenceWrite() != null || !clock.instant().isBefore(request.context().deadlineAt())) return Decision.UNAVAILABLE;
         try {
             if (request.sourceRunId() != null && !request.context().actor().equals(access.require(TianjiAgentPermissions.GET_API).actor())) return Decision.DENY;
             var current = access.require(resource(request.operation())); var actor = request.context().actor();

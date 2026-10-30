@@ -19,17 +19,11 @@ import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQue
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
-import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
-import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -77,16 +71,10 @@ public final class MemoryPreferenceAdmission {
         var prepared = extraction.evaluate(new MemoryPreferenceExtraction.Source(material.run().status(), MemoryPreferenceExtraction.SourceKind.USER_INPUT, true,
                 material.snapshot().input().text() == null ? "" : material.snapshot().input().text()), policy);
         var receipts = new ArrayList<MemoryPreferenceExtractionItemDTO>();
-        for (var proposal : prepared.proposals()) {
+        for (var candidate : MemoryPreferenceCommands.create(context.actor(), command, policy, prepared)) {
             if (!clock.instant().isBefore(context.deadlineAt())) throw unavailable();
-            String name = proposal.content().facts().keySet().iterator().next();
-            String memoryId = memoryId(context, command, name);
-            String reference = "memory-preference:" + binding.id() + '#' + policy.reference().substring(policy.reference().lastIndexOf('#') + 1)
-                    + ':' + proposal.sourceStart() + ':' + proposal.sourceEnd();
-            var source = new MemorySourceDTO(reference, prepared.sourceSha256(), command.runId(), command.sourceEventId());
-            var receipt = memory.upsert(context, new UpsertMemoryCommand(command.itemCommandId(name), command.owner(), binding.scopeId(), memoryId,
-                    proposal.kind(), 0, proposal.content(), source, proposal.confidence(), false, proposal.sensitivity(), proposal.retentionPolicyRef(), null, null));
-            receipts.add(new MemoryPreferenceExtractionItemDTO(name, receipt));
+            var receipt = memory.upsert(context, candidate);
+            receipts.add(new MemoryPreferenceExtractionItemDTO(candidate.content().facts().keySet().iterator().next(), receipt));
         }
         return result(command, MemoryPreferenceExtractionOutcomeEnum.valueOf(prepared.outcome().name()), receipts);
     }
@@ -104,7 +92,7 @@ public final class MemoryPreferenceAdmission {
     }
 
     private PreferenceSource source(MemoryOperationContext context, PrepareMemoryPreferencesQuery query) {
-        if (TransactionSynchronizationManager.isActualTransactionActive() || context.runAuthorization() != null || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
+        if (TransactionSynchronizationManager.isActualTransactionActive() || context.runAuthorization() != null || context.preferenceWrite() != null || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
         if (bindings.values().stream().noneMatch(binding -> binding.acceptsScope(context.actor(), query.owner(), query.scopeId()))) throw denied();
         requireCurrent(context, query);
         var material = ledger.executionMaterial(context.actor(), new GetAgentRunQuery(query.runId()));
@@ -139,13 +127,6 @@ public final class MemoryPreferenceAdmission {
         if (access == MemoryAuthorization.Decision.DENY) throw denied(); if (access != MemoryAuthorization.Decision.ALLOW || !clock.instant().isBefore(context.deadlineAt())) throw unavailable();
     }
 
-    /** Excluding request/policy/value identifiers prevents a retry or policy change from recreating this source's forgotten preference. */
-    private static String memoryId(MemoryOperationContext context, ExtractMemoryPreferencesCommand command, String name) {
-        var data = new StringBuilder("TIANJI_MEMORY_PREFERENCE_ID_V1:");
-        for (var field : List.of(context.actor().identityFingerprint(), command.runId(), command.sourceEventId(), command.scopeId(), name)) data.append(field.getBytes(StandardCharsets.UTF_8).length).append(':').append(field);
-        try { return "pref-" + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data.toString().getBytes(StandardCharsets.UTF_8))); }
-        catch (NoSuchAlgorithmException missing) { throw new IllegalStateException("SHA-256 is unavailable", missing); }
-    }
     private static MemoryPreferenceExtractionResultDTO result(ExtractMemoryPreferencesCommand command, MemoryPreferenceExtractionOutcomeEnum outcome, List<MemoryPreferenceExtractionItemDTO> receipts) {
         return new MemoryPreferenceExtractionResultDTO(command.owner(), command.scopeId(), command.runId(), command.sourceEventId(), command.bindingId(), command.policyRef(), outcome, receipts);
     }
