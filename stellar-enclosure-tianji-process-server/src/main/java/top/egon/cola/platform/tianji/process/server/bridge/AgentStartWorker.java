@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.process.server.bridge;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
@@ -40,9 +41,13 @@ public final class AgentStartWorker {
         if (intent.state() != AgentDispatchStore.State.CLOSING && intent.state() != AgentDispatchStore.State.CLOSED) {
             var resolved = client.resolve(intent.query());
             if (!intent.query().equals(resolved.query())) throw new ProcessConflictException();
+            boolean submitRequired = !resolved.found();
             if (resolved.found()) {
                 intent = store.record(intent.seed().key(), resolved.query(), resolved.submission());
-            } else {
+                // A run can commit before its execution grant. Replay submit to finish queued admission before ACK.
+                submitRequired = !resolved.submission().closed() && resolved.submission().run().status() == AgentRunStatusEnum.QUEUED;
+            }
+            if (submitRequired) {
                 // Resolve may have taken the remaining submission window. The database clock decides admission again.
                 intent = store.refresh(intent.seed().key(), workers.isAgentDispatchActive(intent));
                 if (intent.state() != AgentDispatchStore.State.CLOSING && intent.state() != AgentDispatchStore.State.CLOSED) {

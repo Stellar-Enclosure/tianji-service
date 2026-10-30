@@ -56,7 +56,8 @@ class AgentStartWorkerTest {
         var task = acquired();
         when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending);
         when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), false, null));
-        when(client.submit(pending.command())).thenThrow(new IllegalStateException("controlled lost response"));
+        when(client.submit(pending.command())).thenThrow(new IllegalStateException("controlled lost response"))
+                .thenReturn(new LinkedAgentStartResult(pending.query(), run()));
         assertThrows(IllegalStateException.class, worker::runOnce);
         verify(workers, never()).completeAgentDispatch(any(), any(), any(), any(), any());
         when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), true,
@@ -64,7 +65,7 @@ class AgentStartWorkerTest {
         when(store.record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, run()))).thenReturn(submitted);
         when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending, submitted);
         assertEquals(AgentStartWorker.Outcome.ACKNOWLEDGED, worker.runOnce());
-        verify(client, times(1)).submit(pending.command());
+        verify(client, times(2)).submit(pending.command());
         verify(workers).completeAgentDispatch(ACTOR, task, binding(), store, "run-one");
     }
 
@@ -99,14 +100,40 @@ class AgentStartWorkerTest {
     @Test
     void acknowledgement_failure_leaves_submission_evidence_for_replay() {
         var task = acquired();
+        var running = run(AgentRunStatusEnum.RUNNING);
+        when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending, submitted);
+        when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), true, new LinkedAgentSubmissionDTO(false, running)));
+        when(store.record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, running))).thenReturn(submitted);
+        when(workers.completeAgentDispatch(ACTOR, task, binding(), store, "run-one")).thenThrow(new ProcessConflictException());
+        assertThrows(ProcessConflictException.class, worker::runOnce);
+        verify(store).record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, running));
+        verify(client, never()).submit(any());
+        verify(client, never()).close(any());
+    }
+
+    @Test
+    void resolving_a_queued_run_does_not_ack_until_idempotent_submission_confirms_admission() {
+        var task = acquired();
         when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending, submitted);
         when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), true, new LinkedAgentSubmissionDTO(false, run())));
         when(store.record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, run()))).thenReturn(submitted);
-        when(workers.completeAgentDispatch(ACTOR, task, binding(), store, "run-one")).thenThrow(new ProcessConflictException());
-        assertThrows(ProcessConflictException.class, worker::runOnce);
+        when(client.submit(pending.command())).thenThrow(new IllegalStateException("controlled admission unavailable"));
+        assertThrows(IllegalStateException.class, worker::runOnce);
         verify(store).record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, run()));
+        verify(client).submit(pending.command());
+        verify(workers, never()).completeAgentDispatch(ACTOR, task, binding(), store, "run-one");
+    }
+
+    @Test
+    void resolving_a_completed_run_keeps_its_reference_without_requesting_new_admission() {
+        var task = acquired();
+        var completed = run(AgentRunStatusEnum.COMPLETED);
+        when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending, submitted);
+        when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), true, new LinkedAgentSubmissionDTO(false, completed)));
+        when(store.record(pending.seed().key(), pending.query(), new LinkedAgentSubmissionDTO(false, completed))).thenReturn(submitted);
+        assertEquals(AgentStartWorker.Outcome.ACKNOWLEDGED, worker.runOnce());
         verify(client, never()).submit(any());
-        verify(client, never()).close(any());
+        verify(workers).completeAgentDispatch(ACTOR, task, binding(), store, "run-one");
     }
 
     @Test
@@ -143,7 +170,12 @@ class AgentStartWorkerTest {
         return task;
     }
     static AgentRunDTO run() {
-        return new AgentRunDTO("run-one", "research", 2, null, AgentRunStatusEnum.QUEUED, null, false,
-                0, 1, 0, NOW.plusSeconds(600), NOW, null);
+        return run(AgentRunStatusEnum.QUEUED);
+    }
+    static AgentRunDTO run(AgentRunStatusEnum status) {
+        boolean terminal = status == AgentRunStatusEnum.COMPLETED || status == AgentRunStatusEnum.FAILED
+                || status == AgentRunStatusEnum.CANCELLED || status == AgentRunStatusEnum.TIMED_OUT;
+        return new AgentRunDTO("run-one", "research", 2, null, status, null, false,
+                status == AgentRunStatusEnum.QUEUED ? 0 : 1, terminal ? 2 : 1, 0, NOW.plusSeconds(600), NOW, terminal ? NOW.plusSeconds(2) : null);
     }
 }

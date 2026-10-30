@@ -94,6 +94,10 @@ class LinkedAgentDispatchControllerTest {
         String body = mapper.writeValueAsString(command);
         mvc.perform(post(path("submit")).contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE"));
+        mvc.perform(post(path("resolve")).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(query)))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.found").value(true))
+                .andExpect(jsonPath("$.submission.run.status").value("QUEUED"));
+        verify(admission, times(1)).ensure(eq(authorized), same(principal), any(), eq(command), eq(run));
         mvc.perform(post(path("submit")).contentType(MediaType.APPLICATION_JSON).content(body))
                 .andExpect(status().isAccepted()).andExpect(jsonPath("$.run.runId").value(run.runId()))
                 .andExpect(jsonPath("$.query.link.activityOccurrenceId").value("occurrence-1"));
