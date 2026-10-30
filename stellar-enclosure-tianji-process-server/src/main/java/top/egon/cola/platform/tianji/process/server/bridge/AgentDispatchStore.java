@@ -63,6 +63,12 @@ public final class AgentDispatchStore {
         if (source != candidate || manager != transactionManager) throw invalid();
     }
 
+    /** Ingress and result application lock the dispatch before any Inbox row. */
+    public Intent lockForResult(Key key) {
+        requireTransaction();
+        return lock(key);
+    }
+
     /** Called only after the adapter locks and verifies the current native job and Worker lease. */
     public Intent prepare(Seed seed) {
         requireTransaction();

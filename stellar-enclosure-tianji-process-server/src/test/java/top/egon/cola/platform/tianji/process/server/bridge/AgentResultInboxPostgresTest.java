@@ -1,0 +1,102 @@
+package top.egon.cola.platform.tianji.process.server.bridge;
+
+import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
+import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
+import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStoreTest.*;
+import static top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistryTest.*;
+
+/** Uses a user-provisioned empty database; no database or application is started by this test. */
+@EnabledIfSystemProperty(named = "tianji.process.inbox.postgres.test.url", matches = ".+")
+@Timeout(90)
+class AgentResultInboxPostgresTest {
+    @Test
+    void migration_early_results_concurrent_duplicates_and_payload_conflicts_are_durable_and_scoped() throws Exception {
+        String url = System.getProperty("tianji.process.inbox.postgres.test.url");
+        if (!url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) {
+            throw new IllegalArgumentException("Inbox test requires an explicit empty loopback tianji_it_ database");
+        }
+        var source = new DriverManagerDataSource(url);
+        var jdbc = new JdbcTemplate(source);
+        if (jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='tianji_process'", Integer.class) != 0) {
+            throw new IllegalStateException("Inbox test refuses an existing Process schema");
+        }
+        assertEquals(5, flyway(source, "5").migrate().migrationsExecuted);
+        var checksums = jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history ORDER BY installed_rank", (rs, row) -> rs.getInt(1));
+        var verifier = new ProcessApiSchemaVerifier(source, "tianji_process");
+        assertThrows(IllegalStateException.class, verifier::verifyAgentResultInbox);
+        var next = flyway(source, "6");
+        assertEquals(1, next.migrate().migrationsExecuted);
+        next.validate();
+        verifier.verifyAgentResultInbox();
+        assertEquals(checksums, jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version IN ('1','2','3','4','5') "
+                + "ORDER BY installed_rank", (rs, row) -> rs.getInt(1)));
+        jdbc.update("INSERT INTO tianji_process.tianji_process_release (tenant_id,release_key,state,manifest_sha256,publisher_type,publisher_id,created_at) "
+                + "VALUES (20,'release-one','ACTIVE',?,'SERVICE','legacy',clock_timestamp())", "a".repeat(64));
+        var manager = new DataSourceTransactionManager(source);
+        var transaction = new TransactionTemplate(manager);
+        var dispatches = new AgentDispatchStore(source, manager, "tianji_process");
+        var registration = new AgentResultProducerRegistry.Registration(PRODUCER, "agent-east", "process-east", ACTOR);
+        var registry = new AgentResultProducerRegistry(List.of(registration));
+        var inbox = new AgentResultInbox(source, manager, "tianji_process", dispatches, registry, Duration.ofDays(1));
+        assertThrows(IllegalArgumentException.class, () -> new AgentResultInbox(source, new DataSourceTransactionManager(source),
+                "tianji_process", dispatches, registry, Duration.ofDays(1)));
+        var intent = transaction.execute(status -> dispatches.prepare(seed("job-one")));
+        assertNotNull(intent);
+        var event = event(intent, "run-one", 3, "b".repeat(64));
+        assertThrows(IllegalStateException.class, () -> transaction.execute(status -> inbox.receive(PRODUCER, event)));
+        var first = inbox.receive(PRODUCER, event);
+        assertEquals(AgentResultReceiptStateEnum.RECEIVED, first.state());
+        assertEquals(first, inbox.receive(PRODUCER, event));
+        assertEquals(event.fingerprint(), first.eventFingerprint());
+        // The authenticated early event is stored, but cannot establish the run ID or native acknowledgement.
+        assertNull(jdbc.queryForObject("SELECT run_id FROM tianji_process.tianji_process_agent_dispatch WHERE occurrence_id='job-one'", String.class));
+        assertEquals("PENDING", jdbc.queryForObject("SELECT state FROM tianji_process.tianji_process_agent_result_inbox WHERE event_id=?", String.class, event.eventId()));
+        var start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(8)) {
+            var futures = java.util.stream.IntStream.range(0, 20).mapToObj(index -> executor.submit(() -> {
+                assertTrue(start.await(5, TimeUnit.SECONDS));
+                return inbox.receive(PRODUCER, event);
+            })).toList();
+            start.countDown();
+            for (var future : futures) assertEquals(first, future.get(20, TimeUnit.SECONDS));
+        }
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_process.tianji_process_agent_result_inbox", Integer.class));
+        assertThrows(ProcessConflictException.class, () -> inbox.receive(PRODUCER, event(intent, "run-one", 3, "c".repeat(64))));
+        assertThrows(ProcessConflictException.class, () -> inbox.receive(PRODUCER, event(intent, "run-one", 4, "b".repeat(64))));
+        assertThrows(ProcessResourceNotFoundException.class, () -> inbox.receive(
+                ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "agent-producer", "https://foreign.example/20"), event));
+        assertEquals(first, new AgentResultInbox(source, manager, "tianji_process", dispatches, registry, Duration.ofDays(1)).receive(PRODUCER, event));
+        assertThrows(InjectedFailure.class, () -> transaction.execute(status -> {
+            jdbc.execute("ALTER TABLE tianji_process.tianji_process_agent_result_inbox DROP CONSTRAINT tianji_agent_inbox_state_fields_check");
+            assertThrows(IllegalStateException.class, verifier::verifyAgentResultInbox);
+            throw new InjectedFailure();
+        }));
+        verifier.verifyAgentResultInbox();
+        assertEquals(first, inbox.receive(PRODUCER, event));
+    }
+
+    private static Flyway flyway(DriverManagerDataSource source, String target) {
+        return Flyway.configure().dataSource(source).schemas("tianji_process").defaultSchema("tianji_process")
+                .table("tianji_process_schema_history").locations("classpath:db/tianji-process").target(target).cleanDisabled(true).load();
+    }
+    private static final class InjectedFailure extends RuntimeException { }
+}

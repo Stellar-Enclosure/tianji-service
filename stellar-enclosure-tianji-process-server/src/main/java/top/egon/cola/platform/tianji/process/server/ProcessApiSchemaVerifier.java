@@ -75,6 +75,96 @@ public final class ProcessApiSchemaVerifier {
         }
     }
 
+    public void verifyAgentResultInbox() {
+        verifyAgentDispatch();
+        try {
+            int expectedChecksum = checksum("V6__add_agent_result_inbox.sql");
+            List<Boolean> versions = jdbc.query("SELECT success,checksum FROM \"" + schema + "\".tianji_process_schema_history "
+                            + "WHERE version='6' AND type='SQL'", (rs, row) -> rs.getBoolean("success")
+                            && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+            if (versions.size() != 1 || !versions.getFirst()) throw invalid();
+            verifyAgentInboxColumns();
+            verifyAgentInboxConstraints();
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Agent result Inbox schema verification failed", failure);
+        }
+    }
+
+    private void verifyAgentInboxColumns() {
+        Map<String, Column> expected = new HashMap<>();
+        expected.put("tenant_id", new Column("bigint", true, false));
+        expected.put("terminal_revision", new Column("bigint", true, false));
+        for (String name : List.of("event_id", "producer_issuer", "owner_issuer", "event_sha256")) {
+            expected.put(name, new Column("character(64)", true, true));
+        }
+        for (String name : List.of("producer_id", "source_id", "run_id")) {
+            expected.put(name, new Column("character varying(128)", true, true));
+        }
+        for (String name : List.of("producer_subject", "owner_subject")) {
+            expected.put(name, new Column("character varying(256)", true, true));
+        }
+        for (String name : List.of("scope_id", "occurrence_id")) expected.put(name, new Column("character varying(255)", true, true));
+        for (String name : List.of("received_at", "next_attempt_at", "retry_not_after")) {
+            expected.put(name, new Column("timestamp with time zone", true, false));
+        }
+        expected.put("scope_type", new Column("character varying(8)", true, false));
+        expected.put("state", new Column("character varying(16)", true, false));
+        expected.put("event_payload", new Column("jsonb", true, false));
+        expected.put("attempt_count", new Column("integer", true, false));
+        expected.put("decided_at", new Column("timestamp with time zone", false, false));
+        expected.put("decision_code", new Column("character varying(64)", false, true));
+        Map<String, Column> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,co.collname
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                WHERE n.nspname=? AND t.relname='tianji_process_agent_result_inbox' AND t.relkind='r'
+                """, rs -> {
+            actual.put(rs.getString("attname"), new Column(rs.getString("type"), rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname"))));
+        }, schema);
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyAgentInboxConstraints() {
+        Set<String> actual = new HashSet<>();
+        boolean[] dispatchForeignKey = {false};
+        jdbc.query("""
+                SELECT c.contype,c.convalidated,pg_get_constraintdef(c.oid) AS definition,
+                       c.confrelid=to_regclass(format('%I.%I',?,'tianji_process_agent_dispatch')) AS dispatch_target
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname=? AND t.relname='tianji_process_agent_result_inbox' AND c.contype IN ('p','u','c','f')
+                """, rs -> {
+            if (!rs.getBoolean("convalidated")) throw invalid();
+            String definition = rs.getString("definition");
+            actual.add(definition);
+            if ("f".equals(rs.getString("contype")) && rs.getBoolean("dispatch_target")
+                    && definition.startsWith("FOREIGN KEY (tenant_id, source_id, scope_type, scope_id, occurrence_id) REFERENCES ")
+                    && definition.endsWith("(tenant_id, source_id, scope_type, scope_id, occurrence_id)")) dispatchForeignKey[0] = true;
+        }, schema, schema);
+        Set<String> expected = new HashSet<>(Set.of("PRIMARY KEY (tenant_id, event_id)",
+                "UNIQUE (tenant_id, owner_issuer, owner_subject, run_id)", "CHECK ((tenant_id > 0))",
+                "CHECK ((terminal_revision > 0))", "CHECK (((scope_type)::text = 'BPMN'::text))",
+                "CHECK (((jsonb_typeof(event_payload) = 'object'::text) AND (octet_length((event_payload)::text) <= 65536)))",
+                "CHECK (((attempt_count >= 0) AND (attempt_count <= 1000)))",
+                "CHECK (((state)::text = ANY ((ARRAY['PENDING'::character varying, 'APPLIED'::character varying, 'IGNORED_LATE'::character varying, 'DEAD'::character varying])::text[])))",
+                "CHECK (((retry_not_after >= (received_at + '00:01:00'::interval)) AND (retry_not_after <= (received_at + '720:00:00'::interval))))",
+                "CHECK (((((state)::text = 'PENDING'::text) AND (decided_at IS NULL) AND (decision_code IS NULL)) OR (((state)::text = ANY ((ARRAY['APPLIED'::character varying, 'IGNORED_LATE'::character varying, 'DEAD'::character varying])::text[])) AND (decided_at IS NOT NULL) AND (decision_code IS NOT NULL))))"));
+        for (String name : List.of("event_id", "producer_issuer", "owner_issuer", "event_sha256")) {
+            expected.add("CHECK ((" + name + " ~ '^[0-9a-f]{64}$'::text))");
+        }
+        if (!actual.containsAll(expected) || !dispatchForeignKey[0]) throw invalid();
+        Integer index = jdbc.queryForObject("""
+                SELECT count(*) FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid
+                JOIN pg_namespace n ON n.oid=t.relnamespace JOIN pg_class x ON x.oid=i.indexrelid
+                WHERE n.nspname=? AND t.relname='tianji_process_agent_result_inbox' AND x.relname='tianji_agent_result_inbox_due_idx'
+                  AND i.indisvalid AND i.indisready
+                  AND pg_get_indexdef(i.indexrelid) LIKE '% (tenant_id, producer_issuer, producer_subject, producer_id, source_id, next_attempt_at, event_id) WHERE %'
+                  AND pg_get_expr(i.indpred,i.indrelid)=?
+                """, Integer.class, schema, "((state)::text = 'PENDING'::text)");
+        if (index == null || index != 1) throw invalid();
+    }
+
     private void verifyAgentDispatchColumns() {
         String table = "tianji_process_agent_dispatch";
         Map<String, Column> expected = new HashMap<>();

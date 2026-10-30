@@ -57,7 +57,12 @@ class OutboxAgentTerminalEventPublisherTest {
             assertEquals(OutboxAgentTerminalEventPublisher.CHANNEL, message.channel());
             assertEquals("process-destination", message.destination());
             assertEquals(Map.of("tianji-event-fingerprint", event.fingerprint()), message.headers());
-            assertSame(event, message.payload());
+            String payload = assertInstanceOf(String.class, message.payload());
+            var serializer = new top.egon.cola.component.outbox.serialization.JacksonOutboxMessageSerializer(
+                    new com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules());
+            assertEquals(payload, serializer.serialize(payload, message.contentType()).text());
+            assertTrue(payload.contains("2026-10-30T00:01:00Z"));
+            assertEquals(event, tools.jackson.databind.json.JsonMapper.builder().build().readValue(payload, AgentTerminalEvent.class));
             return new OutboxReceipt(event.eventId(), event.eventId(), true);
         });
         new TransactionTemplate(manager).executeWithoutResult(status -> publisher.publish(event));

@@ -1,7 +1,9 @@
 package top.egon.cola.platform.tianji.agent.server.integration.process;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.context.properties.bind.Bindable;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
@@ -22,6 +24,10 @@ import java.util.Map;
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.terminal-events", name = "enabled", havingValue = "true")
 public class TianjiAgentTerminalOutboxConfiguration {
     private static final String PREFIX = "stellar.tianji.agent.terminal-events.";
+
+    @Bean
+    @ConditionalOnMissingBean(ObjectMapper.class)
+    ObjectMapper tianjiAgentOutboxObjectMapper() { return new ObjectMapper().findAndRegisterModules(); }
 
     @Bean
     OutboxAgentTerminalEventPublisher tianjiAgentTerminalEventPublisher(DataSource source, OutboxInfrastructure infrastructure,
