@@ -26,7 +26,7 @@ public class TianjiExecutionAuthorizationConfiguration {
             @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers,
             @Qualifier("idpServiceOAuth2Client") IdpServiceOAuth2Client oauth,
             @Qualifier("jacksonObjectMapper") ObjectMapper mapper, Rbac3StarterProperties rbac, Environment environment,
-            ObjectProvider<TianjiServiceExecutionGrantAuthorizer> serviceAuthorizers) {
+            ObjectProvider<TianjiServiceExecutionGrantAuthorizer> serviceAuthorizers, ObjectProvider<TianjiMemoryRunAuthorization> memoryAuthorizers) {
         if (!environment.getProperty("stellar.tianji.agent.execution-grants.enabled", Boolean.class, false)) {
             throw new IllegalStateException("TIANJI_EXECUTION_AUTHORIZATION_REQUIRES_GRANTS");
         }
@@ -37,7 +37,12 @@ public class TianjiExecutionAuthorizationConfiguration {
             service = serviceAuthorizers.getIfAvailable();
             if (service == null) throw new IllegalStateException("TIANJI_SERVICE_EXECUTION_AUTHORIZER_REQUIRED");
         }
+        TianjiMemoryRunAuthorization memory = null;
+        if (environment.getProperty("stellar.tianji.agent.context.memory.enabled", Boolean.class, false)) {
+            memory = memoryAuthorizers.getIfAvailable();
+            if (memory == null) throw new IllegalStateException("TIANJI_MEMORY_EXECUTION_AUTHORIZER_REQUIRED");
+        }
         return new TianjiExecutionGrantAuthorizer(ledger, store, starter, authority, issuers, oauth, mapper, rbac,
-                Duration.ofMillis(timeoutMillis), concurrency, service);
+                Duration.ofMillis(timeoutMillis), concurrency, service, memory);
     }
 }

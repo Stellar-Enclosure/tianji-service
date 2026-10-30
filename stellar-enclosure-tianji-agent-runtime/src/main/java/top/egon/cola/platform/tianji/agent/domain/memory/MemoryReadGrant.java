@@ -10,6 +10,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.URI;
+import java.time.Instant;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -23,6 +24,16 @@ import java.util.UUID;
 public final class MemoryReadGrant {
     public static final String PURPOSE = "TIANJI_MEMORY_READ";
     private MemoryReadGrant() { }
+
+    /** Preserves the IdP's disjoint USER/SERVICE ticket namespaces instead of relabeling a SERVICE ticket as a USER ticket. */
+    public record Ticket(String grantId, String ciphertext, Instant expiresAt) {
+        public Ticket {
+            if (grantId != null && grantId.startsWith("8")) new AgentServiceExecutionGrant.Ticket(grantId, ciphertext, expiresAt);
+            else new AgentExecutionGrant.Ticket(grantId, ciphertext, expiresAt);
+        }
+        public TrustedAgentActor.SubjectType subjectType() { return grantId.startsWith("8") ? TrustedAgentActor.SubjectType.SERVICE : TrustedAgentActor.SubjectType.USER; }
+        @Override public String toString() { return "MemoryReadTicket[redacted]"; }
+    }
 
     public record Scope(MemoryOwnerDTO owner, String scopeId, String sourceBindingSha256, AgentServiceExecutionGrant.Subject serviceSubject) {
         public Scope {

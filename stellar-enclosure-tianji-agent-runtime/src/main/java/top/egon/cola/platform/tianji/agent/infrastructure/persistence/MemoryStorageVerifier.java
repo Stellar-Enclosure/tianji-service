@@ -28,6 +28,7 @@ import java.util.zip.CRC32;
 /** Verifies the selected primary and the exact Memory schema contract; never applies DDL or repairs history. */
 public final class MemoryStorageVerifier {
     private static final String FILE = "V10__add_memory_facts_and_index.sql";
+    private static final String SERVICE_FILE = "V11__bind_memory_grant_ticket_to_principal.sql";
     private static final String BASE_VECTOR = "agent_memory_vector_v1";
     private static final List<String> OWNER = List.of("tenant_id", "owner_issuer", "owner_type", "owner_id", "scope_id");
     private static final Set<String> TABLES = Set.of("agent_memory_scope", "agent_memory_entry", "agent_memory_revision", "agent_memory_command_receipt", "agent_memory_index_manifest", "agent_memory_run_grant", BASE_VECTOR);
@@ -61,12 +62,43 @@ public final class MemoryStorageVerifier {
                 var history = jdbc.query("SELECT success,checksum FROM tianji_agent.flyway_schema_history WHERE version='10' AND type='SQL'",
                         (rs, row) -> rs.getBoolean(1) && rs.getObject(2) != null && rs.getInt(2) == checksum(raw));
                 if (history.size() != 1 || !history.getFirst()) throw invalid();
+                if (serviceGrantHistory(jdbc, false)) expected.put("agent_memory_run_grant", serviceGrantContract(expected.get("agent_memory_run_grant"), migration(SERVICE_FILE)));
                 for (var table : expected.entrySet()) { columns(jdbc, table.getKey(), table.getValue()); checks(jdbc, table.getKey(), table.getValue()); privileges(jdbc, table.getKey()); }
                 keys(jdbc); indexes(jdbc, expected);
                 view(jdbc, BASE_VECTOR, baseDimensions);
                 if (!binding.vectorTable().equals(BASE_VECTOR)) view(jdbc, binding.vectorTable(), binding.dimensions());
             });
         } catch (DataAccessException failure) { throw invalid(); }
+    }
+
+    static void verifyServiceGrantTable(DataSource source) {
+        if (source == null || TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Memory SERVICE schema verification requires its own DataSource transaction");
+        var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
+        var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(10);
+        try {
+            transaction.executeWithoutResult(status -> {
+                if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery()", Boolean.class))) throw invalid();
+                jdbc.queryForObject("SELECT set_config('search_path','pg_catalog,tianji_agent,public',true)", String.class);
+                serviceGrantHistory(jdbc, true);
+                var base = contract(migration().replace("${tianjiMemoryDimensions}", "1")).get("agent_memory_run_grant");
+                checks(jdbc, "agent_memory_run_grant", serviceGrantContract(base, migration(SERVICE_FILE)));
+            });
+        } catch (DataAccessException failure) { throw invalid(); }
+    }
+
+    private static boolean serviceGrantHistory(JdbcTemplate jdbc, boolean required) {
+        var history = jdbc.query("SELECT success,checksum,type,script FROM tianji_agent.flyway_schema_history WHERE version='11'", (rs, row) ->
+                rs.getBoolean("success") && "SQL".equals(rs.getString("type")) && SERVICE_FILE.equals(rs.getString("script"))
+                        && rs.getObject("checksum") != null && rs.getInt("checksum") == checksum(migration(SERVICE_FILE)));
+        if (history.isEmpty() && !required) return false;
+        if (history.size() != 1 || !history.getFirst()) throw invalid(); return true;
+    }
+
+    static Table serviceGrantContract(Table base, String sql) {
+        var constraint = Pattern.compile("ALTER TABLE tianji_agent\\.agent_memory_run_grant\\s+ADD CONSTRAINT memory_grant_ticket CHECK\\s*\\(").matcher(sql);
+        if (!constraint.find()) throw invalid(); int open = constraint.end() - 1;
+        String signature = booleanSignature(sql.substring(open + 1, closing(sql, open))); if (constraint.find()) throw invalid();
+        var checks = new HashMap<>(base.checks()); checks.put("memory_grant_ticket", signature); return new Table(base.columns(), Map.copyOf(checks));
     }
 
     private void columns(JdbcTemplate jdbc, String table, Table expected) {
@@ -291,9 +323,12 @@ public final class MemoryStorageVerifier {
     }
 
     private static String migration() {
-        try (var input = MemoryStorageVerifier.class.getResourceAsStream("/db/tianji-agent/" + FILE)) {
+        String sql = migration(FILE); if (!sql.contains("${tianjiMemoryDimensions}")) throw invalid(); return sql;
+    }
+    private static String migration(String file) {
+        try (var input = MemoryStorageVerifier.class.getResourceAsStream("/db/tianji-agent/" + file)) {
             if (input == null) throw invalid(); String text = new String(input.readAllBytes(), StandardCharsets.UTF_8);
-            if (!text.contains("${tianjiMemoryDimensions}")) throw invalid(); return text;
+            return text;
         } catch (IOException failure) { throw invalid(); }
     }
     static int checksum(String sql) {

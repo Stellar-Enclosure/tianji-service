@@ -32,14 +32,16 @@ public final class TianjiMemoryHttpAuthorization implements MemoryAuthorization 
             if (request.owner().type() == MemoryOwnerTypeEnum.USER) return actor.subjectType() == TrustedAgentActor.SubjectType.USER && request.owner().id().equals(actor.subjectId()) ? Decision.ALLOW : Decision.DENY;
             if (request.owner().type() == MemoryOwnerTypeEnum.APPLICATION) return actor.subjectType() == TrustedAgentActor.SubjectType.SERVICE && request.owner().id().equals(actor.subjectId()) ? Decision.ALLOW : Decision.DENY;
             if (actor.subjectType() != TrustedAgentActor.SubjectType.USER || !(SecurityContextHolder.getContext().getAuthentication() instanceof Rbac3AuthenticationToken authenticated)) return Decision.DENY;
-            var team = properties.teams().stream().filter(value -> value.tenantId() == actor.tenantId() && value.issuer().equals(current.issuer())
+            var team = properties.teams().stream().filter(value -> value.tenantId() == actor.tenantId() && value.issuer().toASCIIString().equals(current.issuer().toASCIIString())
                     && value.teamId().equals(request.owner().id()) && value.scopeId().equals(request.scopeId())).findFirst().orElse(null);
             if (team == null) return Decision.DENY;
             var snapshot = authenticated.getPrincipal().snapshot(); String permission = permission(request.operation()); var scope = snapshot.dataScopes().get(permission);
-            if (scope == null || scope.decision() != top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW) return Decision.DENY;
+            if (scope == null) return Decision.DENY;
             if (!snapshot.tenantId().equals(scope.tenantId()) || !snapshot.rbac3UserId().equals(scope.subjectId()) || !permission.equals(scope.permissionCode())
                     || snapshot.authVersion() != scope.authVersion() || snapshot.policyVersion() != scope.policyVersion() || !snapshot.generatedAt().equals(scope.decidedAt())
                     || !snapshot.expiresAt().isAfter(clock.instant()) || snapshot.generatedAt().isAfter(clock.instant())) return Decision.UNAVAILABLE;
+            if (scope.decision() == top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.INDETERMINATE) return Decision.UNAVAILABLE;
+            if (scope.decision() != top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW) return Decision.DENY;
             boolean allowed = scope.allInTenant() || (team.directoryType() == TianjiMemoryAccessProperties.DirectoryType.ORGANIZATION
                     ? scope.allowedOrgIds().contains(team.directoryId()) : scope.allowedDeptIds().contains(team.directoryId()));
             return allowed ? Decision.ALLOW : Decision.DENY;

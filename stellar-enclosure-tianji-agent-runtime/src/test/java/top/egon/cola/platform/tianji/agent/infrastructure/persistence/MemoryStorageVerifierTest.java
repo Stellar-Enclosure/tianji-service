@@ -8,6 +8,23 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class MemoryStorageVerifierTest {
     @Test
+    void corrective_v11_retains_v10_columns_and_binds_each_ticket_namespace_to_its_actor_type() throws Exception {
+        String oldSql; String correction;
+        try (var original = getClass().getResourceAsStream("/db/tianji-agent/V10__add_memory_facts_and_index.sql");
+             var updated = getClass().getResourceAsStream("/db/tianji-agent/V11__bind_memory_grant_ticket_to_principal.sql")) {
+            assertNotNull(original); assertNotNull(updated); byte[] bytes = updated.readAllBytes();
+            assertEquals("8f3456c9b9b01b20ee37d46371bee108f9d27133eca27814a4e89bcc89f6bdc5", java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes)));
+            oldSql = new String(original.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8); correction = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+        }
+        var before = MemoryStorageVerifier.contract(oldSql.replace("${tianjiMemoryDimensions}", "2")).get("agent_memory_run_grant");
+        var after = MemoryStorageVerifier.serviceGrantContract(before, correction); assertEquals(before.columns(), after.columns());
+        assertNotEquals(before.checks().get("memory_grant_ticket"), after.checks().get("memory_grant_ticket"));
+        assertNotEquals(after.checks().get("memory_grant_ticket"), MemoryStorageVerifier.serviceGrantContract(before, correction.replace("actor_type = 'SERVICE' AND ", "")).checks().get("memory_grant_ticket"));
+        assertNotEquals(after.checks().get("memory_grant_ticket"), MemoryStorageVerifier.serviceGrantContract(before, correction.replace("actor_type = 'USER' AND ", "")).checks().get("memory_grant_ticket"));
+        assertEquals(before.checks().size(), after.checks().size());
+    }
+
+    @Test
     void frozen_v10_resource_describes_the_seven_memory_tables_without_changing_its_bytes() throws Exception {
         try (var source = getClass().getResourceAsStream("/db/tianji-agent/V10__add_memory_facts_and_index.sql")) {
             assertNotNull(source); byte[] bytes = source.readAllBytes();

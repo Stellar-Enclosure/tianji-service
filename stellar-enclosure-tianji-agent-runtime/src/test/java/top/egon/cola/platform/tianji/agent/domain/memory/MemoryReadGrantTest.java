@@ -39,6 +39,14 @@ class MemoryReadGrantTest {
     }
 
     private static MemoryReadGrant.Scope scope(String scope, String fingerprint) { return new MemoryReadGrant.Scope(new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"), scope, fingerprint, null); }
+    @Test void ticket_namespaces_retain_their_original_principal_type_and_validation() {
+        var now = Instant.now();
+        assertEquals(TrustedAgentActor.SubjectType.USER, new MemoryReadGrant.Ticket("9" + "1".repeat(62), "ENC:v1:key:nonce:sealed", now).subjectType());
+        var service = new MemoryReadGrant.Ticket("8" + "1".repeat(62), "ENC:v1:key:nonce:sealed", now);
+        assertEquals(TrustedAgentActor.SubjectType.SERVICE, service.subjectType()); assertFalse(service.toString().contains("sealed"));
+        assertThrows(IllegalArgumentException.class, () -> new MemoryReadGrant.Ticket("7" + "1".repeat(62), service.ciphertext(), now));
+        assertThrows(IllegalArgumentException.class, () -> new MemoryReadGrant.Ticket(service.grantId(), "unsealed", now));
+    }
     private static AgentRunAuthorization.Request run(TrustedAgentActor actor) {
         return new AgentRunAuthorization.Request(actor, "00000000-0000-0000-0000-000000000001", "assistant", 2, "a".repeat(64), "b".repeat(64), "c".repeat(64),
                 "policy-v1", false, Instant.parse("2026-10-30T00:01:00Z"));

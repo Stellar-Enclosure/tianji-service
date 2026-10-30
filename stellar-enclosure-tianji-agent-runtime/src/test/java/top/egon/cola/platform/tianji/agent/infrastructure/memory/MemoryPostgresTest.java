@@ -16,6 +16,7 @@ import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
+import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
@@ -120,6 +121,7 @@ class MemoryPostgresTest {
             concurrency(memory);
             lateEmbedding(jdbc, memory, work, events, delegate);
             grants(ledger, source);
+            serviceGrantCorrection(ledger, source, jdbc); memory.verifyStorage(2, version);
             jdbc.execute("ALTER TABLE tianji_agent.agent_memory_entry DROP CONSTRAINT memory_entry_confirmation");
             assertThrows(AgentLedgerException.class, () -> memory.verifyStorage(2, version));
             assertThrows(AgentLedgerException.class, () -> memory.get(context(), new GetMemoryQuery(OWNER, "research", "main")));
@@ -206,6 +208,26 @@ class MemoryPostgresTest {
         assertTrue(store.current(request, resource, new MemoryReadGrant.Scope(OWNER, "other", "f".repeat(64), null)).isEmpty());
         ledger.cancel(ALICE, new CancelAgentRunCommand(started.runId(), "cancel-grant", started.revision(), "controlled cancellation"));
         assertTrue(store.current(request, resource, scope).isEmpty()); assertFalse(store.complete(second, ticket));
+    }
+
+    private static void serviceGrantCorrection(AgentLedgerService ledger, DriverManagerDataSource source, JdbcTemplate jdbc) {
+        var store = new MemoryReadGrantStore(source, ledger); assertThrows(AgentLedgerException.class, store::requireServiceStorage);
+        var before = jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version IS NOT NULL ORDER BY installed_rank");
+        var correction = Flyway.configure().dataSource(source).schemas("tianji_agent").defaultSchema("tianji_agent").locations("classpath:db/tianji-agent")
+                .target("11").placeholders(Map.of("tianjiMemoryDimensions", "2")).cleanDisabled(true).load();
+        assertEquals(1, correction.migrate().migrationsExecuted); correction.validate();
+        assertEquals(before, jdbc.queryForList("SELECT version,checksum FROM tianji_agent.flyway_schema_history WHERE version<>'11' AND version IS NOT NULL ORDER BY installed_rank"));
+        store.requireServiceStorage();
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "memory-client", "https://idp.example/20");
+        var run = ledger.start(actor, new StartAgentRunCommand("memory-grant-test", 1, null, "service-memory-grant", null, null, new AgentInputDTO("input", null, null), null));
+        var request = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId())).authorization(); var resource = URI.create("https://agent.example");
+        var scope = new MemoryReadGrant.Scope(new MemoryOwnerDTO(MemoryOwnerTypeEnum.APPLICATION, "memory-client"), "research", "f".repeat(64),
+                new AgentServiceExecutionGrant.Subject("memory-client", "application", "business", "source", "test", resource));
+        var reserved = store.reserve(request, resource, scope).orElseThrow(); var ticket = new MemoryReadGrant.Ticket("8" + "1".repeat(62), "ENC:v1:test:A:A", Instant.now().plusSeconds(30));
+        assertTrue(store.completeEvidence(reserved, ticket)); assertEquals(ticket.grantId(), store.currentEvidence(request, resource, scope).orElseThrow().grantId());
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("UPDATE tianji_agent.agent_memory_run_grant SET grant_id=? WHERE tenant_id=20 AND run_id=?", "9" + "1".repeat(62), run.runId()));
+        assertThrows(org.springframework.dao.DataIntegrityViolationException.class, () -> jdbc.update("UPDATE tianji_agent.agent_memory_run_grant SET grant_id=? WHERE actor_type='USER'", "8" + "1".repeat(62)));
+        assertEquals(ticket.grantId(), store.currentEvidence(request, resource, scope).orElseThrow().grantId());
     }
 
     private static UpsertMemoryCommand upsert(String command, String id, String text) { return new UpsertMemoryCommand(command, OWNER, "research", id, MemoryKindEnum.PREFERENCE, 0,

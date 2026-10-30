@@ -514,6 +514,11 @@ class TianjiPermissionIntegrationTest {
         assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
         memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 2)));
         assertEquals(MemoryAuthorization.Decision.ALLOW, authority.authorize(query));
+        var foreignIssuer = new TianjiMemoryAccessProperties(List.of(new TianjiMemoryAccessProperties.Team(20, URI.create(snapshotIssuer.get().replace("idp.example", "IDP.example")),
+                "researchers", "research", TianjiMemoryAccessProperties.DirectoryType.ORGANIZATION, "10")));
+        assertEquals(MemoryAuthorization.Decision.DENY, new TianjiMemoryHttpAuthorization(access(), foreignIssuer, CLOCK).authorize(query));
+        memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "10", 2, top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.INDETERMINATE)));
+        assertEquals(MemoryAuthorization.Decision.UNAVAILABLE, authority.authorize(query));
         memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("60", "11", 2)));
         assertEquals(MemoryAuthorization.Decision.DENY, authority.authorize(query));
         memoryScopes.set(Map.of(TianjiAgentPermissions.MEMORY_READ, memoryScope("alice", "10", 2)));
@@ -566,8 +571,9 @@ class TianjiPermissionIntegrationTest {
                 owner, "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null)));
     }
 
-    private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion) {
-        return new DataScopeDecision(top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW, "CURRENT", "20", rbacUser,
+    private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion) { return memoryScope(rbacUser, org, authVersion, top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW); }
+    private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion, top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision decision) {
+        return new DataScopeDecision(decision, "CURRENT", "20", rbacUser,
                 TianjiAgentPermissions.MEMORY_READ, "ORG", false, Set.of(org), true, Set.of(), false, Set.of(), false, null, "directory-1", 1, authVersion, 3, List.of("assignment-1"), NOW);
     }
 

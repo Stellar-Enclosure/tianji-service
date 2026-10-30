@@ -9,6 +9,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryReadGrant;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
@@ -19,20 +20,27 @@ import java.sql.Timestamp;
 import java.time.temporal.ChronoUnit;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Epoch-fenced sealed evidence. It never treats the ordinary run grant as authorization to read Memory. */
 public final class MemoryReadGrantStore {
     private final AgentLedgerService ledger;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
+    private final AtomicBoolean serviceStorageVerified = new AtomicBoolean();
 
     public MemoryReadGrantStore(DataSource source, AgentLedgerService ledger) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); if (!ledger.usesDataSource(source)) throw new IllegalArgumentException("Memory grants require the matching Agent ledger source");
         jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
         transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(10);
     }
+    public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
+
+    /** Read-only V11 check. Existing V10 USER operations do not require the SERVICE correction. */
+    public void requireServiceStorage() { serviceStorageVerified.set(false); MemoryStorageVerifier.verifyServiceGrantTable(jdbc.getDataSource()); serviceStorageVerified.set(true); }
 
     public Optional<MemoryReadGrant.Reservation> reserve(AgentRunAuthorization.Request run, URI resource, MemoryReadGrant.Scope scope) {
+        requireStorage(run);
         String fingerprint = MemoryReadGrant.fingerprint(run, resource, scope); var intent = MemoryReadGrant.intentId(run, scope);
         return transact(status -> {
             if (!lock(run, true)) return Optional.empty();
@@ -58,7 +66,12 @@ public final class MemoryReadGrantStore {
     }
 
     public boolean complete(MemoryReadGrant.Reservation reservation, AgentExecutionGrant.Ticket ticket) {
+        Objects.requireNonNull(ticket, "ticket"); return completeEvidence(reservation, new MemoryReadGrant.Ticket(ticket.grantId(), ticket.ciphertext(), ticket.expiresAt()));
+    }
+
+    public boolean completeEvidence(MemoryReadGrant.Reservation reservation, MemoryReadGrant.Ticket ticket) {
         Objects.requireNonNull(reservation, "reservation"); Objects.requireNonNull(ticket, "ticket"); var run = reservation.run(); var scope = reservation.scope();
+        if (run.actor().subjectType() != ticket.subjectType()) throw new IllegalArgumentException("Memory grant principal type is invalid"); requireStorage(run);
         if (ticket.expiresAt().isAfter(run.deadlineAt())) throw new IllegalArgumentException("Memory grant expiry is outside its run deadline");
         var expires = ticket.expiresAt().truncatedTo(ChronoUnit.MICROS);
         return transact(status -> {
@@ -74,6 +87,12 @@ public final class MemoryReadGrantStore {
     }
 
     public Optional<AgentExecutionGrant.Ticket> current(AgentRunAuthorization.Request run, URI resource, MemoryReadGrant.Scope scope) {
+        if (run.actor().subjectType() != TrustedAgentActor.SubjectType.USER) throw new IllegalArgumentException("The USER ticket projection requires a USER run");
+        return currentEvidence(run, resource, scope).map(ticket -> new AgentExecutionGrant.Ticket(ticket.grantId(), ticket.ciphertext(), ticket.expiresAt()));
+    }
+
+    public Optional<MemoryReadGrant.Ticket> currentEvidence(AgentRunAuthorization.Request run, URI resource, MemoryReadGrant.Scope scope) {
+        requireStorage(run);
         String fingerprint = MemoryReadGrant.fingerprint(run, resource, scope);
         return transact(status -> {
             if (!lock(run, false) || !ledger.executionMaterial(run.actor(), new GetAgentRunQuery(run.runId())).authorization().equals(run)) return Optional.empty();
@@ -81,12 +100,15 @@ public final class MemoryReadGrantStore {
         });
     }
 
-    private Optional<AgentExecutionGrant.Ticket> currentLocked(AgentRunAuthorization.Request run, String fingerprint, MemoryReadGrant.Scope scope) {
+    private Optional<MemoryReadGrant.Ticket> currentLocked(AgentRunAuthorization.Request run, String fingerprint, MemoryReadGrant.Scope scope) {
         var tickets = jdbc.query("""
                 SELECT grant_id,ciphertext,expires_at FROM tianji_agent.agent_memory_run_grant
                 WHERE tenant_id=? AND run_id=? AND source_binding_sha256=? AND binding_sha256=? AND owner_issuer=?
                   AND owner_type=? AND owner_id=? AND scope_id=? AND actor_type=? AND actor_id=? AND intent_id=? AND expires_at>clock_timestamp()
-                """, (rs, row) -> new AgentExecutionGrant.Ticket(rs.getString(1), rs.getString(2), rs.getTimestamp(3).toInstant()), run.actor().tenantId(), run.runId(), scope.sourceBindingSha256(), fingerprint,
+                """, (rs, row) -> {
+                    var ticket = new MemoryReadGrant.Ticket(rs.getString(1), rs.getString(2), rs.getTimestamp(3).toInstant());
+                    if (ticket.subjectType() != run.actor().subjectType()) throw unavailable(); return ticket;
+                }, run.actor().tenantId(), run.runId(), scope.sourceBindingSha256(), fingerprint,
                 run.actor().issuerFingerprint(), scope.owner().type().name(), scope.owner().id(), scope.scopeId(), run.actor().subjectType().name(), run.actor().subjectId(), MemoryReadGrant.intentId(run, scope));
         if (tickets.size() > 1) throw unavailable(); return tickets.isEmpty() ? Optional.empty() : Optional.of(tickets.getFirst());
     }
@@ -101,6 +123,9 @@ public final class MemoryReadGrantStore {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Memory grant operations require their own transaction");
         try { return Objects.requireNonNull(transaction.execute(action)); }
         catch (DataAccessException failure) { throw unavailable(); }
+    }
+    private void requireStorage(AgentRunAuthorization.Request run) {
+        if (run.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE && !serviceStorageVerified.get()) throw unavailable();
     }
     private static AgentLedgerException unavailable() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Memory read grant evidence is unavailable"); }
 }

@@ -21,6 +21,7 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentExecutionGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionScopeAuthorizationContract;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ServiceExecutionAuthorizationContract;
 import top.egon.cola.platform.tianquan.shoubing.contract.state.IdentityAuthorityScopes;
 import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
@@ -43,6 +44,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     private final Duration timeout;
     private final Clock clock;
     private final TianjiServiceExecutionGrantAuthorizer services;
+    private final TianjiMemoryRunAuthorization memory;
 
     public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
@@ -55,8 +57,15 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
             Duration timeout, int concurrency, TianjiServiceExecutionGrantAuthorizer services) {
+        this(ledger, store, starter, authority, issuers, oauth, mapper, rbac, timeout, concurrency, services, null);
+    }
+
+    public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
+            Duration timeout, int concurrency, TianjiServiceExecutionGrantAuthorizer services, TianjiMemoryRunAuthorization memory) {
         this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), systemCode(rbac), issuers,
-                clients(starter, authority, issuers, oauth, mapper, rbac), timeout, concurrency, Clock.systemUTC(), services);
+                clients(starter, authority, issuers, oauth, mapper, rbac), timeout, concurrency, Clock.systemUTC(), services, memory);
     }
 
     TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
@@ -67,6 +76,12 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
             TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock,
             TianjiServiceExecutionGrantAuthorizer services) {
+        this(ledger, store, resource, systemCode, issuers, clients, timeout, concurrency, clock, services, null);
+    }
+
+    TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
+            TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock,
+            TianjiServiceExecutionGrantAuthorizer services, TianjiMemoryRunAuthorization memory) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.systemCode = systemCode(systemCode);
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clients = Map.copyOf(clients);
@@ -80,7 +95,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
         if (services != null && (!services.usesLedger(ledger) || !services.usesIssuerRegistry(issuers))) {
             throw new IllegalArgumentException("TIANJI_SERVICE_AUTHORIZATION_MISMATCH");
         }
-        this.services = services;
+        if (memory != null && (!memory.usesLedger(ledger) || !memory.usesIssuerRegistry(issuers))) throw new IllegalArgumentException("TIANJI_MEMORY_AUTHORIZATION_MISMATCH");
+        this.services = services; this.memory = memory;
         this.timeout = timeout; this.clock = Objects.requireNonNull(clock, "clock");
         this.executor = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-authorization-", 0).factory(),
@@ -88,7 +104,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     }
 
     public boolean usesLedger(AgentLedgerService candidate) {
-        return ledger == candidate && store.usesLedger(candidate) && (services == null || services.usesLedger(candidate));
+        return ledger == candidate && store.usesLedger(candidate) && (services == null || services.usesLedger(candidate)) && (memory == null || memory.usesLedger(candidate));
     }
     public boolean supportsService() { return services != null; }
 
@@ -103,7 +119,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
             long waitNanos = (remaining.compareTo(timeout) < 0 ? remaining : timeout).toNanos();
             TraceContext trace = TraceContext.capture();
             var future = executor.submit(() -> {
-                try (var ignored = trace.open()) { return evaluate(request); }
+                try (var ignored = trace.open()) { return evaluate(request, boundary); }
             });
             try { return future.get(waitNanos, TimeUnit.NANOSECONDS); }
             catch (InterruptedException interrupted) {
@@ -115,7 +131,12 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
         catch (RuntimeException failed) { return Decision.UNAVAILABLE; }
     }
 
-    private Decision evaluate(Request request) {
+    private Decision evaluate(Request request, Boundary boundary) {
+        var ordinary = evaluateRun(request);
+        return ordinary == Decision.ALLOW && memory != null ? memory.authorizeRun(request, boundary) : ordinary;
+    }
+
+    private Decision evaluateRun(Request request) {
         if (request.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE) return services.evaluate(request);
         try {
             var bound = clients.get(request.actor().issuerFingerprint());
@@ -156,6 +177,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
             String issueScope, String decisionScope) {
         if (!(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE.equals(issueScope)
                 && ExecutionAuthorizationContract.SERVICE_SCOPE.equals(decisionScope))
+                && !(IdentityAuthorityScopes.EXECUTION_GRANT_ISSUE.equals(issueScope)
+                && ExecutionScopeAuthorizationContract.SERVICE_SCOPE.equals(decisionScope))
                 && !(IdentityAuthorityScopes.SERVICE_EXECUTION_GRANT_ISSUE.equals(issueScope)
                 && ServiceExecutionAuthorizationContract.SERVICE_SCOPE.equals(decisionScope))) {
             throw new IllegalArgumentException("TIANJI_EXECUTION_AUTHORIZATION_SCOPE_INVALID");

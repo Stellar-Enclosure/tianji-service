@@ -44,7 +44,7 @@ class TianjiServiceExecutionConfigurationTest {
         var environment = new MockEnvironment().withProperty("stellar.tianji.agent.execution-grants.enabled", "true")
                 .withProperty("stellar.tianji.agent.service-execution.enabled", "true");
         var failure = assertThrows(IllegalStateException.class, () -> new TianjiExecutionAuthorizationConfiguration()
-                .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null, environment, services));
+                .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null, environment, services, null));
         assertEquals("TIANJI_SERVICE_EXECUTION_AUTHORIZER_REQUIRED", failure.getMessage());
     }
 
