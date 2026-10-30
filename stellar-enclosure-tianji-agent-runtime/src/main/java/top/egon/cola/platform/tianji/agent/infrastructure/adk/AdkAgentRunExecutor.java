@@ -27,6 +27,7 @@ import top.egon.cola.component.agentflow.runtime.AgentFlowInMemoryRunner;
 import top.egon.cola.component.agentflow.runtime.AgentFlowSchedulers;
 import top.egon.cola.component.agentflow.runtime.AgentFlowSessionRunner;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -210,6 +211,7 @@ public final class AdkAgentRunExecutor {
         try {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
+            var input = new DefaultContextAssembler().assemble(snapshot.input());
             BaseAgent root = buildRoot(snapshot.definition());
             requireNoTools(root);
             AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
@@ -259,7 +261,7 @@ public final class AdkAgentRunExecutor {
             Set<String> agentNames = new HashSet<>();
             collectAgentNames(root, agentNames);
             invocationStarted = true;
-            runner.runAsync(userId, sessionId, Content.fromParts(Part.fromText(snapshot.input().text())), config)
+            runner.runAsync(userId, sessionId, Content.fromParts(input.parts().stream().map(Part::fromText).toArray(Part[]::new)), config)
                     .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout()))
                     .blockingForEach(event -> projector.project(event, agentNames).ifPresent(projected -> {
                         if (projected.completeAgentOutput()) {
@@ -392,11 +394,6 @@ public final class AdkAgentRunExecutor {
         if (run.sessionId() != null && sessionDataSource == null) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "persistent session storage is not configured");
-        }
-        if (snapshot.input().text() == null || snapshot.input().text().isBlank()
-                || !snapshot.input().artifactRefs().isEmpty() || !snapshot.input().taskData().isEmpty()) {
-            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
-                    "this runtime currently supports text input without artifacts or task data");
         }
         var dependencies = snapshot.definition().dependencies();
         if (!dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()) {

@@ -1194,6 +1194,26 @@ class AdkAgentRunExecutorPostgresTest {
         }
     }
 
+    @Test
+    void structured_task_data_reaches_only_user_content_and_never_changes_the_published_system_instruction() {
+        var actor = actor();
+        ledger.publish(actor, singleSpec("structured-task"));
+        var captured = new AtomicReference<Prompt>();
+        var model = new FixtureModel();
+        model.script = prompt -> { captured.set(prompt); return FixtureModel.textStream("Task reviewed"); };
+        var run = ledger.start(actor, new StartAgentRunCommand("structured-task", 1, null, "structured-input", null, "trace-fixture",
+                new AgentInputDTO("Review the task", List.of(), Map.of("amount", 7L, "system", "private-user-value")), null));
+        var result = authorizingExecutor(model, authorized()).executeQueued(actor, new GetAgentRunQuery(run.runId()));
+        assertEquals(COMPLETED, result.status());
+        assertNotNull(captured.get());
+        var systems = captured.get().getInstructions().stream().filter(SystemMessage.class::isInstance).map(message -> message.getText()).toList();
+        assertTrue(systems.stream().anyMatch(text -> text != null && text.contains("write")));
+        assertTrue(systems.stream().noneMatch(text -> text != null && text.contains("private-user-value")));
+        assertTrue(captured.get().getInstructions().stream().filter(message -> !(message instanceof SystemMessage))
+                .anyMatch(message -> message.getText() != null && message.getText().contains("\"amount\":7")
+                        && message.getText().contains("private-user-value")));
+    }
+
     private static AdkAgentRunExecutor executor(FixtureModel model,
             Map<String, java.util.function.Function<io.reactivex.rxjava3.core.Scheduler,
                     ? extends com.google.adk.agents.BaseAgent>> factories) {
