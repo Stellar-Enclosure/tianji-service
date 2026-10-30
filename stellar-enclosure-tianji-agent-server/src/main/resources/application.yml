@@ -37,6 +37,8 @@ egon:
 stellar:
   tianji:
     agent:
+      model-budgets:
+        enabled: false
       context:
         trimming:
           enabled: false

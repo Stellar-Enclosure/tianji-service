@@ -1,2 +1,3 @@
 top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration
+top.egon.cola.platform.tianji.agent.autoconfigure.TianjiModelBudgetAutoConfiguration
 top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentReconciliationAutoConfiguration
