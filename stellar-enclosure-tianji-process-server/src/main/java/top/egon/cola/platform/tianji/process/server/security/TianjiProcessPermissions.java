@@ -79,7 +79,7 @@ public final class TianjiProcessPermissions {
     public static final String DECISION_SCOPE = "tianji:decision:execute";
     public static final String WORKER_ACQUIRE_SCOPE = "tianji:worker:acquire";
     public static final String WORKER_REPORT_SCOPE = "tianji:worker:report";
-    public static final String AGENT_RESULT_RECEIVE_SCOPE = "tianji:process:agent-result:receive";
+    public static final String AGENT_RESULT_RECEIVE_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.AgentResultClient.RECEIVE_SCOPE;
 
     private TianjiProcessPermissions() { }
 }

@@ -54,7 +54,10 @@ public class TianjiAgentTerminalOutboxConfiguration {
             new AgentStorageVerifier(source).verifyLinked();
             var handler = handlers.required(OutboxAgentTerminalEventPublisher.CHANNEL);
             Binder.get(environment).bind(PREFIX + "destinations", Bindable.mapOf(String.class, String.class)).orElse(Map.of())
-                    .values().forEach(handler::validateDestination);
+                    .forEach((sourceId, destination) -> {
+                        handler.validateDestination(destination);
+                        if (handler instanceof AgentResultDeliveryHandler results) results.validateSourceDestination(sourceId, destination);
+                    });
         };
     }
 }

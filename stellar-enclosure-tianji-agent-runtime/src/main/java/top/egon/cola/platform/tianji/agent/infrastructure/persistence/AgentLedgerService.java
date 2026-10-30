@@ -92,6 +92,21 @@ public final class AgentLedgerService {
         return terminalPublisher != null && terminalPublisher == publisher;
     }
 
+    /** Reads an immutable linked terminal reference on the owning primary before delivery opens a network call. */
+    public Optional<AgentTerminalEvent> terminalReference(TrustedAgentActor actor, GetAgentRunQuery query, Duration budget) {
+        if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
+                || query == null || budget == null || budget.compareTo(Duration.ofSeconds(1)) < 0 || budget.compareTo(Duration.ofSeconds(30)) > 0) {
+            throw new IllegalArgumentException("Linked terminal reference requires a verified owner and bounded read");
+        }
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Terminal delivery reference must own its snapshot transaction");
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        // Keep primary routing even when a host routes read-only transactions to replicas.
+        read.setReadOnly(false);
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        read.setTimeout(Math.toIntExact(budget.toSeconds()));
+        return read.execute(status -> terminalReference(actor, requireRun(actor, query)));
+    }
+
     /** Retained for existing callers; PostgreSQL is the authoritative clock for the ledger. */
     @Deprecated
     public AgentLedgerService(DataSource dataSource, Clock clock) {
@@ -583,29 +598,31 @@ public final class AgentLedgerService {
         repository.insertEvent(actor.tenantId(), new AgentEventDTO(UUID.randomUUID().toString(),
                 updated.run().runId(), updated.run().lastEventSequence(), "RUN_STATUS_CHANGED", null, null,
                 null, now(), previous.correlationId(), "1", payload));
-        if (terminalPublisher != null && AgentRunTransitions.terminal(to)) {
-            AgentExecutionSnapshot snapshot = verifiedSnapshot(actor, updated);
-            if (snapshot.processLink() != null) {
-                if (actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
-                        || !TransactionSynchronizationManager.isActualTransactionActive()
-                        || !TransactionSynchronizationManager.hasResource(dataSource)) {
-                    throw new IllegalStateException("Linked terminal publication requires the owning service transaction");
-                }
-                var run = updated.run();
-                AgentExecutionResult result = json.readResult(updated.resultJson());
-                if (!run.runId().equals(result.runId()) || result.status() != to || run.finishedAt() == null) {
-                    throw new IllegalStateException("Linked terminal result does not match its run");
-                }
-                String key = repository.linkedSubmissionKey(actor, run.runId(), json.processLinkHash(snapshot.processLink()))
-                        .orElseThrow(() -> new IllegalStateException("Linked terminal submission evidence is missing"));
-                var query = new LinkedAgentLookupQuery(key, snapshot.processLink());
-                terminalPublisher.publish(new AgentTerminalEvent(1, terminalProducerId,
-                        AgentTerminalEvent.eventIdFor(terminalProducerId, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(),
-                                run.runId(), run.revision()), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), query.idempotencyKey(),
-                        query.link(), run.definitionKey(), run.definitionVersion(), run.runId(), run.revision(), to, run.finishedAt(),
-                        json.resultHash(updated.resultJson()), result.errorCode(), result.sideEffectOutcome() == null ? "UNKNOWN" : result.sideEffectOutcome()));
-            }
+        if (terminalPublisher != null && AgentRunTransitions.terminal(to)) terminalReference(actor, updated).ifPresent(terminalPublisher::publish);
+    }
+
+    private Optional<AgentTerminalEvent> terminalReference(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {
+        if (terminalProducerId == null || !AgentRunTransitions.terminal(stored.run().status())) return Optional.empty();
+        AgentExecutionSnapshot snapshot = verifiedSnapshot(actor, stored);
+        if (snapshot.processLink() == null) return Optional.empty();
+        if (actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
+                || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw new IllegalStateException("Linked terminal reference requires the owning service transaction");
         }
+        var run = stored.run();
+        AgentExecutionResult result = json.readResult(stored.resultJson());
+        if (!run.runId().equals(result.runId()) || result.status() != run.status() || run.finishedAt() == null
+                || !snapshot.definitionContentSha256().equals(snapshot.processLink().definitionContentSha256())) {
+            throw new IllegalStateException("Linked terminal result does not match its run");
+        }
+        String key = repository.linkedSubmissionKey(actor, run.runId(), json.processLinkHash(snapshot.processLink()))
+                .orElseThrow(() -> new IllegalStateException("Linked terminal submission evidence is missing"));
+        var query = new LinkedAgentLookupQuery(key, snapshot.processLink());
+        return Optional.of(new AgentTerminalEvent(1, terminalProducerId,
+                AgentTerminalEvent.eventIdFor(terminalProducerId, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), run.runId(), run.revision()),
+                actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), query.idempotencyKey(), query.link(), run.definitionKey(), run.definitionVersion(),
+                run.runId(), run.revision(), run.status(), run.finishedAt(), json.resultHash(stored.resultJson()), result.errorCode(),
+                result.sideEffectOutcome() == null ? "UNKNOWN" : result.sideEffectOutcome()));
     }
 
     private static long leaseMillis(Duration duration) {

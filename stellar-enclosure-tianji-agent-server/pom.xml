@@ -64,7 +64,6 @@
         <dependency>
             <groupId>top.egon</groupId>
             <artifactId>stellar-enclosure-tianji-client</artifactId>
-            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>

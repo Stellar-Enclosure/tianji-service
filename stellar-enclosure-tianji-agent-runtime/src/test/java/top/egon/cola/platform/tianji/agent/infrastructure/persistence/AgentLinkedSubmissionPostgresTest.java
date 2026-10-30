@@ -152,6 +152,10 @@ class AgentLinkedSubmissionPostgresTest {
             String storedResult = jdbc.queryForObject("SELECT result::text FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?",
                     String.class, service.tenantId(), run.runId());
             assertTrue(payload.contains(codec.resultHash(storedResult)));
+            var reference = publishingLedger.terminalReference(service, new GetAgentRunQuery(run.runId()), Duration.ofSeconds(5)).orElseThrow();
+            assertEquals(eventId, reference.eventId());
+            assertEquals(codec.resultHash(storedResult), reference.resultSha256());
+            assertEquals(command.link(), reference.link());
         }
         var deadlineCommand = command("terminal-deadline", "occurrence-terminal-deadline", now().plusSeconds(60), "input");
         var deadlineRun = linked.submit(service, deadlineCommand);
