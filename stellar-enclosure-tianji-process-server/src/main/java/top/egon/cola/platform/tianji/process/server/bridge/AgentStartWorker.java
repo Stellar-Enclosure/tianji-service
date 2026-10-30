@@ -14,6 +14,7 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 
 import java.time.Duration;
 import java.util.Objects;
+import java.util.function.BooleanSupplier;
 
 /** Short submit/ack orchestration. A host owns scheduling and a SERVICE client bound to this operator registration. */
 public final class AgentStartWorker {
@@ -32,7 +33,13 @@ public final class AgentStartWorker {
     }
 
     public Outcome runOnce() {
+        return runOnce(() -> true);
+    }
+
+    public Outcome runOnce(BooleanSupplier admission) {
         requireNoTransaction();
+        Objects.requireNonNull(admission, "admission");
+        if (!admission.getAsBoolean()) return Outcome.DEFERRED;
         var acquired = workers.acquireAgentDispatch(binding);
         if (acquired.status() == WorkerAcquireStatusEnum.EMPTY) return Outcome.EMPTY;
         var task = acquired.task();
@@ -48,6 +55,7 @@ public final class AgentStartWorker {
                 submitRequired = !resolved.submission().closed() && resolved.submission().run().status() == AgentRunStatusEnum.QUEUED;
             }
             if (submitRequired) {
+                if (!admission.getAsBoolean()) return Outcome.DEFERRED;
                 // Resolve may have taken the remaining submission window. The database clock decides admission again.
                 intent = store.refresh(intent.seed().key(), workers.isAgentDispatchActive(intent));
                 if (intent.state() != AgentDispatchStore.State.CLOSING && intent.state() != AgentDispatchStore.State.CLOSED) {
@@ -102,6 +110,6 @@ public final class AgentStartWorker {
         }
     }
 
-    public enum Outcome { EMPTY, ACKNOWLEDGED, CLOSED }
+    public enum Outcome { EMPTY, ACKNOWLEDGED, CLOSED, DEFERRED }
     public record Reconciliation(int observed, int closed, int failed) { }
 }

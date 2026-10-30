@@ -158,6 +158,19 @@ class AgentStartWorkerTest {
         verifyNoInteractions(store, client);
     }
 
+    @Test
+    void closed_admission_defers_before_acquisition_or_queued_submission_without_erasing_the_intent() {
+        assertEquals(AgentStartWorker.Outcome.DEFERRED, worker.runOnce(() -> false));
+        verifyNoInteractions(workers, store, client);
+        acquired();
+        when(store.refresh(eq(pending.seed().key()), anyBoolean())).thenReturn(pending);
+        when(client.resolve(pending.query())).thenReturn(new LinkedAgentLookupResult(pending.query(), false, null));
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        assertEquals(AgentStartWorker.Outcome.DEFERRED, worker.runOnce(() -> checks.getAndIncrement() == 0));
+        verify(client, never()).submit(any());
+        verify(workers, never()).completeAgentDispatch(any(), any(), any(), any(), any());
+    }
+
     private WorkerTaskDTO acquired() {
         var task = new WorkerTaskDTO("job-one", "job-one", WorkerScopeTypeEnum.BPMN, "instance-one", null, 20,
                 "agent-start", "1", WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT,
