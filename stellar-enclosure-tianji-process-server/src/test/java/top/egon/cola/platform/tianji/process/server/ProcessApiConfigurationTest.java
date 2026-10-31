@@ -61,6 +61,10 @@ class ProcessApiConfigurationTest {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseMessage("Human task API requires the Process API security boundary");
         });
+        runner.withPropertyValues("stellar.tianji.process.human-tasks.publish-enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Governed task publication requires the human task API");
+        });
         runner.withPropertyValues("stellar.tianji.process.agent-results.enabled=true").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseMessage("Agent result Inbox requires the Process API security boundary");

@@ -60,9 +60,11 @@ public class ProcessSecurityConfiguration {
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
         boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
+        boolean taskPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
+        if (taskPublicationEnabled && !tasksEnabled) throw new IllegalStateException("Governed task publication requires the human task API");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -151,11 +153,13 @@ public class ProcessSecurityConfiguration {
         WorkerTopicRegistry registry = workerEnabled ? registries.getIfAvailable() : null;
         if (workerEnabled && registry == null) throw new IllegalStateException("Worker API requires an operator-owned topic registry");
         boolean bridgeEnabled = environment.getProperty("stellar.tianji.process.agent-bridge.enabled", Boolean.class, false);
+        boolean humanPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
+        if (humanPublicationEnabled && !environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false)) throw new IllegalStateException("Governed task publication requires the human task API");
         return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry,
                 bridgeEnabled, () -> {
                     var bridge = bridges.getIfAvailable();
                     return bridge != null && bridge.isRunning();
-                });
+                }, humanPublicationEnabled);
     }
 
     @Bean

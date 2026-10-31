@@ -66,5 +66,6 @@ stellar:
     process:
       human-tasks:
         enabled: false
+        publish-enabled: false
       agent-bridge:
         enabled: false

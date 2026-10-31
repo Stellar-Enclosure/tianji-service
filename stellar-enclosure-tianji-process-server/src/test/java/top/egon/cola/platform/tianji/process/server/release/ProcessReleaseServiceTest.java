@@ -18,6 +18,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 
 import javax.sql.DataSource;
 import java.util.List;
@@ -130,6 +131,37 @@ class ProcessReleaseServiceTest {
         var wrongInputs = new ProcessReleaseService.ModelResource(Type.BPMN, "approvalRouting", bpmn, Map.of("amount", ValueType.STRING));
         assertThrows(IllegalArgumentException.class, () -> enabled.publish(actor, "release", List.of(wrongInputs, rules)));
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
+    }
+
+    @Test
+    void human_task_publication_requires_its_explicit_gate_pinned_factory_and_verified_v7_before_bundle_admission() throws Exception {
+        DataSource source = mock(DataSource.class); var process = process(source); var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        assertThrows(IllegalArgumentException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, false, () -> true, true));
+        when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());
+        byte[] xml; try (var input = getClass().getResourceAsStream("/fixtures/governed-human-task.bpmn20.xml")) { assertNotNull(input); xml = input.readAllBytes(); }
+        var actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "publisher", "https://idp.example/20");
+        var resource = new ProcessReleaseService.ModelResource(Type.BPMN, "humanReview", xml, Map.of());
+        try (var verification = mockConstruction(HumanTaskStorageVerifier.class)) {
+            var disabled = new ProcessReleaseService(process, decision, new ProcessModelValidator());
+            assertThrows(IllegalArgumentException.class, () -> disabled.publish(actor, "release", List.of(resource))); assertTrue(verification.constructed().isEmpty());
+            var enabled = new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, false, () -> true, true);
+            assertEquals(1, verification.constructed().size()); verify(verification.constructed().getFirst()).verify();
+            var collision = new ProcessReleaseService.ModelResource(Type.BPMN, "humanReview", xml, Map.of("reviewApproved", ValueType.BOOLEAN));
+            assertThrows(IllegalArgumentException.class, () -> enabled.publish(actor, "release", List.of(collision))); verifyNoInteractions(source);
+            // A failed connection proves admission reached the existing publication transaction, not a deployment or commit.
+            assertThrows(org.springframework.transaction.CannotCreateTransactionException.class, () -> enabled.publish(actor, "release", List.of(resource)));
+            verify(source).getConnection(); verifyNoInteractions(process.getRepositoryService());
+        }
+    }
+
+    @Test
+    void failed_human_storage_verification_cannot_construct_an_enabled_publisher() {
+        DataSource source = mock(DataSource.class); var process = process(source); var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());
+        try (var verification = mockConstruction(HumanTaskStorageVerifier.class, (value, ignored) -> doThrow(new IllegalStateException("unverified V7")).when(value).verify())) {
+            assertThrows(IllegalStateException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, false, () -> true, true));
+            verifyNoInteractions(source, process.getRepositoryService());
+        }
     }
 
     @Test

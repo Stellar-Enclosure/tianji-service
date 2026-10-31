@@ -52,6 +52,10 @@ public class ProcessStorageConfiguration {
     @Bean
     SmartInitializingSingleton workerWebBoundaryGuard(Environment environment, ApplicationContext context) {
         return () -> {
+            if (environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false)
+                    && !environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false)) {
+                throw new IllegalStateException("Governed task publication requires the human task API");
+            }
             if (environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false)
                     && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false)
                     || !(context instanceof WebApplicationContext))) {

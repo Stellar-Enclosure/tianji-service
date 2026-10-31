@@ -76,6 +76,8 @@ class ProcessStorageConfigurationTest {
         assertDoesNotThrow(() -> config.workerWebBoundaryGuard(tasks, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
         tasks.setProperty("stellar.tianji.process.api.enabled", "false");
         assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(tasks, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        var publication = new MockEnvironment().withProperty("stellar.tianji.process.human-tasks.publish-enabled", "true");
+        assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(publication, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
     }
 
     private static void guard(MockEnvironment environment) {

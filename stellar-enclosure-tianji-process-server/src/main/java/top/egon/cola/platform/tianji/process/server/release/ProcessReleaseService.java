@@ -18,6 +18,7 @@ import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -60,6 +61,7 @@ public final class ProcessReleaseService {
     private final WorkerTopicRegistry workerTopics;
     private final boolean agentMessageWaitsEnabled;
     private final BooleanSupplier agentMaintenanceReady;
+    private final boolean humanTasksEnabled;
 
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
@@ -85,6 +87,12 @@ public final class ProcessReleaseService {
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
                                  boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady) {
+        this(process, dmn, validator, decisionTasksEnabled, workerTopics, agentMessageWaitsEnabled, agentMaintenanceReady, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
+                                 boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady, boolean humanTasksEnabled) {
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -96,16 +104,19 @@ public final class ProcessReleaseService {
                 || process.getDatabaseSchema() == null || !process.getDatabaseSchema().matches("[a-z_][a-z0-9_]{0,62}")
                 || !process.getDatabaseSchema().equals(dmn.getDatabaseSchema())
                 || agentMessageWaitsEnabled && workerTopics == null
+                || humanTasksEnabled && !(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || decisionTasksEnabled && (!(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || !dmn.isHistoryEnabled() || dmn.getDmnHistoryService() == null)) throw invalidConfiguration();
         this.decisionTasksEnabled = decisionTasksEnabled;
         this.workerTopics = workerTopics;
         this.agentMessageWaitsEnabled = agentMessageWaitsEnabled;
+        this.humanTasksEnabled = humanTasksEnabled;
         this.agentMaintenanceReady = Objects.requireNonNull(agentMaintenanceReady, "agentMaintenanceReady");
         this.schema = process.getDatabaseSchema();
         if (workerTopics != null) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
         if (agentMessageWaitsEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyAgentDispatch();
         if (agentMessageWaitsEnabled) FlowableAgentWaitInspector.requireHistory(process);
+        if (humanTasksEnabled) new HumanTaskStorageVerifier(manager.getDataSource(), schema).verify();
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);
@@ -233,7 +244,7 @@ public final class ProcessReleaseService {
         }
         for (PreparedModel processModel : prepared) {
             if (processModel.model().type() != Type.BPMN) continue;
-            if (!processModel.model().humanTasks().isEmpty()) throw invalid();
+            if (!processModel.model().humanTasks().isEmpty() && !humanTasksEnabled) throw invalid();
             PreparedModel decision = null;
             if (!processModel.model().decisionTasks().isEmpty()) {
                 if (!decisionTasksEnabled) throw invalid();
@@ -242,6 +253,7 @@ public final class ProcessReleaseService {
                         && item.model().definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
                 validator.validateDecisionBinding(processModel.model(), processModel.inputs(), decision.model());
             }
+            validator.validateHumanTaskBindings(processModel.model(), processModel.inputs(), decision == null ? null : decision.model());
             if (!processModel.model().workerTasks().isEmpty()) {
                 if (workerTopics == null) throw invalid();
                 WorkerNativeAvailability.require(process);
