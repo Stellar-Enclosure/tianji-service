@@ -21,6 +21,17 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerClient;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskClient;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskPageDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.GetHumanTaskQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ListHumanTasksQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ClaimHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.UnclaimHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.TransferHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.CompleteHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionEnum;
 
 import java.net.URI;
 import java.net.URLEncoder;
@@ -42,16 +53,20 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Supplier;
+import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
-public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient {
+public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient, HumanTaskClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
+    private static final java.util.Set<String> HUMAN_TASK_ERRORS = java.util.Set.of("TIANJI_UNAUTHENTICATED", "TIANJI_PERMISSION_DENIED", "TIANJI_RESOURCE_NOT_FOUND", "TIANJI_IDEMPOTENCY_CONFLICT",
+            "TIANJI_CAPACITY_EXCEEDED", "TIANJI_DEPENDENCY_UNAVAILABLE", "TIANJI_TENANT_CONTEXT_CHANGED", "TIANJI_INVALID_COMMAND", "TIANJI_TASK_VERSION_CONFLICT", "TIANJI_TASK_NOT_AVAILABLE");
     private final URI baseUri;
     private final HttpClient http;
     private final Supplier<String> tokenSupplier;
     private final Duration timeout;
     private final JsonMapper mapper = JsonMapper.builder().build();
+    private final HumanTaskResponseCodec tasks = new HumanTaskResponseCodec();
 
     public HttpProcessClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier, Duration timeout) {
         Objects.requireNonNull(baseUri, "baseUri");
@@ -151,11 +166,63 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         return result;
     }
 
+    @Override
+    public HumanTaskDTO getHumanTask(GetHumanTaskQuery query) {
+        Objects.requireNonNull(query, "query"); var task = call("POST", "human-tasks/get", query, HumanTaskDTO.class, null, tasks::task);
+        if (!query.taskId().equals(task.taskId())) throw invalidResponse(); return task;
+    }
+
+    @Override
+    public HumanTaskPageDTO humanTasks(ListHumanTasksQuery query) {
+        Objects.requireNonNull(query, "query"); var page = call("POST", "human-tasks/query", query, HumanTaskPageDTO.class, null, tasks::page);
+        if (page.scopeType() != query.scopeType() || page.selection() != query.selection() || page.items().size() > query.limit()) throw invalidResponse();
+        String previous = query.afterTaskId();
+        for (var task : page.items()) {
+            if (query.releaseVersion() != null && !query.releaseVersion().equals(task.releaseVersion()) || query.scopeId() != null && !query.scopeId().equals(task.scopeId())
+                    || query.taskDefinitionKey() != null && !query.taskDefinitionKey().equals(task.taskDefinitionKey()) || previous != null && compareTaskIds(previous, task.taskId()) >= 0) throw invalidResponse();
+            previous = task.taskId();
+        }
+        if (page.nextAfterTaskId() != null && (query.afterTaskId() != null && compareTaskIds(query.afterTaskId(), page.nextAfterTaskId()) >= 0
+                || previous != null && compareTaskIds(previous, page.nextAfterTaskId()) > 0)) throw invalidResponse();
+        return page;
+    }
+
+    @Override
+    public HumanTaskActionReceiptDTO claimHumanTask(ClaimHumanTaskCommand command) {
+        Objects.requireNonNull(command, "command"); return taskAction("claim", command, command.commandId(), command.taskId(), command.expectedVersion(), HumanTaskActionEnum.CLAIM);
+    }
+    @Override
+    public HumanTaskActionReceiptDTO unclaimHumanTask(UnclaimHumanTaskCommand command) {
+        Objects.requireNonNull(command, "command"); return taskAction("unclaim", command, command.commandId(), command.taskId(), command.expectedVersion(), HumanTaskActionEnum.UNCLAIM);
+    }
+    @Override
+    public HumanTaskActionReceiptDTO transferHumanTask(TransferHumanTaskCommand command) {
+        Objects.requireNonNull(command, "command"); var result = taskAction("transfer", command, command.commandId(), command.taskId(), command.expectedVersion(), HumanTaskActionEnum.TRANSFER);
+        if (!command.targetLane().equals(result.lane())) throw invalidResponse(); return result;
+    }
+    @Override
+    public HumanTaskActionReceiptDTO completeHumanTask(CompleteHumanTaskCommand command) {
+        Objects.requireNonNull(command, "command"); return taskAction("complete", command, command.commandId(), command.taskId(), command.expectedVersion(), HumanTaskActionEnum.COMPLETE);
+    }
+    private HumanTaskActionReceiptDTO taskAction(String path, Object command, String id, String taskId, String version, HumanTaskActionEnum action) {
+        var result = call("POST", "human-tasks/" + path, command, HumanTaskActionReceiptDTO.class, null, tasks::receipt);
+        if (!id.equals(result.commandId()) || !taskId.equals(result.taskId()) || !version.equals(result.previousVersion()) || result.action() != action) throw invalidResponse(); return result;
+    }
+    private static int compareTaskIds(String left, String right) { return java.util.Arrays.compareUnsigned(left.getBytes(StandardCharsets.UTF_8), right.getBytes(StandardCharsets.UTF_8)); }
+
     private <T> T call(String method, String path, Object body, Class<T> type) {
         return call(method, path, body, type, null);
     }
 
     private <T> T call(String method, String path, Object body, Class<T> type, String leaseToken) {
+        return call(method, path, body, type, leaseToken, bytes -> mapper.readValue(bytes, type));
+    }
+
+    private <T> T call(String method, String path, Object body, Class<T> type, String leaseToken, Function<byte[], T> decoder) {
+        if (path.startsWith("human-tasks/") && (!baseUri.normalize().equals(baseUri) || !"https".equalsIgnoreCase(baseUri.getScheme())
+                && !("http".equalsIgnoreCase(baseUri.getScheme()) && java.util.Set.of("localhost", "127.0.0.1", "[::1]", "::1").contains(baseUri.getHost().toLowerCase(java.util.Locale.ROOT))))) {
+            throw new IllegalArgumentException("Human task transport requires HTTPS or a loopback fixture");
+        }
         byte[] bytes;
         try { bytes = body == null ? null : mapper.writeValueAsBytes(body); }
         catch (RuntimeException invalid) { throw new IllegalArgumentException("Process request cannot be encoded"); }
@@ -171,14 +238,15 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         var call = http.sendAsync(request, info -> new BoundedBodySubscriber(MAX_RESPONSE_BYTES));
         try {
             HttpResponse<byte[]> response = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-            if (response.statusCode() < 200 || response.statusCode() >= 300) throw error(response, token, leaseToken);
+            if (response.statusCode() < 200 || response.statusCode() >= 300) throw error(response, token, leaseToken, path.startsWith("human-tasks/"));
+            if (path.startsWith("human-tasks/") && response.statusCode() != 200) throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
             String contentType = response.headers().firstValue("Content-Type").orElse("");
             String mediaType = contentType.split(";", 2)[0].trim();
             if (!mediaType.equalsIgnoreCase("application/json") && !mediaType.toLowerCase(java.util.Locale.ROOT).endsWith("+json")) {
                 throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
             }
             try {
-                T result = mapper.readValue(response.body(), type);
+                T result = decoder.apply(response.body());
                 if (result == null) throw invalidResponse();
                 return result;
             } catch (RuntimeException invalid) {
@@ -197,7 +265,7 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         }
     }
 
-    private ProcessClientException error(HttpResponse<byte[]> response, String token, String leaseToken) {
+    private ProcessClientException error(HttpResponse<byte[]> response, String token, String leaseToken, boolean humanTask) {
         String code = null;
         String correlation = null;
         try {
@@ -207,8 +275,10 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         } catch (RuntimeException ignored) {
             // A non-JSON error body is not safe to expose to callers.
         }
+        if (humanTask) { if (code == null || !HUMAN_TASK_ERRORS.contains(code)) code = null; correlation = null; }
         if (code == null) {
             code = switch (response.statusCode()) {
+                case 400 -> humanTask ? "TIANJI_INVALID_COMMAND" : "TIANJI_DEPENDENCY_UNAVAILABLE";
                 case 401 -> "TIANJI_UNAUTHENTICATED";
                 case 403 -> "TIANJI_PERMISSION_DENIED";
                 case 404 -> "TIANJI_RESOURCE_NOT_FOUND";

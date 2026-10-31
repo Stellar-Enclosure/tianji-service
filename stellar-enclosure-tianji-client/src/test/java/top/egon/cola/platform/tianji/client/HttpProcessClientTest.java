@@ -236,6 +236,76 @@ class HttpProcessClientTest {
                 () -> client(Duration.ofSeconds(3)).complete(command)).code());
     }
 
+    @Test
+    void human_task_queries_use_private_post_and_closed_bound_snapshot_pages() {
+        var task = humanTask(); var encoded = mapper.writeValueAsString(task); var response = new AtomicReference<>(encoded); var calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/human-tasks/get", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(new GetHumanTaskQuery("task-1"), mapper.readValue(exchange.getRequestBody().readAllBytes(), GetHumanTaskQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(task, client(Duration.ofSeconds(3)).getHumanTask(new GetHumanTaskQuery("task-1")));
+        for (var invalid : List.of(encoded.replace("task-1", "other"), encoded.replace("\"assigned\":false", "\"assigned\":\"false\""), encoded.replace("\"assignedToMe\":false", "\"assignedToMe\":true"),
+                encoded.replace("\"version\":\"" + "a".repeat(64) + "\"", "\"version\":123"), encoded.replace("\"approvalField\":\"approved\"", "\"approvalField\":\"comment\""),
+                encoded.substring(0, encoded.length() - 1) + ",\"candidateRoles\":[\"untrusted\"]}")) {
+            response.set(invalid); int before = calls.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).getHumanTask(new GetHumanTaskQuery("task-1"))).code()); assertEquals(before + 1, calls.get());
+        }
+        var query = new ListHumanTasksQuery(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, "release", "instance", "review", "000", 1);
+        var page = new HumanTaskPageDTO(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, List.of(task), "z"); String pageJson = mapper.writeValueAsString(page); response.set(pageJson);
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/human-tasks/query", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), ListHumanTasksQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(page, client(Duration.ofSeconds(3)).humanTasks(query));
+        for (var invalid : List.of(pageJson.replace("\"releaseVersion\":\"release\"", "\"releaseVersion\":\"other\""), pageJson.replace("\"scopeId\":\"instance\"", "\"scopeId\":\"other\""),
+                pageJson.replace("\"taskDefinitionKey\":\"review\"", "\"taskDefinitionKey\":\"other\""), pageJson.replace("\"nextAfterTaskId\":\"z\"", "\"nextAfterTaskId\":\"000\""), pageJson.replace(",\"nextAfterTaskId\":\"z\"", ""))) {
+            response.set(invalid); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).humanTasks(query)).code());
+        }
+        var empty = new HumanTaskPageDTO(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, List.of(), "scanned"); response.set(mapper.writeValueAsString(empty));
+        assertEquals(empty, client(Duration.ofSeconds(3)).humanTasks(query));
+    }
+
+    @Test
+    void human_task_actions_match_original_command_version_action_and_transfer_lane_without_post_retry() {
+        String version = "a".repeat(64); var claim = new ClaimHumanTaskCommand("claim-1", "task-1", version); var unclaim = new UnclaimHumanTaskCommand("unclaim-1", "task-1", version);
+        var transfer = new TransferHumanTaskCommand("transfer-1", "task-1", version, "manager"); var complete = new CompleteHumanTaskCommand("complete-1", "task-1", version, Map.of("approved", false, "comment", "private form"));
+        var response = new AtomicReference<String>(); var calls = new AtomicInteger(); var status = new AtomicInteger(200);
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertNull(exchange.getRequestURI().getRawQuery()); byte[] body = exchange.getRequestBody().readAllBytes();
+            switch (exchange.getRequestURI().getPath()) {
+                case "/api/tianji/v1/human-tasks/claim" -> assertEquals(claim, mapper.readValue(body, ClaimHumanTaskCommand.class));
+                case "/api/tianji/v1/human-tasks/unclaim" -> assertEquals(unclaim, mapper.readValue(body, UnclaimHumanTaskCommand.class));
+                case "/api/tianji/v1/human-tasks/transfer" -> assertEquals(transfer, mapper.readValue(body, TransferHumanTaskCommand.class));
+                case "/api/tianji/v1/human-tasks/complete" -> assertEquals(complete, mapper.readValue(body, CompleteHumanTaskCommand.class));
+                default -> fail("Unknown human task route");
+            }
+            respond(exchange, status.get(), "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        var client = client(Duration.ofSeconds(3));
+        var claimed = humanReceipt(claim.commandId(), HumanTaskActionEnum.CLAIM, "finance"); response.set(mapper.writeValueAsString(claimed)); assertEquals(claimed, client.claimHumanTask(claim));
+        var released = humanReceipt(unclaim.commandId(), HumanTaskActionEnum.UNCLAIM, "finance"); response.set(mapper.writeValueAsString(released)); assertEquals(released, client.unclaimHumanTask(unclaim));
+        var transferred = humanReceipt(transfer.commandId(), HumanTaskActionEnum.TRANSFER, "manager"); response.set(mapper.writeValueAsString(transferred)); assertEquals(transferred, client.transferHumanTask(transfer));
+        response.set(mapper.writeValueAsString(humanReceipt(transfer.commandId(), HumanTaskActionEnum.TRANSFER, "finance"))); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.transferHumanTask(transfer)).code());
+        var completed = humanReceipt(complete.commandId(), HumanTaskActionEnum.COMPLETE, "finance"); String encoded = mapper.writeValueAsString(completed); response.set(encoded); assertEquals(completed, client.completeHumanTask(complete)); assertEquals(Boolean.FALSE, completed.approved());
+        for (var invalid : List.of(encoded.replace("complete-1", "other"), encoded.replace("task-1", "other"), encoded.replace(version, "c".repeat(64)),
+                encoded.replace("\"approved\":false", "\"approved\":\"false\""), encoded.replace("\"kind\":\"APPROVAL\"", "\"kind\":\"ACTION\""), encoded.substring(0, encoded.length() - 1) + ",\"form\":{}}")) {
+            response.set(invalid); int before = calls.get(); var failure = assertThrows(ProcessClientException.class, () -> client.completeHumanTask(complete)); assertEquals("TIANJI_INVALID_RESPONSE", failure.code()); assertFalse(failure.toString().contains("private form")); assertEquals(before + 1, calls.get());
+        }
+        response.set(encoded); status.set(202); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.completeHumanTask(complete)).code());
+        response.set("{}"); status.set(503); int before = calls.get(); assertThrows(ProcessClientException.class, () -> client.completeHumanTask(complete)); assertEquals(before + 1, calls.get());
+        response.set("{\"code\":\"private form\",\"correlationId\":\"private form\"}"); status.set(409);
+        var error = assertThrows(ProcessClientException.class, () -> client.completeHumanTask(complete)); assertEquals("TIANJI_IDEMPOTENCY_CONFLICT", error.code()); assertNull(error.correlationId()); assertFalse(error.toString().contains("private form"));
+    }
+
+    private static HumanTaskDTO humanTask() { return new HumanTaskDTO("task-1", HumanTaskScopeTypeEnum.PROCESS, "instance", "release", "invoice", "review", "Review", HumanTaskKindEnum.APPROVAL, "approved", "a".repeat(64), "finance", List.of("finance", "manager"), false, false, false, Map.of("approved", ProcessValueTypeEnum.BOOLEAN, "comment", ProcessValueTypeEnum.STRING), NOW, null); }
+    private static HumanTaskActionReceiptDTO humanReceipt(String command, HumanTaskActionEnum action, String lane) { return new HumanTaskActionReceiptDTO(command, "task-1", action, HumanTaskScopeTypeEnum.PROCESS, "instance", "release", "invoice", "review", HumanTaskKindEnum.APPROVAL, lane, "a".repeat(64), action == HumanTaskActionEnum.COMPLETE ? null : "b".repeat(64), action == HumanTaskActionEnum.COMPLETE ? "approval-ref" : null, action == HumanTaskActionEnum.COMPLETE ? Boolean.FALSE : null, NOW); }
+
+    @Test
+    void human_task_transport_refuses_plain_remote_http_before_requesting_a_credential() {
+        var credentials = new AtomicInteger();
+        var unsafe = new HttpProcessClient(URI.create("http://process.example/"), HttpClient.newHttpClient(), () -> { credentials.incrementAndGet(); return TOKEN; }, Duration.ofSeconds(1));
+        assertThrows(IllegalArgumentException.class, () -> unsafe.getHumanTask(new GetHumanTaskQuery("task-1"))); assertEquals(0, credentials.get());
+    }
+
     private HttpProcessClient client(Duration timeout) { return new HttpProcessClient(base, HttpClient.newHttpClient(), () -> TOKEN, timeout); }
     private static String sha(String value) throws Exception {
         return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
