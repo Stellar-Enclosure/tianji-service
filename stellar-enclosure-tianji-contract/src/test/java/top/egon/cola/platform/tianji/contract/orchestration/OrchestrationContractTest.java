@@ -15,6 +15,14 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrchestrationContractTest {
     @Test
+    void canonical_start_values_preserve_the_existing_wire_fields() {
+        assertEquals("tianji:process:start", ProcessClient.START_SCOPE);
+        assertEquals("tianji.api.process.instance.start", ProcessClient.START_RESOURCE_KEY);
+        assertEquals(List.of("definitionKey", "releaseVersion", "businessKey", "commandId", "correlationId", "variables"),
+                java.util.Arrays.stream(StartProcessCommand.class.getRecordComponents()).map(component -> component.getName()).toList());
+    }
+
+    @Test
     void copies_values_and_normalizes_only_supported_numeric_inputs() {
         Map<String, Object> values = new HashMap<>(Map.of("amount", 10, "name", "中文😀"));
         var command = new StartProcessCommand("invoice", "v1", "订单-1", "command-1", "trace-1", values);

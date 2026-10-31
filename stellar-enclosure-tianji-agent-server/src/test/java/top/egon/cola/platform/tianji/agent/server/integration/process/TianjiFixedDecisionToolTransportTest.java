@@ -272,6 +272,11 @@ class TianjiFixedDecisionToolTransportTest {
             assertFailure(DEADLINE_EXCEEDED, () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> operation.evaluate()));
             assertEquals(0, fixture.posts()); assertTrue(fixture.requests.isEmpty());
         }
+        try (var fixture = new Fixture()) {
+            fixture.afterToken.set(() -> Thread.currentThread().interrupt());
+            assertFailure(CANCELLED, () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> operation.evaluate()));
+            assertEquals(0, fixture.posts()); assertTrue(fixture.requests.isEmpty());
+        }
     }
 
     @Test void valid_late_http_observations_reach_the_callback_before_outer_postchecks_suppress_model_values() throws Exception {
@@ -289,6 +294,8 @@ class TianjiFixedDecisionToolTransportTest {
                 assertFailure(variant.equals("deadline") ? DEADLINE_EXCEEDED : CREDENTIAL_UNAVAILABLE,
                         () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> { observed.set(operation.evaluate()); recorded.countDown(); return "model-value"; }));
                 assertTrue(recorded.await(1, TimeUnit.SECONDS)); assertEquals(DECISION_ID, observed.get().decisionExecutionId()); assertEquals(1, fixture.posts());
+                assertEquals(ReadOnlyDecisionToolTransport.Status.MATCHED, observed.get().status());
+                assertEquals(Map.of("eligible", true), observed.get().output());
             }
         }
     }

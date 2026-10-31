@@ -1,12 +1,12 @@
 package top.egon.cola.platform.tianji.agent.server.integration.process;
 
-import org.springframework.security.oauth2.core.OAuth2AccessToken;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.component.common.trace.TraceContext;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
-import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiFixedDecisionToolBindings.BackendVO;
+import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier.CredentialVO;
+import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier.TargetVO;
 import top.egon.cola.platform.tianji.client.HttpProcessClient;
 import top.egon.cola.platform.tianji.client.ProcessClientException;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
@@ -15,11 +15,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQue
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
-import top.egon.cola.platform.tianquan.shoubing.contract.PrincipalType;
-import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
-import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRequest;
-import top.egon.cola.platform.tianquan.shoubing.starter.client.ServiceAuthorizationKey;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TenantIssuerAuthenticationManagerComponent;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedPrincipalConverter;
@@ -28,7 +24,6 @@ import java.net.http.HttpClient;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -57,6 +52,7 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
     private final HttpClient http;
     private final Clock clock;
     private final LongSupplier nanoTime;
+    private final TianjiProcessToolCredentialVerifier credentialVerifier;
     private final ThreadPoolExecutor calls;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<Runnable> cancellations = ConcurrentHashMap.newKeySet();
@@ -73,6 +69,7 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
         this.authentication = Objects.requireNonNull(authentication, "authentication"); this.converter = Objects.requireNonNull(converter, "converter");
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.http = Objects.requireNonNull(http, "http");
         this.clock = Objects.requireNonNull(clock, "clock"); this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        credentialVerifier = new TianjiProcessToolCredentialVerifier(this.oauth, this.authentication, this.converter, this.issuers, this.clock);
         if (concurrency < 1 || concurrency > 8 || http.followRedirects() != HttpClient.Redirect.NEVER) throw new IllegalArgumentException("Fixed decision transport configuration is invalid");
         calls = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-fixed-decision-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
@@ -148,32 +145,11 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
         current(scope, backend); return value;
     }
 
-    private CredentialContextVO credentials(BackendVO backend, CallScope scope) {
+    private CredentialVO credentials(BackendVO backend, CallScope scope) {
         try {
             scope.remaining();
-            var request = new IdpServiceTokenRequest(backend.registrationId(), backend.expectedAppId(), backend.processResourceUri(), ServiceTokenContext.TENANT, Long.toString(backend.tenantId()), SCOPES);
-            var trust = trust(backend); var key = oauth.authorizationKey(request); requireKey(key, request, backend); scope.remaining();
-            var token = oauth.authorizeBounded(request, backend.processIssuer().toASCIIString(), Duration.ofNanos(scope.remaining()));
-            scope.remaining();
-            if (token == null || !OAuth2AccessToken.TokenType.BEARER.equals(token.getTokenType()) || token.getExpiresAt() == null || !token.getExpiresAt().isAfter(clock.instant())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
-            scope.publishBearer(token.getTokenValue());
-            var proof = authentication.authenticate(scope.bearer.get(), backend.processResourceUri()); scope.remaining(); proof.validate();
-            var jwt = proof.getJwt(); var principal = converter.toServicePrincipal(jwt, backend.processResourceUri()); scope.remaining();
-            String tenant = Long.toString(backend.tenantId());
-            if (proof.getPrincipalType() != PrincipalType.SERVICE || !sameTrust(trust, proof.getTrustedIssuer()) || !Objects.equals(scope.bearer.get(), jwt.getTokenValue())
-                    || !backend.processIssuer().toASCIIString().equals(jwt.getClaimAsString("iss")) || !List.of(backend.processResourceUri().toASCIIString()).equals(jwt.getAudience())
-                    || !backend.expectedClientId().equals(proof.getSubject()) || !tenant.equals(proof.getTenantId()) || !backend.expectedClientId().equals(jwt.getSubject())
-                    || !tenant.equals(jwt.getClaimAsString("tenant_id")) || !proof.getTokenId().equals(jwt.getClaimAsString("jti"))
-                    || principal == null || !tenant.equals(principal.tenantId()) || !backend.expectedClientId().equals(principal.subject())
-                    || !key.clientId().equals(principal.clientId()) || !backend.expectedClientId().equals(principal.clientId()) || !backend.expectedAppId().equals(principal.appId())
-                    || principal.scopeContext() != ServiceTokenContext.TENANT || !backend.processResourceUri().toASCIIString().equals(principal.resourceUri().toASCIIString())
-                    || !backend.expectedSourceBiz().equals(principal.sourceBizCode()) || !backend.expectedSourceApp().equals(principal.sourceAppCode())
-                    || !backend.expectedEnvironment().equals(principal.sourceEnvironment()) || !SCOPES.equals(principal.scopes())
-                    || !proof.getTokenId().equals(principal.tokenId()) || !principal.issuedAt().equals(jwt.getIssuedAt()) || !principal.expiresAt().equals(jwt.getExpiresAt())
-                    || !proof.getExpiresAt().equals(jwt.getExpiresAt())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
-            Instant expiry = earlier(earlier(token.getExpiresAt(), principal.expiresAt()), scope.window.deadlineAt());
-            var actor = TrustedAgentActor.verified(backend.tenantId(), TrustedAgentActor.SubjectType.SERVICE, principal.clientId(), proof.getTrustedIssuer().issuer().toASCIIString());
-            var result = new CredentialContextVO(request, key, trust, actor, expiry);
+            if (TransactionSynchronizationManager.isActualTransactionActive()) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+            var result = credentialVerifier.credentials(target(backend), scope.window.deadlineAt(), scope::remaining, scope::publishBearer, scope.bearer::get);
             scope.credential = result; current(scope, backend); return result;
         } catch (Failure rejected) { throw failure(rejected.kind()); }
         catch (RuntimeException privateCredential) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
@@ -210,30 +186,15 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
         var credential = scope.credential;
         if (credential == null) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
         try {
-            var key = oauth.authorizationKey(credential.request()); requireKey(key, credential.request(), backend);
-            if (!sameKey(credential.key(), key) || !sameTrust(credential.trust(), trust(backend))) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+            credentialVerifier.requireCurrent(target(backend), credential);
         } catch (Failure rejected) { throw failure(rejected.kind()); }
         catch (RuntimeException privateSource) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
         scope.remaining();
     }
 
-    private TrustedIssuerRegistry.TrustedIssuerVO trust(BackendVO backend) {
-        var trust = issuers.findByIssuer(backend.processIssuer().toASCIIString()).orElseThrow(() -> failure(FailureKind.CREDENTIAL_UNAVAILABLE));
-        if (trust.status() != TrustedIssuerRegistry.Status.ACTIVE || trust.realmType() != TrustedIssuerRegistry.RealmType.TENANT || !Long.toString(backend.tenantId()).equals(trust.tenantId())
-                || !backend.processIssuer().toASCIIString().equals(trust.issuer().toASCIIString())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
-        return trust;
-    }
-    private static void requireKey(ServiceAuthorizationKey key, IdpServiceTokenRequest request, BackendVO backend) {
-        if (key == null || !backend.processIssuer().toASCIIString().equals(key.issuer()) || !backend.registrationId().equals(key.registrationId())
-                || !backend.expectedClientId().equals(key.clientId()) || !backend.expectedAppId().equals(key.appId())
-                || !backend.processResourceUri().toASCIIString().equals(key.audience().toASCIIString()) || key.context() != ServiceTokenContext.TENANT
-                || !Long.toString(backend.tenantId()).equals(key.tenantId()) || !SCOPES.equals(key.scopes()) || !request.scopes().equals(key.scopes())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
-    }
-    private static boolean sameKey(ServiceAuthorizationKey expected, ServiceAuthorizationKey current) {
-        return expected.equals(current) && expected.audience().toASCIIString().equals(current.audience().toASCIIString());
-    }
-    private static boolean sameTrust(TrustedIssuerRegistry.TrustedIssuerVO expected, TrustedIssuerRegistry.TrustedIssuerVO current) {
-        return current != null && expected.equals(current) && expected.issuer().toASCIIString().equals(current.issuer().toASCIIString()) && expected.jwksUri().toASCIIString().equals(current.jwksUri().toASCIIString());
+    private static TargetVO target(BackendVO backend) {
+        return new TargetVO(backend.tenantId(), backend.processIssuer(), backend.processResourceUri(), backend.registrationId(),
+                backend.expectedClientId(), backend.expectedAppId(), backend.expectedSourceBiz(), backend.expectedSourceApp(), backend.expectedEnvironment(), SCOPES);
     }
     private static void requireRelease(ProcessReleaseDTO release, BackendVO backend) {
         var models = release.models().stream().filter(model -> model.type() == ProcessModelTypeEnum.DMN && model.definitionKey().equals(backend.decisionKey())).toList();
@@ -254,7 +215,7 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
         final AtomicReference<String> bearer = new AtomicReference<>();
         final AtomicReference<Future<?>> future = new AtomicReference<>();
         final Object publishLock = new Object();
-        volatile CredentialContextVO credential;
+        volatile CredentialVO credential;
 
         CallScope(WindowVO window) { this.window = window; }
         long remaining() {
@@ -280,9 +241,7 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
         }
     }
     private record WindowVO(Instant startedAt, long startedNanos, Instant deadlineAt) { }
-    private record CredentialContextVO(IdpServiceTokenRequest request, ServiceAuthorizationKey key, TrustedIssuerRegistry.TrustedIssuerVO trust, TrustedAgentActor actor, Instant expiresAt) {
-        @Override public String toString() { return "FixedDecisionCredentialContext[redacted]"; }
-    }
+
     private static Instant earlier(Instant left, Instant right) { return left.isBefore(right) ? left : right; }
     private static Failure failure(FailureKind kind) { return new Failure(kind); }
     private static AgentLedgerException ledgerFailure(AgentLedgerException failure) { return new AgentLedgerException(failure.code(), "Fixed decision callback could not complete"); }

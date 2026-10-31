@@ -114,7 +114,7 @@ public final class TianjiProcessPermissions {
     public static final String AGENT_RESULT_RECEIVE = "TIANJI_AGENT_RESULT_RECEIVE";
     public static final String RELEASE_PUBLISH_API = "tianji.api.process.release.publish";
     public static final String RELEASE_GET_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_RESOURCE_KEY;
-    public static final String START_API = "tianji.api.process.instance.start";
+    public static final String START_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_RESOURCE_KEY;
     public static final String GET_API = "tianji.api.process.instance.get";
     public static final String DECISION_API = top.egon.cola.platform.tianji.contract.orchestration.DecisionClient.EXECUTE_RESOURCE_KEY;
     public static final String WORKER_ACQUIRE_API = "tianji.api.process.worker.acquire";
@@ -123,7 +123,7 @@ public final class TianjiProcessPermissions {
     public static final String AGENT_RESULT_RECEIVE_API = "tianji.api.process.agent.result.receive";
     public static final String RELEASE_PUBLISH_SCOPE = "tianji:process:publish";
     public static final String RELEASE_READ_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_SCOPE;
-    public static final String START_SCOPE = "tianji:process:start";
+    public static final String START_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_SCOPE;
     public static final String READ_SCOPE = "tianji:process:read";
     public static final String DECISION_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.DecisionClient.EXECUTE_SCOPE;
     public static final String WORKER_ACQUIRE_SCOPE = "tianji:worker:acquire";
