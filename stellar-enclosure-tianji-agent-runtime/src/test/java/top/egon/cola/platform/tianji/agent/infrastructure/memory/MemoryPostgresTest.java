@@ -389,6 +389,9 @@ class MemoryPostgresTest {
         var resource = URI.create("https://agent.example/api"); var deadline = Instant.now().plusSeconds(300).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
         var first = store.reserve(material.authorization(), binding, resource, deadline, 5).orElseThrow(); var second = store.reserve(material.authorization(), binding, resource, deadline.plusSeconds(10), 5).orElseThrow();
         var ticket = new AgentExecutionGrant.Ticket("9" + "2".repeat(62), "ENC:v1:test:A:A", deadline.minusSeconds(30));
+        assertFalse(store.recordIssueFailure(first, "OWNER_DENIED", true));
+        assertTrue(store.recordIssueFailure(second, "ISSUE_UNAVAILABLE", false));
+        assertEquals("ISSUE_UNAVAILABLE", store.view(ALICE, run.runId(), "background").orElseThrow().reasonCode());
         assertFalse(store.complete(first, ticket)); assertTrue(store.complete(second, ticket)); assertEquals(second.deadlineAt(), first.deadlineAt());
         var claimedRun = ledger.claim(ALICE, query, run.revision(), "background-source", Duration.ofSeconds(30));
         var finished = ledger.finish(ALICE, claimedRun.lease(), claimedRun.run().revision(), new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED, Map.of(), null, "1", null, null, null));

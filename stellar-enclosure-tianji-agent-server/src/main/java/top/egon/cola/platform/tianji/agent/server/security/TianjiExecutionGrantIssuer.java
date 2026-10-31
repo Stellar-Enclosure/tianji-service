@@ -30,8 +30,10 @@ public final class TianjiExecutionGrantIssuer {
     private final TrustedIssuerRegistry issuers;
     private final Map<URI, HttpExecutionGrantClient> clients;
     private final TianjiMemoryGrantIssuer memory;
+    private final TianjiMemoryPreferenceGrantIssuer preferences;
 
     public boolean usesMemoryIssuer(TianjiMemoryGrantIssuer candidate) { return memory == candidate; }
+    public boolean usesPreferenceIssuer(TianjiMemoryPreferenceGrantIssuer candidate) { return preferences == candidate; }
 
     public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
@@ -42,8 +44,14 @@ public final class TianjiExecutionGrantIssuer {
     public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
             IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper, TianjiMemoryGrantIssuer memory) {
+        this(ledger, store, starter, authority, issuers, oauth, mapper, memory, null);
+    }
+
+    public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, TianjiMemoryGrantIssuer memory, TianjiMemoryPreferenceGrantIssuer preferences) {
         this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), issuers,
-                clients(starter, authority, issuers, oauth, mapper), memory);
+                clients(starter, authority, issuers, oauth, mapper), memory, preferences);
     }
 
     TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
@@ -53,17 +61,28 @@ public final class TianjiExecutionGrantIssuer {
 
     TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
             TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients, TianjiMemoryGrantIssuer memory) {
+        this(ledger, store, resource, issuers, clients, memory, null);
+    }
+
+    TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
+            TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients, TianjiMemoryGrantIssuer memory, TianjiMemoryPreferenceGrantIssuer preferences) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.issuers = Objects.requireNonNull(issuers, "issuers");
         this.clients = Map.copyOf(clients);
         if (memory != null && (!memory.usesLedger(ledger) || !memory.usesIssuerRegistry(issuers) || !memory.usesResource(resource))) throw new IllegalArgumentException("Memory issue authority does not match the run issuer");
         this.memory = memory;
+        if (preferences != null && (!preferences.usesLedger(ledger) || !preferences.usesIssuerRegistry(issuers) || !preferences.usesResource(resource))) throw new IllegalArgumentException("Memory preference issue authority does not match the run issuer");
+        this.preferences = preferences;
         if (this.clients.isEmpty()) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_REQUIRED");
     }
 
     /** A failed or uncertain issue leaves the run queued; a repeated start with the same key can retry. */
     public AgentRunDTO ensure(TianjiAgentAccess.Authorized authorized, AgentRunDTO run) {
-        try { var current = ensureInternal(authorized, run); return memory == null ? current : memory.ensure(authorized, current); }
+        try {
+            var current = ensureInternal(authorized, run);
+            if (memory != null) current = memory.ensure(authorized, current);
+            return preferences == null ? current : preferences.ensure(authorized, current);
+        }
         catch (AgentLedgerException failure) { throw failure; }
         catch (RuntimeException failure) { throw unavailable(); }
     }

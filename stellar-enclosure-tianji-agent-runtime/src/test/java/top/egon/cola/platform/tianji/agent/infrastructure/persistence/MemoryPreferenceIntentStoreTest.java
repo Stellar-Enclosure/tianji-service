@@ -66,6 +66,18 @@ class MemoryPreferenceIntentStoreTest {
         }
     }
 
+    @Test void issuance_failure_records_are_epoch_fenced_and_definite_denials_close_only_the_matching_reservation() throws Exception {
+        var source = source(); var ledger = ledger(source); var values = values(MemoryPreferenceIntent.State.RESERVED, 2); var jdbc = new AtomicReference<JdbcTemplate>();
+        try (var templates = templates(values, jdbc); var verifiers = mockConstruction(MemoryPreferenceIntentStorageVerifier.class)) {
+            var store = new MemoryPreferenceIntentStore(source, ledger); store.verifyStorage();
+            assertFalse(store.recordIssueFailure(reservation(1), "ISSUE_UNAVAILABLE", false)); verify(jdbc.get(), never()).update(anyString(), any(Object[].class));
+            assertTrue(store.recordIssueFailure(reservation(2), "ISSUE_UNAVAILABLE", false));
+            verify(jdbc.get()).update(startsWith("UPDATE tianji_agent.agent_memory_preference_intent SET last_error_code="), eq("ISSUE_UNAVAILABLE"), eq(Timestamp.from(NOW)), eq(reservation(2).intentId()));
+            assertTrue(store.recordIssueFailure(reservation(2), "OWNER_DENIED", true));
+            verify(jdbc.get()).update(contains("grant_id=NULL,ciphertext=NULL"), eq("REJECTED"), eq(Timestamp.from(NOW)), eq(Timestamp.from(NOW)), eq("OWNER_DENIED"), eq(0), isNull(), isNull(), isNull(), eq(reservation(2).intentId()));
+        }
+    }
+
     @Test void an_expired_worker_epoch_or_substituted_command_list_cannot_cross_the_fact_fence() throws Exception {
         var source = source(); var ledger = ledger(source); var values = values(MemoryPreferenceIntent.State.CLAIMED, 1); var jdbc = new AtomicReference<JdbcTemplate>();
         values.put("lease_epoch", 2L); var evidence = new MemoryPreferenceIntent.Evidence(reservation(1), ticket());

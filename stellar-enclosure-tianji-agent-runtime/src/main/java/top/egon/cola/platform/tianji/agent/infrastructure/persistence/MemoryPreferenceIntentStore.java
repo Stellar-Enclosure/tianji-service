@@ -116,6 +116,23 @@ public final class MemoryPreferenceIntentStore {
         });
     }
 
+    /** Optional issuance failures never change a later reservation or attach evidence from a different epoch. */
+    public boolean recordIssueFailure(MemoryPreferenceIntent.Reservation reservation, String reasonCode, boolean definite) {
+        Objects.requireNonNull(reservation, "reservation"); reason(reasonCode);
+        return transact(status -> {
+            var found = read(reservation.intentId(), true); if (found.isEmpty()) return false; var row = found.orElseThrow();
+            if (!row.reservation().equals(reservation) || row.state() != MemoryPreferenceIntent.State.RESERVED) return false;
+            Instant now = databaseNow();
+            if (!reservation.deadlineAt().isAfter(now)) closeRow(row, MemoryPreferenceIntent.State.EXPIRED, "INTENT_EXPIRED", now, null, null);
+            else if (definite) closeRow(row, MemoryPreferenceIntent.State.REJECTED, reasonCode, now, null, null);
+            else {
+                counters(row);
+                jdbc.update("UPDATE tianji_agent.agent_memory_preference_intent SET last_error_code=?,revision=revision+1,updated_at=? WHERE intent_id=?", reasonCode, Timestamp.from(now), reservation.intentId());
+            }
+            return true;
+        });
+    }
+
     public List<UUID> candidates(long tenantId, String issuerFingerprint, int limit) {
         origin(tenantId, issuerFingerprint); limit(limit);
         return transact(status -> jdbc.query("""

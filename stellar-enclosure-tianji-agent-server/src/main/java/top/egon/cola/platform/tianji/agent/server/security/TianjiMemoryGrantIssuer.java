@@ -156,7 +156,7 @@ public final class TianjiMemoryGrantIssuer {
         return subject;
     }
     private void check(Instant deadline, long monotonicDeadline) { if (Thread.currentThread().isInterrupted() || !clock.instant().isBefore(deadline) || monotonicDeadline - System.nanoTime() <= 0) throw unavailable(); }
-    private static Map<URI, HttpExecutionGrantClient> clients(IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+    static Map<URI, HttpExecutionGrantClient> clients(IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
             IdpServiceOAuth2Client oauth, ObjectMapper mapper, String scope) {
         var result = new LinkedHashMap<URI, HttpExecutionGrantClient>();
         TianjiExecutionAuthorityBindings.source(starter, authority, issuers, scope).forEach((issuer, context) -> result.put(issuer,
