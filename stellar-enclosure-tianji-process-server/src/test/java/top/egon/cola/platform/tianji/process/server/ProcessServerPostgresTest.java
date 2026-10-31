@@ -242,6 +242,12 @@ class ProcessServerPostgresTest {
                 .locations("classpath:db/tianji-process").target("6").cleanDisabled(true).load();
         assertEquals(1, inboxSchema.migrate().migrationsExecuted);
         inboxSchema.validate();
+        List<Integer> beforeHumanTasks = jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history ORDER BY installed_rank", (rs, row) -> rs.getInt(1));
+        Flyway humanSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0")
+                .locations("classpath:db/tianji-process").target("7").cleanDisabled(true).load();
+        assertEquals(1, humanSchema.migrate().migrationsExecuted); humanSchema.validate();
+        assertEquals(beforeHumanTasks, jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version<>'7' ORDER BY installed_rank", (rs, row) -> rs.getInt(1)));
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='1'", Integer.class));
         assertEquals(version2Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='2'", Integer.class));
         assertEquals(version3Checksum, jdbc.queryForObject("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version='3'", Integer.class));
@@ -635,6 +641,7 @@ class ProcessServerPostgresTest {
             verifyWorkerAdapter(app, jdbc);
             verifyAgentDispatchAdapter(app, jdbc);
             verifyAgentInboxApplication(app, jdbc);
+            HumanTaskFlowableScenarios.verify(app, jdbc);
         }
         assertFalse(executor.isActive());
     }
