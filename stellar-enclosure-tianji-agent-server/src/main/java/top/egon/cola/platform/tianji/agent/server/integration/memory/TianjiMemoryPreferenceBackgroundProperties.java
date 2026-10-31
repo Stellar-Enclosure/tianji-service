@@ -8,7 +8,7 @@ import java.time.Duration;
 public record TianjiMemoryPreferenceBackgroundProperties(int batchSize, int maximumAttempts, Duration interval, Duration timeout,
         Duration leaseDuration, Duration retryDelay, Duration shutdownTimeout, Duration grantLifetime, Duration authorizationTimeout, int authorizationConcurrency) {
     public TianjiMemoryPreferenceBackgroundProperties {
-        batchSize = batchSize == 0 ? 16 : batchSize; maximumAttempts = maximumAttempts == 0 ? 16 : maximumAttempts;
+        batchSize = batchSize == 0 ? 16 : batchSize; maximumAttempts = maximumAttempts == 0 ? 32 : maximumAttempts;
         interval = interval == null ? Duration.ofSeconds(5) : interval; timeout = timeout == null ? Duration.ofSeconds(10) : timeout;
         leaseDuration = leaseDuration == null ? Duration.ofSeconds(30) : leaseDuration; retryDelay = retryDelay == null ? Duration.ofSeconds(1) : retryDelay;
         shutdownTimeout = shutdownTimeout == null ? Duration.ofSeconds(10) : shutdownTimeout; grantLifetime = grantLifetime == null ? Duration.ofHours(1) : grantLifetime;

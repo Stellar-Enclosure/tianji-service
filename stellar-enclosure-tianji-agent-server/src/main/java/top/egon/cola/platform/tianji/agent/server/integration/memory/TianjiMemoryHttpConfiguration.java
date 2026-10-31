@@ -27,6 +27,7 @@ public class TianjiMemoryHttpConfiguration {
     @Bean(name = "tianjiMemoryAuthorization")
     @ConditionalOnMissingBean(name = "tianjiMemoryAuthorization")
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.context.memory", name = "enabled", havingValue = "false", matchIfMissing = true)
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.memory.extraction.background", name = "enabled", havingValue = "false", matchIfMissing = true)
     MemoryAuthorization tianjiMemoryHttpAuthorization(TianjiAgentAccess access, TianjiMemoryAccessProperties properties) {
         return new TianjiMemoryHttpAuthorization(access, properties, Clock.systemUTC());
     }

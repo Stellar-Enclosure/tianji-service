@@ -69,7 +69,8 @@ public final class TianjiMemoryPreferenceGrantIssuer {
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clients = Map.copyOf(clients); this.clock = Objects.requireNonNull(clock, "clock");
         this.issueTimeout = Objects.requireNonNull(issueTimeout, "issueTimeout"); this.lifetime = Objects.requireNonNull(lifetime, "lifetime"); this.maximumAttempts = maximumAttempts;
         if (!store.usesLedger(ledger) || bindings == null || bindings.isEmpty() || bindings.size() > 1000 || issueTimeout.compareTo(Duration.ofMillis(100)) < 0
-                || issueTimeout.compareTo(Duration.ofSeconds(30)) > 0 || lifetime.compareTo(Duration.ofSeconds(1)) < 0 || lifetime.compareTo(Duration.ofHours(8)) > 0 || maximumAttempts < 1 || maximumAttempts > 100) throw invalid();
+                || issueTimeout.compareTo(Duration.ofSeconds(30)) > 0 || lifetime.compareTo(Duration.ofSeconds(1)) < 0 || lifetime.compareTo(Duration.ofHours(8)) > 0
+                || lifetime.compareTo(issueTimeout) <= 0 || maximumAttempts < 1 || maximumAttempts > 100) throw invalid();
         this.bindings = List.copyOf(bindings); var ids = new HashSet<String>(); var sources = new HashSet<List<String>>(); var definitions = new HashMap<List<String>, String>();
         for (var binding : this.bindings) {
             var definition = List.of(Long.toString(binding.tenantId()), binding.issuerFingerprint(), binding.definitionKey(), Long.toString(binding.definitionVersion()));

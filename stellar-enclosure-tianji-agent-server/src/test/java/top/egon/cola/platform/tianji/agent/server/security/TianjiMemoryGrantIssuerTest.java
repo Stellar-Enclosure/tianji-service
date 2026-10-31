@@ -161,8 +161,22 @@ class TianjiMemoryGrantIssuerTest {
         verifyNoInteractions(client, permissions);
         @SuppressWarnings("unchecked") org.springframework.beans.factory.ObjectProvider<TianjiMemoryGrantIssuer> memory = mock(org.springframework.beans.factory.ObjectProvider.class);
         var environment = new org.springframework.mock.env.MockEnvironment().withProperty("stellar.tianji.agent.context.memory.enabled", "true");
-        assertThrows(IllegalStateException.class, () -> new TianjiExecutionGrantConfiguration().tianjiExecutionGrantIssuer(null, null, null, null, null, null, null, environment, memory));
+        assertThrows(IllegalStateException.class, () -> new TianjiExecutionGrantConfiguration().tianjiExecutionGrantIssuer(null, null, null, null, null, null, null, environment, memory, null));
         assertThrows(IllegalStateException.class, () -> new TianjiServiceExecutionConfiguration().tianjiServiceExecutionGrantIssuer(null, null, null, null, null, null, null, null, environment, memory));
+    }
+
+    @Test void the_actual_user_factory_requires_and_forwards_the_optional_write_issuer_when_enabled() {
+        @SuppressWarnings("unchecked") org.springframework.beans.factory.ObjectProvider<TianjiMemoryGrantIssuer> reads = mock(org.springframework.beans.factory.ObjectProvider.class);
+        @SuppressWarnings("unchecked") org.springframework.beans.factory.ObjectProvider<TianjiMemoryPreferenceGrantIssuer> writes = mock(org.springframework.beans.factory.ObjectProvider.class);
+        var environment = new org.springframework.mock.env.MockEnvironment().withProperty("stellar.tianji.agent.memory.extraction.background.enabled", "true");
+        var failure = assertThrows(IllegalStateException.class, () -> new TianjiExecutionGrantConfiguration().tianjiExecutionGrantIssuer(null, null, null, null, null, null, null, environment, reads, writes));
+        assertEquals("TIANJI_MEMORY_PREFERENCE_GRANT_ISSUER_REQUIRED", failure.getMessage());
+        var readIssuer = mock(TianjiMemoryGrantIssuer.class); var writeIssuer = mock(TianjiMemoryPreferenceGrantIssuer.class); when(reads.getIfAvailable()).thenReturn(readIssuer); when(writes.getIfAvailable()).thenReturn(writeIssuer);
+        environment.withProperty("stellar.tianji.agent.context.memory.enabled", "true"); var arguments = new java.util.concurrent.atomic.AtomicReference<List<?>>();
+        try (var constructed = mockConstruction(TianjiExecutionGrantIssuer.class, (value, context) -> arguments.set(context.arguments()))) {
+            var result = new TianjiExecutionGrantConfiguration().tianjiExecutionGrantIssuer(null, null, null, null, null, null, null, environment, reads, writes);
+            assertSame(constructed.constructed().getFirst(), result); assertSame(readIssuer, arguments.get().get(7)); assertSame(writeIssuer, arguments.get().get(8));
+        }
     }
 
     private TianjiMemoryGrantIssuer create(MemoryContextBinding binding, TianjiServiceExecutionBindings services, Map<URI, HttpExecutionGrantClient> clients) {

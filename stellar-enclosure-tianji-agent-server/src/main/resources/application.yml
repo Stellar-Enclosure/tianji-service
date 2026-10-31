@@ -43,6 +43,8 @@ stellar:
       memory:
         enabled: false
         extraction:
+          background:
+            enabled: false
           http:
             enabled: false
         merge-suggestions:

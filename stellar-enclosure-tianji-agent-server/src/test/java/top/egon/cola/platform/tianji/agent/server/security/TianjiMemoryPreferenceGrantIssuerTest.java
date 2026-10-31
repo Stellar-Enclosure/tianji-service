@@ -164,6 +164,12 @@ class TianjiMemoryPreferenceGrantIssuerTest {
         verify(ledger, never()).executionMaterial(any(), any()); verify(store, never()).reserve(any(), any(), any(), any(), anyInt()); verifyNoInteractions(client);
     }
 
+    @Test void the_configured_write_window_must_leave_room_for_the_whole_issue_exchange() {
+        assertThrows(IllegalArgumentException.class, () -> new TianjiMemoryPreferenceGrantIssuer(ledger, store, List.of(BINDING), access, permissions, RESOURCE, issuers, Map.of(ISSUER, client),
+                Duration.ofSeconds(1), Duration.ofSeconds(1), 3, Clock.fixed(NOW, ZoneOffset.UTC)));
+        verifyNoInteractions(client); verify(ledger, never()).executionMaterial(any(), any());
+    }
+
     private TianjiMemoryPreferenceGrantIssuer create() { return new TianjiMemoryPreferenceGrantIssuer(ledger, store, List.of(BINDING), access, permissions, RESOURCE, issuers, Map.of(ISSUER, client),
             Duration.ofSeconds(1), Duration.ofSeconds(120), 3, Clock.fixed(NOW, ZoneOffset.UTC)); }
     private static AgentRunDTO run(AgentRunStatusEnum status) { return new AgentRunDTO(RUN, "assistant", 1, "session", status, null, false, 1, 2, 1, NOW.plusSeconds(60), NOW.minusSeconds(30), status == AgentRunStatusEnum.COMPLETED ? NOW.minusSeconds(1) : null); }

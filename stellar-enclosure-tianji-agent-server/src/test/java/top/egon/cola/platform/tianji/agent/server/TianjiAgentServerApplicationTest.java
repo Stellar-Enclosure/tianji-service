@@ -4,6 +4,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.health.actuate.endpoint.HealthEndpoint;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import top.egon.cola.platform.tianji.contract.agent.AgentClient;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryPreferenceIntentStore;
+import top.egon.cola.platform.tianji.agent.server.integration.memory.MemoryPreferenceJob;
 import javax.sql.DataSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -22,6 +24,8 @@ class TianjiAgentServerApplicationTest {
             assertThat(context).hasSingleBean(HealthEndpoint.class);
             assertThat(context).doesNotHaveBean(AgentClient.class);
             assertThat(context).doesNotHaveBean(DataSource.class);
+            assertThat(context).doesNotHaveBean(MemoryPreferenceJob.class);
+            assertThat(context).doesNotHaveBean(MemoryPreferenceIntentStore.class);
             assertThat(context).doesNotHaveBean("webServerFactory");
         });
     }

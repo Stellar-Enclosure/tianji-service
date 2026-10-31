@@ -22,6 +22,7 @@ import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantA
 import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantIssuer;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiMemoryGrantIssuer;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiMemoryRunAuthorization;
+import top.egon.cola.platform.tianji.agent.server.security.TianjiMemoryPreferenceWriteAuthorization;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiServiceExecutionBindings;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiServiceExecutionGrantIssuer;
 import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
@@ -71,8 +72,14 @@ public class TianjiMemoryContextConfiguration {
 
     @Bean(name = "tianjiMemoryAuthorization")
     @ConditionalOnMissingBean(name = "tianjiMemoryAuthorization")
-    MemoryAuthorization tianjiMemorySourceAuthorization(TianjiMemoryHttpAuthorization http, TianjiMemoryRunAuthorization runs) {
-        return request -> request.context().runAuthorization() == null ? http.authorize(request) : runs.authorize(request);
+    MemoryAuthorization tianjiMemorySourceAuthorization(TianjiMemoryHttpAuthorization http, TianjiMemoryRunAuthorization runs, Environment environment, ObjectProvider<TianjiMemoryPreferenceWriteAuthorization> candidates) {
+        boolean enabled = environment.getProperty("stellar.tianji.agent.memory.extraction.background.enabled", Boolean.class, false);
+        var writes = enabled ? candidates.getIfAvailable() : null;
+        if (enabled && writes == null) throw new IllegalStateException("TIANJI_MEMORY_PREFERENCE_WRITE_AUTHORIZER_REQUIRED");
+        return request -> {
+            if (request.context().preferenceWrite() != null && writes != null) return writes.authorize(request);
+            return request.context().runAuthorization() == null ? http.authorize(request) : runs.authorize(request);
+        };
     }
 
     @Bean(destroyMethod = "close")
