@@ -11,6 +11,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -34,6 +35,7 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 
 import java.net.URI;
 import java.math.BigDecimal;
@@ -120,6 +122,129 @@ class ToolExecutionJournalPostgresTest {
         invocationPreparation(source, jdbc, ledger, capabilities);
         readOnlyRecording(source, jdbc, ledger, capabilities);
         idempotentWriteJournal(source, jdbc, ledger, capabilities);
+        fixedStartRecording(source, jdbc, ledger, capabilities);
+    }
+
+    private static void fixedStartRecording(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                             ToolCapabilityStore capabilities) {
+        var fixture = new StartRecorderFixture(source, jdbc, ledger, capabilities); var calls = new AtomicInteger();
+        var transport = controlledStartTransport(request -> {
+            calls.incrementAndGet(); assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals("DISPATCHING", invocationState(jdbc, fixture.request)); assertEquals("DISPATCHING", writeActionFacts(jdbc, fixture.request.action()).get("state"));
+            assertEquals("RESERVED", startBudgetState(jdbc, fixture.request)); return startObservation();
+        }, false);
+        var result = fixture.recorder.executeIdempotentStart(transport, fixture.request);
+        assertNotNull(result); assertEquals(fixture.request.action().intentId(), result.actionIntentId());
+        assertEquals("PREPARED", result.actionStateAtPreparation()); assertEquals(1, result.actionRevisionAtPreparation());
+        var own = result.ownAttempt(); assertNotNull(own); assertEquals("SUCCEEDED", own.state()); assertTrue(own.operationInvokedThisCall());
+        assertEquals(Map.of("instanceId", "controlled-start-instance"), own.outcome().output());
+        assertEquals(startObservation().hostReceiptReference(), own.outcome().businessReceiptId());
+        assertEquals(ToolInvocationRecorder.AccountingState.SETTLED, own.accountingState());
+        assertEquals("APPLIED", writeActionFacts(jdbc, fixture.request.action()).get("state"));
+        assertEquals("SETTLED", startBudgetState(jdbc, fixture.request));
+        assertEquals(0, ((Number) invocationCounters(jdbc, fixture.run.runId()).get("active_tool_calls")).intValue());
+        var replay = fixture.recorder.executeIdempotentStart(transport, fixture.request);
+        assertNotNull(replay.ownAttempt()); assertEquals("SUCCEEDED", replay.ownAttempt().state()); assertNull(replay.ownAttempt().outcome());
+        assertFalse(replay.ownAttempt().operationInvokedThisCall());
+        var another = fixture.recorder.executeIdempotentStart(transport, fixture.newInvocation());
+        assertNull(another.ownAttempt()); assertEquals(1, calls.get());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=?", Integer.class, ACTOR.tenantId(), fixture.run.runId()));
+        startOuterFailure(source, jdbc, ledger, capabilities);
+        startAccountingFailure(source, jdbc, ledger, capabilities);
+    }
+
+    private static void startOuterFailure(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                           ToolCapabilityStore capabilities) {
+        var fixture = new StartRecorderFixture(source, jdbc, ledger, capabilities); var calls = new AtomicInteger();
+        var transport = controlledStartTransport(request -> { calls.incrementAndGet(); return startObservation(); }, true);
+        var failure = assertThrows(FixedBpmnStartToolTransport.Failure.class, () -> fixture.recorder.executeIdempotentStart(transport, fixture.request));
+        assertEquals(FixedBpmnStartToolTransport.FailureKind.RELEASE_CHANGED, failure.kind()); assertNull(failure.getCause());
+        assertEquals("SUCCEEDED", invocationState(jdbc, fixture.request));
+        var action = writeActionFacts(jdbc, fixture.request.action()); assertEquals("APPLIED", action.get("state"));
+        assertEquals(startObservation().hostReceiptReference(), action.get("business_receipt_id"));
+        var replay = fixture.recorder.executeIdempotentStart(transport, fixture.request);
+        assertNotNull(replay.ownAttempt()); assertNull(replay.ownAttempt().outcome()); assertFalse(replay.ownAttempt().operationInvokedThisCall());
+        assertEquals(action, writeActionFacts(jdbc, fixture.request.action())); assertEquals(1, calls.get());
+    }
+
+    private static void startAccountingFailure(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                                ToolCapabilityStore capabilities) {
+        var fixture = new StartRecorderFixture(source, jdbc, ledger, capabilities); var calls = new AtomicInteger();
+        var transport = controlledStartTransport(request -> { calls.incrementAndGet(); return startObservation(); }, false);
+        jdbc.execute("CREATE FUNCTION tianji_agent.tool_start_accounting_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled start accounting failure'; END; $$");
+        jdbc.execute("CREATE TRIGGER tool_start_accounting_fail BEFORE UPDATE ON tianji_agent.agent_budget_reservation FOR EACH ROW WHEN (OLD.state='RESERVED' AND NEW.state='SETTLED') EXECUTE FUNCTION tianji_agent.tool_start_accounting_fail()");
+        try {
+            var result = fixture.recorder.executeIdempotentStart(transport, fixture.request);
+            assertEquals("PREPARED", result.actionStateAtPreparation()); assertNotNull(result.ownAttempt().outcome());
+            assertEquals("SUCCEEDED", result.ownAttempt().state()); assertEquals(ToolInvocationRecorder.AccountingState.PENDING, result.ownAttempt().accountingState());
+            assertEquals("APPLIED", writeActionFacts(jdbc, fixture.request.action()).get("state"));
+            assertEquals("RESERVED", startBudgetState(jdbc, fixture.request));
+        } finally {
+            jdbc.execute("DROP TRIGGER tool_start_accounting_fail ON tianji_agent.agent_budget_reservation"); jdbc.execute("DROP FUNCTION tianji_agent.tool_start_accounting_fail()");
+        }
+        new ToolExecutionStorageVerifier(source).verify();
+        var replay = fixture.recorder.executeIdempotentStart(transport, fixture.request);
+        assertEquals("SUCCEEDED", replay.ownAttempt().state()); assertNull(replay.ownAttempt().outcome());
+        assertFalse(replay.ownAttempt().operationInvokedThisCall()); assertEquals(ToolInvocationRecorder.AccountingState.PENDING, replay.ownAttempt().accountingState());
+        assertEquals("RESERVED", startBudgetState(jdbc, fixture.request));
+        assertEquals(1, ((Number) invocationCounters(jdbc, fixture.run.runId()).get("active_tool_calls")).intValue()); assertEquals(1, calls.get());
+    }
+
+    private static FixedBpmnStartToolTransport controlledStartTransport(Function<FixedBpmnStartToolTransport.Request, FixedBpmnStartToolTransport.StartObservation> operation,
+                                                                        boolean failAfterCallback) {
+        return new FixedBpmnStartToolTransport() {
+            @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                T result = callback.apply(new ReadOnlyDecisionToolTransport.VerifiedExecutor(EXECUTOR, request.deadlineAt()), () -> operation.apply(request));
+                if (failAfterCallback) throw new Failure(FailureKind.RELEASE_CHANGED);
+                return result;
+            }
+        };
+    }
+    private static FixedBpmnStartToolTransport.StartObservation startObservation() {
+        return new FixedBpmnStartToolTransport.StartObservation("tianji:ps-start:v1:" + "c".repeat(64), "controlled-start-instance");
+    }
+    private static String startBudgetState(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO request) {
+        return jdbc.queryForObject("SELECT state FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=? AND reservation_id=?",
+                String.class, ACTOR.tenantId(), request.binding().run().runId(), request.reservationId());
+    }
+    private static final class StartRecorderFixture {
+        final AgentRunAuthorization.Request run;
+        final ToolInvocationStore.PreparationRequestVO request;
+        final ToolInvocationRecorder recorder;
+
+        StartRecorderFixture(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger, ToolCapabilityStore capabilities) {
+            var descriptor = new ToolDescriptor("process.recordedStart", 1, "recorded_start", "Controlled fixed START recorder",
+                    DESCRIPTOR.input(), new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
+                    new ToolPolicy(ToolPolicy.Risk.IDEMPOTENT_WRITE, "process.start.recorded", ProcessClient.START_RESOURCE_KEY, "b".repeat(64), null));
+            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(30), 5, 32, 10_000, 10_000,
+                    null, null, 8, Set.of(descriptor.versionKey()), "no-retry", null);
+            ledger.publish(ACTOR, new AgentDefinitionSpecDTO("tool-start-recorder-test", 1, "CODE_FIRST", "controlled-test", "text-v1", "text-v1",
+                    new DefinitionDependenciesDTO(List.of(), List.of(), List.of(descriptor.reference()), "model-route", "tool-policy-v1"), policy, Map.of()));
+            var queued = ledger.start(ACTOR, new StartAgentRunCommand("tool-start-recorder-test", 1, null, UUID.randomUUID().toString(), null, null,
+                    new AgentInputDTO("controlled fixed START recorder", List.of(), Map.of()), null));
+            run = ledger.executionMaterial(ACTOR, new GetAgentRunQuery(queued.runId())).authorization();
+            var binding = new ToolExecutionGrant.BindingVO(run, descriptor.reference(), descriptor.policy().bindingSha256(), "TIANJI_TOOL_START_RECORDER_TEST_V1", RESOURCE, "tianji.api.agent.start", null);
+            var reserved = capabilities.reserve(binding, descriptor).orElseThrow();
+            assertTrue(capabilities.attach(evidence(reserved, now(jdbc).plusSeconds(120).truncatedTo(ChronoUnit.MICROS)), descriptor));
+            var ticket = capabilities.current(binding, descriptor).orElseThrow();
+            var claim = ledger.claim(ACTOR, new GetAgentRunQuery(run.runId()), ledger.get(ACTOR, new GetAgentRunQuery(run.runId())).revision(), "start-recorder-test", Duration.ofMinutes(5));
+            var authority = new ToolExecutionAuthorization() {
+                @Override public Decision authorize(Request value, Boundary boundary) { return check(value, boundary).decision(); }
+                @Override public CheckResult check(Request value, Boundary boundary) {
+                    assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertEquals(run, value.run());
+                    return new CheckResult(value, boundary, Decision.ALLOW, new AuditVO(1, UUID.randomUUID(), boundary, Decision.ALLOW,
+                            ACTOR.subjectType(), ticket.grantId(), 1L, null, 1L, Instant.now(), ticket.expiresAt()));
+                }
+            };
+            var preparations = new ToolInvocationStore(source, ledger, capabilities, authority); preparations.verifyStorage();
+            recorder = new ToolInvocationRecorder(source, ledger, preparations, capabilities, authority); recorder.verifyStorage();
+            var action = new ToolActionRequest(ACTOR, descriptor, "fixed-start-recorder-" + UUID.randomUUID(), "business-v1", Map.of("amount", 20L));
+            request = new ToolInvocationStore.PreparationRequestVO(binding, claim.lease(), descriptor, action.arguments(), action, UUID.randomUUID(), BigDecimal.ZERO, now(jdbc).plusSeconds(600));
+        }
+        ToolInvocationStore.PreparationRequestVO newInvocation() {
+            return new ToolInvocationStore.PreparationRequestVO(request.binding(), request.lease(), request.descriptor(), request.arguments(), request.action(), UUID.randomUUID(), BigDecimal.ZERO, request.intentExpiry());
+        }
     }
 
     /** Controlled journal calls only: no transport, native tool callback or real identity authority is used here. */

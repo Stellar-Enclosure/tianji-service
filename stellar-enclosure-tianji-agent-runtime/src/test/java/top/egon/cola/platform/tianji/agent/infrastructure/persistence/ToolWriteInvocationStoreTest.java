@@ -316,7 +316,7 @@ class ToolWriteInvocationStoreTest {
     }
     private static ToolExecutionOutcome success(BigDecimal cost) { return new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("reference", "business-value"), "business-receipt", null, cost); }
     private static ToolExecutionOutcome failure(String code, BigDecimal cost) { return new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, code, cost); }
-    private static final class Rig implements AutoCloseable {
+    static final class Rig implements AutoCloseable {
         final ToolInvocationStoreTest.Fixture base;
         final ToolInvocationStore store;
         final ToolActionIntentSql actionSql;

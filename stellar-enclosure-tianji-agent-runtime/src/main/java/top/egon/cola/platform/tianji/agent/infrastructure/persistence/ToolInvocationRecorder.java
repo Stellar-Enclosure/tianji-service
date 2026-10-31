@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -10,12 +11,14 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorizatio
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.DispatchAttemptVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.DispatchWindowVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.PreparationRequestVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecordedResultVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecorderPreparationVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
@@ -32,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
-/** Owns preparation, dispatch and receipt ordering for one fixed nonbillable read-only decision call. */
+/** Owns preparation, dispatch and receipt ordering for fixed nonbillable decision and BPMN START calls. */
 public final class ToolInvocationRecorder {
     private final DataSource source;
     private final AgentLedgerService ledger;
@@ -87,6 +90,136 @@ public final class ToolInvocationRecorder {
         } catch (RuntimeException privateFailure) {
             var safe = unavailable(); cleanup(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
         }
+    }
+
+    public IdempotentStartResultVO executeIdempotentStart(FixedBpmnStartToolTransport transport, PreparationRequestVO request) {
+        if (transport == null || request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE
+                || request.action() == null || request.intentExpiry() == null || request.estimatedCost() == null || request.estimatedCost().signum() != 0
+                || !ProcessClient.START_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey())
+                || !request.descriptor().output().fields().equals(Map.of("instanceId", ToolSchema.ValueType.STRING))
+                || !request.descriptor().output().required().equals(Set.of("instanceId"))) throw invalidStart();
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Fixed START recording requires its own transactions");
+        if (!verified.get()) throw unavailableStart();
+        RecorderPreparationVO expected = null;
+        try {
+            var prepared = preparations.prepareOrLoadIdempotentWrite(request); expected = prepared.invocation();
+            var snapshot = prepared.action();
+            if (expected == null) return startResult(snapshot, null);
+            if (!"PREPARED".equals(expected.state())) return startResult(snapshot, startMetadata(expected, prepared.budget()));
+            if (!"PREPARED".equals(snapshot.state())) {
+                var original = expected;
+                var closed = bookkeeping(() -> preparations.closePreparedWriteFailure(request, original, outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, "ACTION_NOT_DISPATCHABLE")))
+                        .orElseThrow(ToolInvocationRecorder::unavailableStart);
+                return startResult(snapshot, startMetadata(closed, prepared.budget()));
+            }
+            var transportRequest = new FixedBpmnStartToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), request.invocationId(), expected.dispatchNotAfter());
+            var original = expected;
+            var own = Objects.requireNonNull(transport.withVerifiedCall(transportRequest,
+                    (executor, operation) -> dispatchAndRecordStart(request, original, prepared.budget(), executor, operation)));
+            return startResult(snapshot, own);
+        } catch (FixedBpmnStartToolTransport.Failure rejected) {
+            var safe = new FixedBpmnStartToolTransport.Failure(rejected.kind()); cleanupStart(request, expected, startCleanupCode(rejected.kind()), safe); throw safe;
+        } catch (AgentLedgerException rejected) {
+            var safe = new AgentLedgerException(rejected.code(), "Fixed START invocation could not complete");
+            cleanupStart(request, expected, rejected.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
+        } catch (RuntimeException privateFailure) {
+            var safe = unavailableStart(); cleanupStart(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
+        }
+    }
+
+    private WriteAttemptResultVO dispatchAndRecordStart(PreparationRequestVO request, RecorderPreparationVO expected, AgentBudgetReservation observedBudget,
+                                                       ReadOnlyDecisionToolTransport.VerifiedExecutor executor, FixedBpmnStartToolTransport.OneShotStart operation) {
+        if (executor == null || operation == null || executor.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(executor.actor().issuerFingerprint())
+                || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailableStart();
+        Instant started = clock.instant(); long startedNanos = nanoTime.getAsLong();
+        Instant initialDeadline = earlier(earlier(expected.dispatchNotAfter(), request.binding().run().deadlineAt()), executor.expiresAt());
+        if (!initialDeadline.isAfter(started)) throw new FixedBpmnStartToolTransport.Failure(FixedBpmnStartToolTransport.FailureKind.DEADLINE_EXCEEDED);
+        var initialWindow = window(started, startedNanos, initialDeadline); checkStart(initialWindow);
+        ToolExecutionGrant.EvidenceVO evidence;
+        try { evidence = capabilities.current(request.binding(), request.descriptor()).orElseThrow(ToolInvocationRecorder::unavailableStart); }
+        catch (RuntimeException privateEvidence) { throw unavailableStart(); }
+        checkStart(initialWindow);
+        if (!request.binding().equals(evidence.reservation().binding())) throw unavailableStart();
+        var window = window(started, startedNanos, earlier(initialDeadline, evidence.expiresAt())); checkStart(window);
+        var expectedCheck = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(),
+                request.parametersSha256(), request.action().intentId(), window.callDeadlineAt());
+        ToolExecutionAuthorization.CheckResult checked;
+        try { checked = authorization.check(expectedCheck, ToolExecutionAuthorization.Boundary.DISPATCH); }
+        catch (RuntimeException privateAuthority) { throw unavailableStart(); }
+        if (checked == null || !expectedCheck.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.DISPATCH) throw unavailableStart();
+        if (checked.decision() == ToolExecutionAuthorization.Decision.DENY) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current fixed START access was denied");
+        var audit = checked.audit();
+        if (checked.decision() != ToolExecutionAuthorization.Decision.ALLOW || audit == null || audit.boundary() != checked.boundary() || audit.decision() != checked.decision()
+                || audit.subjectType() != request.binding().run().actor().subjectType() || !evidence.grantId().equals(audit.grantId())
+                || audit.checkedAt().isBefore(started) || audit.checkedAt().isAfter(clock.instant()) || audit.expiresAt().isBefore(window.callDeadlineAt()) || audit.expiresAt().isAfter(evidence.expiresAt())) throw unavailableStart();
+        checkStart(window);
+        String nonce = nonce();
+        var begin = preparations.beginIdempotentWriteDispatch(request, expected, evidence, checked, executor, ToolInvocationStore.dispatchNonceSha256(nonce),
+                outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, "ACTION_NOT_DISPATCHABLE"), window);
+        // Metadata cannot prove that this caller closed a loser; another caller may have recorded a different fee.
+        if (!begin.started()) return startMetadata(begin.invocation(), observedBudget);
+        boolean invoked = false; ToolExecutionOutcome observed;
+        try {
+            checkStart(window); invoked = true;
+            try { observed = startObservation(request, operation.start()); }
+            catch (FixedBpmnStartToolTransport.Failure rejected) { observed = startOperationFailure(rejected.kind()); }
+            catch (RuntimeException privateOperation) { observed = outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN"); }
+        } catch (RuntimeException notSent) {
+            observed = outcome(invoked ? ToolExecutionOutcome.Status.UNKNOWN : ToolExecutionOutcome.Status.FAILED_KNOWN, invoked ? "OUTCOME_UNKNOWN" : "DISPATCH_NOT_SENT");
+        }
+        var fact = observed;
+        var recorded = bookkeeping(() -> preparations.completeIdempotentWrite(request, begin.attempt(), nonce, fact));
+        var metadata = recorded.invocation();
+        return new WriteAttemptResultVO(metadata.runId(), metadata.invocationId(), metadata.state(), metadata.revision(), metadata.dispatchEpoch(), metadata.dispatchedAt(), metadata.finishedAt(),
+                recorded.outcome(), invoked, account(request, recorded.budget()));
+    }
+
+    private void cleanupStart(PreparationRequestVO request, RecorderPreparationVO expected, String safeCode, RuntimeException original) {
+        try {
+            bookkeeping(() -> {
+                var closed = preparations.closePreparedWriteFailure(request, expected, outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, safeCode));
+                if (closed.isPresent() && closed.get().dispatchEpoch() == 0 && "FAILED_KNOWN".equals(closed.get().state()))
+                    original.addSuppressed(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Fixed START accounting was not confirmed"));
+                return null;
+            });
+        } catch (RuntimeException pending) {
+            original.addSuppressed(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Fixed START cleanup could not complete"));
+        }
+    }
+
+    private void checkStart(DispatchWindowVO window) {
+        if (!verified.get()) throw unavailableStart();
+        if (Thread.currentThread().isInterrupted()) throw new FixedBpmnStartToolTransport.Failure(FixedBpmnStartToolTransport.FailureKind.CANCELLED);
+        if (!window.deadlineAt().isAfter(clock.instant()) || window.startedNanos() + Duration.between(window.startedAt(), window.deadlineAt()).toNanos() - nanoTime.getAsLong() <= 0)
+            throw new FixedBpmnStartToolTransport.Failure(FixedBpmnStartToolTransport.FailureKind.DEADLINE_EXCEEDED);
+    }
+
+    private static IdempotentStartResultVO startResult(ToolActionIntentStore.PreparedActionResult snapshot, WriteAttemptResultVO own) {
+        return new IdempotentStartResultVO(snapshot.intentId(), snapshot.state(), snapshot.revision(), own);
+    }
+    private static WriteAttemptResultVO startMetadata(RecorderPreparationVO value, AgentBudgetReservation observedBudget) {
+        return new WriteAttemptResultVO(value.runId(), value.invocationId(), value.state(), value.revision(), value.dispatchEpoch(), value.dispatchedAt(), value.finishedAt(), null, false,
+                settledZero(observedBudget) ? AccountingState.SETTLED : AccountingState.PENDING);
+    }
+    private static ToolExecutionOutcome startObservation(PreparationRequestVO request, FixedBpmnStartToolTransport.StartObservation observation) {
+        try {
+            if (observation == null) throw invalidStart();
+            return new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, observation.output(), observation.hostReceiptReference(), null, BigDecimal.ZERO).validated(request.descriptor());
+        } catch (RuntimeException invalidResponse) { return outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_INVALID_RESPONSE"); }
+    }
+    private static ToolExecutionOutcome startOperationFailure(FixedBpmnStartToolTransport.FailureKind kind) {
+        return switch (kind) {
+            case OPERATION_DENIED -> outcome(ToolExecutionOutcome.Status.REJECTED, "DOWNSTREAM_PERMISSION_DENIED");
+            case OPERATION_NOT_SENT, CANCELLED, DEADLINE_EXCEEDED -> outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, "DISPATCH_NOT_SENT");
+            case OPERATION_INVALID_RESPONSE -> outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_INVALID_RESPONSE");
+            default -> outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN");
+        };
+    }
+    private static String startCleanupCode(FixedBpmnStartToolTransport.FailureKind kind) {
+        return switch (kind) {
+            case CANCELLED, DEADLINE_EXCEEDED, CREDENTIAL_UNAVAILABLE, RELEASE_UNAVAILABLE, RELEASE_CHANGED -> kind.name();
+            default -> "DISPATCH_NOT_SENT";
+        };
     }
 
     private RecordResult dispatchAndRecord(PreparationRequestVO request, RecorderPreparationVO expected, AgentBudgetReservation originalBudget,
@@ -236,6 +369,38 @@ public final class ToolInvocationRecorder {
         @Override public String toString() { return "ToolInvocationRecorder.RecordResult[redacted]"; }
     }
 
+    public record IdempotentStartResultVO(String actionIntentId, String actionStateAtPreparation, long actionRevisionAtPreparation, WriteAttemptResultVO ownAttempt) {
+        public IdempotentStartResultVO {
+            try {
+                if (actionIntentId == null || !UUID.fromString(actionIntentId).toString().equals(actionIntentId) || actionStateAtPreparation == null
+                        || !Set.of("PREPARED", "DISPATCHING", "APPLIED", "REJECTED", "FAILED_KNOWN", "UNKNOWN", "EXPIRED").contains(actionStateAtPreparation)
+                        || actionRevisionAtPreparation < 1) throw invalidStart();
+            } catch (RuntimeException invalidValue) { throw invalidStart(); }
+        }
+        @Override public String toString() { return "ToolInvocationRecorder.IdempotentStartResultVO[redacted]"; }
+    }
+    public record WriteAttemptResultVO(String runId, UUID invocationId, String state, long revision, long dispatchEpoch, Instant dispatchedAt, Instant finishedAt,
+                                       ToolExecutionOutcome outcome, boolean operationInvokedThisCall, AccountingState accountingState) {
+        public WriteAttemptResultVO {
+            if (runId == null || runId.isBlank() || !runId.equals(runId.trim()) || runId.length() > 64 || invocationId == null || state == null
+                    || !Set.of("PREPARED", "DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN").contains(state)
+                    || revision < 1 || dispatchEpoch < 0 || accountingState == null || (dispatchEpoch == 0) != (dispatchedAt == null)
+                    || Set.of("SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN").contains(state) != (finishedAt != null)
+                    || Set.of("DISPATCHING", "SUCCEEDED", "UNKNOWN").contains(state) && dispatchEpoch == 0
+                    || "PREPARED".equals(state) && dispatchEpoch != 0 || operationInvokedThisCall && dispatchEpoch == 0
+                    || finishedAt != null && dispatchedAt != null && finishedAt.isBefore(dispatchedAt)
+                    || outcome != null && (dispatchEpoch == 0 || !state.equals(outcome.status().name()) || outcome.actualCost() == null || outcome.actualCost().signum() != 0)) throw invalidStart();
+            if (outcome != null && outcome.status() == ToolExecutionOutcome.Status.SUCCEEDED) {
+                if (!outcome.output().keySet().equals(Set.of("instanceId")) || !(outcome.output().get("instanceId") instanceof String instanceId)) throw invalidStart();
+                var normalized = new FixedBpmnStartToolTransport.StartObservation(outcome.businessReceiptId(), instanceId);
+                if (!normalized.output().equals(outcome.output())) throw invalidStart();
+            }
+        }
+        @Override public String toString() { return "ToolInvocationRecorder.WriteAttemptResultVO[redacted]"; }
+    }
+
+    private static IllegalArgumentException invalidStart() { return new IllegalArgumentException("Fixed START invocation recorder binding is invalid"); }
+    private static AgentLedgerException unavailableStart() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Fixed START invocation authority or storage is unavailable"); }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Read-only invocation recorder binding is invalid"); }
     private static AgentLedgerException unavailable() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Read-only invocation authority or storage is unavailable"); }
 }
