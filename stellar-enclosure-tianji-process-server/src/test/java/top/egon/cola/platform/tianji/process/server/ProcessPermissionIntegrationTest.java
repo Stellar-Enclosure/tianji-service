@@ -36,6 +36,8 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
 import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
+import top.egon.cola.platform.tianji.process.server.security.TianjiApprovalVerificationAccess;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
@@ -439,6 +441,28 @@ class ProcessPermissionIntegrationTest {
     }
 
     @Test
+    void approval_verification_requires_a_current_service_resource_grant_and_exact_scope_and_never_accepts_user_authority() {
+        var request = new MockHttpServletRequest(); request.setAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer", "https://idp.example/tenants/20");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        var service = new ServiceIdentityPrincipal("approval-consumer", "20", "approval-consumer", "service-token", URI.create("https://api.example/tianji"), 1, Set.of(ApprovalClient.VERIFY_SCOPE),
+                "xingyuan", "tianji", "test", "credential", NOW.minusSeconds(1), NOW.plusSeconds(60));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(service, List.of(), URI.create("https://idp.example/tenants/20")));
+        var access = new TianjiApprovalVerificationAccess(new TianjiProcessAccess(guard(), CLOCK), CLOCK);
+        assertEquals("approval-consumer", access.require().actor().subjectId());
+        var reduced = new java.util.HashSet<>(resources()); reduced.remove(TianjiProcessPermissions.APPROVAL_VERIFY_API); serviceGranted.set(Set.copyOf(reduced));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, access::require);
+        serviceGranted.set(resources());
+        var withoutScope = new ServiceIdentityPrincipal("approval-consumer", "20", "approval-consumer", "other-token", URI.create("https://api.example/tianji"), 1, Set.of(HumanTaskClient.READ_SCOPE),
+                "xingyuan", "tianji", "test", "credential", NOW.minusSeconds(1), NOW.plusSeconds(60));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(withoutScope, List.of(), URI.create("https://idp.example/tenants/20")));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, access::require);
+        granted.set(Set.of(TianjiProcessPermissions.APPROVAL_VERIFY));
+        VerifiedUserTokenCarrier.set(request, "verified-test-token");
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())), List.of(new SimpleGrantedAuthority("SCOPE_" + ApprovalClient.VERIFY_SCOPE))));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, access::require);
+    }
+
+    @Test
     void method_permission_annotation_matches_the_runtime_resource_policy() throws Exception {
         var request = new MockHttpServletRequest();
         VerifiedUserTokenCarrier.set(request, "verified-test-token");
@@ -495,7 +519,8 @@ class ProcessPermissionIntegrationTest {
                 taskResource(TianjiProcessPermissions.TASK_UNCLAIM_API, List.of(TianjiProcessPermissions.TASK_CLAIM), List.of(HumanTaskClient.CLAIM_SCOPE), "unclaim"),
                 taskResource(TianjiProcessPermissions.TASK_TRANSFER_API, List.of(TianjiProcessPermissions.TASK_TRANSFER), List.of(HumanTaskClient.TRANSFER_SCOPE), "transfer"),
                 taskResource(TianjiProcessPermissions.TASK_COMPLETE_API, List.of(TianjiProcessPermissions.TASK_COMPLETE), List.of(HumanTaskClient.COMPLETE_SCOPE), "complete"),
-                taskResource(TianjiProcessPermissions.TASK_ADMIN_QUERY_API, List.of(TianjiProcessPermissions.TASK_READ, TianjiProcessPermissions.TASK_TRANSFER), List.of(HumanTaskClient.READ_SCOPE, HumanTaskClient.TRANSFER_SCOPE), "admin/query"));
+                taskResource(TianjiProcessPermissions.TASK_ADMIN_QUERY_API, List.of(TianjiProcessPermissions.TASK_READ, TianjiProcessPermissions.TASK_TRANSFER), List.of(HumanTaskClient.READ_SCOPE, HumanTaskClient.TRANSFER_SCOPE), "admin/query"),
+                workerResource(TianjiProcessPermissions.APPROVAL_VERIFY_API, TianjiProcessPermissions.APPROVAL_VERIFY, ApprovalClient.VERIFY_SCOPE, ApprovalClient.PATH, "api.task.approval.verify"));
         return new PermissionManifest("1.0", new PermissionManifest.Application("xingyuan", "tianji"),
                 new PermissionManifest.Producer("tianji-process-java", PermissionManifest.ProducerKind.JAVA,
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji.api.process."), List.of("process-server"),
@@ -504,7 +529,7 @@ class ProcessPermissionIntegrationTest {
                 List.of(), List.of(TianjiProcessPermissions.READ, TianjiProcessPermissions.START, TianjiProcessPermissions.RELEASE_READ,
                 TianjiProcessPermissions.RELEASE_PUBLISH, TianjiProcessPermissions.DECISION_EXECUTE,
                 TianjiProcessPermissions.WORKER_ACQUIRE, TianjiProcessPermissions.WORKER_REPORT, TianjiProcessPermissions.AGENT_RESULT_RECEIVE,
-                TianjiProcessPermissions.TASK_READ, TianjiProcessPermissions.TASK_CLAIM, TianjiProcessPermissions.TASK_COMPLETE, TianjiProcessPermissions.TASK_TRANSFER), resources, List.of(), List.of());
+                TianjiProcessPermissions.TASK_READ, TianjiProcessPermissions.TASK_CLAIM, TianjiProcessPermissions.TASK_COMPLETE, TianjiProcessPermissions.TASK_TRANSFER, TianjiProcessPermissions.APPROVAL_VERIFY), resources, List.of(), List.of());
     }
 
     private static PermissionManifest.ResourceDefinition resource(String key, String permission, String scope,
@@ -534,7 +559,7 @@ class ProcessPermissionIntegrationTest {
                 TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API,
                 TianjiProcessPermissions.WORKER_ACQUIRE_API, TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_FAIL_API,
                 TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API, TianjiProcessPermissions.TASK_GET_API, TianjiProcessPermissions.TASK_QUERY_API, TianjiProcessPermissions.TASK_ADMIN_QUERY_API,
-                TianjiProcessPermissions.TASK_CLAIM_API, TianjiProcessPermissions.TASK_UNCLAIM_API, TianjiProcessPermissions.TASK_TRANSFER_API, TianjiProcessPermissions.TASK_COMPLETE_API);
+                TianjiProcessPermissions.TASK_CLAIM_API, TianjiProcessPermissions.TASK_UNCLAIM_API, TianjiProcessPermissions.TASK_TRANSFER_API, TianjiProcessPermissions.TASK_COMPLETE_API, TianjiProcessPermissions.APPROVAL_VERIFY_API);
     }
 
     private RuntimePolicyBinding binding() {

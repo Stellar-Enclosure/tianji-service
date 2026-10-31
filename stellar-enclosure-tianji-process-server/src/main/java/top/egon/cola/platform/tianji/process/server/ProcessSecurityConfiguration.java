@@ -28,6 +28,11 @@ import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess
 import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalConsumerRegistry;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationProperties;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationService;
+import top.egon.cola.platform.tianji.process.server.security.TianjiApprovalVerificationAccess;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
@@ -61,10 +66,12 @@ public class ProcessSecurityConfiguration {
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
         boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
         boolean taskPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
+        boolean approvalVerificationEnabled = environment.getProperty("stellar.tianji.process.approval-verification.enabled", Boolean.class, false);
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
         if (taskPublicationEnabled && !tasksEnabled) throw new IllegalStateException("Governed task publication requires the human task API");
+        if (approvalVerificationEnabled && !enabled) throw new IllegalStateException("Approval verification requires the Process API security boundary");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -76,6 +83,7 @@ public class ProcessSecurityConfiguration {
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
+                    if (approvalVerificationEnabled) authorize.requestMatchers(ApprovalClient.PATH).authenticated();
                     authorize.anyRequest().denyAll();
                 });
         if (enabled) {
@@ -112,7 +120,7 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy processEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
-                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox"),
+                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**"), true);
@@ -176,6 +184,35 @@ public class ProcessSecurityConfiguration {
     ProcessDecisionService processDecisionService(ProcessEngine process, DmnEngine dmn,
                                                    ProcessModelValidator validator) {
         return new ProcessDecisionService(processConfiguration(process), decisionConfiguration(dmn), validator);
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "approval-verification.enabled"}, havingValue = "true")
+    @EnableConfigurationProperties(ApprovalVerificationProperties.class)
+    static class ApprovalVerificationConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(ApprovalConsumerRegistry.class)
+        ApprovalConsumerRegistry approvalConsumerRegistry(ApprovalVerificationProperties properties) {
+            if (properties.consumers().isEmpty()) throw new IllegalStateException("Approval verification requires registered consumers");
+            return new ApprovalConsumerRegistry(properties.registrations());
+        }
+        @Bean
+        @ConditionalOnMissingBean(HumanTaskReceiptStore.class)
+        HumanTaskReceiptStore approvalReceiptStore(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw new IllegalStateException("Approval verification requires the owning Process JDBC manager");
+            var store = new HumanTaskReceiptStore(manager.getDataSource(), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
+        }
+        @Bean
+        @ConditionalOnMissingBean(ApprovalVerificationService.class)
+        ApprovalVerificationService approvalVerificationService(ProcessEngine process, HumanTaskReceiptStore store, ApprovalConsumerRegistry consumers) {
+            var configuration = processConfiguration(process);
+            if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager)) throw new IllegalStateException("Approval verification requires the owning Process JDBC manager");
+            return new ApprovalVerificationService(manager.getDataSource(), manager, store, consumers);
+        }
+        @Bean
+        @ConditionalOnMissingBean(TianjiApprovalVerificationAccess.class)
+        TianjiApprovalVerificationAccess tianjiApprovalVerificationAccess(TianjiProcessAccess access) { return new TianjiApprovalVerificationAccess(access, Clock.systemUTC()); }
     }
 
     @Configuration(proxyBeanMethods = false)

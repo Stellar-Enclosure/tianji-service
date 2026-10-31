@@ -12,6 +12,13 @@ import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
 import top.egon.cola.platform.tianji.process.server.api.HumanTaskController;
 import top.egon.cola.platform.tianji.process.server.api.HumanTaskRequestBodyAdvice;
+import top.egon.cola.platform.tianji.process.server.api.ApprovalVerificationController;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalRequesterTypeEnum;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalConsumerRegistry;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationService;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationProperties;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -52,6 +59,7 @@ class ProcessApiConfigurationTest {
             assertThat(context).doesNotHaveBean(WorkerController.class);
             assertThat(context).doesNotHaveBean(AgentResultInboxController.class);
             assertThat(context).doesNotHaveBean(HumanTaskController.class);
+            assertThat(context).doesNotHaveBean(ApprovalVerificationController.class);
         });
         runner.withPropertyValues("stellar.tianji.process.worker.enabled=true").run(context -> {
             assertThat(context).hasFailed();
@@ -64,6 +72,10 @@ class ProcessApiConfigurationTest {
         runner.withPropertyValues("stellar.tianji.process.human-tasks.publish-enabled=true").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseMessage("Governed task publication requires the human task API");
+        });
+        runner.withPropertyValues("stellar.tianji.process.approval-verification.enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Approval verification requires the Process API security boundary");
         });
         runner.withPropertyValues("stellar.tianji.process.agent-results.enabled=true").run(context -> {
             assertThat(context).hasFailed();
@@ -104,6 +116,45 @@ class ProcessApiConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(HumanTaskController.class); assertThat(context).hasSingleBean(HumanTaskRequestBodyAdvice.class);
                 });
+    }
+
+    @Test
+    void approval_verification_requires_registration_and_can_be_enabled_without_mutation_endpoints() {
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, () -> new ProcessSecurityConfiguration.ApprovalVerificationConfiguration().approvalConsumerRegistry(new ApprovalVerificationProperties(java.util.List.of())));
+        var base = runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.approval-verification.enabled=true")
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean(HumanTaskReceiptStore.class, () -> mock(HumanTaskReceiptStore.class))
+                .withBean(ApprovalVerificationService.class, () -> mock(ApprovalVerificationService.class));
+        base.run(context -> { assertThat(context).hasFailed(); assertThat(context.getStartupFailure()).hasRootCauseMessage("Approval verification requires registered consumers"); });
+        base.withBean(ApprovalConsumerRegistry.class, () -> new ApprovalConsumerRegistry(java.util.List.of(approvalBinding()))).run(context -> {
+            assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(ApprovalVerificationController.class); assertThat(context).hasSingleBean(HumanTaskRequestBodyAdvice.class); assertThat(context).doesNotHaveBean(HumanTaskController.class);
+        });
+    }
+
+    @Test
+    void task_and_approval_assemblies_share_one_verified_receipt_store() {
+        var source = mock(DataSource.class); var engine = mock(ProcessEngine.class); var configuration = mock(SpringProcessEngineConfiguration.class);
+        when(engine.getProcessEngineConfiguration()).thenReturn(configuration); when(configuration.getTransactionManager()).thenReturn(new DataSourceTransactionManager(source)); when(configuration.getDatabaseSchema()).thenReturn("tianji_process");
+        try (var stores = mockConstruction(HumanTaskReceiptStore.class, (value, ignored) -> when(value.usesDataSource(source)).thenReturn(true))) {
+            runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.human-tasks.enabled=true", "stellar.tianji.process.approval-verification.enabled=true")
+                    .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                    .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                    .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                    .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                    .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                    .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                    .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                    .withBean(ProcessEngine.class, () -> engine)
+                    .withBean(FlowableHumanTaskService.class, () -> mock(FlowableHumanTaskService.class))
+                    .withBean(ApprovalConsumerRegistry.class, () -> new ApprovalConsumerRegistry(java.util.List.of(approvalBinding())))
+                    .run(context -> { assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(HumanTaskReceiptStore.class); assertThat(stores.constructed()).hasSize(1); verify(stores.constructed().getFirst()).verifyStorage(); });
+        }
     }
 
     @Test
@@ -184,11 +235,15 @@ class ProcessApiConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
         assertThat(policy.requirement(new MockHttpServletRequest("POST", "/api/tianji/v1/human-tasks/complete")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER);
+        assertThat(policy.requirement(new MockHttpServletRequest("POST", ApprovalClient.PATH)))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
     }
 
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class, ApprovalVerificationController.class})
     static class TestWeb { }
+    private static ApprovalConsumerRegistry.Registration approvalBinding() { return new ApprovalConsumerRegistry.Registration(ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "consumer", "https://idp.example/20"),
+            "approval.v1", "release", "approval", "a".repeat(64), "review", java.util.Set.of("50"), java.time.Duration.ofMinutes(1), java.util.Set.of(ApprovalRequesterTypeEnum.USER)); }
 }

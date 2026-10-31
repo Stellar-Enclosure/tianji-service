@@ -78,6 +78,11 @@ class ProcessStorageConfigurationTest {
         assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(tasks, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
         var publication = new MockEnvironment().withProperty("stellar.tianji.process.human-tasks.publish-enabled", "true");
         assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(publication, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        var approvals = new MockEnvironment().withProperty("stellar.tianji.process.approval-verification.enabled", "true").withProperty("stellar.tianji.process.api.enabled", "true");
+        assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(approvals, mock(ApplicationContext.class)).afterSingletonsInstantiated());
+        assertDoesNotThrow(() -> config.workerWebBoundaryGuard(approvals, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        approvals.setProperty("stellar.tianji.process.api.enabled", "false");
+        assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(approvals, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
     }
 
     private static void guard(MockEnvironment environment) {

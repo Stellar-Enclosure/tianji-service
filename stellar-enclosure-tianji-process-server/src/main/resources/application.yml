@@ -64,6 +64,8 @@ egon:
 stellar:
   tianji:
     process:
+      approval-verification:
+        enabled: false
       human-tasks:
         enabled: false
         publish-enabled: false

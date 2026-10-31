@@ -84,7 +84,15 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Transfer a human task queue"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.complete", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Complete a human task"))
+@PermissionDefinition(code = TianjiProcessPermissions.APPROVAL_VERIFY, meaning = "Verify pinned approval provenance for a registered service consumer",
+        labelPage = "tianji.process.permissions", labelKey = "permission.task.approval.verify")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.task.approval.verify", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Verify approval provenance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.approval.verify", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Verify an approval reference"))
 public final class TianjiProcessPermissions {
+    public static final String APPROVAL_VERIFY = "TIANJI_TASK_APPROVAL_VERIFY";
+    public static final String APPROVAL_VERIFY_API = "tianji.api.process.task.approval.verify";
     public static final String TASK_READ = "TIANJI_TASK_READ";
     public static final String TASK_CLAIM = "TIANJI_TASK_CLAIM";
     public static final String TASK_COMPLETE = "TIANJI_TASK_COMPLETE";

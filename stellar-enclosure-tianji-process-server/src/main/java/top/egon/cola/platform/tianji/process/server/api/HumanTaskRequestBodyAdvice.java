@@ -21,6 +21,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.GetHumanTaskQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ListHumanTasksQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.TransferHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.UnclaimHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifyApprovalQuery;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -29,11 +30,11 @@ import java.lang.reflect.Type;
 import java.util.Set;
 
 /** Closed task request shapes without changing existing Process/Worker JSON behavior. */
-@ControllerAdvice(assignableTypes = HumanTaskController.class)
-@ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "human-tasks.enabled"}, havingValue = "true")
+@ControllerAdvice(assignableTypes = {HumanTaskController.class, ApprovalVerificationController.class})
+@ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
 public final class HumanTaskRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 128 * 1024;
-    private static final Set<Type> TYPES = Set.of(GetHumanTaskQuery.class, ListHumanTasksQuery.class, ClaimHumanTaskCommand.class, UnclaimHumanTaskCommand.class, TransferHumanTaskCommand.class, CompleteHumanTaskCommand.class);
+    private static final Set<Type> TYPES = Set.of(GetHumanTaskQuery.class, ListHumanTasksQuery.class, ClaimHumanTaskCommand.class, UnclaimHumanTaskCommand.class, TransferHumanTaskCommand.class, CompleteHumanTaskCommand.class, VerifyApprovalQuery.class);
     private static final JsonMapper JSON = JsonMapper.builder(JsonFactory.builder().streamReadConstraints(StreamReadConstraints.builder()
                     .maxNestingDepth(4).maxStringLength(4096).maxNameLength(64).maxNumberLength(20).maxTokenCount(256).build()).build())
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
@@ -44,7 +45,12 @@ public final class HumanTaskRequestBodyAdvice extends RequestBodyAdviceAdapter {
         byte[] body = input.getBody().readNBytes(MAX_BYTES + 1); if (body.length > MAX_BYTES) throw new ProcessRequestBodyAdvice.TooLarge();
         try {
             var root = JSON.readTree(body); if (root == null || !root.isObject()) throw invalid();
-            if (type == ListHumanTasksQuery.class) {
+            if (type == VerifyApprovalQuery.class) {
+                strings(root, Set.of("policyRef", "policyBindingSha256", "approvalReceiptId", "requesterType", "requesterSubjectId"));
+                var source = root.get("sourceStart"); if (source == null || !source.isObject()) throw invalid();
+                strings(source, Set.of("definitionKey", "releaseVersion", "businessKey", "commandId", "correlationId"));
+                if (!source.path("variables").isObject()) throw invalid();
+            } else if (type == ListHumanTasksQuery.class) {
                 strings(root, Set.of("scopeType", "selection")); var limit = root.get("limit"); if (limit == null || !limit.isIntegralNumber() || !limit.canConvertToInt()) throw invalid();
                 for (var name : Set.of("releaseVersion", "scopeId", "taskDefinitionKey", "afterTaskId")) { var value = root.get(name); if (value != null && !value.isNull() && !value.isString()) throw invalid(); }
             } else {
