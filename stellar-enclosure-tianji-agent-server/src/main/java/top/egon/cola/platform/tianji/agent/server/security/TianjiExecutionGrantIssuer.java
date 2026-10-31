@@ -31,6 +31,7 @@ public final class TianjiExecutionGrantIssuer {
     private final Map<URI, HttpExecutionGrantClient> clients;
     private final TianjiMemoryGrantIssuer memory;
     private final TianjiMemoryPreferenceGrantIssuer preferences;
+    private final TianjiToolGrantIssuer tools;
 
     public boolean usesMemoryIssuer(TianjiMemoryGrantIssuer candidate) { return memory == candidate; }
     public boolean usesPreferenceIssuer(TianjiMemoryPreferenceGrantIssuer candidate) { return preferences == candidate; }
@@ -66,6 +67,22 @@ public final class TianjiExecutionGrantIssuer {
 
     TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
             TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients, TianjiMemoryGrantIssuer memory, TianjiMemoryPreferenceGrantIssuer preferences) {
+        this(ledger, store, resource, issuers, clients, memory, preferences, null);
+    }
+
+    public boolean usesToolIssuer(TianjiToolGrantIssuer candidate) { return tools == candidate; }
+
+    public TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, TianjiMemoryGrantIssuer memory, TianjiMemoryPreferenceGrantIssuer preferences,
+            TianjiToolGrantIssuer tools) {
+        this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), issuers,
+                clients(starter, authority, issuers, oauth, mapper), memory, preferences, tools);
+    }
+
+    TianjiExecutionGrantIssuer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource,
+            TrustedIssuerRegistry issuers, Map<URI, HttpExecutionGrantClient> clients, TianjiMemoryGrantIssuer memory,
+            TianjiMemoryPreferenceGrantIssuer preferences, TianjiToolGrantIssuer tools) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.issuers = Objects.requireNonNull(issuers, "issuers");
         this.clients = Map.copyOf(clients);
@@ -74,6 +91,8 @@ public final class TianjiExecutionGrantIssuer {
         if (preferences != null && (!preferences.usesLedger(ledger) || !preferences.usesIssuerRegistry(issuers) || !preferences.usesResource(resource))) throw new IllegalArgumentException("Memory preference issue authority does not match the run issuer");
         this.preferences = preferences;
         if (this.clients.isEmpty()) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_BINDINGS_REQUIRED");
+        if (tools != null && (!tools.usesLedger(ledger) || !tools.usesIssuerRegistry(issuers) || !tools.usesResource(resource))) throw new IllegalArgumentException("Tool issue authority does not match the run issuer");
+        this.tools = tools;
     }
 
     /** A failed or uncertain issue leaves the run queued; a repeated start with the same key can retry. */
@@ -81,7 +100,8 @@ public final class TianjiExecutionGrantIssuer {
         try {
             var current = ensureInternal(authorized, run);
             if (memory != null) current = memory.ensure(authorized, current);
-            return preferences == null ? current : preferences.ensure(authorized, current);
+            if (preferences != null) current = preferences.ensure(authorized, current);
+            return tools == null ? current : tools.ensure(authorized, current);
         }
         catch (AgentLedgerException failure) { throw failure; }
         catch (RuntimeException failure) { throw unavailable(); }

@@ -235,6 +235,31 @@ class TianjiServiceExecutionGrantIssuerTest {
                 ledger, store, bindings, RESOURCE, other, Map.of(ISSUER, client), clock));
     }
 
+    @Test void linked_service_replay_prepares_tools_after_memory_without_reissuing_the_run_grant() throws Exception {
+        var memory = mock(TianjiMemoryGrantIssuer.class); var tools = mock(TianjiToolGrantIssuer.class);
+        when(memory.usesLedger(ledger)).thenReturn(true); when(memory.usesIssuerRegistry(issuers)).thenReturn(true); when(memory.usesResource(RESOURCE)).thenReturn(true);
+        when(memory.ensure(authorized, run)).thenReturn(run);
+        when(tools.usesLedger(ledger)).thenReturn(true); when(tools.usesIssuerRegistry(issuers)).thenReturn(true); when(tools.usesResource(RESOURCE)).thenReturn(true); when(tools.usesServices(bindings)).thenReturn(true);
+        when(tools.ensure(authorized, run)).thenReturn(run);
+        issuer = new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, RESOURCE, issuers, Map.of(ISSUER, client), clock, memory, tools);
+        when(store.current(authorization, RESOURCE, subject)).thenReturn(Optional.of(new AgentServiceExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:existing", NOW.plusSeconds(60))));
+        withRequest(request -> issuer.ensure(authorized, principal, binding, command, run));
+        var order = inOrder(memory, tools); order.verify(memory).ensure(authorized, run); order.verify(tools).ensure(authorized, run);
+        assertTrue(issuer.usesToolIssuer(tools)); verifyNoInteractions(client);
+    }
+
+    @Test void a_tool_issuer_from_another_service_source_is_rejected() {
+        assertThrows(IllegalArgumentException.class, () -> new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, RESOURCE, issuers, Map.of(ISSUER, client), clock, null, mock(TianjiToolGrantIssuer.class)));
+    }
+
+    @Test void user_only_tools_do_not_require_a_service_mapping_but_configured_service_tools_must_share_it() {
+        var tools = mock(TianjiToolGrantIssuer.class);
+        when(tools.usesLedger(ledger)).thenReturn(true); when(tools.usesIssuerRegistry(issuers)).thenReturn(true); when(tools.usesResource(RESOURCE)).thenReturn(true);
+        assertDoesNotThrow(() -> new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, RESOURCE, issuers, Map.of(ISSUER, client), clock, null, tools));
+        when(tools.hasServiceBindings()).thenReturn(true);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, RESOURCE, issuers, Map.of(ISSUER, client), clock, null, tools));
+    }
+
     private static void withRequest(Consumer<MockHttpServletRequest> action) throws Exception {
         var request = new MockHttpServletRequest("POST", "/api/tianji/v1/agent-process-dispatches/submit");
         request.addHeader("Authorization", "Bearer " + TOKEN);

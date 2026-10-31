@@ -45,6 +45,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     private final Clock clock;
     private final TianjiServiceExecutionGrantAuthorizer services;
     private final TianjiMemoryRunAuthorization memory;
+    private final TianjiToolGrantAuthorizer tools;
 
     public boolean usesMemoryAuthorization(TianjiMemoryRunAuthorization candidate) { return memory == candidate; }
 
@@ -84,6 +85,23 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
             TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock,
             TianjiServiceExecutionGrantAuthorizer services, TianjiMemoryRunAuthorization memory) {
+        this(ledger, store, resource, systemCode, issuers, clients, timeout, concurrency, clock, services, memory, null);
+    }
+
+    public boolean usesToolAuthorization(TianjiToolGrantAuthorizer candidate) { return tools == candidate; }
+
+    public TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store,
+            IdpStarterProperties starter, IdentityAuthorityProperties authority, TrustedIssuerRegistry issuers,
+            IdpServiceOAuth2Client oauth, ObjectMapper mapper, Rbac3StarterProperties rbac,
+            Duration timeout, int concurrency, TianjiServiceExecutionGrantAuthorizer services, TianjiMemoryRunAuthorization memory,
+            TianjiToolGrantAuthorizer tools) {
+        this(ledger, store, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), systemCode(rbac), issuers,
+                clients(starter, authority, issuers, oauth, mapper, rbac), timeout, concurrency, Clock.systemUTC(), services, memory, tools);
+    }
+
+    TianjiExecutionGrantAuthorizer(AgentLedgerService ledger, AgentExecutionGrantStore store, URI resource, String systemCode,
+            TrustedIssuerRegistry issuers, Map<String, BoundClient> clients, Duration timeout, int concurrency, Clock clock,
+            TianjiServiceExecutionGrantAuthorizer services, TianjiMemoryRunAuthorization memory, TianjiToolGrantAuthorizer tools) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.systemCode = systemCode(systemCode);
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clients = Map.copyOf(clients);
@@ -98,7 +116,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
             throw new IllegalArgumentException("TIANJI_SERVICE_AUTHORIZATION_MISMATCH");
         }
         if (memory != null && (!memory.usesLedger(ledger) || !memory.usesIssuerRegistry(issuers))) throw new IllegalArgumentException("TIANJI_MEMORY_AUTHORIZATION_MISMATCH");
-        this.services = services; this.memory = memory;
+        if (tools != null && (!tools.usesLedger(ledger) || !tools.usesIssuerRegistry(issuers) || !tools.usesResource(resource))) throw new IllegalArgumentException("Tool authorization does not match the run authorizer");
+        this.services = services; this.memory = memory; this.tools = tools;
         this.timeout = timeout; this.clock = Objects.requireNonNull(clock, "clock");
         this.executor = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-authorization-", 0).factory(),
@@ -106,7 +125,7 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
     }
 
     public boolean usesLedger(AgentLedgerService candidate) {
-        return ledger == candidate && store.usesLedger(candidate) && (services == null || services.usesLedger(candidate)) && (memory == null || memory.usesLedger(candidate));
+        return ledger == candidate && store.usesLedger(candidate) && (services == null || services.usesLedger(candidate)) && (memory == null || memory.usesLedger(candidate)) && (tools == null || tools.usesLedger(candidate));
     }
     public boolean supportsService() { return services != null; }
 
@@ -135,7 +154,8 @@ public final class TianjiExecutionGrantAuthorizer implements AgentRunAuthorizati
 
     private Decision evaluate(Request request, Boundary boundary) {
         var ordinary = evaluateRun(request);
-        return ordinary == Decision.ALLOW && memory != null ? memory.authorizeRun(request, boundary) : ordinary;
+        if (ordinary == Decision.ALLOW && memory != null) ordinary = memory.authorizeRun(request, boundary);
+        return ordinary == Decision.ALLOW && tools != null ? tools.authorizeRun(request, boundary) : ordinary;
     }
 
     private Decision evaluateRun(Request request) {

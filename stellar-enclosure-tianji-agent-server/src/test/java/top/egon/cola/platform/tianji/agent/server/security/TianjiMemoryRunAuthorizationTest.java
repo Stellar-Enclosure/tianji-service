@@ -177,7 +177,7 @@ class TianjiMemoryRunAuthorizationTest {
         var environment = new org.springframework.mock.env.MockEnvironment().withProperty("stellar.tianji.agent.execution-grants.enabled", "true")
                 .withProperty("stellar.tianji.agent.context.memory.enabled", "true");
         var failure = assertThrows(IllegalStateException.class, () -> new TianjiExecutionAuthorizationConfiguration()
-                .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null, environment, null, memory));
+                .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null, environment, null, memory, null));
         assertEquals("TIANJI_MEMORY_EXECUTION_AUTHORIZER_REQUIRED", failure.getMessage());
     }
 

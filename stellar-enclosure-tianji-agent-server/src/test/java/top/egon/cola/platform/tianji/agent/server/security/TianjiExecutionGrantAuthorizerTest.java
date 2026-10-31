@@ -212,7 +212,34 @@ class TianjiExecutionGrantAuthorizerTest {
                 .run(context -> assertTrue(context.getBeansOfType(TianjiExecutionGrantAuthorizer.class).isEmpty()));
         assertThrows(IllegalStateException.class, () -> new TianjiExecutionAuthorizationConfiguration()
                 .tianjiExecutionGrantAuthorizer(null, null, null, null, null, null, null, null,
-                        new org.springframework.mock.env.MockEnvironment(), null, null));
+                        new org.springframework.mock.env.MockEnvironment(), null, null, null));
+    }
+
+    @Test void actual_run_authorization_checks_tools_only_after_ordinary_and_memory_allow() {
+        var memory = mock(TianjiMemoryRunAuthorization.class); var tools = mock(TianjiToolGrantAuthorizer.class);
+        when(memory.usesLedger(ledger)).thenReturn(true); when(memory.usesIssuerRegistry(issuers)).thenReturn(true);
+        when(tools.usesLedger(ledger)).thenReturn(true); when(tools.usesIssuerRegistry(issuers)).thenReturn(true); when(tools.usesResource(RESOURCE)).thenReturn(true);
+        when(memory.authorizeRun(request, AgentRunAuthorization.Boundary.CLAIM)).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+        when(tools.authorizeRun(request, AgentRunAuthorization.Boundary.CLAIM)).thenReturn(AgentRunAuthorization.Decision.UNAVAILABLE);
+        authorizer.close();
+        authorizer = new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)), Duration.ofSeconds(1), 2,
+                Clock.fixed(NOW, ZoneOffset.UTC), null, memory, tools);
+        assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM));
+        var order = inOrder(client, memory, tools); order.verify(client).decide(any(), any()); order.verify(memory).authorizeRun(request, AgentRunAuthorization.Boundary.CLAIM); order.verify(tools).authorizeRun(request, AgentRunAuthorization.Boundary.CLAIM);
+        assertTrue(authorizer.usesToolAuthorization(tools));
+        clearInvocations(memory, tools);
+        when(memory.authorizeRun(request, AgentRunAuthorization.Boundary.CLAIM)).thenReturn(AgentRunAuthorization.Decision.DENY);
+        assertEquals(AgentRunAuthorization.Decision.DENY, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM)); verifyNoInteractions(tools);
+        clearInvocations(memory, tools);
+        doThrow(new HttpExecutionAuthorizationClient.ExecutionAuthorizationDeniedException()).when(client).decide(any(), any());
+        assertEquals(AgentRunAuthorization.Decision.DENY, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM)); verifyNoInteractions(memory, tools);
+    }
+
+    @Test void a_tool_gate_with_a_different_ledger_or_issuer_registry_cannot_be_added() {
+        assertThrows(IllegalArgumentException.class, () -> new TianjiExecutionGrantAuthorizer(ledger, store, RESOURCE, "tianji", issuers,
+                Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(ISSUER, "21", client)), Duration.ofSeconds(1), 1,
+                Clock.fixed(NOW, ZoneOffset.UTC), null, null, mock(TianjiToolGrantAuthorizer.class)));
     }
 
     private TianjiExecutionGrantAuthorizer create(Duration timeout, int concurrency) {

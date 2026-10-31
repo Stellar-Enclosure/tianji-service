@@ -40,6 +40,13 @@ egon:
 stellar:
   tianji:
     agent:
+      tools:
+        authority:
+          enabled: false
+          timeout: PT5S
+          concurrency: 4
+          descriptors: []
+          bindings: []
       memory:
         enabled: false
         extraction:

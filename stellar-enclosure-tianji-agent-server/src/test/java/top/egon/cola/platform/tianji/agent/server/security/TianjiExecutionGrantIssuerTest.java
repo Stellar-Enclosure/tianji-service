@@ -134,6 +134,27 @@ class TianjiExecutionGrantIssuerTest {
                 .tianjiExecutionGrantStore(null, null, new org.springframework.mock.env.MockEnvironment()));
     }
 
+    @Test void an_existing_user_grant_still_prepares_tools_after_memory_and_preferences() {
+        var memory = mock(TianjiMemoryGrantIssuer.class); var preferences = mock(TianjiMemoryPreferenceGrantIssuer.class);
+        var tools = mock(TianjiToolGrantIssuer.class);
+        when(memory.usesLedger(ledger)).thenReturn(true); when(memory.usesIssuerRegistry(issuers)).thenReturn(true); when(memory.usesResource(RESOURCE)).thenReturn(true);
+        when(preferences.usesLedger(ledger)).thenReturn(true); when(preferences.usesIssuerRegistry(issuers)).thenReturn(true); when(preferences.usesResource(RESOURCE)).thenReturn(true);
+        when(tools.usesLedger(ledger)).thenReturn(true); when(tools.usesIssuerRegistry(issuers)).thenReturn(true); when(tools.usesResource(RESOURCE)).thenReturn(true);
+        when(memory.ensure(authorized, run)).thenReturn(run); when(preferences.ensure(authorized, run)).thenReturn(run); when(tools.ensure(authorized, run)).thenReturn(run);
+        when(store.current(binding, RESOURCE)).thenReturn(Optional.of(new AgentExecutionGrant.Ticket(ID, "ENC:v1:key:nonce:existing", NOW.plusSeconds(300))));
+        issuer = new TianjiExecutionGrantIssuer(ledger, store, RESOURCE, issuers, Map.of(ISSUER, client), memory, preferences, tools);
+        assertEquals(run, issuer.ensure(authorized, run));
+        var order = inOrder(memory, preferences, tools); order.verify(memory).ensure(authorized, run); order.verify(preferences).ensure(authorized, run); order.verify(tools).ensure(authorized, run);
+        assertTrue(issuer.usesToolIssuer(tools)); verifyNoInteractions(client);
+        doThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Tool scope refused")).when(tools).ensure(authorized, run);
+        assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> issuer.ensure(authorized, run)).code());
+    }
+
+    @Test void a_tool_issuer_with_a_different_source_cannot_be_added_to_the_user_chain() {
+        var tools = mock(TianjiToolGrantIssuer.class);
+        assertThrows(IllegalArgumentException.class, () -> new TianjiExecutionGrantIssuer(ledger, store, RESOURCE, issuers, Map.of(ISSUER, client), null, null, tools));
+    }
+
     private static AgentRunDTO run(AgentRunStatusEnum status) {
         return new AgentRunDTO(RUN, "review", 1, "session", status, null, false, 0, 0, 1,
                 NOW.plusSeconds(600), NOW, status == AgentRunStatusEnum.CANCELLED ? NOW.plusSeconds(1) : null);

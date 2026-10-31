@@ -42,10 +42,13 @@ public class TianjiServiceExecutionConfiguration {
             @Qualifier("identityAuthorityProperties") IdentityAuthorityProperties authority,
             @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers,
             @Qualifier("idpServiceOAuth2Client") IdpServiceOAuth2Client oauth, @Qualifier("jacksonObjectMapper") ObjectMapper mapper,
-            Environment environment, ObjectProvider<TianjiMemoryGrantIssuer> memoryIssuers) {
+            Environment environment, ObjectProvider<TianjiMemoryGrantIssuer> memoryIssuers, @Qualifier("tianjiToolGrantIssuer") ObjectProvider<TianjiToolGrantIssuer> toolIssuers) {
         var memory = environment.getProperty("stellar.tianji.agent.context.memory.enabled", Boolean.class, false) ? memoryIssuers.getIfAvailable() : null;
         if (environment.getProperty("stellar.tianji.agent.context.memory.enabled", Boolean.class, false) && memory == null) throw new IllegalStateException("TIANJI_MEMORY_GRANT_ISSUER_REQUIRED");
-        return new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, starter, authority, issuers, oauth, mapper, memory);
+        boolean toolsEnabled = environment.getProperty("stellar.tianji.agent.tools.authority.enabled", Boolean.class, false);
+        var tools = toolsEnabled && toolIssuers != null ? toolIssuers.getIfAvailable() : null;
+        if (toolsEnabled && tools == null) throw new IllegalStateException("TIANJI_TOOL_GRANT_ISSUER_REQUIRED");
+        return new TianjiServiceExecutionGrantIssuer(ledger, store, bindings, starter, authority, issuers, oauth, mapper, memory, tools);
     }
 
     @Bean

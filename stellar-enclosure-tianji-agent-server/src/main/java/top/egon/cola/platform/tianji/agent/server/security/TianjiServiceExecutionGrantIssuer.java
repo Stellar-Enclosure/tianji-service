@@ -41,6 +41,7 @@ public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServ
     private final Map<URI, HttpExecutionGrantClient> clients;
     private final Clock clock;
     private final TianjiMemoryGrantIssuer memory;
+    private final TianjiToolGrantIssuer tools;
 
     public boolean usesMemoryIssuer(TianjiMemoryGrantIssuer candidate) { return memory == candidate; }
 
@@ -66,6 +67,22 @@ public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServ
     TianjiServiceExecutionGrantIssuer(AgentLedgerService ledger, AgentServiceExecutionGrantStore store,
             TianjiServiceExecutionBindings bindings, URI resource, TrustedIssuerRegistry issuers,
             Map<URI, HttpExecutionGrantClient> clients, Clock clock, TianjiMemoryGrantIssuer memory) {
+        this(ledger, store, bindings, resource, issuers, clients, clock, memory, null);
+    }
+
+    public boolean usesToolIssuer(TianjiToolGrantIssuer candidate) { return tools == candidate; }
+
+    public TianjiServiceExecutionGrantIssuer(AgentLedgerService ledger, AgentServiceExecutionGrantStore store,
+            TianjiServiceExecutionBindings bindings, IdpStarterProperties starter, IdentityAuthorityProperties authority,
+            TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth, ObjectMapper mapper, TianjiMemoryGrantIssuer memory,
+            TianjiToolGrantIssuer tools) {
+        this(ledger, store, bindings, TianjiExecutionAuthorityBindings.resource(starter.getResourceUri()), issuers,
+                clients(starter, authority, issuers, oauth, mapper), Clock.systemUTC(), memory, tools);
+    }
+
+    TianjiServiceExecutionGrantIssuer(AgentLedgerService ledger, AgentServiceExecutionGrantStore store,
+            TianjiServiceExecutionBindings bindings, URI resource, TrustedIssuerRegistry issuers,
+            Map<URI, HttpExecutionGrantClient> clients, Clock clock, TianjiMemoryGrantIssuer memory, TianjiToolGrantIssuer tools) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.store = Objects.requireNonNull(store, "store");
         this.bindings = Objects.requireNonNull(bindings, "bindings"); this.resource = TianjiExecutionAuthorityBindings.resource(resource);
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clients = Map.copyOf(clients);
@@ -75,12 +92,18 @@ public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServ
         if (!store.usesLedger(ledger) || !bindings.usesIssuerRegistry(issuers) || this.clients.isEmpty()) {
             throw new IllegalArgumentException("TIANJI_SERVICE_EXECUTION_ISSUER_CONFIGURATION_INVALID");
         }
+        if (tools != null && (!tools.usesLedger(ledger) || !tools.usesIssuerRegistry(issuers) || !tools.usesResource(resource) || tools.hasServiceBindings() && !tools.usesServices(bindings))) throw new IllegalArgumentException("Tool issue authority does not match the service issuer");
+        this.tools = tools;
     }
 
     @Override
     public void ensure(TianjiAgentAccess.Authorized authorized, ServiceIdentityPrincipal principal,
             TianjiLinkedDispatchProperties.Binding binding, LinkedAgentStartCommand command, AgentRunDTO run) {
-        try { ensureInternal(authorized, principal, binding, command, run); if (memory != null) memory.ensure(authorized, run); }
+        try {
+            ensureInternal(authorized, principal, binding, command, run);
+            AgentRunDTO current = memory == null ? run : memory.ensure(authorized, run);
+            if (tools != null) tools.ensure(authorized, current);
+        }
         catch (AgentLedgerException known) { throw known; }
         catch (HttpExecutionGrantClient.ExecutionGrantDeniedException denied) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Service execution authorization was denied");
