@@ -52,6 +52,18 @@ public final class ProcessCommandReceiptStore {
         return one(rows);
     }
 
+    /** A task approver need not be the starter; origin remains the exact authenticated tenant/issuer namespace. */
+    public TaskOrigin taskOrigin(ProcessActor actor, String instanceId) {
+        if (actor == null || actor.subjectType() != ProcessActor.SubjectType.USER || "LEGACY".equals(actor.issuerFingerprint())
+                || instanceId == null || instanceId.isBlank() || instanceId.length() > 255 || !instanceId.equals(instanceId.trim())) throw new IllegalArgumentException("Task source is invalid");
+        List<TaskOrigin> rows = jdbc.query("SELECT subject_type, subject_id, command_id, request_sha256, release_key, correlation_id, created_at FROM "
+                        + table + " WHERE tenant_id=? AND subject_issuer=? AND command_type='START' AND state='APPLIED' AND resource_id=?",
+                (rs, number) -> new TaskOrigin(new ProcessActor(actor.tenantId(), ProcessActor.SubjectType.valueOf(rs.getString("subject_type")), rs.getString("subject_id"), actor.issuerFingerprint()),
+                        rs.getString("command_id"), rs.getString("request_sha256"), rs.getString("release_key"), rs.getString("correlation_id"), instanceId, rs.getTimestamp("created_at").toInstant()),
+                actor.tenantId(), actor.issuerFingerprint(), instanceId);
+        if (rows.size() != 1) throw new ProcessResourceNotFoundException(); return rows.getFirst();
+    }
+
     public void apply(ProcessActor actor, Kind kind, String commandId, String resourceId, String decisionResult) {
         if (kind == null || (kind == Kind.DECISION) != (decisionResult != null)) throw new IllegalArgumentException("Process receipt result is invalid");
         String resultAssignment = kind == Kind.DECISION ? ", decision_result=CAST(? AS jsonb)" : "";
@@ -70,4 +82,5 @@ public final class ProcessCommandReceiptStore {
 
     public record Receipt(String requestHash, String releaseKey, String correlationId, String state,
                           String resourceId, Instant createdAt, String decisionResult) { }
+    public record TaskOrigin(ProcessActor requester, String commandId, String requestHash, String releaseKey, String correlationId, String instanceId, Instant createdAt) { }
 }
