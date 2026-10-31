@@ -13,6 +13,10 @@ import java.util.UUID;
  * Implementations must bind every field to independently verified evidence and the exact registered
  * execution resource. A model argument, tool descriptor or original run grant is not a tool decision.
  * Call outside database transactions, without retaining a USER bearer; unknown authority is UNAVAILABLE.
+ * ALLOW requires a verified independent tool ticket whose validity covers Request.deadlineAt;
+ * insufficient evidence or a shorter validity window is UNAVAILABLE. Calls must themselves be bounded.
+ * The lease expiry is the original claim hint and may have been renewed by a heartbeat without
+ * changing the Java value. The owning store rechecks actual live expiry, owner and epoch under its database lock.
  */
 @FunctionalInterface
 public interface ToolExecutionAuthorization {
