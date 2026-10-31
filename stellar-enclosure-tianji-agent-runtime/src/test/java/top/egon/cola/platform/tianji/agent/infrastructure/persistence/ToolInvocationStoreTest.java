@@ -8,6 +8,7 @@ import org.springframework.jdbc.core.RowMapper;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -62,11 +63,11 @@ import static org.mockito.Mockito.*;
 
 /** Real Spring/budget transactions with controlled JDBC; actual SQL, catalogs and races remain opt-in PostgreSQL checks. */
 class ToolInvocationStoreTest {
-    private static final Instant NOW = Instant.parse("2026-10-31T14:00:00Z");
-    private static final String RUN = "10000000-0000-0000-0000-000000000001", HASH = "a".repeat(64), GRANT = "9" + "1".repeat(62);
-    private static final UUID INVOCATION = UUID.fromString("20000000-0000-0000-0000-000000000001");
-    private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/20");
-    private static final ToolDescriptor READ = descriptor(ToolPolicy.Risk.READ_ONLY);
+    static final Instant NOW = Instant.parse("2026-10-31T14:00:00Z");
+    static final String RUN = "10000000-0000-0000-0000-000000000001", HASH = "a".repeat(64), GRANT = "9" + "1".repeat(62);
+    static final UUID INVOCATION = UUID.fromString("20000000-0000-0000-0000-000000000001");
+    static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/20");
+    static final ToolDescriptor READ = descriptor(ToolPolicy.Risk.READ_ONLY);
     private static final ToolDescriptor WRITE = descriptor(ToolPolicy.Risk.IDEMPOTENT_WRITE);
     private static final ToolDescriptor APPROVAL = descriptor(ToolPolicy.Risk.APPROVAL_REQUIRED);
 
@@ -340,7 +341,212 @@ class ToolInvocationStoreTest {
         }
     }
 
-    private static final class Fixture implements AutoCloseable {
+    @Test void recorder_metadata_loads_advanced_history_without_rebinding_it_to_a_new_capability_grant() throws Exception {
+        for (var state : List.of("DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN")) {
+            try (var fixture = new Fixture(READ)) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared);
+                var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started); assertTrue(started.started());
+                if (!state.equals("DISPATCHING")) {
+                    var outcome = state.equals("SUCCEEDED") ? success() : new ToolExecutionOutcome(ToolExecutionOutcome.Status.valueOf(state), Map.of(), null, "CONTROLLED_RESULT", state.equals("UNKNOWN") ? null : BigDecimal.ZERO);
+                    assertNotNull(store.completeReadOnly(request, started.attempt(), "1".repeat(64), outcome));
+                }
+                var old = fixture.evidence.get();
+                fixture.evidence.set(new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(old.reservation().binding(), 4), "9" + "2".repeat(62), "ENC:v1:key:B:changed", old.expiresAt()));
+                clearInvocations(fixture.authority);
+                var loaded = store.prepareOrLoadForRecorder(request); assertNotNull(loaded); assertEquals(state, loaded.invocation().state());
+                assertEquals(3, loaded.invocation().capabilityIssueEpoch()); assertEquals(1, loaded.invocation().dispatchEpoch());
+                assertEquals(1, fixture.budgetInserts.get()); assertEquals(1, fixture.invocationInserts.get());
+                verify(fixture.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.PREPARE));
+                assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> store.prepare(request));
+                assertEquals(11, ToolInvocationStore.RecorderPreparationVO.class.getRecordComponents().length);
+                assertEquals("ToolInvocationStore.RecorderPreparationVO[redacted]", loaded.invocation().toString());
+            }
+        }
+    }
+
+    @Test void only_the_first_read_only_dispatch_commits_a_service_executor_nonce_and_dispatch_audit() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); fixture.trace.clear();
+            var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started); assertTrue(started.started()); assertNotNull(started.attempt());
+            assertEquals("DISPATCHING", started.invocation().state()); assertEquals(2, started.invocation().revision()); assertEquals(1, started.invocation().dispatchEpoch());
+            assertEquals(ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), fixture.row.get().get("dispatch_nonce_sha256"));
+            assertEquals(executor().actor().issuerFingerprint(), fixture.row.get().get("executor_issuer"));
+            assertEquals(executor().actor().subjectId(), fixture.row.get().get("executor_id")); assertNotEquals(ACTOR.issuerFingerprint(), fixture.row.get().get("executor_issuer"));
+            var audit = new ToolExecutionJsonCodec().audit((String) fixture.row.get().get("authorization_audit"));
+            assertEquals(ToolExecutionAuthorization.Boundary.DISPATCH, audit.boundary()); assertEquals(ACTOR.subjectType(), audit.subjectType());
+            assertEquals("NONE", fixture.row.get().get("side_effect_outcome")); assertNull(fixture.row.get().get("outcome"));
+            assertTrue(fixture.trace.indexOf("run-lock") < fixture.trace.indexOf("cap-in"));
+            assertTrue(fixture.trace.indexOf("dispatch-update") < fixture.trace.indexOf("commit"));
+            var repeated = begin(fixture, store, request, prepared.invocation()); assertNotNull(repeated); assertFalse(repeated.started()); assertNull(repeated.attempt());
+            assertEquals("DISPATCHING", repeated.invocation().state()); assertEquals(1, fixture.trace.stream().filter("dispatch-update"::equals).count());
+            assertFalse(started.attempt().toString().contains(started.attempt().dispatchNonceSha256()));
+        }
+    }
+
+    @Test void dispatch_keeps_the_original_short_pdp_window_and_rechecks_evidence_and_actual_lease_after_waits() throws Exception {
+        for (var change : List.of("window", "epoch", "ciphertext", "lease")) {
+            try (var fixture = new Fixture(READ)) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared);
+                var window = dispatchWindow(fixture, prepared.invocation(), executor()); var checked = checkedDispatch(fixture, request, window);
+                if (change.equals("window")) { fixture.nano.set(10_000_000_001L); fixture.wall.set(NOW.minusSeconds(30)); }
+                if (change.equals("epoch") || change.equals("ciphertext")) {
+                    var old = fixture.evidence.get(); fixture.insideEvidence.set(new ToolExecutionGrant.EvidenceVO(
+                            new ToolExecutionGrant.ReservationVO(old.reservation().binding(), change.equals("epoch") ? 4 : 3), old.grantId(),
+                            change.equals("ciphertext") ? "ENC:v1:key:B:changed" : old.ciphertext(), old.expiresAt()));
+                }
+                if (change.equals("lease")) { fixture.databaseLease.set(NOW.plusSeconds(2)); fixture.beforeRunLock.set(() -> fixture.databaseNow.set(NOW.plusSeconds(3))); }
+                assertThrows(AgentLedgerException.class, () -> store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checked,
+                        executor(), ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), window));
+                assertFalse(fixture.trace.contains("dispatch-update")); assertEquals("PREPARED", fixture.row.get().get("state"));
+            }
+        }
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var window = dispatchWindow(fixture, prepared.invocation(), executor());
+            var checked = checkedDispatch(fixture, request, window);
+            fixture.wall.set(NOW.plusSeconds(9)); fixture.nano.set(9_000_000_000L); fixture.databaseNow.set(NOW.plusSeconds(9));
+            var started = store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checked, executor(), ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), window);
+            assertNotNull(started); assertTrue(started.started()); assertEquals(NOW.plusSeconds(20), started.attempt().callDeadlineAt());
+        }
+    }
+
+    @Test void metadata_and_begin_acknowledgments_survive_expiry_only_after_their_commit() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            fixture.afterCommit.set(() -> { fixture.wall.set(NOW.plusSeconds(11)); fixture.nano.set(11_000_000_000L); fixture.databaseNow.set(NOW.plusSeconds(11)); });
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); assertEquals("PREPARED", prepared.invocation().state());
+        }
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared);
+            fixture.afterCommit.set(() -> { fixture.wall.set(NOW.plusSeconds(11)); fixture.nano.set(11_000_000_000L); fixture.databaseNow.set(NOW.plusSeconds(11)); });
+            var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started); assertTrue(started.started());
+            fixture.afterCommit.set(() -> { });
+            var saved = store.completeReadOnly(request, started.attempt(), "1".repeat(64), new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "DISPATCH_NOT_SENT", BigDecimal.ZERO));
+            assertNotNull(saved); assertEquals("FAILED_KNOWN", saved.invocation().state());
+        }
+    }
+
+    @Test void completion_requires_the_original_preimage_generation_executor_audit_and_immutable_request() throws Exception {
+        for (var change : List.of("nonce", "epoch", "capability", "executor", "audit", "parameters")) {
+            try (var fixture = new Fixture(READ)) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started);
+                var old = started.attempt(); var audit = old.authorizationAudit();
+                if (change.equals("audit")) audit = new ToolExecutionAuthorization.AuditVO(1, UUID.randomUUID(), audit.boundary(), audit.decision(), audit.subjectType(), audit.grantId(), audit.authVersion(), audit.catalogVersion(), audit.policyVersion(), audit.checkedAt(), audit.expiresAt());
+                var changed = new ToolInvocationStore.DispatchAttemptVO(old.runId(), old.invocationId(), old.dispatchEpoch() + (change.equals("epoch") ? 1 : 0),
+                        old.capabilityIssueEpoch() + (change.equals("capability") ? 1 : 0), old.dispatchNonceSha256(),
+                        change.equals("executor") ? TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "other", "https://process.example/20") : old.executor(), audit, old.dispatchedAt(), old.callDeadlineAt());
+                var supplied = change.equals("parameters") ? request(READ, Map.of("amount", 21L), null, INVOCATION, BigDecimal.ZERO, null) : request;
+                assertCode(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, () -> store.completeReadOnly(supplied, changed, change.equals("nonce") ? "2".repeat(64) : "1".repeat(64), success()));
+                assertEquals("DISPATCHING", fixture.row.get().get("state")); assertNull(fixture.row.get().get("outcome"));
+            }
+        }
+    }
+
+    @Test void a_late_outcome_uses_original_dispatch_history_after_lease_cancel_capability_expiry_and_interrupt() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started);
+            fixture.wall.set(NOW.plusSeconds(120)); fixture.databaseNow.set(NOW.plusSeconds(120)); fixture.nano.set(120_000_000_000L);
+            fixture.sourceActive.set(false); fixture.databaseLease.set(NOW.minusSeconds(1));
+            var evidence = fixture.evidence.get(); fixture.evidence.set(new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(evidence.reservation().binding(), 4), "9" + "2".repeat(62), "ENC:v1:key:B:changed", NOW.plusSeconds(50)));
+            var oldBudget = fixture.budgetRows.get(request.reservationId());
+            fixture.budgetRows.put(request.reservationId(), new AgentBudgetReservation(oldBudget.reservationId(), oldBudget.leaseEpoch(), oldBudget.kind(), oldBudget.toolVersion(), 0, 0, BigDecimal.ZERO, AgentBudgetReservation.State.UNKNOWN, null, null, null, false));
+            clearInvocations(fixture.capabilities, fixture.authority, fixture.ledger, fixture.jdbc.get());
+            Thread.currentThread().interrupt();
+            try {
+                var saved = store.completeReadOnly(request, started.attempt(), "1".repeat(64), success()); assertNotNull(saved);
+                assertEquals("SUCCEEDED", saved.invocation().state()); assertEquals(NOW.plusSeconds(120), saved.invocation().finishedAt());
+                assertEquals(AgentBudgetReservation.State.UNKNOWN, saved.budget().state()); assertTrue(Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+            verifyNoInteractions(fixture.capabilities, fixture.authority, fixture.ledger);
+            verify(fixture.jdbc.get(), never()).query(contains("status='RUNNING'"), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
+            assertEquals(1, fixture.trace.stream().filter("outcome-update"::equals).count());
+        }
+    }
+
+    @Test void unknown_outcomes_refine_with_the_same_nonce_and_known_outcomes_are_idempotent_but_never_replaced() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started);
+            var unknown = new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OPERATION_RESULT_UNKNOWN", null);
+            assertEquals("UNKNOWN", store.completeReadOnly(request, started.attempt(), "1".repeat(64), unknown).invocation().state());
+            var known = store.completeReadOnly(request, started.attempt(), "1".repeat(64), success()); assertNotNull(known); assertEquals("SUCCEEDED", known.invocation().state());
+            var equivalent = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of(), null, null, new BigDecimal("0.00"));
+            assertEquals(known.invocation(), store.completeReadOnly(request, started.attempt(), "1".repeat(64), equivalent).invocation());
+            assertCode(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, () -> store.completeReadOnly(request, started.attempt(), "1".repeat(64),
+                    new ToolExecutionOutcome(ToolExecutionOutcome.Status.REJECTED, Map.of(), null, "DECISION_NO_MATCH", BigDecimal.ZERO)));
+            assertEquals(2, fixture.trace.stream().filter("outcome-update"::equals).count());
+        }
+    }
+
+    @Test void prepared_cleanup_can_find_a_missing_ack_and_never_invents_dispatch_or_overwrites_an_advanced_row() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); String audit = (String) fixture.row.get().get("authorization_audit");
+            fixture.sourceActive.set(false);
+            var closed = store.closePreparedFailure(request, null, "CANCELLED"); assertNotNull(closed); assertEquals("FAILED_KNOWN", closed.orElseThrow().state());
+            assertEquals(0L, fixture.row.get().get("dispatch_epoch")); assertNull(fixture.row.get().get("dispatch_nonce_sha256")); assertNull(fixture.row.get().get("executor_id"));
+            assertEquals(audit, fixture.row.get().get("authorization_audit")); assertEquals(AgentBudgetReservation.State.RESERVED, fixture.budgetRows.get(request.reservationId()).state());
+            assertThrows(IllegalArgumentException.class, () -> store.closePreparedFailure(request, null, "private arguments"));
+        }
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            assertTrue(store.closePreparedFailure(request, null, "CANCELLED").isEmpty());
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started);
+            assertEquals("DISPATCHING", store.closePreparedFailure(request, null, "CANCELLED").orElseThrow().state());
+            assertEquals(0, fixture.trace.stream().filter("prepared-close"::equals).count());
+        }
+    }
+
+    @Test void private_known_results_need_fresh_dispatch_authority_current_callback_and_live_old_window() throws Exception {
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared); var started = begin(fixture, store, request, prepared.invocation()); assertNotNull(started);
+            var saved = store.completeReadOnly(request, started.attempt(), "1".repeat(64), success()); assertNotNull(saved);
+            var window = dispatchWindow(fixture, saved.invocation(), executor()); var checked = checkedDispatch(fixture, request, window);
+            var replay = store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checked, executor(), window); assertNotNull(replay); assertEquals(success(), replay.orElseThrow().outcome());
+            var denied = new ToolExecutionAuthorization.CheckResult(checked.request(), checked.boundary(), ToolExecutionAuthorization.Decision.DENY, null);
+            assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () -> store.readRecorded(request, saved.invocation(), fixture.evidence.get(), denied, executor(), window));
+            fixture.sourceActive.set(false);
+            assertCode(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, () -> store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checked, executor(), window));
+            fixture.sourceActive.set(true); fixture.wall.set(NOW.plusSeconds(21)); fixture.databaseNow.set(NOW.plusSeconds(21)); fixture.nano.set(21_000_000_000L);
+            assertThrows(AgentLedgerException.class, () -> store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checked, executor(), window));
+        }
+    }
+
+    @Test void nonce_preimages_and_dispatch_windows_are_closed_and_private_and_failed_updates_roll_back() throws Exception {
+        assertEquals("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925", ToolInvocationStore.dispatchNonceSha256("0".repeat(64)));
+        for (var invalid : java.util.Arrays.asList(null, "", "0".repeat(63), "A".repeat(64), "g".repeat(64), "0".repeat(128))) assertThrows(IllegalArgumentException.class, () -> ToolInvocationStore.dispatchNonceSha256(invalid));
+        assertThrows(IllegalArgumentException.class, () -> new ToolInvocationStore.DispatchWindowVO(NOW, 0, NOW.plusSeconds(11), NOW.plusSeconds(20)));
+        try (var fixture = new Fixture(READ)) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION); var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared);
+            fixture.failUpdate.set(true);
+            var failure = assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> begin(fixture, store, request, prepared.invocation()));
+            assertNull(failure.getCause()); assertEquals("PREPARED", fixture.row.get().get("state")); assertFalse(fixture.trace.contains("dispatch-update")); verify(fixture.connection).rollback();
+        }
+    }
+
+    private static VerifiedExecutor executor() { return new VerifiedExecutor(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "decision-executor", "https://process.example/20"), NOW.plusSeconds(40)); }
+    private static ToolExecutionOutcome success() { return new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of(), null, null, BigDecimal.ZERO); }
+    private static ToolInvocationStore.DispatchWindowVO dispatchWindow(Fixture fixture, ToolInvocationStore.RecorderPreparationVO prepared, VerifiedExecutor executor) {
+        Instant call = prepared.dispatchNotAfter(); if (executor.expiresAt().isBefore(call)) call = executor.expiresAt(); if (fixture.evidence.get().expiresAt().isBefore(call)) call = fixture.evidence.get().expiresAt();
+        Instant deadline = fixture.wall.get().plusSeconds(10); if (call.isBefore(deadline)) deadline = call;
+        return new ToolInvocationStore.DispatchWindowVO(fixture.wall.get(), fixture.nano.get(), deadline, call);
+    }
+    private static ToolExecutionAuthorization.CheckResult checkedDispatch(Fixture fixture, ToolInvocationStore.PreparationRequestVO request, ToolInvocationStore.DispatchWindowVO window) {
+        return fixture.allowedDispatch(new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(), request.parametersSha256(), null, window.callDeadlineAt()));
+    }
+    private static ToolInvocationStore.DispatchBeginResultVO begin(Fixture fixture, ToolInvocationStore store, ToolInvocationStore.PreparationRequestVO request, ToolInvocationStore.RecorderPreparationVO prepared) {
+        var executor = executor(); var window = dispatchWindow(fixture, prepared, executor);
+        return store.beginReadOnlyDispatch(request, prepared, fixture.evidence.get(), checkedDispatch(fixture, request, window), executor, ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), window);
+    }
+
+    static final class Fixture implements AutoCloseable {
         final ToolDescriptor tool;
         final ToolActionRequest action;
         final DataSource source = mock(DataSource.class);
@@ -356,10 +562,11 @@ class ToolInvocationStoreTest {
         final AtomicReference<Instant> databaseNow = new AtomicReference<>(NOW), databaseLease = new AtomicReference<>(NOW.plusSeconds(30)), wall = new AtomicReference<>(NOW);
         final AtomicReference<ToolExecutionGrant.EvidenceVO> evidence, insideEvidence = new AtomicReference<>();
         final AtomicReference<ToolActionIntentSql.Row> intentRow = new AtomicReference<>();
-        final AtomicBoolean intentNew = new AtomicBoolean(true), sourceActive = new AtomicBoolean(true), failInsert = new AtomicBoolean();
+        final AtomicBoolean intentNew = new AtomicBoolean(true), sourceActive = new AtomicBoolean(true), failInsert = new AtomicBoolean(), failUpdate = new AtomicBoolean();
         final AtomicLong nano = new AtomicLong(), budgetInserts = new AtomicLong(), invocationInserts = new AtomicLong();
         final List<String> trace = new ArrayList<>();
         final AtomicReference<Runnable> beforeRunLock = new AtomicReference<>(() -> { }), afterOutsideCap = new AtomicReference<>(() -> { });
+        final AtomicReference<Runnable> afterCommit = new AtomicReference<>(() -> { });
         final AtomicReference<Function<ToolExecutionAuthorization.Request, ToolExecutionAuthorization.CheckResult>> check = new AtomicReference<>();
         final MockedConstruction<JdbcTemplate> templates;
         final MockedConstruction<ToolExecutionStorageVerifier> verifiers;
@@ -375,7 +582,7 @@ class ToolInvocationStoreTest {
             var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, new AgentInputDTO("private original input", null, null), null);
             var view = new AgentRunDTO(RUN, "assistant", 1, null, AgentRunStatusEnum.RUNNING, null, false, 1, 2, 0, run().deadlineAt(), NOW.minusSeconds(1), null);
             when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
-            doAnswer(call -> { trace.add("commit"); return null; }).when(connection).commit();
+            doAnswer(call -> { trace.add("commit"); afterCommit.get().run(); return null; }).when(connection).commit();
             doAnswer(call -> { trace.add("rollback"); return null; }).when(connection).rollback();
             when(ledger.usesDataSource(source)).thenReturn(true); when(capabilities.usesDataSource(source)).thenReturn(true); when(capabilities.usesLedger(ledger)).thenReturn(true);
             when(ledger.executionMaterial(ACTOR, new GetAgentRunQuery(RUN))).thenReturn(new AgentLedgerService.ExecutionMaterial(view, snapshot, run()));
@@ -392,6 +599,9 @@ class ToolInvocationStoreTest {
             check.set(this::allowed);
             when(authority.check(any(), eq(ToolExecutionAuthorization.Boundary.PREPARE))).thenAnswer(call -> {
                 assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); trace.add("authorize"); return check.get().apply(call.getArgument(0));
+            });
+            when(authority.check(any(), eq(ToolExecutionAuthorization.Boundary.DISPATCH))).thenAnswer(call -> {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); trace.add("dispatch-authorize"); return allowedDispatch(call.getArgument(0));
             });
             when(budgetRepository.lockRunForBudget(ACTOR, RUN)).thenAnswer(call -> { trace.add("budget-run-lock"); assertTrue(TransactionSynchronizationManager.hasResource(source)); return true; });
             when(budgetRepository.databaseNow()).thenAnswer(call -> databaseNow.get());
@@ -424,6 +634,9 @@ class ToolInvocationStoreTest {
                         trace.add("run-lock"); beforeRunLock.get().run();
                         return sourceActive.get() ? List.of(mapper.mapRow(result(Map.of("lease_expires_at", databaseLease.get())), 0)) : List.of();
                     }
+                    if (sql.startsWith("SELECT run_id FROM tianji_agent.agent_run")) {
+                        trace.add("identity-lock"); return List.of(mapper.mapRow(result(Map.of("run_id", RUN)), 0));
+                    }
                     if (sql.contains("FROM tianji_agent.agent_tool_invocation i")) {
                         if (row.get() == null) return List.of();
                         Object[] bindings = (Object[]) call.getRawArguments()[2];
@@ -448,6 +661,25 @@ class ToolInvocationStoreTest {
                     stored.put("revision", 1L); stored.put("dispatch_epoch", 0L); stored.put("side_effect_outcome", "NONE");
                     row.set(stored); invocationInserts.incrementAndGet(); return 1;
                 }).when(template).update(startsWith("INSERT INTO tianji_agent.agent_tool_invocation"), any(Object[].class));
+                doAnswer(call -> {
+                    if (failUpdate.get()) throw new DataIntegrityViolationException("private arguments");
+                    String sql = call.getArgument(0); Object[] values = (Object[]) call.getRawArguments()[1]; var stored = row.get();
+                    if (stored == null) return 0;
+                    if (sql.contains("SET state='DISPATCHING'")) {
+                        if (!"PREPARED".equals(stored.get("state")) || ((Number) stored.get("dispatch_epoch")).longValue() != 0) return 0;
+                        trace.add("dispatch-update"); stored.put("state", "DISPATCHING"); stored.put("dispatch_epoch", 1L);
+                        stored.put("dispatch_nonce_sha256", values[0]); stored.put("executor_issuer", values[1]); stored.put("executor_id", values[2]);
+                        stored.put("authorization_audit", values[3]); stored.put("updated_at", values[4]); stored.put("dispatched_at", values[5]);
+                    } else if (sql.contains("SET state='FAILED_KNOWN'")) {
+                        if (!"PREPARED".equals(stored.get("state")) || ((Number) stored.get("dispatch_epoch")).longValue() != 0) return 0;
+                        trace.add("prepared-close"); stored.put("state", "FAILED_KNOWN"); stored.put("outcome", values[0]); stored.put("error_code", values[1]);
+                        stored.put("updated_at", values[2]); stored.put("finished_at", values[3]);
+                    } else if (sql.contains("SET state=?")) {
+                        trace.add("outcome-update"); stored.put("state", values[0]); stored.put("outcome", values[1]); stored.put("error_code", values[2]);
+                        stored.put("updated_at", values[3]); stored.put("finished_at", values[4]);
+                    } else throw new AssertionError("Unexpected controlled invocation update");
+                    stored.put("revision", ((Number) stored.get("revision")).longValue() + 1); return 1;
+                }).when(template).update(startsWith("UPDATE tianji_agent.agent_tool_invocation"), any(Object[].class));
             });
             verifiers = mockConstruction(ToolExecutionStorageVerifier.class);
             intents = mockConstruction(ToolActionIntentSql.class, (intent, context) -> when(intent.prepareWithStatus(any(), any(), any(), any(), any(), any())).thenAnswer(call -> {
@@ -463,17 +695,24 @@ class ToolInvocationStoreTest {
 
         Map<String, Object> arguments() { return Map.of("amount", 20L); }
         ToolInvocationStore.PreparationRequestVO request(UUID id) { return ToolInvocationStoreTest.request(tool, arguments(), action, id, new BigDecimal("0.20"), action == null ? null : NOW.plusSeconds(300)); }
+        ToolInvocationStore.PreparationRequestVO recorderRequest(UUID id) { return ToolInvocationStoreTest.request(tool, arguments(), action, id, BigDecimal.ZERO, action == null ? null : NOW.plusSeconds(300)); }
         ToolExecutionAuthorization.CheckResult allowed(ToolExecutionAuthorization.Request request) {
             return new ToolExecutionAuthorization.CheckResult(request, ToolExecutionAuthorization.Boundary.PREPARE, ToolExecutionAuthorization.Decision.ALLOW,
-                    audit(ToolExecutionAuthorization.Boundary.PREPARE, GRANT, wall.get(), evidence.get().expiresAt()));
+                    audit(ToolExecutionAuthorization.Boundary.PREPARE, evidence.get().grantId(), wall.get(), evidence.get().expiresAt()));
+        }
+        ToolExecutionAuthorization.CheckResult allowedDispatch(ToolExecutionAuthorization.Request request) {
+            return new ToolExecutionAuthorization.CheckResult(request, ToolExecutionAuthorization.Boundary.DISPATCH, ToolExecutionAuthorization.Decision.ALLOW,
+                    audit(ToolExecutionAuthorization.Boundary.DISPATCH, evidence.get().grantId(), wall.get(), evidence.get().expiresAt()));
         }
         ToolInvocationStore store(boolean ready, ToolExecutionAuthorization selected) {
-            var clock = new Clock() {
+            var store = new ToolInvocationStore(source, ledger, capabilities, selected, clock(), nano::get); if (ready) store.verifyStorage(); return store;
+        }
+        Clock clock() {
+            return new Clock() {
                 @Override public ZoneId getZone() { return ZoneOffset.UTC; }
                 @Override public Clock withZone(ZoneId zone) { return this; }
                 @Override public Instant instant() { return wall.get(); }
             };
-            var store = new ToolInvocationStore(source, ledger, capabilities, selected, clock, nano::get); if (ready) store.verifyStorage(); return store;
         }
         @Override public void close() { intents.close(); verifiers.close(); templates.close(); }
     }

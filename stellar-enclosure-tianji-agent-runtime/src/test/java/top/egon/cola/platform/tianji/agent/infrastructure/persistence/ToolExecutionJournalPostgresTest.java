@@ -8,6 +8,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -22,11 +23,14 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 
 import java.net.URI;
 import java.math.BigDecimal;
@@ -43,6 +47,8 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -57,6 +63,10 @@ class ToolExecutionJournalPostgresTest {
             new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
             new ToolSchema(Map.of("reference", ToolSchema.ValueType.STRING), Set.of("reference")),
             new ToolPolicy(ToolPolicy.Risk.IDEMPOTENT_WRITE, "process.start.invoice", "tianji.api.process.instance.start", "a".repeat(64), null));
+    private static final ToolDescriptor READ_DESCRIPTOR = new ToolDescriptor("decision.evaluate", 1, "evaluate_decision", "Fixed recorder test",
+            DESCRIPTOR.input(), DESCRIPTOR.output(), new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "decision.evaluate", DecisionClient.EXECUTE_RESOURCE_KEY, "f".repeat(64), null));
+    private static final TrustedAgentActor EXECUTOR = TrustedAgentActor.verified(ACTOR.tenantId(), TrustedAgentActor.SubjectType.SERVICE,
+            "decision-tool-service", "https://process-idp.example/20");
 
     @Test void opt_in_tool_journal_contract_and_atomicity() throws Exception {
         String url = System.getProperty("tianji.tool.journal.postgres.test.url");
@@ -105,6 +115,159 @@ class ToolExecutionJournalPostgresTest {
         assertFalse(capabilities.attach(evidence(reservation, now(jdbc).plusSeconds(30)), DESCRIPTOR)); assertTrue(capabilities.current(queuedBinding, DESCRIPTOR).isEmpty());
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation", Integer.class));
         invocationPreparation(source, jdbc, ledger, capabilities);
+        readOnlyRecording(source, jdbc, ledger, capabilities);
+    }
+
+    private static void readOnlyRecording(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                          ToolCapabilityStore capabilities) throws Exception {
+        var fixture = new RecorderFixture(source, jdbc, ledger, capabilities);
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var observed = new CountDownLatch(1);
+        var calls = new AtomicInteger(); var start = new CountDownLatch(1);
+        var transport = controlledTransport(request -> {
+            calls.incrementAndGet(); entered.countDown();
+            assertEquals("DISPATCHING", invocationState(jdbc, fixture.request));
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            try { assertTrue(release.await(10, TimeUnit.SECONDS)); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new ReadOnlyDecisionToolTransport.Failure(ReadOnlyDecisionToolTransport.FailureKind.CANCELLED); }
+            return observation();
+        });
+        var results = new ArrayList<ToolInvocationRecorder.RecordResult>();
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            var futures = new ArrayList<java.util.concurrent.Future<ToolInvocationRecorder.RecordResult>>();
+            for (int index = 0; index < 20; index++) futures.add(pool.submit(() -> {
+                start.await(); var result = fixture.recorder.executeReadOnly(transport, fixture.request);
+                if (!result.operationInvoked()) observed.countDown(); return result;
+            }));
+            start.countDown();
+            try { assertTrue(entered.await(10, TimeUnit.SECONDS)); assertTrue(observed.await(10, TimeUnit.SECONDS)); }
+            finally { release.countDown(); }
+            for (var future : futures) { var result = future.get(20, TimeUnit.SECONDS); assertNotNull(result); results.add(result); }
+        }
+        assertEquals(1, calls.get()); assertEquals(1, results.stream().filter(ToolInvocationRecorder.RecordResult::operationInvoked).count());
+        assertEquals("SUCCEEDED", invocationState(jdbc, fixture.request));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=?", Integer.class, ACTOR.tenantId(), fixture.run.runId()));
+        var dispatch = jdbc.queryForMap("SELECT dispatch_epoch,dispatch_nonce_sha256,executor_issuer,executor_id FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?",
+                ACTOR.tenantId(), fixture.run.runId(), fixture.request.invocationId());
+        assertEquals(1, ((Number) dispatch.get("dispatch_epoch")).intValue());
+        assertTrue(((String) dispatch.get("dispatch_nonce_sha256")).matches("[0-9a-f]{64}"));
+        assertEquals(EXECUTOR.issuerFingerprint(), dispatch.get("executor_issuer")); assertEquals(EXECUTOR.subjectId(), dispatch.get("executor_id"));
+        assertEquals(0, ((Number) invocationCounters(jdbc, fixture.run.runId()).get("active_tool_calls")).intValue());
+        assertEquals(1, ((Number) invocationCounters(jdbc, fixture.run.runId()).get("tool_calls_reserved")).intValue());
+        recorderAccountingFailure(source, jdbc, ledger, capabilities);
+        recorderCompletionRollback(source, jdbc, ledger, capabilities);
+        recorderLateCompletion(source, jdbc, ledger, capabilities);
+    }
+
+    private static void recorderAccountingFailure(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                                  ToolCapabilityStore capabilities) {
+        var fixture = new RecorderFixture(source, jdbc, ledger, capabilities); var calls = new AtomicInteger();
+        var transport = controlledTransport(request -> { calls.incrementAndGet(); return observation(); });
+        jdbc.execute("CREATE FUNCTION tianji_agent.tool_accounting_test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled accounting failure'; END; $$");
+        jdbc.execute("CREATE TRIGGER tool_accounting_test_fail BEFORE UPDATE ON tianji_agent.agent_budget_reservation FOR EACH ROW WHEN (OLD.state='RESERVED' AND NEW.state='SETTLED') EXECUTE FUNCTION tianji_agent.tool_accounting_test_fail()");
+        try {
+            var result = fixture.recorder.executeReadOnly(transport, fixture.request); assertNotNull(result);
+            assertEquals("SUCCEEDED", result.state()); assertEquals(ToolInvocationRecorder.AccountingState.PENDING, result.accountingState());
+            assertEquals("SUCCEEDED", invocationState(jdbc, fixture.request));
+            assertEquals("RESERVED", jdbc.queryForObject("SELECT state FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=? AND reservation_id=?",
+                    String.class, ACTOR.tenantId(), fixture.run.runId(), fixture.request.reservationId()));
+        } finally {
+            jdbc.execute("DROP TRIGGER tool_accounting_test_fail ON tianji_agent.agent_budget_reservation"); jdbc.execute("DROP FUNCTION tianji_agent.tool_accounting_test_fail()");
+        }
+        new ToolExecutionStorageVerifier(source).verify();
+        var replay = fixture.recorder.executeReadOnly(transport, fixture.request); assertNotNull(replay);
+        assertEquals("SUCCEEDED", replay.state()); assertFalse(replay.operationInvoked());
+        assertEquals(ToolInvocationRecorder.AccountingState.SETTLED, replay.accountingState()); assertEquals(1, calls.get());
+    }
+
+    private static void recorderCompletionRollback(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                                    ToolCapabilityStore capabilities) {
+        var fixture = new RecorderFixture(source, jdbc, ledger, capabilities); var calls = new AtomicInteger();
+        var transport = controlledTransport(request -> { calls.incrementAndGet(); return observation(); });
+        jdbc.execute("CREATE FUNCTION tianji_agent.tool_completion_test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled completion failure'; END; $$");
+        jdbc.execute("CREATE TRIGGER tool_completion_test_fail BEFORE UPDATE ON tianji_agent.agent_tool_invocation FOR EACH ROW WHEN (OLD.state='DISPATCHING' AND NEW.state='SUCCEEDED') EXECUTE FUNCTION tianji_agent.tool_completion_test_fail()");
+        try {
+            var failure = assertThrows(AgentLedgerException.class, () -> fixture.recorder.executeReadOnly(transport, fixture.request));
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code()); assertNull(failure.getCause());
+            assertEquals("DISPATCHING", invocationState(jdbc, fixture.request));
+            assertEquals("RESERVED", jdbc.queryForObject("SELECT state FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=? AND reservation_id=?",
+                    String.class, ACTOR.tenantId(), fixture.run.runId(), fixture.request.reservationId()));
+            assertNull(jdbc.queryForObject("SELECT outcome::text FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?",
+                    String.class, ACTOR.tenantId(), fixture.run.runId(), fixture.request.invocationId()));
+        } finally {
+            jdbc.execute("DROP TRIGGER tool_completion_test_fail ON tianji_agent.agent_tool_invocation"); jdbc.execute("DROP FUNCTION tianji_agent.tool_completion_test_fail()");
+        }
+        new ToolExecutionStorageVerifier(source).verify();
+        var replay = fixture.recorder.executeReadOnly(transport, fixture.request); assertNotNull(replay);
+        assertEquals("DISPATCHING", replay.state()); assertFalse(replay.operationInvoked()); assertEquals(1, calls.get());
+    }
+
+    private static void recorderLateCompletion(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                               ToolCapabilityStore capabilities) {
+        var fixture = new RecorderFixture(source, jdbc, ledger, capabilities);
+        var result = fixture.recorder.executeReadOnly(controlledTransport(request -> {
+            var current = ledger.get(ACTOR, new GetAgentRunQuery(fixture.run.runId()));
+            ledger.finish(ACTOR, fixture.lease, current.revision(), new AgentExecutionResult(fixture.run.runId(), AgentRunStatusEnum.COMPLETED,
+                    Map.of(), null, null, null, null, "NONE"));
+            // Simulate a later legal slot generation without using the old grant as completion authority.
+            jdbc.update("UPDATE tianji_agent.agent_tool_capability SET issue_epoch=issue_epoch+1,grant_id=?,ciphertext='ENC:v1:test:B:B',updated_at=clock_timestamp() WHERE tenant_id=? AND run_id=?",
+                    "9" + "2".repeat(62), ACTOR.tenantId(), fixture.run.runId());
+            return observation();
+        }), fixture.request);
+        assertNotNull(result); assertEquals("SUCCEEDED", result.state());
+        assertEquals(ToolInvocationRecorder.AccountingState.PENDING, result.accountingState());
+        assertEquals("SUCCEEDED", invocationState(jdbc, fixture.request));
+        assertEquals(AgentRunStatusEnum.COMPLETED, ledger.get(ACTOR, new GetAgentRunQuery(fixture.run.runId())).status());
+    }
+
+    private static ReadOnlyDecisionToolTransport controlledTransport(Function<ReadOnlyDecisionToolTransport.Request, ReadOnlyDecisionToolTransport.DecisionObservation> operation) {
+        return new ReadOnlyDecisionToolTransport() {
+            @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                return callback.apply(new VerifiedExecutor(EXECUTOR, request.deadlineAt()), () -> operation.apply(request));
+            }
+        };
+    }
+
+    private static ReadOnlyDecisionToolTransport.DecisionObservation observation() {
+        return new ReadOnlyDecisionToolTransport.DecisionObservation(ReadOnlyDecisionToolTransport.Status.MATCHED, UUID.randomUUID().toString(),
+                Instant.now(), Instant.now(), Map.of("reference", "evaluated"), "row:1");
+    }
+
+    private static String invocationState(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO request) {
+        return jdbc.queryForObject("SELECT state FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?",
+                String.class, ACTOR.tenantId(), request.binding().run().runId(), request.invocationId());
+    }
+
+    private static final class RecorderFixture {
+        final AgentRunAuthorization.Request run;
+        final AgentRunLease lease;
+        final ToolInvocationStore.PreparationRequestVO request;
+        final ToolInvocationRecorder recorder;
+
+        RecorderFixture(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger, ToolCapabilityStore capabilities) {
+            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(30), 5, 32, 10_000, 10_000,
+                    null, null, 8, Set.of(READ_DESCRIPTOR.versionKey()), "no-retry", null);
+            ledger.publish(ACTOR, new AgentDefinitionSpecDTO("tool-recorder-test", 1, "CODE_FIRST", "controlled-test", "text-v1", "text-v1",
+                    new DefinitionDependenciesDTO(List.of(), List.of(), List.of(READ_DESCRIPTOR.reference()), "model-route", "tool-policy-v1"), policy, Map.of()));
+            var queued = ledger.start(ACTOR, new StartAgentRunCommand("tool-recorder-test", 1, null, UUID.randomUUID().toString(), null, null,
+                    new AgentInputDTO("readonly recorder fixture", List.of(), Map.of()), null));
+            run = ledger.executionMaterial(ACTOR, new GetAgentRunQuery(queued.runId())).authorization();
+            var binding = new ToolExecutionGrant.BindingVO(run, READ_DESCRIPTOR.reference(), READ_DESCRIPTOR.policy().bindingSha256(), "TIANJI_TOOL_DMN_TEST_V1", RESOURCE, "tianji.api.agent.start", null);
+            var reserved = capabilities.reserve(binding, READ_DESCRIPTOR).orElseThrow();
+            var ticket = evidence(reserved, now(jdbc).plusSeconds(120).truncatedTo(ChronoUnit.MICROS)); assertTrue(capabilities.attach(ticket, READ_DESCRIPTOR));
+            var claim = ledger.claim(ACTOR, new GetAgentRunQuery(run.runId()), ledger.get(ACTOR, new GetAgentRunQuery(run.runId())).revision(), "recorder-test", Duration.ofMinutes(5)); lease = claim.lease();
+            var authority = new ToolExecutionAuthorization() {
+                @Override public Decision authorize(Request value, Boundary boundary) { return check(value, boundary).decision(); }
+                @Override public CheckResult check(Request value, Boundary boundary) {
+                    assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertEquals(run, value.run());
+                    return new CheckResult(value, boundary, Decision.ALLOW, new AuditVO(1, UUID.randomUUID(), boundary, Decision.ALLOW,
+                            ACTOR.subjectType(), ticket.grantId(), 1L, null, 1L, Instant.now(), ticket.expiresAt()));
+                }
+            };
+            var preparations = new ToolInvocationStore(source, ledger, capabilities, authority); preparations.verifyStorage();
+            recorder = new ToolInvocationRecorder(source, ledger, preparations, capabilities, authority); recorder.verifyStorage();
+            request = new ToolInvocationStore.PreparationRequestVO(binding, lease, READ_DESCRIPTOR, Map.of("amount", 20L), null, UUID.randomUUID(), BigDecimal.ZERO, null);
+        }
     }
 
     private static void invocationPreparation(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
