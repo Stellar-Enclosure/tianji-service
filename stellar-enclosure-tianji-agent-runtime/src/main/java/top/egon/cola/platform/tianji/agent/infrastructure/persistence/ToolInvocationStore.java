@@ -124,6 +124,27 @@ public final class ToolInvocationStore {
         if (rows.invocation() == null) throw unavailable();
         return new RecorderPreparationResultVO(rows.invocation().invocation(), rows.invocation().budget());
     }
+    WritePreparationResultVO prepareOrLoadIdempotentWrite(PreparationRequestVO request) {
+        idempotentWrite(request);
+        var rows = prepareInternal(request, ToolInvocationSql.Projection.IDEMPOTENT_WRITE_METADATA);
+        return new WritePreparationResultVO(rows.invocation() == null ? null : rows.invocation().invocation(), rows.action(), rows.invocation() == null ? null : rows.invocation().budget());
+    }
+    WriteDispatchBeginResultVO beginIdempotentWriteDispatch(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionGrant.EvidenceVO evidence,
+            ToolExecutionAuthorization.CheckResult checked, VerifiedExecutor executor, String nonceSha256, ToolExecutionOutcome notDispatchedOutcome, DispatchWindowVO window) {
+        idempotentWrite(request); writeFailure(request, notDispatchedOutcome, true); if (!hash(nonceSha256)) throw invalid();
+        validateDispatch(request, expected, evidence, checked, executor, window);
+        return transact(() -> checkDispatch(window), () -> invocations.beginIdempotentWriteDispatch(request, expected, evidence, checked.audit(), executor,
+                nonceSha256, notDispatchedOutcome, window.callDeadlineAt(), window.deadlineAt()));
+    }
+    RecordedResultVO completeIdempotentWrite(PreparationRequestVO request, DispatchAttemptVO attempt, String plainNonceHex, ToolExecutionOutcome outcome) {
+        idempotentWrite(request); if (attempt == null || outcome == null) throw invalid();
+        if (!dispatchNonceSha256(plainNonceHex).equals(attempt.dispatchNonceSha256())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Dispatch completion proof changed");
+        return writeFact(() -> { var window = factWindow(); return transact(() -> checkFact(window), () -> invocations.completeIdempotentWrite(request, attempt, outcome, window.deadlineAt())); });
+    }
+    Optional<RecorderPreparationVO> closePreparedWriteFailure(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionOutcome notDispatchedOutcome) {
+        idempotentWrite(request); writeFailure(request, notDispatchedOutcome, false);
+        return writeFact(() -> { var window = factWindow(); return transact(() -> checkFact(window), () -> invocations.closePreparedWriteFailure(request, expected, notDispatchedOutcome, window.deadlineAt())); });
+    }
     DispatchBeginResultVO beginReadOnlyDispatch(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionGrant.EvidenceVO evidence,
                                                ToolExecutionAuthorization.CheckResult checked, VerifiedExecutor executor, String nonceSha256, DispatchWindowVO window) {
         readOnly(request); if (!hash(nonceSha256)) throw invalid();
@@ -160,7 +181,8 @@ public final class ToolInvocationStore {
                 || !request.binding().run().runId().equals(expected.runId()) || !request.invocationId().equals(expected.invocationId()) || !request.reservationId().equals(expected.reservationId())
                 || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailable();
         Instant deadline = earlier(expected.dispatchNotAfter(), earlier(request.binding().run().deadlineAt(), earlier(evidence.expiresAt(), executor.expiresAt())));
-        var original = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(), request.parametersSha256(), null, deadline);
+        var original = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(), request.parametersSha256(),
+                request.action() == null ? null : request.action().intentId(), deadline);
         if (!deadline.equals(window.callDeadlineAt()) || !original.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.DISPATCH) throw unavailable();
         if (checked.decision() == ToolExecutionAuthorization.Decision.DENY) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current tool dispatch access was denied");
         var audit = checked.audit();
@@ -190,6 +212,21 @@ public final class ToolInvocationStore {
     private static void readOnly(PreparationRequestVO request) {
         if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.READ_ONLY || request.action() != null
                 || request.estimatedCost() == null || request.estimatedCost().signum() != 0) throw invalid();
+    }
+    private static void idempotentWrite(PreparationRequestVO request) {
+        if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || request.action() == null || request.intentExpiry() == null) throw invalid();
+        var action = request.action(); var expected = new ToolActionRequest(request.binding().run().actor(), request.descriptor(), action.businessKey(), action.businessVersion(), request.arguments());
+        if (!expected.intentId().equals(action.intentId()) || !expected.requestSha256().equals(action.requestSha256()) || !expected.policy().equals(action.policy())) throw invalid();
+    }
+    private static void writeFailure(PreparationRequestVO request, ToolExecutionOutcome outcome, boolean loser) {
+        if (outcome == null || outcome.status() != ToolExecutionOutcome.Status.FAILED_KNOWN || !outcome.output().isEmpty() || outcome.businessReceiptId() != null
+                || (loser ? !"ACTION_NOT_DISPATCHABLE".equals(outcome.errorCode()) : !CLEANUP_CODES.contains(outcome.errorCode()) && !"ACTION_NOT_DISPATCHABLE".equals(outcome.errorCode()))) throw invalid();
+        outcome.validated(request.descriptor());
+    }
+    private static <T> T writeFact(Supplier<T> operation) {
+        boolean interrupted = Thread.interrupted();
+        try { return operation.get(); }
+        finally { if (interrupted) Thread.currentThread().interrupt(); }
     }
     private static boolean hash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
 
@@ -237,6 +274,25 @@ public final class ToolInvocationStore {
     record RecordedResultVO(RecorderPreparationVO invocation, ToolExecutionOutcome outcome, AgentBudgetReservation budget) {
         RecordedResultVO { if (invocation == null || outcome == null || budget == null || !invocation.state().equals(outcome.status().name())) throw invalid(); }
         @Override public String toString() { return "ToolInvocationStore.RecordedResultVO[redacted]"; }
+    }
+    record WritePreparationResultVO(RecorderPreparationVO invocation, ToolActionIntentStore.PreparedActionResult action, AgentBudgetReservation budget) {
+        WritePreparationResultVO {
+            if (action == null || action.risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || (invocation == null) != (budget == null)
+                    || invocation != null && (!invocation.reservationId().equals(budget.reservationId()) || budget.kind() != AgentBudgetRequest.Kind.TOOL
+                    || !(action.toolRef().key() + '@' + action.toolRef().version()).equals(budget.toolVersion()) || budget.inputTokens() != 0 || budget.outputTokens() != 0)) throw invalid();
+        }
+        @Override public String toString() { return "ToolInvocationStore.WritePreparationResultVO[redacted]"; }
+    }
+    record WriteDispatchBeginResultVO(RecorderPreparationVO invocation, ToolActionIntentStore.PreparedActionResult action, DispatchAttemptVO attempt) {
+        WriteDispatchBeginResultVO {
+            if (invocation == null || action == null || action.risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || attempt != null
+                    && (!invocation.state().equals("DISPATCHING") || !action.state().equals("DISPATCHING") || !invocation.runId().equals(attempt.runId())
+                    || !invocation.invocationId().equals(attempt.invocationId()) || invocation.dispatchEpoch() != attempt.dispatchEpoch()
+                    || invocation.capabilityIssueEpoch() != attempt.capabilityIssueEpoch() || !Objects.equals(invocation.dispatchedAt(), attempt.dispatchedAt())
+                    || attempt.callDeadlineAt().isAfter(invocation.dispatchNotAfter()))) throw invalid();
+        }
+        boolean started() { return attempt != null; }
+        @Override public String toString() { return "ToolInvocationStore.WriteDispatchBeginResultVO[redacted]"; }
     }
 
     private WindowVO window(Instant startedAt, long startedNanos, Instant bound) {

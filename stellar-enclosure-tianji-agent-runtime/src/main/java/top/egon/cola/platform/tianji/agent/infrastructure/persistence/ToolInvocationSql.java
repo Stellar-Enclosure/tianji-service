@@ -16,6 +16,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvoca
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.PreparationRequestVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecordedResultVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecorderPreparationVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.WriteDispatchBeginResultVO;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
@@ -49,7 +50,85 @@ final class ToolInvocationSql {
         intents = new ToolActionIntentSql(source, ledger);
     }
 
-    enum Projection { LEGACY_PREPARATION, RECORDER_METADATA }
+    enum Projection { LEGACY_PREPARATION, RECORDER_METADATA, IDEMPOTENT_WRITE_METADATA }
+
+    WriteDispatchBeginResultVO beginIdempotentWriteDispatch(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionGrant.EvidenceVO evidence,
+            ToolExecutionAuthorization.AuditVO audit, VerifiedExecutor executor, String nonceSha256, ToolExecutionOutcome notDispatchedOutcome,
+            Instant callDeadline, Instant authorityDeadline) {
+        var live = requireRun(request, authorityDeadline); var current = currentEvidence(request, evidence, authorityDeadline);
+        var action = intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+        var stored = read(request, authorityDeadline, false).orElseThrow(ToolInvocationSql::unavailable); sameMetadata(expected, stored.invocation());
+        callBounds(request, stored, current, audit, executor, callDeadline, live, authorityDeadline);
+        if (callDeadline.isAfter(action.expiresAt())) throw unavailable();
+        if (!"PREPARED".equals(stored.invocation().state())) {
+            if (stored.invocation().dispatchEpoch() > 0 && action.dispatch() == null) throw conflict();
+            return new WriteDispatchBeginResultVO(stored.invocation(), projection(action), null);
+        }
+        if (!"PREPARED".equals(action.state()) || action.dispatch() != null || !action.expiresAt().isAfter(now(authorityDeadline))) {
+            var closed = closeWriteInvocation(request, stored, notDispatchedOutcome, authorityDeadline);
+            var currentAction = intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+            return new WriteDispatchBeginResultVO(closed.invocation(), projection(currentAction), null);
+        }
+        if (expected.revision() != stored.invocation().revision() || stored.invocation().revision() == Long.MAX_VALUE) throw conflict();
+        requirePreparationState(request, current, live, action, stored);
+        Instant dispatched = now(authorityDeadline).truncatedTo(ChronoUnit.MICROS); var owner = request.binding().run().actor();
+        if (!callDeadline.isAfter(dispatched) || !action.expiresAt().isAfter(dispatched)) throw unavailable();
+        if (jdbc.update("""
+                UPDATE tianji_agent.agent_tool_invocation SET state='DISPATCHING',revision=revision+1,dispatch_epoch=1,
+                  dispatch_nonce_sha256=?,executor_issuer=?,executor_id=?,authorization_audit=CAST(? AS jsonb),updated_at=?,dispatched_at=?,side_effect_outcome='UNKNOWN'
+                WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND run_id=? AND invocation_id=?
+                  AND state='PREPARED' AND revision=? AND dispatch_epoch=0 AND dispatch_nonce_sha256 IS NULL AND executor_issuer IS NULL AND executor_id IS NULL AND dispatched_at IS NULL
+                  AND risk='IDEMPOTENT_WRITE' AND intent_id=?
+                """, nonceSha256, executor.actor().issuerFingerprint(), executor.actor().subjectId(), codec.audit(audit), Timestamp.from(dispatched), Timestamp.from(dispatched),
+                owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), request.binding().run().runId(), request.invocationId(), stored.invocation().revision(), UUID.fromString(request.action().intentId())) != 1) throw conflict();
+        var dispatch = new ToolActionIntentSql.DispatchVO(request.binding().run().runId(), request.invocationId(), 1, nonceSha256, executor.actor());
+        // The immediate backlink FK requires the invocation key before the action points at it.
+        intents.beginWrite(action, dispatch, dispatched, authorityDeadline);
+        var currentAction = intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+        var changed = read(request, authorityDeadline, false).orElseThrow(ToolInvocationSql::unavailable);
+        requireRun(request, authorityDeadline); now(authorityDeadline);
+        var metadata = changed.invocation();
+        return new WriteDispatchBeginResultVO(metadata, projection(currentAction), new DispatchAttemptVO(metadata.runId(), metadata.invocationId(), metadata.dispatchEpoch(),
+                metadata.capabilityIssueEpoch(), changed.dispatchNonceSha256(), changed.executor(), changed.authorizationAudit(), metadata.dispatchedAt(), callDeadline));
+    }
+    RecordedResultVO completeIdempotentWrite(PreparationRequestVO request, DispatchAttemptVO attempt, ToolExecutionOutcome outcome, Instant authorityDeadline) {
+        if (!identityRun(request, authorityDeadline)) throw unavailable();
+        var action = intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+        var stored = read(request, authorityDeadline, true).orElseThrow(ToolInvocationSql::unavailable); var metadata = stored.invocation();
+        requireAttempt(stored, attempt);
+        if (action.dispatch() == null) throw conflict();
+        boolean linked = sameDispatch(action.dispatch(), stored);
+        outcome = outcome.validated(request.descriptor());
+        if (outcome.status() == ToolExecutionOutcome.Status.AWAITING_APPROVAL) throw unavailable();
+        if (Set.of("SUCCEEDED", "REJECTED", "FAILED_KNOWN").contains(metadata.state()) || "UNKNOWN".equals(metadata.state()) && outcome.status() == ToolExecutionOutcome.Status.UNKNOWN) {
+            if (!sameOutcome(stored.outcome(), outcome)) throw conflict(); return result(stored);
+        }
+        if (!Set.of("DISPATCHING", "UNKNOWN").contains(metadata.state()) || metadata.revision() == Long.MAX_VALUE) throw conflict();
+        Instant finished = now(authorityDeadline, true).truncatedTo(ChronoUnit.MICROS);
+        if (finished.isBefore(stored.updatedAt()) || linked && finished.isBefore(action.updatedAt())) throw unavailable();
+        var owner = request.binding().run().actor(); String effect = outcome.status() == ToolExecutionOutcome.Status.SUCCEEDED ? "CONFIRMED" : outcome.status() == ToolExecutionOutcome.Status.UNKNOWN ? "UNKNOWN" : "NONE";
+        if (jdbc.update("""
+                UPDATE tianji_agent.agent_tool_invocation SET state=?,revision=revision+1,outcome=CAST(? AS jsonb),business_receipt_id=?,error_code=?,side_effect_outcome=?,updated_at=?,finished_at=?
+                WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND run_id=? AND invocation_id=?
+                  AND state IN ('DISPATCHING','UNKNOWN') AND revision=? AND dispatch_epoch=? AND dispatch_nonce_sha256=? AND executor_issuer=? AND executor_id=?
+                  AND risk='IDEMPOTENT_WRITE' AND intent_id=?
+                """, outcome.status().name(), codec.outcome(request.descriptor(), outcome), outcome.businessReceiptId(), outcome.errorCode(), effect, Timestamp.from(finished), Timestamp.from(finished),
+                owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), request.binding().run().runId(), request.invocationId(), metadata.revision(), metadata.dispatchEpoch(),
+                attempt.dispatchNonceSha256(), attempt.executor().issuerFingerprint(), attempt.executor().subjectId(), UUID.fromString(request.action().intentId())) != 1) throw conflict();
+        if (linked) intents.completeWrite(action, outcome, finished, authorityDeadline);
+        intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+        return result(read(request, authorityDeadline, true).orElseThrow(ToolInvocationSql::unavailable));
+    }
+    Optional<RecorderPreparationVO> closePreparedWriteFailure(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionOutcome notDispatchedOutcome,
+            Instant authorityDeadline) {
+        if (!identityRun(request, authorityDeadline) || !invocationExists(request, authorityDeadline)) return Optional.empty();
+        intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline);
+        var found = read(request, authorityDeadline, true); if (found.isEmpty()) return Optional.empty();
+        var stored = found.orElseThrow(); sameMetadata(expected, stored.invocation());
+        if (!"PREPARED".equals(stored.invocation().state())) return Optional.of(stored.invocation());
+        var closed = closeWriteInvocation(request, stored, notDispatchedOutcome, authorityDeadline);
+        intents.lockForWrite(request.action(), request.descriptor(), authorityDeadline); return Optional.of(closed.invocation());
+    }
 
     PreparedRowsVO prepare(PreparationRequestVO request, ToolExecutionGrant.EvidenceVO expected, ToolExecutionAuthorization.AuditVO audit, Instant authorityDeadline, Projection projection) {
         var live = requireRun(request, authorityDeadline);
@@ -61,12 +140,16 @@ final class ToolInvocationSql {
         var existing = read(request, authorityDeadline, false);
         if (existing.isPresent()) {
             var stored = existing.orElseThrow();
-            if (Set.of("PREPARED", "AWAITING_APPROVAL").contains(stored.invocation().state())) requirePreparationState(request, current, live, actionRow, stored);
+            if (Set.of("PREPARED", "AWAITING_APPROVAL").contains(stored.invocation().state())) {
+                if (projection != Projection.IDEMPOTENT_WRITE_METADATA || "PREPARED".equals(actionRow.state())) requirePreparationState(request, current, live, actionRow, stored);
+            }
             else if (projection == Projection.LEGACY_PREPARATION) throw unavailable();
+            if (projection == Projection.IDEMPOTENT_WRITE_METADATA && stored.invocation().dispatchEpoch() > 0 && actionRow.dispatch() == null) throw conflict();
             requireRun(request, authorityDeadline);
             return new PreparedRowsVO(stored, projection(actionRow), false);
         }
-        if (action != null && !action.newlyCreated()) {
+        if (projection == Projection.IDEMPOTENT_WRITE_METADATA && (!"PREPARED".equals(actionRow.state()) || !actionRow.expiresAt().isAfter(now(authorityDeadline)))
+                || action != null && !action.newlyCreated() && projection != Projection.IDEMPOTENT_WRITE_METADATA) {
             requireRun(request, authorityDeadline);
             return new PreparedRowsVO(null, projection(actionRow), false);
         }
@@ -138,11 +221,7 @@ final class ToolInvocationSql {
     RecordedResultVO completeReadOnly(PreparationRequestVO request, DispatchAttemptVO attempt, ToolExecutionOutcome supplied, Instant authorityDeadline) {
         if (!identityRun(request, authorityDeadline)) throw unavailable();
         var stored = read(request, authorityDeadline, true).orElseThrow(ToolInvocationSql::unavailable); var metadata = stored.invocation();
-        if (!metadata.runId().equals(attempt.runId()) || !metadata.invocationId().equals(attempt.invocationId()) || metadata.dispatchEpoch() != attempt.dispatchEpoch()
-                || metadata.capabilityIssueEpoch() != attempt.capabilityIssueEpoch() || !Objects.equals(stored.dispatchNonceSha256(), attempt.dispatchNonceSha256())
-                || !Objects.equals(stored.executor(), attempt.executor()) || !stored.authorizationAudit().equals(attempt.authorizationAudit())
-                || !Objects.equals(metadata.dispatchedAt(), attempt.dispatchedAt()) || attempt.callDeadlineAt().isAfter(metadata.dispatchNotAfter())
-                || attempt.authorizationAudit().expiresAt().isBefore(attempt.callDeadlineAt())) throw conflict();
+        requireAttempt(stored, attempt);
         var outcome = supplied.validated(request.descriptor());
         if (outcome.status() == ToolExecutionOutcome.Status.AWAITING_APPROVAL || outcome.actualCost() != null && outcome.actualCost().signum() != 0
                 || outcome.status() != ToolExecutionOutcome.Status.UNKNOWN && outcome.actualCost() == null) throw unavailable();
@@ -178,6 +257,46 @@ final class ToolInvocationSql {
                 """, codec.outcome(request.descriptor(), outcome), safeCode, Timestamp.from(finished), Timestamp.from(finished), owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(),
                 owner.subjectId(), request.binding().run().runId(), request.invocationId(), stored.invocation().revision()) != 1) throw conflict();
         return Optional.of(read(request, authorityDeadline, true).orElseThrow(ToolInvocationSql::unavailable).invocation());
+    }
+
+    private boolean invocationExists(PreparationRequestVO request, Instant deadline) {
+        now(deadline, true); var owner = request.binding().run().actor();
+        var found = jdbc.query("""
+                SELECT i.invocation_id FROM tianji_agent.agent_tool_invocation i
+                WHERE i.tenant_id=? AND i.owner_type=? AND i.owner_issuer=? AND i.owner_id=? AND i.run_id=? AND i.invocation_id=?
+                """, (rs, number) -> rs.getObject("invocation_id", UUID.class), owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), request.binding().run().runId(), request.invocationId());
+        now(deadline, true); if (found.size() > 1 || !found.isEmpty() && !request.invocationId().equals(found.getFirst())) throw unavailable(); return !found.isEmpty();
+    }
+
+    private StoredInvocationRow closeWriteInvocation(PreparationRequestVO request, StoredInvocationRow stored, ToolExecutionOutcome outcome, Instant deadline) {
+        var metadata = stored.invocation();
+        if (!"PREPARED".equals(metadata.state()) || metadata.dispatchEpoch() != 0 || metadata.revision() == Long.MAX_VALUE) throw conflict();
+        outcome = outcome.validated(request.descriptor());
+        if (outcome.status() != ToolExecutionOutcome.Status.FAILED_KNOWN || !outcome.output().isEmpty() || outcome.businessReceiptId() != null) throw unavailable();
+        Instant finished = now(deadline, true).truncatedTo(ChronoUnit.MICROS); if (finished.isBefore(stored.updatedAt())) throw unavailable(); var owner = request.binding().run().actor();
+        if (jdbc.update("""
+                UPDATE tianji_agent.agent_tool_invocation SET state='FAILED_KNOWN',revision=revision+1,outcome=CAST(? AS jsonb),error_code=?,updated_at=?,finished_at=?,side_effect_outcome='NONE'
+                WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND run_id=? AND invocation_id=?
+                  AND state='PREPARED' AND revision=? AND dispatch_epoch=0 AND dispatch_nonce_sha256 IS NULL AND executor_issuer IS NULL AND executor_id IS NULL AND dispatched_at IS NULL
+                  AND risk='IDEMPOTENT_WRITE' AND intent_id=?
+                """, codec.outcome(request.descriptor(), outcome), outcome.errorCode(), Timestamp.from(finished), Timestamp.from(finished),
+                owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), request.binding().run().runId(), request.invocationId(), metadata.revision(), UUID.fromString(request.action().intentId())) != 1) throw conflict();
+        return read(request, deadline, true).orElseThrow(ToolInvocationSql::unavailable);
+    }
+
+    private static boolean sameDispatch(ToolActionIntentSql.DispatchVO dispatch, StoredInvocationRow stored) {
+        var metadata = stored.invocation();
+        return dispatch.runId().equals(metadata.runId()) && dispatch.invocationId().equals(metadata.invocationId()) && dispatch.epoch() == metadata.dispatchEpoch()
+                && dispatch.nonceSha256().equals(stored.dispatchNonceSha256()) && dispatch.executor().equals(stored.executor());
+    }
+
+    private static void requireAttempt(StoredInvocationRow stored, DispatchAttemptVO attempt) {
+        var metadata = stored.invocation();
+        if (!metadata.runId().equals(attempt.runId()) || !metadata.invocationId().equals(attempt.invocationId()) || metadata.dispatchEpoch() != attempt.dispatchEpoch()
+                || metadata.capabilityIssueEpoch() != attempt.capabilityIssueEpoch() || !Objects.equals(stored.dispatchNonceSha256(), attempt.dispatchNonceSha256())
+                || !Objects.equals(stored.executor(), attempt.executor()) || !stored.authorizationAudit().equals(attempt.authorizationAudit())
+                || !Objects.equals(metadata.dispatchedAt(), attempt.dispatchedAt()) || attempt.callDeadlineAt().isAfter(metadata.dispatchNotAfter())
+                || attempt.authorizationAudit().expiresAt().isBefore(attempt.callDeadlineAt())) throw conflict();
     }
 
     private ToolExecutionGrant.EvidenceVO currentEvidence(PreparationRequestVO request, ToolExecutionGrant.EvidenceVO expected, Instant deadline) {

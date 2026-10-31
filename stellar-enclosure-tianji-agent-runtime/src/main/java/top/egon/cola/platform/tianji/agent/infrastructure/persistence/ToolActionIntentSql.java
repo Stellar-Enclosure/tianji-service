@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -95,6 +96,91 @@ final class ToolActionIntentSql {
         sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
         var found = read(action.owner(), UUID.fromString(action.intentId()), false, storageDeadline);
         found.ifPresent(row -> same(row, action)); return found;
+    }
+
+    Row lockForWrite(ToolActionRequest action, ToolDescriptor descriptor, Instant deadline) {
+        now(deadline); requireIdempotentWrite(action, descriptor);
+        try {
+            var locked = read(action.owner(), UUID.fromString(action.intentId()), true, deadline).orElseThrow(ToolActionIntentSql::unavailable);
+            same(locked, action); return locked;
+        } catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    void beginWrite(Row expected, DispatchVO dispatch, Instant dispatchedAt, Instant deadline) {
+        Instant checked = now(deadline); requireIdempotentWrite(expected);
+        if (!"PREPARED".equals(expected.state()) || expected.dispatch() != null || expected.approval() != null
+                || dispatch == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
+        if (expected.revision() == Long.MAX_VALUE) throw unavailable();
+        writeTime(expected, dispatchedAt, checked);
+        if (!expected.expiresAt().isAfter(dispatchedAt) || !expected.expiresAt().isAfter(checked)) throw invalid();
+        var action = expected.action(); var owner = action.owner(); var tool = expected.descriptor();
+        try {
+            if (jdbc.update("""
+                    UPDATE tianji_agent.agent_tool_action_intent
+                    SET state='DISPATCHING',revision=revision+1,dispatch_epoch=1,dispatch_nonce_sha256=?,dispatch_run_id=?,dispatch_invocation_id=?,
+                        executor_issuer=?,executor_id=?,updated_at=?,side_effect_outcome='UNKNOWN'
+                    WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
+                      AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='IDEMPOTENT_WRITE'
+                      AND revision=? AND state='PREPARED' AND dispatch_epoch=0
+                      AND dispatch_nonce_sha256 IS NULL AND dispatch_run_id IS NULL AND dispatch_invocation_id IS NULL AND executor_issuer IS NULL AND executor_id IS NULL
+                      AND approval_policy_ref IS NULL AND approval_source_namespace_sha256 IS NULL AND approval_receipt_id IS NULL AND approval_proof_sha256 IS NULL
+                      AND approval_proof IS NULL AND approval_approved IS NULL AND approval_consumed_at IS NULL AND approval_expires_at IS NULL
+                      AND side_effect_outcome='NONE' AND result IS NULL AND business_receipt_id IS NULL AND last_error_code IS NULL AND closed_at IS NULL
+                      AND origin_run_id=? AND origin_snapshot_sha256=? AND created_at=? AND updated_at=? AND expires_at=? AND expires_at>clock_timestamp()
+                    """, dispatch.nonceSha256(), dispatch.runId(), dispatch.invocationId(), dispatch.executor().issuerFingerprint(), dispatch.executor().subjectId(), Timestamp.from(dispatchedAt),
+                    owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), UUID.fromString(action.intentId()),
+                    action.actionKey(), action.businessKey(), action.businessVersion(), action.requestSha256(), logicalIdentity(action), tool.key(), tool.version(), tool.reference().contentSha256(), tool.policy().bindingSha256(),
+                    expected.revision(), expected.originRunId(), expected.originSnapshotSha256(), Timestamp.from(expected.createdAt()), Timestamp.from(expected.updatedAt()), Timestamp.from(expected.expiresAt())) != 1) throw conflict();
+            // The invocation is updated first by the owner; its matching action JOIN is valid only after both writes.
+            now(deadline);
+        } catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    void completeWrite(Row expected, ToolExecutionOutcome outcome, Instant finishedAt, Instant deadline) {
+        Instant checked = now(deadline); requireIdempotentWrite(expected);
+        if (!Set.of("DISPATCHING", "UNKNOWN").contains(expected.state()) || expected.dispatch() == null || expected.approval() != null || outcome == null) throw invalid();
+        if (expected.revision() == Long.MAX_VALUE) throw unavailable();
+        writeTime(expected, finishedAt, checked); outcome = outcome.validated(expected.descriptor());
+        String effect = switch (outcome.status()) {
+            case SUCCEEDED -> "CONFIRMED";
+            case REJECTED, FAILED_KNOWN -> "NONE";
+            case UNKNOWN -> "UNKNOWN";
+            default -> throw invalid();
+        };
+        String state = outcome.status() == ToolExecutionOutcome.Status.SUCCEEDED ? "APPLIED" : outcome.status().name();
+        var action = expected.action(); var owner = action.owner(); var tool = expected.descriptor(); var dispatch = expected.dispatch();
+        try {
+            if (jdbc.update("""
+                    UPDATE tianji_agent.agent_tool_action_intent
+                    SET state=?,side_effect_outcome=?,result=CAST(? AS jsonb),business_receipt_id=?,last_error_code=?,closed_at=?,updated_at=?,revision=revision+1
+                    WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
+                      AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='IDEMPOTENT_WRITE'
+                      AND state=? AND revision=? AND dispatch_epoch=? AND dispatch_nonce_sha256=? AND dispatch_run_id=? AND dispatch_invocation_id=? AND executor_issuer=? AND executor_id=?
+                      AND approval_policy_ref IS NULL AND approval_source_namespace_sha256 IS NULL AND approval_receipt_id IS NULL AND approval_proof_sha256 IS NULL
+                      AND approval_proof IS NULL AND approval_approved IS NULL AND approval_consumed_at IS NULL AND approval_expires_at IS NULL
+                      AND origin_run_id=? AND origin_snapshot_sha256=? AND created_at=? AND updated_at=? AND expires_at=?
+                    """, state, effect, codec.outcome(tool, outcome), outcome.businessReceiptId(), outcome.errorCode(), Timestamp.from(finishedAt), Timestamp.from(finishedAt),
+                    owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), UUID.fromString(action.intentId()),
+                    action.actionKey(), action.businessKey(), action.businessVersion(), action.requestSha256(), logicalIdentity(action), tool.key(), tool.version(), tool.reference().contentSha256(), tool.policy().bindingSha256(),
+                    expected.state(), expected.revision(), dispatch.epoch(), dispatch.nonceSha256(), dispatch.runId(), dispatch.invocationId(), dispatch.executor().issuerFingerprint(), dispatch.executor().subjectId(),
+                    expected.originRunId(), expected.originSnapshotSha256(), Timestamp.from(expected.createdAt()), Timestamp.from(expected.updatedAt()), Timestamp.from(expected.expiresAt())) != 1) throw conflict();
+            now(deadline);
+        } catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    private static void requireIdempotentWrite(Row expected) {
+        if (expected == null) throw invalid(); requireIdempotentWrite(expected.action(), expected.descriptor());
+    }
+    private static void requireIdempotentWrite(ToolActionRequest action, ToolDescriptor descriptor) {
+        if (action == null || descriptor == null || descriptor.policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE
+                || action.policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || !descriptor.reference().equals(action.tool())) throw invalid();
+        sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
+    }
+    private static void writeTime(Row expected, Instant writtenAt, Instant databaseNow) {
+        if (writtenAt == null || writtenAt.getNano() % 1_000 != 0 || writtenAt.isAfter(databaseNow)
+                || writtenAt.isBefore(expected.createdAt()) || writtenAt.isBefore(expected.updatedAt())) throw invalid();
     }
 
     private Optional<Row> read(TrustedAgentActor owner, UUID id, boolean lock, Instant deadline) {
@@ -313,6 +399,7 @@ final class ToolActionIntentSql {
     private static boolean hash(String value) { return value != null && value.matches("[0-9a-f]{64}"); }
     private static boolean runId(String value) { return value != null && value.length() <= 64 && !value.isBlank() && value.equals(value.trim()) && value.chars().noneMatch(Character::isISOControl); }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Tool action source or binding is invalid"); }
+    private static AgentLedgerException conflict() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Tool action write identity, revision or dispatch changed"); }
     private static AgentLedgerException unavailable() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Tool action source or storage is unavailable"); }
     private static AgentLedgerException leaseLost() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Tool action run lease is no longer valid"); }
 }
