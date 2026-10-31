@@ -12,6 +12,7 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandRece
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.identity.HumanTaskContext;
+import top.egon.cola.platform.tianji.process.server.identity.ApprovalVerificationContext;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskActionResult.Entry;
 
@@ -84,11 +85,21 @@ public final class HumanTaskReceiptStore {
         commands.apply(context.actor(), kind(result.action()), result.commandId(), result.taskId(), null); current(context);
     }
 
-    public Instant current(HumanTaskContext context) {
+    /** The consumer namespace is authenticated separately; requester/body fields never choose another namespace. */
+    public Optional<Entry> approval(ApprovalVerificationContext context, String reference) {
+        if (reference == null || reference.isBlank() || reference.length() > 255 || !reference.equals(reference.trim())) throw new IllegalArgumentException("Approval reference is invalid");
+        approvalNow(context);
+        var rows = jdbc.query(joined() + " WHERE h.tenant_id=? AND h.subject_issuer=? AND h.approval_receipt_id=? AND h.command_type='TASK_COMPLETE' AND h.task_kind='APPROVAL'",
+                (rs, number) -> entry(rs), context.actor().tenantId(), context.actor().issuerFingerprint(), reference);
+        approvalNow(context); if (rows.size() > 1) throw unavailable(); return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
+    }
+    public Instant approvalNow(ApprovalVerificationContext context) { return currentDeadline(context.deadlineAt()); }
+    public Instant current(HumanTaskContext context) { return currentDeadline(context.deadlineAt()); }
+    private Instant currentDeadline(Instant deadline) {
         if (!verified.get() || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
         if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))) throw unavailable();
         Instant now = Objects.requireNonNull(jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class)).toInstant();
-        if (Thread.currentThread().isInterrupted() || !context.deadlineAt().isAfter(now)) throw unavailable(); return now;
+        if (Thread.currentThread().isInterrupted() || !deadline.isAfter(now)) throw unavailable(); return now;
     }
     private void require(HumanTaskContext context, HumanTaskActionEnum action, String commandId, String requestHash) {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(action, "action"); context.requireResource("tianji.api.process.task." + action.name().toLowerCase(java.util.Locale.ROOT));

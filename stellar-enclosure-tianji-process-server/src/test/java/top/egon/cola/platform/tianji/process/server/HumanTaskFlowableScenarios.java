@@ -20,17 +20,22 @@ import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskSelectionEn
 import top.egon.cola.platform.tianji.contract.orchestration.ListHumanTasksQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.TransferHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.UnclaimHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalRequesterTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifyApprovalQuery;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.HumanTaskContext;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.identity.ApprovalVerificationContext;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalConsumerRegistry;
+import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationService;
 
 import java.sql.Timestamp;
 import java.time.Duration;
@@ -57,7 +62,7 @@ final class HumanTaskFlowableScenarios {
         var service = new FlowableHumanTaskService(process, dmn, validator, store); var releases = new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true, true);
         var runs = new ProcessExecutionService(process, dmn, validator); var tasks = app.getBean(TaskService.class);
         byte[] model = new ClassPathResource("fixtures/governed-human-task.bpmn20.xml").getContentAsByteArray();
-        releases.publish(APPLICANT, "native-human-release", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "humanReview", model, Map.of())));
+        var published = releases.publish(APPLICANT, "native-human-release", List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "humanReview", model, Map.of())));
         String instance = start(runs, "native-human-release", "humanReview", "life"); var task = task(service, tasks, instance, bootstrap);
         assertEquals(Set.of("finance", "manager"), Set.copyOf(task.availableLanes())); assertEquals("approved", task.approvalField());
         assertThrows(ProcessResourceNotFoundException.class, () -> service.get(context("get", APPLICANT, Set.of("50"), bootstrap), new GetHumanTaskQuery(task.taskId())));
@@ -91,6 +96,13 @@ final class HumanTaskFlowableScenarios {
         assertThrows(ProcessConflictException.class, () -> service.complete(context("complete", OTHER, Set.of("60"), bootstrap), new CompleteHumanTaskCommand(complete.commandId(), complete.taskId(), complete.expectedVersion(), Map.of("approved", true, "comment", "private human form"))));
         assertEquals("rejected", app.getBean(HistoryService.class).createHistoricProcessInstanceQuery().processInstanceId(instance).singleResult().getEndActivityId());
         String stored = bootstrap.queryForObject("SELECT row_to_json(h)::text FROM tianji_process.tianji_human_task_receipt h WHERE command_id='native-human-complete'", String.class); assertFalse(stored.contains("private human form"));
+        var consumer = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "native-proof-consumer", "https://idp.example/20");
+        var definition = published.definitions().stream().filter(value -> value.type() == Type.BPMN).findFirst().orElseThrow();
+        var binding = new ApprovalConsumerRegistry.Registration(consumer, "native-approval", "native-human-release", "humanReview", definition.modelSha256(), "review", Set.of("50", "51", "60"), Duration.ofMinutes(1), Set.of(ApprovalRequesterTypeEnum.USER));
+        var proofs = new ApprovalVerificationService(manager.getDataSource(), manager, store, new ApprovalConsumerRegistry(List.of(binding)));
+        var source = new top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand("humanReview", "native-human-release", "native-human-life", "native-human-start-life", "native-human-correlation-life", Map.of());
+        var proofContext = new ApprovalVerificationContext(consumer, bootstrap.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant().plusSeconds(20));
+        assertFalse(proofs.verify(proofContext, new VerifyApprovalQuery(binding.policyRef(), binding.fingerprint(), receipt.approvalReceiptId(), ApprovalRequesterTypeEnum.USER, APPLICANT.subjectId(), source)).approved());
         verifyRollback(service, runs, tasks, bootstrap);
         verifyClaimAndCompletionContention(service, runs, tasks, bootstrap);
         verifyDmnRoutes(app, runs, service, tasks, bootstrap);

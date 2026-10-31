@@ -9,6 +9,7 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
 /** Closed task-only decoder; existing Process/Decision/Worker response compatibility is preserved. */
 final class HumanTaskResponseCodec {
@@ -26,6 +27,12 @@ final class HumanTaskResponseCodec {
         var node = mapper.readTree(body); strings(node, "commandId", "taskId", "action", "scopeType", "scopeId", "releaseVersion", "definitionKey", "taskDefinitionKey", "kind", "lane", "previousVersion", "occurredAt");
         optionalString(node.path("resultingVersion")); optionalString(node.path("approvalReceiptId")); var approved = node.path("approved");
         if (!approved.isMissingNode() && !approved.isNull() && !approved.isBoolean()) throw invalid(); return mapper.treeToValue(node, HumanTaskActionReceiptDTO.class);
+    }
+    VerifiedApprovalDTO approval(byte[] body) {
+        var node = mapper.readTree(body);
+        strings(node, "policyRef", "policyBindingSha256", "requestSha256", "approvalReceiptId", "requesterType", "requesterSubjectId", "sourceStartCommandId",
+                "scopeId", "taskId", "releaseVersion", "definitionKey", "definitionSha256", "taskDefinitionKey", "sourceRequestSha256", "occurredAt", "verifiedAt", "expiresAt");
+        if (!node.path("approved").isBoolean()) throw invalid(); return mapper.treeToValue(node, VerifiedApprovalDTO.class);
     }
     private static void task(JsonNode node) {
         strings(node, "taskId", "scopeType", "scopeId", "releaseVersion", "definitionKey", "taskDefinitionKey", "name", "kind", "version", "lane", "createdAt"); optionalString(node.path("dueAt"));

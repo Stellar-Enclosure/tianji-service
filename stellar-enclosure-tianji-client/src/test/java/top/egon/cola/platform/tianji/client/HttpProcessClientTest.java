@@ -265,6 +265,28 @@ class HttpProcessClientTest {
     }
 
     @Test
+    void approval_verification_is_private_strict_request_bound_and_preserves_a_false_decision() {
+        var start = new StartProcessCommand("approval", "release", "business", "start", "correlation", Map.of("inputSha256", "a".repeat(64), "objectVersion", "7"));
+        var query = new VerifyApprovalQuery("approval.v1", "a".repeat(64), "approval-ref", ApprovalRequesterTypeEnum.USER, "requester", start);
+        var now = Instant.now(); var proof = new VerifiedApprovalDTO(query.policyRef(), query.policyBindingSha256(), query.fingerprint(), query.approvalReceiptId(), query.requesterType(), query.requesterSubjectId(),
+                start.commandId(), "instance", "task", start.releaseVersion(), start.definitionKey(), "b".repeat(64), "review", OrchestrationRequestDigests.start(start), false, now.minusSeconds(1), now, now.plusSeconds(30));
+        String encoded = mapper.writeValueAsString(proof); var response = new AtomicReference<>(encoded); var calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals(ApprovalClient.PATH, exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), VerifyApprovalQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(proof, client(Duration.ofSeconds(3)).verifyApproval(query));
+        for (var invalid : List.of(encoded.replace("\"approved\":false", "\"approved\":\"false\""), encoded.replace("\"requesterSubjectId\":\"requester\"", "\"requesterSubjectId\":\"other\""),
+                encoded.replace("\"sourceStartCommandId\":\"start\"", "\"sourceStartCommandId\":\"other\""), encoded.replace(query.fingerprint(), "f".repeat(64)),
+                encoded.replace(OrchestrationRequestDigests.start(start), "f".repeat(64)), encoded.substring(0, encoded.length() - 1) + ",\"extraAuthority\":true}")) {
+            response.set(invalid); int before = calls.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).verifyApproval(query)).code()); assertEquals(before + 1, calls.get());
+        }
+        var expired = new VerifiedApprovalDTO(proof.policyRef(), proof.policyBindingSha256(), proof.requestSha256(), proof.approvalReceiptId(), proof.requesterType(), proof.requesterSubjectId(),
+                proof.sourceStartCommandId(), proof.scopeId(), proof.taskId(), proof.releaseVersion(), proof.definitionKey(), proof.definitionSha256(), proof.taskDefinitionKey(), proof.sourceRequestSha256(), false, now.minusSeconds(60), now.minusSeconds(60), now.minusSeconds(30));
+        response.set(mapper.writeValueAsString(expired)); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).verifyApproval(query)).code());
+    }
+
+    @Test
     void administrative_task_visibility_uses_its_own_private_endpoint_and_the_same_response_bounds() {
         var query = new ListHumanTasksQuery(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, "release", "instance", "review", "000", 1);
         var page = new HumanTaskPageDTO(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, List.of(humanTask()), "z");

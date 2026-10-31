@@ -16,6 +16,7 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandRece
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.Receipt;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
 import top.egon.cola.platform.tianji.process.server.identity.HumanTaskContext;
+import top.egon.cola.platform.tianji.process.server.identity.ApprovalVerificationContext;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskActionResult.Entry;
 
@@ -95,6 +96,20 @@ class HumanTaskReceiptStoreTest {
             when(fixture.jdbc.get().update(anyString(), any(Object[].class))).thenReturn(0);
             assertThrows(IllegalStateException.class, () -> fixture.transaction.executeWithoutResult(status -> store.apply(context, result)));
             verify(fixture.commands.get(), never()).apply(any(), any(), anyString(), anyString(), any()); verify(fixture.connection).rollback();
+        }
+    }
+
+    @Test void approval_lookup_uses_only_the_authenticated_service_namespace_and_full_applied_source_joins() throws Exception {
+        try (var fixture = new Fixture()) {
+            var store = fixture.store(true); var result = result(context("complete")); var consumer = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "verifier", "https://idp.example/20");
+            var context = new ApprovalVerificationContext(consumer, NOW.plusSeconds(30));
+            when(fixture.jdbc.get().query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Entry>>any(), any(Object[].class))).thenReturn(List.of(result));
+            assertEquals(result, fixture.transaction.execute(status -> store.approval(context, result.receipt().approvalReceiptId()).orElseThrow()));
+            verify(fixture.jdbc.get()).query(argThat(sql -> sql.contains("a.state='APPLIED'") && sql.contains("s.state='APPLIED'") && sql.contains("s.request_sha256=h.start_request_sha256")
+                            && sql.contains("d.model_sha256=h.definition_sha256") && sql.contains("h.tenant_id=? AND h.subject_issuer=? AND h.approval_receipt_id=?")
+                            && sql.contains("h.command_type='TASK_COMPLETE' AND h.task_kind='APPROVAL'")),
+                    org.mockito.ArgumentMatchers.<RowMapper<Entry>>any(), eq(20L), eq(consumer.issuerFingerprint()), eq(result.receipt().approvalReceiptId()));
+            assertThrows(IllegalStateException.class, () -> store.approval(context, result.receipt().approvalReceiptId()));
         }
     }
 

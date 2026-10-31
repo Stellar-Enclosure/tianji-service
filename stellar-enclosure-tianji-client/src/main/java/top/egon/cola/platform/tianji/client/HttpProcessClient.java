@@ -22,6 +22,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnu
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifyApprovalQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionReceiptDTO;
@@ -56,7 +60,7 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
-public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient, HumanTaskClient {
+public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient, HumanTaskClient, ApprovalClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
     private static final java.util.Set<String> HUMAN_TASK_ERRORS = java.util.Set.of("TIANJI_UNAUTHENTICATED", "TIANJI_PERMISSION_DENIED", "TIANJI_RESOURCE_NOT_FOUND", "TIANJI_IDEMPOTENCY_CONFLICT",
@@ -163,6 +167,17 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
                     && result.outcome() != WorkerReceiptOutcomeEnum.NEEDS_MANUAL
                 || command.kind() == WorkerFailureKindEnum.BUSINESS_REJECTED && result.outcome() != WorkerReceiptOutcomeEnum.BUSINESS_REJECTED
                     && result.outcome() != WorkerReceiptOutcomeEnum.NEEDS_MANUAL) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public VerifiedApprovalDTO verifyApproval(VerifyApprovalQuery query) {
+        Objects.requireNonNull(query, "query"); var result = call("POST", "human-tasks/approvals/verify", query, VerifiedApprovalDTO.class, null, tasks::approval);
+        var source = query.sourceStart();
+        if (!query.policyRef().equals(result.policyRef()) || !query.policyBindingSha256().equals(result.policyBindingSha256()) || !query.fingerprint().equals(result.requestSha256())
+                || !query.approvalReceiptId().equals(result.approvalReceiptId()) || query.requesterType() != result.requesterType() || !query.requesterSubjectId().equals(result.requesterSubjectId())
+                || !source.commandId().equals(result.sourceStartCommandId()) || !source.releaseVersion().equals(result.releaseVersion()) || !source.definitionKey().equals(result.definitionKey())
+                || !OrchestrationRequestDigests.start(source).equals(result.sourceRequestSha256()) || !result.expiresAt().isAfter(java.time.Instant.now())) throw invalidResponse();
         return result;
     }
 
