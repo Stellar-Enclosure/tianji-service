@@ -184,6 +184,47 @@ class AgentBudgetPostgresTest {
         }
     }
 
+    @Test
+    void reserve_replays_and_settlement_share_one_lock_order_and_keep_terminal_replay() throws Exception {
+        TrustedAgentActor actor = actor();
+        ClaimedAgentRun claim = claim(actor, Set.of());
+        AgentBudgetRequest request = model("mixed", 100, 100, "0.20");
+        AgentBudgetSettlement actual = new AgentBudgetSettlement(20L, 30L, new BigDecimal("0.05"));
+        assertTrue(ledger.budgets().reserveBudget(actor, claim.lease(), request).newlyCreated());
+        CountDownLatch gate = new CountDownLatch(1);
+        List<Future<AgentBudgetReservation>> futures = new ArrayList<>();
+        try (ExecutorService pool = Executors.newFixedThreadPool(20)) {
+            for (int i = 0; i < 20; i++) {
+                boolean reserve = i % 2 == 0;
+                futures.add(pool.submit(() -> {
+                    gate.await();
+                    return reserve ? ledger.budgets().reserveBudget(actor, claim.lease(), request)
+                            : ledger.budgets().settleBudget(actor, claim.lease(), request.reservationId(), actual);
+                }));
+            }
+            gate.countDown();
+            for (var future : futures) assertFalse(future.get(10, TimeUnit.SECONDS).newlyCreated());
+        }
+        assertEquals(1, jdbc.queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_budget_reservation
+                WHERE tenant_id=? AND run_id=? AND reservation_id=?
+                """, Integer.class, actor.tenantId(), claim.run().runId(), request.reservationId()));
+        Map<String, Object> row = counters(actor, claim);
+        assertEquals(1, ((Number) row.get("model_calls_reserved")).intValue());
+        assertEquals(0, ((Number) row.get("active_model_calls")).intValue());
+        assertEquals(0, ((Number) row.get("active_tool_calls")).intValue());
+        assertEquals(20L, ((Number) row.get("input_tokens_reserved")).longValue());
+        assertEquals(30L, ((Number) row.get("output_tokens_reserved")).longValue());
+        assertEquals(0, ((BigDecimal) row.get("estimated_cost_reserved")).compareTo(new BigDecimal("0.05")));
+        assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED,
+                ledger.finish(actor, claim.lease(), claim.run().revision(),
+                        new AgentExecutionResult(claim.run().runId(),
+                                top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED,
+                                Map.of(), null, null, null, null, "UNKNOWN")).status());
+        assertEquals(AgentBudgetReservation.State.SETTLED,
+                ledger.budgets().settleBudget(actor, claim.lease(), request.reservationId(), actual).state());
+    }
+
     private static AgentBudgetRequest model(String id, long input, long output, String cost) {
         return new AgentBudgetRequest(id, MODEL, null, input, output, new BigDecimal(cost));
     }
@@ -213,7 +254,8 @@ class AgentBudgetPostgresTest {
 
     private static Map<String, Object> counters(TrustedAgentActor actor, ClaimedAgentRun claim) {
         return jdbc.queryForMap("""
-                SELECT model_calls_reserved, input_tokens_reserved, output_tokens_reserved, estimated_cost_reserved
+                SELECT model_calls_reserved, active_model_calls, active_tool_calls,
+                       input_tokens_reserved, output_tokens_reserved, estimated_cost_reserved
                 FROM tianji_agent.agent_run WHERE tenant_id = ? AND run_id = ?
                 """, actor.tenantId(), claim.run().runId());
     }

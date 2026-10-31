@@ -33,6 +33,7 @@ class AgentContextBudgetServiceTest {
         when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
         when(ledger.databaseNow()).thenReturn(NOW);
         when(repository.databaseNow()).thenReturn(NOW);
+        when(repository.lockRunForBudget(ACTOR, RUN.runId())).thenReturn(true);
         when(ledger.snapshot(ACTOR, new GetAgentRunQuery(RUN.runId()))).thenReturn(SNAPSHOT);
         when(ledger.executionMaterial(ACTOR, new GetAgentRunQuery(RUN.runId()))).thenReturn(new AgentLedgerService.ExecutionMaterial(RUN, SNAPSHOT, AUTHORIZATION));
         when(repository.insertBudgetReservation(eq(ACTOR), eq(LEASE), eq(REQUEST), any())).thenReturn(1);

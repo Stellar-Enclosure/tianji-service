@@ -55,6 +55,7 @@ public final class AgentBudgetService {
         String payload = context == null ? null : contexts.write(context);
         String fingerprint = context == null ? null : contexts.fingerprint(context);
         return transaction.execute(status -> {
+            if (!repository.lockRunForBudget(actor, lease.runId())) throw notFound();
             var material = context == null ? null : ledger.executionMaterial(actor, new GetAgentRunQuery(lease.runId()));
             ExecutionPolicyDTO policy = material == null ? ledger.snapshot(actor, new GetAgentRunQuery(lease.runId())).effectivePolicy() : material.snapshot().effectivePolicy();
             if (context != null && (!context.definitionContentSha256().equals(material.authorization().definitionSha256())
@@ -124,6 +125,7 @@ public final class AgentBudgetService {
             throw invalid("budget reservation id is invalid");
         }
         BudgetSettlementOutcome outcome = transaction.execute(status -> {
+            if (!repository.lockRunForBudget(actor, lease.runId())) throw notFound();
             AgentBudgetReservation reservation = repository.budgetReservation(actor, lease.runId(), reservationId, false)
                     .orElseThrow(AgentBudgetService::notFound);
             if (reservation.leaseEpoch() != lease.epoch()) throw leaseLost();

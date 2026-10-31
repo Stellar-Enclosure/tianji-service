@@ -383,6 +383,16 @@ final class JdbcAgentLedgerRepository {
                 runId, expectedRevision).stream().findFirst();
     }
 
+    boolean lockRunForBudget(TrustedAgentActor actor, String runId) {
+        // Lock identity alone so settled replay remains available after termination.
+        return jdbc.query("""
+                SELECT run_id FROM tianji_agent.agent_run
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?
+                FOR UPDATE
+                """, (rs, row) -> rs.getString("run_id"), actor.tenantId(), actor.subjectType().name(),
+                actor.issuerFingerprint(), actor.subjectId(), runId).size() == 1;
+    }
+
     int insertBudgetReservation(TrustedAgentActor actor, AgentRunLease lease, AgentBudgetRequest request, Instant now) {
         return jdbc.update("""
                 INSERT INTO tianji_agent.agent_budget_reservation
