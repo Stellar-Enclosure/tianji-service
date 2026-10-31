@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
-/** Current-authorized preparation facts only. A prepared receipt, including an expired one, is not a dispatch permit. */
+/** Current-authorized preparation metadata and internal historical facts; neither is a dispatch permit. */
 public final class ToolActionIntentStore {
     private final DataSource source;
     private final AgentLedgerService ledger;
@@ -47,7 +47,7 @@ public final class ToolActionIntentStore {
         if (!ledger.usesDataSource(source)) throw new IllegalArgumentException("Tool preparation requires the exact Agent ledger DataSource");
         intents = new ToolActionIntentSql(source, ledger);
         transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(10);
-        transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED); transaction.setReadOnly(false);
     }
     public boolean usesDataSource(DataSource candidate) { return candidate == source; }
     public boolean usesLedger(AgentLedgerService candidate) { return candidate == ledger; }
@@ -63,6 +63,19 @@ public final class ToolActionIntentStore {
     public Optional<PreparedActionResult> current(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor) {
         var window = authorize(run, lease, action, descriptor);
         return transact(window, () -> intents.current(run, lease, action, descriptor, window.deadlineAt()).map(ToolActionIntentStore::projection));
+    }
+
+    /** Internal stored facts only; exposing their result body requires a separate current authorization boundary. */
+    Optional<ToolActionIntentSql.Row> historical(ToolActionRequest action, ToolDescriptor descriptor) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool history requires its own transaction");
+        if (!verified.get()) throw unavailable();
+        if (action == null || descriptor == null || !descriptor.reference().equals(action.tool())) throw invalid();
+        var reconstructed = new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments());
+        if (!reconstructed.requestSha256().equals(action.requestSha256()) || !reconstructed.intentId().equals(action.intentId())
+                || !descriptor.policy().equals(action.policy())) throw invalid();
+        Instant now = clock.instant(); long startedNanos = nanoTime.getAsLong();
+        var window = new WindowVO(now.plusSeconds(10), startedNanos + Duration.ofSeconds(10).toNanos());
+        return transact(window, () -> intents.historical(action, descriptor, window.deadlineAt()));
     }
 
     private WindowVO authorize(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor) {

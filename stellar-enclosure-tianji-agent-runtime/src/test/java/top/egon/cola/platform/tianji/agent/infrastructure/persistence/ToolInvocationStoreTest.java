@@ -201,8 +201,14 @@ class ToolInvocationStoreTest {
         for (var state : List.of("PREPARED", "AWAITING_APPROVAL", "DISPATCHING", "APPLIED", "REJECTED", "FAILED_KNOWN", "UNKNOWN", "EXPIRED")) {
             try (var fixture = new Fixture(state.equals("AWAITING_APPROVAL") ? APPROVAL : WRITE)) {
                 fixture.intentNew.set(false);
+                boolean dispatched = Set.of("DISPATCHING", "APPLIED", "UNKNOWN").contains(state);
+                var dispatch = dispatched ? new ToolActionIntentSql.DispatchVO(RUN, INVOCATION, 1, HASH, executor().actor()) : null;
+                var outcome = state.equals("APPLIED") ? new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of(), "business-receipt", null, new BigDecimal("0.20"))
+                        : Set.of("REJECTED", "FAILED_KNOWN", "UNKNOWN").contains(state) ? new ToolExecutionOutcome(ToolExecutionOutcome.Status.valueOf(state), Map.of(), null, "CONTROLLED_RESULT", null) : null;
                 fixture.intentRow.set(new ToolActionIntentSql.Row(fixture.action, fixture.tool, RUN, run().snapshotSha256(), state, 3,
-                        NOW.minusSeconds(60), NOW.minusSeconds(30), state.equals("EXPIRED") ? NOW.minusSeconds(1) : NOW.plusSeconds(30)));
+                        NOW.minusSeconds(60), NOW, state.equals("EXPIRED") ? NOW.minusSeconds(1) : NOW.plusSeconds(30), null, dispatch,
+                        state.equals("APPLIED") ? "CONFIRMED" : dispatched ? "UNKNOWN" : "NONE", outcome,
+                        state.equals("EXPIRED") ? "INTENT_EXPIRED" : outcome == null ? null : outcome.errorCode(), Set.of("PREPARED", "AWAITING_APPROVAL", "DISPATCHING").contains(state) ? null : NOW));
                 var result = fixture.store(true, fixture.authority).prepare(fixture.request(INVOCATION));
                 assertNull(result.invocation()); assertEquals(state, result.action().state()); assertEquals(3, result.action().revision());
                 assertEquals(0, fixture.budgetInserts.get()); assertEquals(0, fixture.invocationInserts.get());
@@ -686,7 +692,8 @@ class ToolInvocationStoreTest {
                 trace.add("action"); boolean created = intentNew.getAndSet(false); var current = intentRow.get();
                 if (current == null || created) {
                     Instant expiry = ((Instant) call.getArgument(4)).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
-                    current = new ToolActionIntentSql.Row(action, tool, RUN, run().snapshotSha256(), tool.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED ? "AWAITING_APPROVAL" : "PREPARED", 1, NOW, NOW, expiry);
+                    current = new ToolActionIntentSql.Row(action, tool, RUN, run().snapshotSha256(), tool.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED ? "AWAITING_APPROVAL" : "PREPARED", 1, NOW, NOW, expiry,
+                            null, null, "NONE", null, null, null);
                     intentRow.set(current);
                 }
                 return new ToolActionIntentSql.PreparationResultVO(current, created);

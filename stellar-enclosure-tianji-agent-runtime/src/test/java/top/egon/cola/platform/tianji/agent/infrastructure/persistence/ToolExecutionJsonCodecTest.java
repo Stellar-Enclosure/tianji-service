@@ -2,19 +2,27 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -24,6 +32,9 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ToolExecutionJsonCodecTest {
     private static final JsonMapper AUDIT_JSON = new JsonMapper();
+    private static final JsonMapper APPROVAL_JSON = JsonMapper.builder().addModule(new JavaTimeModule()).disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS).build();
+    private static final Instant APPROVAL_AT = Instant.parse("2020-01-01T00:00:00.123456789Z");
+    private static final String APPROVAL_ISSUER = "https://idp.example/21";
     private static final UUID AUDIT_ID = UUID.fromString("123e4567-e89b-12d3-a456-426614174000");
     private static final Instant AUDIT_AT = Instant.parse("2026-10-31T00:00:00.123456789Z");
     private final ToolExecutionJsonCodec codec = new ToolExecutionJsonCodec();
@@ -167,6 +178,200 @@ class ToolExecutionJsonCodecTest {
         assertSanitized(() -> codec.audit(validAuditJson().replace("PREPARE", "\uD800")));
         assertSanitized(() -> codec.audit(validAuditJson().replace("PREPARE", "\\uD800")));
         assertSanitized(() -> codec.audit(" ".repeat(ToolExecutionJsonCodec.MAX_AUDIT_BYTES + 1)));
+    }
+
+    @Test void historical_user_and_service_approval_proofs_round_trip_as_exact_closed_objects() throws Exception {
+        for (var type : TrustedAgentActor.SubjectType.values()) {
+            var action = approvedAction(type); var proof = approvalProof(action);
+            String json = codec.approval(proof, action); assertNotNull(json);
+            String sha = codec.approvalSha256(proof, action); assertNotNull(sha); assertTrue(sha.matches("[0-9a-f]{64}"));
+            assertEquals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(json.getBytes(StandardCharsets.UTF_8))), sha);
+            var decoded = codec.approval(json, sha, action); assertNotNull(decoded); assertEquals(proof, decoded);
+            var tree = (ObjectNode) APPROVAL_JSON.readTree(json);
+            for (var path : List.of("", "source", "binding", "binding.consumer", "approval")) {
+                var object = proofObject(tree, path); assertEquals(proofFields(path), fieldNames(object));
+            }
+            for (var field : List.of("occurredAt", "verifiedAt", "expiresAt")) assertEquals(
+                    field.equals("expiresAt") ? APPROVAL_AT.plusSeconds(10).toString() : APPROVAL_AT.toString(), tree.get("approval").get(field).textValue());
+            assertTrue(tree.get("approval").get("approved").isBoolean()); assertTrue(tree.get("approval").get("approved").booleanValue());
+            assertEquals("ApprovalProofVO[redacted]", proof.toString()); assertEquals("ApprovalSourceVO[redacted]", proof.source().toString());
+        }
+    }
+
+    @Test void canonical_approval_sha_ignores_original_whitespace_and_field_order() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); var proof = approvalProof(action);
+        String sha = codec.approvalSha256(proof, action); assertNotNull(sha);
+        String reordered = APPROVAL_JSON.writerWithDefaultPrettyPrinter().writeValueAsString(approvalTree(action));
+        var decoded = codec.approval(" \n" + reordered + "\n ", sha, action); assertNotNull(decoded); assertEquals(proof, decoded);
+        assertEquals(sha, codec.approvalSha256(decoded, action));
+        assertSanitized(() -> codec.approval(reordered, "f".repeat(64), action));
+        assertSanitized(() -> codec.approval(reordered, sha.toUpperCase(java.util.Locale.ROOT), action));
+        assertSanitized(() -> codec.approval(reordered, null, action));
+    }
+
+    @Test void approval_source_namespace_has_its_own_stable_encoding_and_exact_https_identity() {
+        var source = approvalProof(approvedAction(TrustedAgentActor.SubjectType.USER)).source();
+        assertEquals("0247b2bc66813db582ed628936ce0e38c8ba32d4839ff3a13ee19a4eb4a617df", source.namespaceSha256());
+        for (var changed : List.of(new ToolExecutionJsonCodec.ApprovalSourceVO("other-source", 21, source.issuer(), source.resource()),
+                new ToolExecutionJsonCodec.ApprovalSourceVO(source.sourceId(), 22, source.issuer(), source.resource()),
+                new ToolExecutionJsonCodec.ApprovalSourceVO(source.sourceId(), 21, "https://IDP.example/21", source.resource()),
+                new ToolExecutionJsonCodec.ApprovalSourceVO(source.sourceId(), 21, source.issuer(), "https://process.example/api/22"))) {
+            assertNotEquals(source.namespaceSha256(), changed.namespaceSha256());
+        }
+        for (var uri : List.of("http://private.example/", "https://private.example/a/../b", "https://secret@private.example/",
+                "https://private.example/?token=private", "https://private.example/#private", "https://private.example/资料", "https://private.example/" + "x".repeat(2048))) {
+            assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalSourceVO("approval-source", 21, uri, source.resource()));
+            assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalSourceVO("approval-source", 21, source.issuer(), uri));
+        }
+        for (var id : List.of("", " private", "private source", "x".repeat(129), "\uD800")) assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalSourceVO(id, 21, source.issuer(), source.resource()));
+        assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalSourceVO(source.sourceId(), 0, source.issuer(), source.resource()));
+        String prefix = "https://process.example/";
+        assertNotNull(new ToolExecutionJsonCodec.ApprovalSourceVO("a".repeat(128), Long.MAX_VALUE, prefix + "x".repeat(2048 - prefix.length()), prefix + "x".repeat(512 - prefix.length())));
+        assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalSourceVO(source.sourceId(), 21, source.issuer(), prefix + "x".repeat(513 - prefix.length())));
+    }
+
+    @Test void every_approval_field_at_every_object_level_is_required_and_unknown_duplicate_or_trailing_content_is_rejected() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); String sha = validProofSha(action);
+        for (var path : List.of("", "source", "binding", "binding.consumer", "approval")) {
+            for (var field : proofFields(path)) {
+                var tree = approvalTree(action); proofObject(tree, path).remove(field);
+                assertSanitized(() -> codec.approval(tree.toString(), sha, action));
+            }
+            var unknown = approvalTree(action); proofObject(unknown, path).put("privateUnknown", "private arguments");
+            assertSanitized(() -> codec.approval(unknown.toString(), sha, action));
+            var tree = approvalTree(action); var object = proofObject(tree, path); String key = object.fieldNames().next();
+            String original = object.toString(), duplicate = original.substring(0, original.length() - 1) + ",\"" + key + "\":" + object.get(key) + '}';
+            String json = tree.toString(); assertTrue(json.contains(original)); String malformed = json.replace(original, duplicate);
+            assertSanitized(() -> codec.approval(malformed, sha, action));
+        }
+        for (var json : List.of("null", "[]", "true", "{}", approvalTree(action) + " {}")) assertSanitized(() -> codec.approval(json, sha, action));
+    }
+
+    @Test void approval_json_scalar_types_are_exact_and_consumed_proof_requires_boolean_true() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); String sha = validProofSha(action);
+        for (var path : List.of("", "source", "binding.consumer")) {
+            String field = path.isEmpty() ? "schemaVersion" : "tenantId";
+            for (var value : Arrays.<Object>asList("1", 1.0d, true, null, new BigInteger("9223372036854775808"), 0L, -1L)) {
+                String json = approvalField(action, path, field, value); assertSanitized(() -> codec.approval(json, sha, action));
+            }
+        }
+        for (var path : List.of("source", "binding", "binding.consumer", "approval")) {
+            var object = proofObject(approvalTree(action), path);
+            for (var field : proofFields(path)) if (object.get(field).isTextual()) {
+                String json = approvalField(action, path, field, 1); assertSanitized(() -> codec.approval(json, sha, action));
+            }
+        }
+        for (var value : Arrays.<Object>asList(false, "true", 1, null)) {
+            String json = approvalField(action, "approval", "approved", value); assertSanitized(() -> codec.approval(json, sha, action));
+        }
+        for (var value : List.of("user", "SERVICE ", "private arguments")) {
+            String json = approvalField(action, "approval", "requesterType", value); assertSanitized(() -> codec.approval(json, sha, action));
+        }
+    }
+
+    @Test void approval_instants_are_canonical_utc_and_the_reader_uses_historical_verified_at() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); String sha = validProofSha(action);
+        for (var field : List.of("occurredAt", "verifiedAt", "expiresAt")) {
+            for (var value : Arrays.<Object>asList(0L, APPROVAL_AT.toString().replace("Z", "+00:00"), APPROVAL_AT.toString().replace("Z", "z"),
+                    "2020-01-01T00:00:00.000Z", "2020-01-01 00:00:00Z", null)) {
+                String json = approvalField(action, "approval", field, value); assertSanitized(() -> codec.approval(json, sha, action));
+            }
+        }
+        var proof = approvalProof(action); assertTrue(proof.approval().expiresAt().isBefore(Instant.parse("2021-01-01T00:00:00Z")));
+        String json = codec.approval(proof, action); assertNotNull(json); assertEquals(proof, codec.approval(json, sha, action));
+    }
+
+    @Test void source_consumer_and_action_drift_is_rejected_without_leaking_supplied_action_or_private_causes() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); var proof = approvalProof(action);
+        var tenant = new ToolExecutionJsonCodec.ApprovalSourceVO(proof.source().sourceId(), 22, proof.source().issuer(), proof.source().resource());
+        var issuer = new ToolExecutionJsonCodec.ApprovalSourceVO(proof.source().sourceId(), 21, "https://other.example/21", proof.source().resource());
+        assertSanitized(() -> codec.approval(new ToolExecutionJsonCodec.ApprovalProofVO(1, tenant, proof.binding(), proof.approval()), action));
+        assertSanitized(() -> codec.approval(new ToolExecutionJsonCodec.ApprovalProofVO(1, issuer, proof.binding(), proof.approval()), action));
+        var changed = new ToolActionRequest(action.owner(), approvalDescriptor(), action.businessKey(), "changed-private-version", action.arguments());
+        assertSanitized(() -> codec.approval(proof, changed));
+        assertSanitized(() -> codec.approvalSha256(proof, changed));
+        for (var field : List.of("policyBindingSha256", "requestSha256", "definitionSha256", "sourceRequestSha256")) {
+            var tree = approvalTree(action); proofObject(tree, "approval").put(field, "f".repeat(64));
+            var value = APPROVAL_JSON.treeToValue(tree.get("approval"), VerifiedApprovalDTO.class);
+            assertSanitized(() -> codec.approval(new ToolExecutionJsonCodec.ApprovalProofVO(1, proof.source(), proof.binding(), value), action));
+        }
+        var falseTree = approvalTree(action); proofObject(falseTree, "approval").put("approved", false);
+        var falseDecision = APPROVAL_JSON.treeToValue(falseTree.get("approval"), VerifiedApprovalDTO.class);
+        assertFalse(falseDecision.approved());
+        assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalProofVO(1, proof.source(), proof.binding(), falseDecision));
+        assertSanitized(() -> new ToolExecutionJsonCodec.ApprovalProofVO(2, proof.source(), proof.binding(), proof.approval()));
+        assertSanitized(() -> codec.approval((ToolExecutionJsonCodec.ApprovalProofVO) null, action));
+        assertSanitized(() -> codec.approval(proof, null)); assertSanitized(() -> codec.approvalSha256(null, action));
+    }
+
+    @Test void approval_content_obeys_the_sixteen_kib_utf8_boundary_and_rejects_invalid_unicode() throws Exception {
+        var action = approvedAction(TrustedAgentActor.SubjectType.USER); String json = approvalTree(action).toString(), sha = validProofSha(action);
+        assertTrue(json.getBytes(StandardCharsets.UTF_8).length > json.length());
+        String atLimit = json + " ".repeat(ToolExecutionJsonCodec.MAX_APPROVAL_BYTES - json.getBytes(StandardCharsets.UTF_8).length);
+        var decoded = codec.approval(atLimit, sha, action); assertNotNull(decoded); assertEquals(approvalProof(action), decoded);
+        assertSanitized(() -> codec.approval(atLimit + ' ', sha, action));
+        assertSanitized(() -> codec.approval(json.replace("私密审批", "\uD800"), sha, action));
+        assertSanitized(() -> codec.approval(json.replace("私密审批", "\\uD800"), sha, action));
+        assertSanitized(() -> codec.approval(null, sha, action));
+    }
+
+    @Test void persisted_outcomes_require_all_five_keys_even_when_nullable_and_reject_scalar_coercion() throws Exception {
+        var value = new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OUTCOME_UNKNOWN", null);
+        String json = codec.outcome(descriptor, value); assertNotNull(json);
+        for (var field : List.of("status", "output", "businessReceiptId", "errorCode", "actualCost")) {
+            var object = (ObjectNode) AUDIT_JSON.readTree(json); object.remove(field); assertSanitized(() -> codec.outcome(object.toString(), descriptor));
+        }
+        for (var entry : List.<Map.Entry<String, Object>>of(Map.entry("status", 1), Map.entry("status", true), Map.entry("output", "private output"),
+                Map.entry("businessReceiptId", 1), Map.entry("errorCode", 1), Map.entry("actualCost", "0"), Map.entry("actualCost", true))) {
+            String malformed = auditField(json, entry.getKey(), entry.getValue()); assertSanitized(() -> codec.outcome(malformed, descriptor));
+        }
+        assertSanitized(() -> codec.outcome(json.substring(0, json.length() - 1) + ",\"privateExtra\":true}", descriptor));
+        assertSanitized(() -> codec.outcome(json.substring(0, json.length() - 1) + ",\"actualCost\":0}", descriptor));
+        assertSanitized(() -> codec.outcome(json + " {}", descriptor));
+        var fractional = new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OUTCOME_UNKNOWN", new BigDecimal("0.12345678"));
+        assertEquals(fractional, codec.outcome(codec.outcome(descriptor, fractional), descriptor));
+        assertEquals(value, codec.outcome(json, descriptor));
+    }
+
+    private static ToolDescriptor approvalDescriptor() {
+        return new ToolDescriptor("process.approved_start", 1, "approved_start", "Approved fixed operation",
+                new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")), new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
+                new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "process.start.invoice", "tianji.api.process.instance.start", "a".repeat(64), "approval.v1"));
+    }
+    private static ToolActionRequest approvedAction(TrustedAgentActor.SubjectType type) {
+        var owner = TrustedAgentActor.verified(21, type, type == TrustedAgentActor.SubjectType.USER ? "alice" : "approval-consumer", APPROVAL_ISSUER);
+        return new ToolActionRequest(owner, approvalDescriptor(), "private-business-1", "business-v1", Map.of("amount", 20L));
+    }
+    private static ToolExecutionJsonCodec.ApprovalProofVO approvalProof(ToolActionRequest action) {
+        var consumer = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "approval-consumer", APPROVAL_ISSUER);
+        var binding = new ToolApprovalBinding(consumer, "approval.v1", "b".repeat(64), "approval-release", "approval_process", "c".repeat(64), "review_task");
+        var query = binding.query(action, "私密审批-receipt-1"); var source = query.sourceStart();
+        var approved = new VerifiedApprovalDTO(binding.policyRef(), binding.policyBindingSha256(), query.fingerprint(), query.approvalReceiptId(), query.requesterType(), query.requesterSubjectId(),
+                source.commandId(), "private-scope", "private-task", binding.releaseVersion(), binding.definitionKey(), binding.definitionSha256(), binding.taskDefinitionKey(),
+                OrchestrationRequestDigests.start(source), true, APPROVAL_AT, APPROVAL_AT, APPROVAL_AT.plusSeconds(10));
+        return new ToolExecutionJsonCodec.ApprovalProofVO(1, new ToolExecutionJsonCodec.ApprovalSourceVO("ps-approval-primary", 21, APPROVAL_ISSUER, "https://process.example/api/21"), binding, approved);
+    }
+    private static ObjectNode approvalTree(ToolActionRequest action) {
+        return APPROVAL_JSON.valueToTree(approvalProof(action));
+    }
+    private String validProofSha(ToolActionRequest action) { String sha = codec.approvalSha256(approvalProof(action), action); assertNotNull(sha); return sha; }
+    private static String approvalField(ToolActionRequest action, String path, String field, Object value) {
+        var tree = approvalTree(action); proofObject(tree, path).set(field, APPROVAL_JSON.valueToTree(value)); return tree.toString();
+    }
+    private static ObjectNode proofObject(ObjectNode root, String path) {
+        var value = root; if (!path.isEmpty()) for (var part : path.split("\\.")) value = (ObjectNode) value.get(part); return value;
+    }
+    private static Set<String> fieldNames(ObjectNode value) { var fields = new java.util.HashSet<String>(); value.fieldNames().forEachRemaining(fields::add); return fields; }
+    private static Set<String> proofFields(String path) {
+        return switch (path) {
+            case "" -> Set.of("schemaVersion", "source", "binding", "approval");
+            case "source" -> Set.of("sourceId", "tenantId", "issuer", "resource");
+            case "binding" -> Set.of("consumer", "policyRef", "policyBindingSha256", "releaseVersion", "definitionKey", "definitionSha256", "taskDefinitionKey");
+            case "binding.consumer" -> Set.of("tenantId", "subjectType", "subjectId", "issuerFingerprint");
+            case "approval" -> Set.of("policyRef", "policyBindingSha256", "requestSha256", "approvalReceiptId", "requesterType", "requesterSubjectId", "sourceStartCommandId", "scopeId", "taskId", "releaseVersion",
+                    "definitionKey", "definitionSha256", "taskDefinitionKey", "sourceRequestSha256", "approved", "occurredAt", "verifiedAt", "expiresAt");
+            default -> throw new AssertionError("Unexpected proof fixture path");
+        };
     }
 
     private static ToolExecutionAuthorization.AuditVO audit(TrustedAgentActor.SubjectType subject, ToolExecutionAuthorization.Decision decision) {
