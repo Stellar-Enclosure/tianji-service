@@ -54,7 +54,48 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Receive Agent results"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.agent.result.receive", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Receive an Agent result reference"))
+@PermissionDefinition(code = TianjiProcessPermissions.TASK_READ, meaning = "Read governed human tasks",
+        labelPage = "tianji.process.permissions", labelKey = "permission.task.read")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.task.read", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read human tasks"))
+@PermissionDefinition(code = TianjiProcessPermissions.TASK_CLAIM, meaning = "Claim and release governed human tasks",
+        labelPage = "tianji.process.permissions", labelKey = "permission.task.claim")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.task.claim", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Claim and release human tasks"))
+@PermissionDefinition(code = TianjiProcessPermissions.TASK_COMPLETE, meaning = "Complete governed human tasks",
+        labelPage = "tianji.process.permissions", labelKey = "permission.task.complete")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.task.complete", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Complete human tasks"))
+@PermissionDefinition(code = TianjiProcessPermissions.TASK_TRANSFER, meaning = "Administratively transfer governed human tasks",
+        labelPage = "tianji.process.permissions", labelKey = "permission.task.transfer")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.task.transfer", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Administratively transfer human tasks"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read a human task"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.query", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Query current human tasks"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.adminQuery", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Administratively query human tasks"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.claim", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Claim a human task"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.unclaim", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Release a human task claim"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.transfer", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Transfer a human task queue"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.complete", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Complete a human task"))
 public final class TianjiProcessPermissions {
+    public static final String TASK_READ = "TIANJI_TASK_READ";
+    public static final String TASK_CLAIM = "TIANJI_TASK_CLAIM";
+    public static final String TASK_COMPLETE = "TIANJI_TASK_COMPLETE";
+    public static final String TASK_TRANSFER = "TIANJI_TASK_TRANSFER";
+    public static final String TASK_GET_API = "tianji.api.process.task.get";
+    public static final String TASK_QUERY_API = "tianji.api.process.task.query";
+    public static final String TASK_ADMIN_QUERY_API = "tianji.api.process.task.adminQuery";
+    public static final String TASK_CLAIM_API = "tianji.api.process.task.claim";
+    public static final String TASK_UNCLAIM_API = "tianji.api.process.task.unclaim";
+    public static final String TASK_TRANSFER_API = "tianji.api.process.task.transfer";
+    public static final String TASK_COMPLETE_API = "tianji.api.process.task.complete";
     public static final String RELEASE_PUBLISH = "TIANJI_PROCESS_RELEASE_PUBLISH";
     public static final String RELEASE_READ = "TIANJI_PROCESS_RELEASE_READ";
     public static final String START = "TIANJI_PROCESS_START";

@@ -265,6 +265,21 @@ class HttpProcessClientTest {
     }
 
     @Test
+    void administrative_task_visibility_uses_its_own_private_endpoint_and_the_same_response_bounds() {
+        var query = new ListHumanTasksQuery(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, "release", "instance", "review", "000", 1);
+        var page = new HumanTaskPageDTO(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.ALL, List.of(humanTask()), "z");
+        String encoded = mapper.writeValueAsString(page); var response = new AtomicReference<>(encoded); var count = new AtomicInteger();
+        handler.set(exchange -> {
+            count.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/human-tasks/admin/query", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), ListHumanTasksQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(page, client(Duration.ofSeconds(3)).humanTasksForAdministration(query));
+        for (var invalid : List.of(encoded.replace("\"releaseVersion\":\"release\"", "\"releaseVersion\":\"other\""), encoded.replace("\"nextAfterTaskId\":\"z\"", "\"nextAfterTaskId\":\"000\""))) {
+            response.set(invalid); int before = count.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client(Duration.ofSeconds(3)).humanTasksForAdministration(query)).code()); assertEquals(before + 1, count.get());
+        }
+    }
+
+    @Test
     void human_task_actions_match_original_command_version_action_and_transfer_lane_without_post_retry() {
         String version = "a".repeat(64); var claim = new ClaimHumanTaskCommand("claim-1", "task-1", version); var unclaim = new UnclaimHumanTaskCommand("unclaim-1", "task-1", version);
         var transfer = new TransferHumanTaskCommand("transfer-1", "task-1", version, "manager"); var complete = new CompleteHumanTaskCommand("complete-1", "task-1", version, Map.of("approved", false, "comment", "private form"));

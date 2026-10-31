@@ -25,6 +25,9 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionSe
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
+import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
+import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
@@ -56,8 +59,10 @@ public class ProcessSecurityConfiguration {
         boolean enabled = environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
+        boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
+        if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -68,6 +73,7 @@ public class ProcessSecurityConfiguration {
                             "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**").authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
+                    if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
                     authorize.anyRequest().denyAll();
                 });
         if (enabled) {
@@ -166,6 +172,28 @@ public class ProcessSecurityConfiguration {
     ProcessDecisionService processDecisionService(ProcessEngine process, DmnEngine dmn,
                                                    ProcessModelValidator validator) {
         return new ProcessDecisionService(processConfiguration(process), decisionConfiguration(dmn), validator);
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "human-tasks.enabled"}, havingValue = "true")
+    static class HumanTaskConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(HumanTaskReceiptStore.class)
+        HumanTaskReceiptStore humanTaskReceiptStore(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw new IllegalStateException("Human task API requires the owning Process JDBC manager");
+            var store = new HumanTaskReceiptStore(manager.getDataSource(), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(FlowableHumanTaskService.class)
+        FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts) {
+            return new FlowableHumanTaskService(processConfiguration(process), decisionConfiguration(dmn), validator, receipts);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(TianjiHumanTaskAccess.class)
+        TianjiHumanTaskAccess tianjiHumanTaskAccess(TianjiProcessAccess access) { return new TianjiHumanTaskAccess(access, Clock.systemUTC()); }
     }
 
     @Configuration(proxyBeanMethods = false)

@@ -174,7 +174,16 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
 
     @Override
     public HumanTaskPageDTO humanTasks(ListHumanTasksQuery query) {
-        Objects.requireNonNull(query, "query"); var page = call("POST", "human-tasks/query", query, HumanTaskPageDTO.class, null, tasks::page);
+        return taskPage("query", query);
+    }
+
+    @Override
+    public HumanTaskPageDTO humanTasksForAdministration(ListHumanTasksQuery query) {
+        return taskPage("admin/query", query);
+    }
+
+    private HumanTaskPageDTO taskPage(String path, ListHumanTasksQuery query) {
+        Objects.requireNonNull(query, "query"); var page = call("POST", "human-tasks/" + path, query, HumanTaskPageDTO.class, null, tasks::page);
         if (page.scopeType() != query.scopeType() || page.selection() != query.selection() || page.items().size() > query.limit()) throw invalidResponse();
         String previous = query.afterTaskId();
         for (var task : page.items()) {

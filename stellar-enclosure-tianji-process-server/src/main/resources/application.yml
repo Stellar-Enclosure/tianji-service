@@ -56,9 +56,15 @@ egon:
               TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]
               TIANJI_WORKER_ACQUIRE: ["tianji:worker:acquire"]
               TIANJI_WORKER_REPORT: ["tianji:worker:report"]
+              TIANJI_TASK_READ: ["tianji:task:read"]
+              TIANJI_TASK_CLAIM: ["tianji:task:claim"]
+              TIANJI_TASK_COMPLETE: ["tianji:task:complete"]
+              TIANJI_TASK_TRANSFER: ["tianji:task:transfer"]
 
 stellar:
   tianji:
     process:
+      human-tasks:
+        enabled: false
       agent-bridge:
         enabled: false

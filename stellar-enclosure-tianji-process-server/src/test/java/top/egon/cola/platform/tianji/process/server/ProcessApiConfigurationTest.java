@@ -10,6 +10,13 @@ import org.springframework.web.servlet.config.annotation.EnableWebMvc;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
+import top.egon.cola.platform.tianji.process.server.api.HumanTaskController;
+import top.egon.cola.platform.tianji.process.server.api.HumanTaskRequestBodyAdvice;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
+import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+
+import javax.sql.DataSource;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
@@ -29,6 +36,8 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthen
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.mockConstruction;
 
 class ProcessApiConfigurationTest {
     private final WebApplicationContextRunner runner = new WebApplicationContextRunner().withUserConfiguration(TestWeb.class)
@@ -42,10 +51,15 @@ class ProcessApiConfigurationTest {
             assertThat(context).doesNotHaveBean(ProcessController.class);
             assertThat(context).doesNotHaveBean(WorkerController.class);
             assertThat(context).doesNotHaveBean(AgentResultInboxController.class);
+            assertThat(context).doesNotHaveBean(HumanTaskController.class);
         });
         runner.withPropertyValues("stellar.tianji.process.worker.enabled=true").run(context -> {
             assertThat(context).hasFailed();
             assertThat(context.getStartupFailure()).hasRootCauseMessage("Worker API requires the Process API security boundary");
+        });
+        runner.withPropertyValues("stellar.tianji.process.human-tasks.enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Human task API requires the Process API security boundary");
         });
         runner.withPropertyValues("stellar.tianji.process.agent-results.enabled=true").run(context -> {
             assertThat(context).hasFailed();
@@ -61,6 +75,30 @@ class ProcessApiConfigurationTest {
                     assertThat(context).hasFailed();
                     assertThat(context.getStartupFailure()).hasRootCauseMessage(
                             "Tianji Process API requires both identity and permission filters in its security chain");
+                });
+    }
+
+    @Test
+    void human_task_activation_verifies_its_own_store_and_exposes_no_task_api_when_disabled() {
+        var source = mock(DataSource.class); var engine = mock(ProcessEngine.class); var configuration = mock(SpringProcessEngineConfiguration.class);
+        when(engine.getProcessEngineConfiguration()).thenReturn(configuration); when(configuration.getTransactionManager()).thenReturn(new DataSourceTransactionManager(source)); when(configuration.getDatabaseSchema()).thenReturn("tianji_process");
+        try (var stores = mockConstruction(HumanTaskReceiptStore.class, (value, construction) -> {
+            assertThat(construction.arguments()).isEqualTo(java.util.List.of(source, "tianji_process"));
+        })) {
+            var store = new ProcessSecurityConfiguration.HumanTaskConfiguration().humanTaskReceiptStore(engine); verify(store).verifyStorage(); assertThat(stores.constructed()).containsExactly(store);
+        }
+        runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.human-tasks.enabled=true")
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean(HumanTaskReceiptStore.class, () -> mock(HumanTaskReceiptStore.class))
+                .withBean(FlowableHumanTaskService.class, () -> mock(FlowableHumanTaskService.class))
+                .run(context -> {
+                    assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(HumanTaskController.class); assertThat(context).hasSingleBean(HumanTaskRequestBodyAdvice.class);
                 });
     }
 
@@ -140,11 +178,13 @@ class ProcessApiConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
+        assertThat(policy.requirement(new MockHttpServletRequest("POST", "/api/tianji/v1/human-tasks/complete")))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER);
     }
 
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class})
     static class TestWeb { }
 }
