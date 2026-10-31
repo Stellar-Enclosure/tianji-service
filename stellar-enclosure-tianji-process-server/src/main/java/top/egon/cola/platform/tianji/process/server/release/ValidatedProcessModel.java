@@ -23,6 +23,7 @@ public final class ValidatedProcessModel {
     private final Map<String, WorkerTask> workerTasks;
     private final Map<String, MessageWait> messageWaits;
     private final Map<String, HumanTask> humanTasks;
+    private final Map<String, HumanTaskTimer> humanTaskTimers;
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds) {
@@ -40,6 +41,13 @@ public final class ValidatedProcessModel {
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds,
                           Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
                           Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks) {
+        this(type, definitionKey, xml, inputs, outputs, ruleIds, decisionTasks, routeConditions, workerTasks, messageWaits, humanTasks, Map.of());
+    }
+
+    ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
+                          Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds,
+                          Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
+                          Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks, Map<String, HumanTaskTimer> humanTaskTimers) {
         this.type = type;
         this.definitionKey = definitionKey;
         this.xml = xml.clone();
@@ -51,6 +59,7 @@ public final class ValidatedProcessModel {
         this.workerTasks = Map.copyOf(workerTasks);
         this.messageWaits = Map.copyOf(messageWaits);
         this.humanTasks = Map.copyOf(humanTasks);
+        this.humanTaskTimers = Map.copyOf(humanTaskTimers);
     }
 
     public Type type() { return type; }
@@ -64,8 +73,10 @@ public final class ValidatedProcessModel {
     public Map<String, WorkerTask> workerTasks() { return workerTasks; }
     public Map<String, MessageWait> messageWaits() { return messageWaits; }
     public Map<String, HumanTask> humanTasks() { return humanTasks; }
+    public Map<String, HumanTaskTimer> humanTaskTimers() { return humanTaskTimers; }
 
     public record HumanTaskField(String name, String target, ValueType type) { }
+    public record HumanTaskTimer(String taskElementId, Duration duration) { }
     /** Only validator-produced metadata is a release approval; constructing this record grants no task or IAM authority. */
     public record HumanTask(HumanTaskKind kind, Map<String, Set<String>> lanes, String initialLane, String laneVariable,
                             String approvalVariable, List<HumanTaskField> fields) {

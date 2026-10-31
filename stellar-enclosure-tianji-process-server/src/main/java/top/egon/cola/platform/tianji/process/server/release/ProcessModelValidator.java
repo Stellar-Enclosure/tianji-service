@@ -42,8 +42,9 @@ public final class ProcessModelValidator {
             + "|" + INTEGER + "|true|false)\\}");
     private static final Map<String, Set<String>> BPMN_CHILDREN = Map.ofEntries(
             Map.entry("definitions", Set.of("process", "message")),
-            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow")),
+            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "boundaryEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow")),
             Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition", "messageEventDefinition")),
+            Map.entry("boundaryEvent", Set.of("timerEventDefinition")),
             Map.entry("timerEventDefinition", Set.of("timeDuration")),
             Map.entry("serviceTask", Set.of("extensionElements")),
             Map.entry("userTask", Set.of("extensionElements")),
@@ -55,6 +56,7 @@ public final class ProcessModelValidator {
             Map.entry("process", Set.of("id", "name", "isExecutable")),
             Map.entry("startEvent", Set.of("id", "name")), Map.entry("endEvent", Set.of("id", "name")),
             Map.entry("userTask", Set.of("id", "name")), Map.entry("parallelGateway", Set.of("id", "name")),
+            Map.entry("boundaryEvent", Set.of("id", "name", "attachedToRef", "cancelActivity")),
             Map.entry("eventBasedGateway", Set.of("id", "name")),
             Map.entry("serviceTask", Set.of("id", "name")), Map.entry("extensionElements", Set.of()),
             Map.entry("field", Set.of("name")), Map.entry("string", Set.of()),
@@ -104,6 +106,7 @@ public final class ProcessModelValidator {
         Map<String, String> messageRefs = new LinkedHashMap<>();
         Map<String, String> messageStatusVariables = new LinkedHashMap<>();
         Map<String, Duration> timers = new LinkedHashMap<>();
+        Map<String, ValidatedProcessModel.HumanTaskTimer> humanTimers = new LinkedHashMap<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
             if ("sequenceFlow".equals(kind)) {
@@ -146,14 +149,14 @@ public final class ProcessModelValidator {
                     } else {
                         if (element.hasAttributeNS(TIANJI_WORKER, "workerRef") || element.hasAttributeNS(TIANJI_WORKER, "statusVariable")) throw invalid();
                         Element duration = only(only(element, "timerEventDefinition"), "timeDuration");
-                        try {
-                            String literal = duration.getTextContent();
-                            if (!literal.equals(literal.trim())) throw invalid();
-                            Duration value = Duration.parse(literal);
-                            if (value.compareTo(Duration.ofSeconds(1)) < 0 || value.compareTo(Duration.ofDays(365)) > 0) throw invalid();
-                            timers.put(id, value);
-                        } catch (RuntimeException badDuration) { throw invalid(); }
+                        timers.put(id, timerDuration(duration));
                     }
+                }
+                if ("boundaryEvent".equals(kind)) {
+                    if (!"true".equals(element.getAttribute("cancelActivity")) || children(element).size() != 1) throw invalid();
+                    String attached = required(element, "attachedToRef"); var literal = only(only(element, "timerEventDefinition"), "timeDuration"); var duration = timerDuration(literal);
+                    if (duration.getNano() != 0 || !duration.toString().equals(literal.getTextContent())) throw invalid();
+                    humanTimers.put(id, new ValidatedProcessModel.HumanTaskTimer(attached, duration));
                 }
             }
         }
@@ -182,6 +185,7 @@ public final class ProcessModelValidator {
                 }
                 case "endEvent" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing != 0) throw invalid(); }
                 case "userTask", "serviceTask", "intermediateCatchEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
+                case "boundaryEvent" -> { if (node.incoming != 0 || outgoing != 1) throw invalid(); }
                 case "parallelGateway" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing < 1 || outgoing > 4) throw invalid(); }
                 case "eventBasedGateway" -> {
                     if (node.incoming != 1 || outgoing != 2 || !workers.containsKey(node.previous.getFirst().element.getAttribute("id"))
@@ -223,6 +227,12 @@ public final class ProcessModelValidator {
                     .findFirst().orElseThrow(ProcessModelValidator::invalid);
             waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer), messageStatusVariables.get(entry.getKey())));
         }
+        var timedTasks = new HashSet<String>();
+        for (var entry : humanTimers.entrySet()) {
+            String attached = entry.getValue().taskElementId(); if (!humans.containsKey(attached) || !timedTasks.add(attached)) throw invalid();
+            // The native boundary has an implicit edge from its attached task, not an incoming sequenceFlow.
+            var task = nodes.get(attached); var boundary = nodes.get(entry.getKey()); task.next.add(boundary); boundary.previous.add(task); boundary.incoming++;
+        }
         if (start == null) throw invalid();
         ArrayDeque<FlowNode> ready = new ArrayDeque<>();
         start.paths = 1;
@@ -245,7 +255,13 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits, humans);
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits, humans, humanTimers);
+    }
+
+    private static Duration timerDuration(Element duration) {
+        try { String literal = duration.getTextContent(); if (!literal.equals(literal.trim())) throw invalid(); var value = Duration.parse(literal);
+            if (value.compareTo(Duration.ofSeconds(1)) < 0 || value.compareTo(Duration.ofDays(365)) > 0) throw invalid(); return value;
+        } catch (RuntimeException badDuration) { throw invalid(); }
     }
 
     private static HumanTask humanTask(Element task) {

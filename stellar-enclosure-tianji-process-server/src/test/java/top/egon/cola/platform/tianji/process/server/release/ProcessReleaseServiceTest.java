@@ -155,6 +155,23 @@ class ProcessReleaseServiceTest {
     }
 
     @Test
+    void timed_human_models_require_live_native_timer_job_acquisition_before_publication() throws Exception {
+        DataSource source = mock(DataSource.class); var process = process(source); var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());
+        try (var verification = mockConstruction(HumanTaskStorageVerifier.class); var input = getClass().getResourceAsStream("/fixtures/governed-human-task-timer.bpmn20.xml")) {
+            assertNotNull(input); var resource = new ProcessReleaseService.ModelResource(Type.BPMN, "timedHumanReview", input.readAllBytes(), Map.of());
+            var service = new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, false, () -> true, true);
+            var actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "publisher", "https://idp.example/20");
+            assertThrows(IllegalStateException.class, () -> service.publish(actor, "release", List.of(resource))); verifyNoInteractions(source);
+            var jobs = mock(AsyncJobExecutorConfiguration.class); var executor = mock(AsyncExecutor.class);
+            when(process.isAsyncExecutorActivate()).thenReturn(true); when(process.getAsyncExecutorConfiguration()).thenReturn(jobs); when(process.getAsyncExecutor()).thenReturn(executor); when(executor.isActive()).thenReturn(true);
+            when(jobs.isTimerJobAcquisitionEnabled()).thenReturn(true); when(jobs.isAsyncJobAcquisitionEnabled()).thenReturn(true); when(jobs.isResetExpiredJobEnabled()).thenReturn(true);
+            assertThrows(org.springframework.transaction.CannotCreateTransactionException.class, () -> service.publish(actor, "release", List.of(resource)));
+            verify(source).getConnection(); verifyNoInteractions(process.getRepositoryService());
+        }
+    }
+
+    @Test
     void failed_human_storage_verification_cannot_construct_an_enabled_publisher() {
         DataSource source = mock(DataSource.class); var process = process(source); var decision = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
         when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());

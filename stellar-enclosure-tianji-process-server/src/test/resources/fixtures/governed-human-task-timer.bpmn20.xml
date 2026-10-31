@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:task="urn:stellar-enclosure:tianji:task:1" targetNamespace="urn:stellar-enclosure:tianji:fixtures">
+    <process id="timedHumanReview" isExecutable="true">
+        <startEvent id="start"/>
+        <userTask id="review" name="Review" task:kind="APPROVAL" task:initialLane="finance" task:approvalVariable="reviewApproved">
+            <extensionElements>
+                <task:taskLane key="finance" roleIds="50,51"/>
+                <task:taskField name="approved" target="reviewApproved" type="BOOLEAN"/>
+            </extensionElements>
+        </userTask>
+        <boundaryEvent id="reviewTimeout" attachedToRef="review" cancelActivity="true">
+            <timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>
+        </boundaryEvent>
+        <endEvent id="completed"/>
+        <endEvent id="timedOut"/>
+        <sequenceFlow id="startReview" sourceRef="start" targetRef="review"/>
+        <sequenceFlow id="reviewCompleted" sourceRef="review" targetRef="completed"/>
+        <sequenceFlow id="timeoutEnd" sourceRef="reviewTimeout" targetRef="timedOut"/>
+    </process>
+</definitions>

@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskTimerAvailability;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -245,6 +246,7 @@ public final class ProcessReleaseService {
         for (PreparedModel processModel : prepared) {
             if (processModel.model().type() != Type.BPMN) continue;
             if (!processModel.model().humanTasks().isEmpty() && !humanTasksEnabled) throw invalid();
+            if (!processModel.model().humanTaskTimers().isEmpty()) HumanTaskTimerAvailability.require(process);
             PreparedModel decision = null;
             if (!processModel.model().decisionTasks().isEmpty()) {
                 if (!decisionTasksEnabled) throw invalid();
