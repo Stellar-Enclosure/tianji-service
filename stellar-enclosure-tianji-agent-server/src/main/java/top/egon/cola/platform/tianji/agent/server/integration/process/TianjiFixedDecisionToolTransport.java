@@ -78,6 +78,13 @@ public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionT
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-fixed-decision-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
     }
 
+    public boolean usesBindings(TianjiFixedDecisionToolBindings candidate) { return candidate == bindings; }
+    public boolean usesOAuth(IdpServiceOAuth2Client candidate) { return candidate == oauth; }
+    public boolean usesAuthentication(TenantIssuerAuthenticationManagerComponent candidate) { return candidate == authentication; }
+    public boolean usesConverter(VerifiedPrincipalConverter candidate) { return candidate == converter; }
+    public boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return candidate == issuers; }
+    public boolean usesHttpClient(HttpClient candidate) { return candidate == http; }
+
     @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
         if (request == null || callback == null) throw new IllegalArgumentException("Fixed decision request and callback are required");
         if (closed.get() || Thread.currentThread().isInterrupted()) throw failure(FailureKind.CANCELLED);

@@ -47,6 +47,10 @@ stellar:
           concurrency: 4
           descriptors: []
           bindings: []
+        read-only-decision:
+          enabled: false
+          concurrency: 4
+          bindings: []
       memory:
         enabled: false
         extraction:

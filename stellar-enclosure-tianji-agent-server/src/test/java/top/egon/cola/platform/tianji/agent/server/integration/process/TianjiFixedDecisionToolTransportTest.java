@@ -75,6 +75,33 @@ class TianjiFixedDecisionToolTransportTest {
     private static final Set<String> SCOPES = Set.of(ProcessReleaseClient.READ_SCOPE, DecisionClient.EXECUTE_SCOPE);
     private static final TrustedAgentActor OWNER = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://owner.example/20");
 
+    @Test void affinity_observes_only_each_exact_constructor_instance_without_using_the_dependency() {
+        try (var fixture = new Fixture()) {
+            clearInvocations(fixture.oauth, fixture.authentication, fixture.converter, fixture.issuers, fixture.http);
+            assertAll(
+                    () -> assertTrue(fixture.transport.usesBindings(fixture.bindings)),
+                    () -> assertTrue(fixture.transport.usesOAuth(fixture.oauth)),
+                    () -> assertTrue(fixture.transport.usesAuthentication(fixture.authentication)),
+                    () -> assertTrue(fixture.transport.usesConverter(fixture.converter)),
+                    () -> assertTrue(fixture.transport.usesIssuerRegistry(fixture.issuers)),
+                    () -> assertTrue(fixture.transport.usesHttpClient(fixture.http)),
+                    () -> assertFalse(fixture.transport.usesBindings(null)),
+                    () -> assertFalse(fixture.transport.usesOAuth(null)),
+                    () -> assertFalse(fixture.transport.usesAuthentication(null)),
+                    () -> assertFalse(fixture.transport.usesConverter(null)),
+                    () -> assertFalse(fixture.transport.usesIssuerRegistry(null)),
+                    () -> assertFalse(fixture.transport.usesHttpClient(null)),
+                    () -> assertFalse(fixture.transport.usesBindings(new TianjiFixedDecisionToolBindings(List.of(fixture.descriptor), fixture.bindings.bindings()))),
+                    () -> assertFalse(fixture.transport.usesOAuth(mock(IdpServiceOAuth2Client.class))),
+                    () -> assertFalse(fixture.transport.usesAuthentication(mock(TenantIssuerAuthenticationManagerComponent.class))),
+                    () -> assertFalse(fixture.transport.usesConverter(mock(VerifiedPrincipalConverter.class))),
+                    () -> assertFalse(fixture.transport.usesIssuerRegistry(mock(TrustedIssuerRegistry.class))),
+                    () -> assertFalse(fixture.transport.usesHttpClient(mock(HttpClient.class))));
+            assertTrue(fixture.requests.isEmpty());
+            verifyNoInteractions(fixture.oauth, fixture.authentication, fixture.converter, fixture.issuers, fixture.http);
+        }
+    }
+
     @Test void verifies_an_independent_service_and_uses_the_actual_sdk_with_only_fixed_backend_inputs() throws Exception {
         try (var fixture = new Fixture()) {
             var seen = new AtomicReference<ReadOnlyDecisionToolTransport.VerifiedExecutor>();
@@ -359,6 +386,7 @@ class TianjiFixedDecisionToolTransportTest {
         final AtomicReference<Runnable> oauthWait = new AtomicReference<>(() -> { }), afterToken = new AtomicReference<>(() -> { }), afterGet = new AtomicReference<>(() -> { }), afterPost = new AtomicReference<>(() -> { });
         final List<HttpRequest> requests = java.util.Collections.synchronizedList(new ArrayList<>());
         final ToolDescriptor descriptor;
+        final TianjiFixedDecisionToolBindings bindings;
         final TianjiFixedDecisionToolTransport transport;
 
         Fixture() { this(Duration.ofSeconds(5)); }
@@ -368,7 +396,7 @@ class TianjiFixedDecisionToolTransportTest {
                     new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")), new ToolSchema(Map.of("eligible", ToolSchema.ValueType.BOOLEAN), Set.of("eligible")),
                     new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "decision.eligibility", DecisionClient.EXECUTE_RESOURCE_KEY, backend.bindingSha256(), null));
             var binding = new TianjiFixedDecisionToolBindings.BindingVO(20, OWNER.issuerFingerprint(), OWNER.subjectType(), "assistant", 1, DEF, descriptor.reference(), backend);
-            var bindings = new TianjiFixedDecisionToolBindings(List.of(descriptor), List.of(binding));
+            bindings = new TianjiFixedDecisionToolBindings(List.of(descriptor), List.of(binding));
             when(http.followRedirects()).thenReturn(HttpClient.Redirect.NEVER);
             when(oauth.authorizationKey(context)).thenAnswer(call -> key.get());
             when(oauth.authorizeBounded(eq(context), eq(ISSUER.toASCIIString()), any())).thenAnswer(call -> { oauthWait.get().run(); afterToken.get().run(); return token.get(); });
