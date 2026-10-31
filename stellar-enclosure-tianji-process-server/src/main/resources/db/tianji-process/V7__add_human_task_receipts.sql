@@ -1,0 +1,51 @@
+CREATE TABLE tianji_human_task_receipt (
+    tenant_id bigint NOT NULL CONSTRAINT human_task_tenant_id CHECK (tenant_id > 0),
+    subject_type varchar(16) NOT NULL CONSTRAINT human_task_subject_type CHECK (subject_type = 'USER'),
+    subject_issuer varchar(64) COLLATE "C" NOT NULL CONSTRAINT human_task_subject_issuer CHECK (subject_issuer ~ '^[0-9a-f]{64}$'),
+    subject_id varchar(256) COLLATE "C" NOT NULL,
+    command_type varchar(32) COLLATE "C" NOT NULL CONSTRAINT human_task_command_type CHECK (command_type = ANY(ARRAY['TASK_CLAIM','TASK_UNCLAIM','TASK_TRANSFER','TASK_COMPLETE'])),
+    command_id varchar(128) COLLATE "C" NOT NULL,
+    request_sha256 char(64) COLLATE "C" NOT NULL CONSTRAINT human_task_request_sha256 CHECK (request_sha256 ~ '^[0-9a-f]{64}$'),
+    task_id varchar(255) COLLATE "C" NOT NULL,
+    process_instance_id varchar(255) COLLATE "C" NOT NULL,
+    release_key varchar(128) COLLATE "C" NOT NULL,
+    model_type varchar(8) NOT NULL DEFAULT 'BPMN' CONSTRAINT human_task_model_type CHECK (model_type = 'BPMN'),
+    definition_key varchar(128) COLLATE "C" NOT NULL,
+    definition_sha256 char(64) COLLATE "C" NOT NULL CONSTRAINT human_task_definition_sha256 CHECK (definition_sha256 ~ '^[0-9a-f]{64}$'),
+    engine_definition_id varchar(255) COLLATE "C" NOT NULL,
+    task_definition_key varchar(128) COLLATE "C" NOT NULL,
+    task_kind varchar(16) COLLATE "C" NOT NULL CONSTRAINT human_task_kind CHECK (task_kind = ANY(ARRAY['ACTION','APPROVAL'])),
+    lane_key varchar(128) COLLATE "C" NOT NULL,
+    previous_version char(64) COLLATE "C" NOT NULL CONSTRAINT human_task_previous_version CHECK (previous_version ~ '^[0-9a-f]{64}$'),
+    resulting_version char(64) COLLATE "C" CONSTRAINT human_task_resulting_version CHECK (resulting_version IS NULL OR resulting_version ~ '^[0-9a-f]{64}$'),
+    approval_receipt_id varchar(255) COLLATE "C",
+    approved boolean,
+    requester_type varchar(16) NOT NULL CONSTRAINT human_task_requester_type CHECK (requester_type = ANY(ARRAY['USER','SERVICE'])),
+    requester_issuer varchar(64) COLLATE "C" NOT NULL CONSTRAINT human_task_requester_issuer CHECK (requester_issuer = subject_issuer),
+    requester_id varchar(256) COLLATE "C" NOT NULL,
+    start_command_type varchar(32) COLLATE "C" NOT NULL DEFAULT 'START' CONSTRAINT human_task_start_command_type CHECK (start_command_type = 'START'),
+    start_command_id varchar(128) COLLATE "C" NOT NULL,
+    start_request_sha256 char(64) COLLATE "C" NOT NULL CONSTRAINT human_task_start_request_sha256 CHECK (start_request_sha256 ~ '^[0-9a-f]{64}$'),
+    correlation_id varchar(128) COLLATE "C" NOT NULL,
+    authorized_role_id bigint CONSTRAINT human_task_role_id CHECK (authorized_role_id > 0),
+    auth_version bigint NOT NULL CONSTRAINT human_task_auth_version CHECK (auth_version >= 0),
+    policy_version bigint NOT NULL CONSTRAINT human_task_policy_version CHECK (policy_version >= 0),
+    previous_assignee varchar(255) COLLATE "C",
+    resulting_assignee varchar(255) COLLATE "C",
+    occurred_at timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id,subject_type,subject_issuer,subject_id,command_type,command_id),
+    FOREIGN KEY (tenant_id,subject_type,subject_issuer,subject_id,command_type,command_id)
+        REFERENCES tianji_process_command_receipt (tenant_id,subject_type,subject_issuer,subject_id,command_type,command_id),
+    FOREIGN KEY (tenant_id,requester_type,requester_issuer,requester_id,start_command_type,start_command_id)
+        REFERENCES tianji_process_command_receipt (tenant_id,subject_type,subject_issuer,subject_id,command_type,command_id),
+    FOREIGN KEY (tenant_id,release_key,model_type,definition_key)
+        REFERENCES tianji_process_release_definition (tenant_id,release_key,model_type,definition_key),
+    CONSTRAINT human_task_result_version CHECK ((command_type = 'TASK_COMPLETE' AND resulting_version IS NULL) OR (command_type <> 'TASK_COMPLETE' AND resulting_version IS NOT NULL)),
+    CONSTRAINT human_task_decision_kind CHECK ((command_type = 'TASK_COMPLETE' AND task_kind = 'APPROVAL' AND approval_receipt_id IS NOT NULL AND approved IS NOT NULL) OR ((command_type <> 'TASK_COMPLETE' OR task_kind <> 'APPROVAL') AND approval_receipt_id IS NULL AND approved IS NULL)),
+    CONSTRAINT human_task_applicant_separation CHECK (command_type <> 'TASK_COMPLETE' OR task_kind <> 'APPROVAL' OR requester_type <> 'USER' OR requester_id <> subject_id),
+    CONSTRAINT human_task_assignment CHECK ((command_type = 'TASK_CLAIM' AND previous_assignee IS NULL AND resulting_assignee IS NOT NULL) OR (command_type = 'TASK_UNCLAIM' AND previous_assignee IS NOT NULL AND resulting_assignee IS NULL) OR (command_type = 'TASK_TRANSFER' AND resulting_assignee IS NULL) OR (command_type = 'TASK_COMPLETE' AND previous_assignee IS NOT NULL AND resulting_assignee IS NULL)),
+    CONSTRAINT human_task_authorized_role CHECK ((command_type = ANY(ARRAY['TASK_CLAIM','TASK_COMPLETE']) AND authorized_role_id IS NOT NULL) OR (command_type = ANY(ARRAY['TASK_UNCLAIM','TASK_TRANSFER']) AND authorized_role_id IS NULL))
+);
+
+CREATE UNIQUE INDEX tianji_human_task_approval_idx ON tianji_human_task_receipt (tenant_id,subject_issuer,approval_receipt_id) WHERE approval_receipt_id IS NOT NULL;
+CREATE UNIQUE INDEX tianji_human_task_completed_idx ON tianji_human_task_receipt (tenant_id,subject_issuer,task_id) WHERE command_type='TASK_COMPLETE';

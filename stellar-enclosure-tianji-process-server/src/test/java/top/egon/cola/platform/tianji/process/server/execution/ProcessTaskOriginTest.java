@@ -45,4 +45,18 @@ class ProcessTaskOriginTest {
         doReturn(List.of(reference, reference)).when(jdbc).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
         assertThrows(ProcessResourceNotFoundException.class, () -> store.taskOrigin(REVIEWER, "instance"));
     }
+
+    @Test void optional_command_lookup_preserves_the_required_lookup_and_exact_actor_fence() {
+        var jdbc = mock(JdbcTemplate.class); var store = new ProcessCommandReceiptStore(jdbc, "tianji_process");
+        when(jdbc.query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class))).thenReturn(List.of());
+        assertTrue(store.lockIfPresent(REVIEWER, ProcessCommandReceiptStore.Kind.TASK_COMPLETE, "complete").isEmpty());
+        assertThrows(ProcessResourceNotFoundException.class, () -> store.lock(REVIEWER, ProcessCommandReceiptStore.Kind.TASK_COMPLETE, "complete"));
+        verify(jdbc, times(2)).query(argThat(sql -> sql.contains("subject_type=? AND subject_issuer=? AND subject_id=? AND command_type=? AND command_id=? FOR UPDATE")
+                        && sql.contains("NULL::text AS decision_result")), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), eq(20L), eq("USER"), eq(REVIEWER.issuerFingerprint()), eq("reviewer"), eq("TASK_COMPLETE"), eq("complete"));
+        var receipt = new ProcessCommandReceiptStore.Receipt("a".repeat(64), "release", "correlation", "APPLIED", "task", Instant.EPOCH, null);
+        doReturn(List.of(receipt)).when(jdbc).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
+        assertEquals(receipt, store.lock(REVIEWER, ProcessCommandReceiptStore.Kind.TASK_COMPLETE, "complete"));
+        doReturn(List.of(receipt, receipt)).when(jdbc).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
+        assertThrows(IllegalStateException.class, () -> store.lockIfPresent(REVIEWER, ProcessCommandReceiptStore.Kind.TASK_COMPLETE, "complete"));
+    }
 }

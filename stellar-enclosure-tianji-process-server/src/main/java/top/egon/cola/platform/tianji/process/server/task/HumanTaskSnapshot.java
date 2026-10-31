@@ -74,6 +74,7 @@ public final class HumanTaskSnapshot {
 
     public String version() { return version; }
     public String taskId() { return taskId; }
+    public String taskDefinitionKey() { return taskDefinitionKey; }
     public TaskOrigin origin() { return origin; }
     public Definition definition() { return definition; }
     public HumanTask policy() { return policy; }

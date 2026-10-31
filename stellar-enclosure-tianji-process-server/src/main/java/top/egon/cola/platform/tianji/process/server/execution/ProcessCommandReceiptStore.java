@@ -6,10 +6,11 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoun
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 /** Local transaction participant for scoped idempotency receipts. */
 public final class ProcessCommandReceiptStore {
-    public enum Kind { START, DECISION, AGENT_RESULT }
+    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE }
 
     private final JdbcTemplate jdbc;
     private final String table;
@@ -32,6 +33,10 @@ public final class ProcessCommandReceiptStore {
     }
 
     public Receipt lock(ProcessActor actor, Kind kind, String commandId) {
+        return lockIfPresent(actor, kind, commandId).orElseThrow(ProcessResourceNotFoundException::new);
+    }
+
+    public Optional<Receipt> lockIfPresent(ProcessActor actor, Kind kind, String commandId) {
         String result = kind == Kind.DECISION ? "decision_result::text" : "NULL::text";
         List<Receipt> rows = jdbc.query("SELECT request_sha256, release_key, correlation_id, state, resource_id, created_at, "
                         + result + " AS decision_result FROM " + table
@@ -39,7 +44,7 @@ public final class ProcessCommandReceiptStore {
                 (rs, row) -> new Receipt(rs.getString("request_sha256"), rs.getString("release_key"), rs.getString("correlation_id"),
                         rs.getString("state"), rs.getString("resource_id"), rs.getTimestamp("created_at").toInstant(),
                         rs.getString("decision_result")), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), kind.name(), commandId);
-        return one(rows);
+        if (rows.size() > 1) throw new IllegalStateException("Process command receipt is ambiguous"); return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
     }
 
     public Receipt startByInstance(ProcessActor actor, String instanceId) {
