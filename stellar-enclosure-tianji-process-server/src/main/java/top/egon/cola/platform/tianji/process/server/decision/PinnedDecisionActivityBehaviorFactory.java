@@ -3,9 +3,11 @@ package top.egon.cola.platform.tianji.process.server.decision;
 import org.flowable.bpmn.model.SendTask;
 import org.flowable.bpmn.model.ServiceTask;
 import org.flowable.bpmn.model.Task;
+import org.flowable.bpmn.model.UserTask;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.delegate.DelegateExecution;
 import org.flowable.engine.impl.bpmn.behavior.DmnActivityBehavior;
+import org.flowable.engine.impl.bpmn.behavior.UserTaskActivityBehavior;
 import org.flowable.engine.impl.bpmn.parser.factory.DefaultActivityBehaviorFactory;
 import org.flowable.engine.impl.util.CommandContextUtil;
 import org.flowable.spring.SpringProcessEngineConfiguration;
@@ -16,12 +18,19 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
+import top.egon.cola.platform.tianji.process.server.task.PinnedHumanTaskActivityBehavior;
 
 import java.util.HashMap;
 import java.util.Map;
 
-/** Replaces Flowable's latest-version DMN fallback with the process release binding. */
+/** Binds native decision execution and governed user-task assignment to the immutable process release. */
 public final class PinnedDecisionActivityBehaviorFactory extends DefaultActivityBehaviorFactory {
+    @Override
+    public UserTaskActivityBehavior createUserTaskActivityBehavior(UserTask task) {
+        return task.getAttributeValue("urn:stellar-enclosure:tianji:task:1", "kind") == null
+                ? super.createUserTaskActivityBehavior(task) : new PinnedHumanTaskActivityBehavior(task);
+    }
+
     @Override
     public DmnActivityBehavior createDmnActivityBehavior(ServiceTask task) {
         return new PinnedDecisionActivityBehavior(task);
