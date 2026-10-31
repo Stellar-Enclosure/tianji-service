@@ -22,6 +22,7 @@ import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkReadOnlyDecisionToolBridge;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
@@ -50,7 +51,8 @@ public class TianjiAgentRuntimeAutoConfiguration {
             @Qualifier("tianjiAgentCodeFirstFactories") Map<String, Function<Scheduler, ? extends BaseAgent>> factories,
             @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control,
             AgentModelBudgetEstimator estimator, AgentRunAuthorization authorizer, Environment environment,
-            ObjectProvider<DefaultContextAssembler> contexts) {
+            ObjectProvider<DefaultContextAssembler> contexts,
+            @Qualifier("tianjiAdkReadOnlyDecisionTools") ObjectProvider<AdkReadOnlyDecisionToolBridge> tools) {
         if (!ledger.usesDataSource(dataSource)) throw new IllegalStateException("TIANJI_RUNTIME_DATA_SOURCE_MISMATCH");
         if (chatModels.isEmpty() && factories.isEmpty()) throw new IllegalStateException("TIANJI_RUNTIME_MODEL_REQUIRED");
         if (chatModels.keySet().stream().anyMatch(key -> key == null || key.isBlank())
@@ -63,8 +65,10 @@ public class TianjiAgentRuntimeAutoConfiguration {
         var contextOptions = new AgentContextRuntimeOptions(snapshots, trimming);
         if (!snapshots) new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
+        boolean readOnlyTools = environment.getProperty("stellar.tianji.agent.tools.read-only-decision.enabled", Boolean.class, false);
         return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
-                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), contextOptions);
+                dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), contextOptions,
+                readOnlyTools ? tools::getObject : null);
     }
 
     @Bean(destroyMethod = "close")

@@ -1,6 +1,11 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.agents.CallbackContext;
+import com.google.adk.agents.InvocationContext;
+import com.google.adk.agents.LlmAgent;
+import com.google.adk.sessions.Session;
+import com.google.adk.tools.BaseTool;
+import com.google.adk.tools.ToolContext;
 import com.google.adk.models.LlmRequest;
 import com.google.genai.types.Content;
 import com.google.genai.types.GenerateContentConfig;
@@ -37,6 +42,8 @@ import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -184,6 +191,133 @@ class AdkRunContextTest {
         plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
                 new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
                 Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization, true);
+    }
+
+    @Test
+    void tool_handoff_uses_the_admitted_leaf_identity_across_distinct_callback_wrappers_on_context_io() {
+        var scope = tools(); var nativeContext = nativeContext("writer", false);
+        var thread = new AtomicReference<Thread>();
+        var tool = scope.declaredTools().getFirst();
+        when(scope.execute(eq(tool), anyMap(), any(), eq("writer"))).thenAnswer(call -> {
+            thread.set(Thread.currentThread()); return Map.of("status", "SUCCEEDED", "output", Map.of("value", "done"));
+        });
+        plugin.beforeModelCallback(modelContext(nativeContext, "call-one"), request()).blockingGet();
+        var result = plugin.beforeToolCallback(tool, Map.of("amount", 7L), toolContext(nativeContext)).blockingGet();
+        assertEquals("SUCCEEDED", result.get("status")); assertNotSame(Thread.currentThread(), thread.get());
+        var id = org.mockito.ArgumentCaptor.forClass(java.util.UUID.class);
+        verify(scope).execute(eq(tool), eq(Map.of("amount", 7L)), id.capture(), eq("writer"));
+        assertNotNull(id.getValue()); assertNotEquals("private-native-call-id", id.getValue().toString());
+    }
+
+    @Test
+    void an_equal_looking_foreign_context_or_same_name_foreign_tool_never_reaches_the_scope() {
+        var scope = tools(); var admitted = nativeContext("writer", false);
+        plugin.beforeModelCallback(modelContext(admitted, "call-one"), request()).blockingGet();
+        BaseTool tool = scope.declaredTools().getFirst(); var foreign = nativeContext("writer", false);
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(tool, Map.of(), toolContext(foreign)).blockingGet());
+        String toolName = tool.name(); var sameName = mock(BaseTool.class); when(sameName.name()).thenReturn(toolName);
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(sameName, Map.of(), toolContext(admitted)).blockingGet());
+        verify(scope, never()).execute(any(), anyMap(), any(), anyString());
+    }
+
+    @Test
+    void every_leaf_is_admitted_individually_and_close_revokes_all_retained_contexts() {
+        var scope = tools(); var first = nativeContext("writer", false); var second = nativeContext("reviewer", false);
+        when(scope.execute(any(), anyMap(), any(), anyString())).thenReturn(Map.of("status", "SUCCEEDED"));
+        plugin.beforeModelCallback(modelContext(first, "round-one"), request()).blockingGet();
+        plugin.beforeModelCallback(modelContext(second, "round-two"), request()).blockingGet();
+        plugin.beforeModelCallback(modelContext(first, "round-three"), request()).blockingGet();
+        var tool = scope.declaredTools().getFirst();
+        assertNotNull(plugin.beforeToolCallback(tool, Map.of(), toolContext(first)).blockingGet());
+        assertNotNull(plugin.beforeToolCallback(tool, Map.of(), toolContext(second)).blockingGet());
+        plugin.close().blockingAwait();
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(tool, Map.of(), toolContext(first)).blockingGet());
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeModelCallback(modelContext(nativeContext("late", false), "after-close"), request()).blockingGet());
+        verify(scope, times(2)).execute(any(), anyMap(), any(), anyString());
+    }
+
+    @Test
+    void native_context_identity_admission_is_bounded_even_when_the_budget_fixture_still_accepts_reservations() {
+        var scope = tools();
+        for (int index = 0; index < snapshot.effectivePolicy().maxModelCalls(); index++) {
+            assertNull(plugin.beforeModelCallback(modelContext(nativeContext("leaf_" + index, false), "call_" + index), request()).blockingGet());
+        }
+        var overflow = nativeContext("overflow", false);
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeModelCallback(modelContext(overflow, "overflow"), request()).blockingGet());
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(scope.declaredTools().getFirst(), Map.of(), toolContext(overflow)).blockingGet());
+        verify(budgets, times(snapshot.effectivePolicy().maxModelCalls())).reserveBudget(eq(actor), eq(lease), any());
+        verify(scope, never()).execute(any(), anyMap(), any(), anyString());
+    }
+
+    @Test
+    void failed_model_governance_and_changed_native_session_identity_do_not_admit_tool_calls() {
+        var scope = tools(); var denied = nativeContext("writer", false);
+        doThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "revoked"))
+                .when(provider).revalidate(any(), anyList());
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeModelCallback(modelContext(denied, "denied"), request()).blockingGet());
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(scope.declaredTools().getFirst(), Map.of(), toolContext(denied)).blockingGet());
+        reset(provider); when(provider.provide(any())).thenReturn(List.of(new ContextProvider.Fragment(ContextProvider.Kind.PROMPT,
+                "fixed", "2", "d".repeat(64), "published-reference", "published instruction", NOW)));
+        tools();
+        assertNull(plugin.beforeModelCallback(modelContext(nativeContext("writer", false), "healthy"), request()).blockingGet());
+        clearInvocations(budgets);
+        var bad = nativeContext("writer", false); when(bad.appName()).thenReturn("foreign-app");
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeModelCallback(modelContext(bad, "foreign"), request()).blockingGet());
+        verifyNoInteractions(budgets);
+        verify(scope, never()).execute(any(), anyMap(), any(), anyString());
+    }
+
+    @Test
+    void durable_session_fencing_is_rechecked_before_tool_dispatch_after_model_admission() {
+        authorization = new AgentRunAuthorization.Request(actor, authorization.runId(), authorization.definitionKey(), authorization.definitionVersion(),
+                authorization.definitionSha256(), authorization.requestSha256(), authorization.snapshotSha256(), authorization.policyVersionRef(), true, authorization.deadlineAt());
+        var scope = tools(); var live = new AtomicBoolean(true);
+        when(ledger.sessionContextHistory(eq(actor), eq(lease), eq(authorization), eq("session"), any()))
+                .thenReturn(new AgentLedgerService.ContextHistory(List.of(), Set.of(), true, false, true));
+        plugin.bindSessionFence(() -> { if (!live.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "fenced"); });
+        var context = nativeContext("writer", true);
+        plugin.beforeModelCallback(modelContext(context, "call-one"), request()).blockingGet(); live.set(false);
+        assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, assertThrows(AgentLedgerException.class,
+                () -> plugin.beforeToolCallback(scope.declaredTools().getFirst(), Map.of(), toolContext(context)).blockingGet()).code());
+        verify(scope, never()).execute(any(), anyMap(), any(), anyString());
+    }
+
+    private AdkReadOnlyDecisionToolBridge.RunScope tools() {
+        plugin.close().blockingAwait();
+        var scope = mock(AdkReadOnlyDecisionToolBridge.RunScope.class); var tool = mock(BaseTool.class);
+        when(tool.name()).thenReturn("fixed_decision"); when(scope.declaredTools()).thenReturn(List.of(tool));
+        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
+                new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
+                Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization,
+                new AgentContextRuntimeOptions(false, false), scope);
+        return scope;
+    }
+
+    private InvocationContext nativeContext(String name, boolean durable) {
+        var context = mock(InvocationContext.class);
+        String app = durable ? "tianji" : "tianji_run_one";
+        String user = durable ? "USER:alice" : "20:USER:alice";
+        var session = Session.builder("session").appName(app).userId(user).state(Map.of()).build();
+        when(context.appName()).thenReturn(app); when(context.userId()).thenReturn(user);
+        when(context.session()).thenReturn(session); when(context.invocationId()).thenReturn("invocation");
+        var agent = mock(LlmAgent.class); when(agent.name()).thenReturn(name); when(context.agent()).thenReturn(agent);
+        return context;
+    }
+
+    private static CallbackContext modelContext(InvocationContext nativeContext, String eventId) {
+        String name = nativeContext.agent().name(); String user = nativeContext.userId();
+        var context = callback(eventId); when(context.invocationContext()).thenReturn(nativeContext);
+        when(context.agentName()).thenReturn(name); when(context.userId()).thenReturn(user);
+        return context;
+    }
+
+    private static ToolContext toolContext(InvocationContext nativeContext) {
+        String name = nativeContext.agent().name(); String invocation = nativeContext.invocationId();
+        String user = nativeContext.userId(); String session = nativeContext.session().id();
+        var context = mock(ToolContext.class); when(context.invocationContext()).thenReturn(nativeContext);
+        when(context.agentName()).thenReturn(name); when(context.invocationId()).thenReturn(invocation);
+        when(context.userId()).thenReturn(user); when(context.sessionId()).thenReturn(session);
+        when(context.functionCallId()).thenReturn(java.util.Optional.of("private-native-call-id")); return context;
     }
 
     private AgentBudgetReservation reservation(AgentBudgetRequest request) {

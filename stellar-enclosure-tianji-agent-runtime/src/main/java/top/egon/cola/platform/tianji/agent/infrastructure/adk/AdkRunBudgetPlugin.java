@@ -1,6 +1,8 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.agents.CallbackContext;
+import com.google.adk.agents.InvocationContext;
+import com.google.adk.agents.LlmAgent;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import com.google.adk.plugins.Plugin;
@@ -29,12 +31,17 @@ import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextTrimDecisionDTO;
+import top.egon.cola.component.agentflow.runtime.AgentFlowSchedulers;
 
 import java.util.Map;
 import java.util.List;
 import java.util.ArrayList;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -56,6 +63,11 @@ final class AdkRunBudgetPlugin implements Plugin {
     private DefaultContextAssembler.ResolvedSources contextSources;
     private final AdkContextSnapshotProjector snapshots;
     private final boolean trimming;
+    private final AdkReadOnlyDecisionToolBridge.RunScope toolScope;
+    private final Set<InvocationContext> admittedContexts = Collections.newSetFromMap(new IdentityHashMap<>());
+    private boolean closed;
+    private String nativeSessionId;
+    private String nativeInvocationId;
     private final java.util.concurrent.atomic.AtomicReference<Runnable> sessionFence = new java.util.concurrent.atomic.AtomicReference<>();
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
@@ -83,6 +95,21 @@ final class AdkRunBudgetPlugin implements Plugin {
                        AgentExecutionAuthorization authorization, Scheduler retryScheduler,
                        ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
                        AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions) {
+        this(ledger, actor, lease, snapshot, estimator, authorization, retryScheduler, controlExecutor,
+                contextAssembler, authorizationRequest, contextOptions, null);
+    }
+
+    @Override
+    public String getName() {
+        return "tianji-run-budget";
+    }
+
+    AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
+                       AgentExecutionSnapshot snapshot, AgentModelBudgetEstimator estimator,
+                       AgentExecutionAuthorization authorization, Scheduler retryScheduler,
+                       ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
+                       AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions,
+                       AdkReadOnlyDecisionToolBridge.RunScope toolScope) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
@@ -95,11 +122,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         this.authorizationRequest = Objects.requireNonNull(authorizationRequest, "authorizationRequest");
         this.snapshots = contextOptions.snapshots() ? new AdkContextSnapshotProjector(snapshot, authorizationRequest, lease, contextAssembler) : null;
         this.trimming = contextOptions.trimming();
-    }
-
-    @Override
-    public String getName() {
-        return "tianji-run-budget";
+        this.toolScope = toolScope;
     }
 
     void bindSessionFence(Runnable fence) {
@@ -116,6 +139,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         var preparedContext = new java.util.concurrent.atomic.AtomicReference<AdkContextSnapshotProjector.PreparedCall>();
         var contextPlan = new java.util.concurrent.atomic.AtomicReference<AdkContextWindowPlan>();
         return safeErrors(Maybe.<LlmResponse>defer(() -> {
+            if (toolScope != null) requireNativeContext(context, false);
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
             requireSessionFence();
             long sourceDeadline = authorizationRequest.sessionRequired() || contextAssembler.hasProviders() ? System.nanoTime() + sourceTimeout().toNanos() : 0;
@@ -177,13 +201,21 @@ final class AdkRunBudgetPlugin implements Plugin {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
                         "model call reservation was already used");
             }
-            IdleGuard guard = new IdleGuard(snapshot.effectivePolicy().modelIdleTimeout().toNanos());
-            if (idleGuards.putIfAbsent(context.eventId(), guard) != null) {
-                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
-                        "model call idle guard was already registered");
+            synchronized (admittedContexts) {
+                if (toolScope != null) requireNativeContext(context, false);
+                IdleGuard guard = new IdleGuard(snapshot.effectivePolicy().modelIdleTimeout().toNanos());
+                if (idleGuards.putIfAbsent(context.eventId(), guard) != null) {
+                    throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
+                            "model call idle guard was already registered");
+                }
+                guard.touch();
+                if (snapshots == null) request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
+                if (toolScope != null) {
+                    InvocationContext nativeContext = context.invocationContext();
+                    nativeSessionId = context.sessionId(); nativeInvocationId = context.invocationId();
+                    admittedContexts.add(nativeContext);
+                }
             }
-            guard.touch();
-            if (snapshots == null) request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
             return Maybe.empty();
         }).retryWhen(errors -> errors.flatMap(failure -> {
             if (failure instanceof AgentLedgerException capacity
@@ -308,6 +340,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public io.reactivex.rxjava3.core.Completable close() {
         return io.reactivex.rxjava3.core.Completable.fromAction(() -> {
+            synchronized (admittedContexts) { closed = true; admittedContexts.clear(); }
             idleGuards.values().forEach(IdleGuard::close);
             idleGuards.clear();
             idleSignal.onComplete();
@@ -363,8 +396,40 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<Map<String, Object>> beforeToolCallback(BaseTool tool, Map<String, Object> arguments,
                                                           ToolContext context) {
-        return Maybe.error(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+        if (toolScope == null) return Maybe.error(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                 "governed tool execution is not available"));
+        return safeErrors(Maybe.fromCallable(() -> {
+            requireNativeContext(context, true);
+            if (toolScope.declaredTools().stream().noneMatch(candidate -> candidate == tool)) throw nativeContextUnavailable();
+            requireSessionFence();
+            return Objects.requireNonNull(toolScope.execute(tool, arguments, UUID.randomUUID(), context.agentName()), "governed tool result");
+        }).subscribeOn(AgentFlowSchedulers.contextAwareIo()));
+    }
+
+    private void requireNativeContext(CallbackContext context, boolean admitted) {
+        InvocationContext nativeContext = context == null ? null : context.invocationContext();
+        String app = authorizationRequest.sessionRequired() ? "tianji" : "tianji_" + lease.runId().replace('-', '_');
+        String user = (authorizationRequest.sessionRequired() ? "" : actor.tenantId() + ":") + actor.subjectType().name() + ":" + actor.subjectId();
+        if (nativeContext == null || nativeContext.session() == null || !(nativeContext.agent() instanceof LlmAgent)
+                || !app.equals(nativeContext.appName()) || !app.equals(nativeContext.session().appName())
+                || !user.equals(nativeContext.userId()) || !user.equals(nativeContext.session().userId())
+                || !user.equals(context.userId()) || !Objects.equals(nativeContext.agent().name(), context.agentName())
+                || nativeContext.invocationId() == null || nativeContext.invocationId().isBlank()
+                || !nativeContext.invocationId().equals(context.invocationId()) || !nativeContext.session().id().equals(context.sessionId())) {
+            throw nativeContextUnavailable();
+        }
+        synchronized (admittedContexts) {
+            if (closed || nativeSessionId != null && !nativeSessionId.equals(context.sessionId())
+                    || nativeInvocationId != null && !nativeInvocationId.equals(context.invocationId())
+                    || admitted && !admittedContexts.contains(nativeContext)
+                    || !admitted && !admittedContexts.contains(nativeContext) && admittedContexts.size() >= snapshot.effectivePolicy().maxModelCalls()) {
+                throw nativeContextUnavailable();
+            }
+        }
+    }
+
+    private static AgentLedgerException nativeContextUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "governed native tool context is unavailable");
     }
 
     private AgentModelBudgetEstimator.Estimate estimate(LlmRequest request) {

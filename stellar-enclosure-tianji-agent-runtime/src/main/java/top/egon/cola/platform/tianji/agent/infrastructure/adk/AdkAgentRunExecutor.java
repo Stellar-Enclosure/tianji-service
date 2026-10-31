@@ -9,6 +9,7 @@ import com.google.adk.agents.RunConfig;
 import com.google.adk.agents.SequentialAgent;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.Session;
+import com.google.adk.tools.BaseTool;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Flowable;
@@ -61,6 +62,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Executes one explicitly selected queued run; it does not schedule or expose an endpoint. */
 public final class AdkAgentRunExecutor {
@@ -80,6 +82,8 @@ public final class AdkAgentRunExecutor {
     private final boolean typedSessionWrites;
     private final DefaultContextAssembler contextAssembler;
     private final AgentContextRuntimeOptions contextOptions;
+    private final Supplier<AdkReadOnlyDecisionToolBridge> readOnlyDecisionToolSupplier;
+    private volatile AdkReadOnlyDecisionToolBridge readOnlyDecisionToolBridge;
     private final ObjectMapper mapper = new ObjectMapper();
     private final AdkEventProjector projector = new AdkEventProjector();
 
@@ -146,6 +150,18 @@ public final class AdkAgentRunExecutor {
                                ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
                                DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
                                DefaultContextAssembler contextAssembler, AgentContextRuntimeOptions contextOptions) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, typedSessionWrites, authorizer, contextAssembler, contextOptions, null);
+    }
+
+    /** Fixed read-only tools are resolved after the host has installed its telemetry policy. */
+    public AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
+                               DefaultContextAssembler contextAssembler, AgentContextRuntimeOptions contextOptions,
+                               Supplier<AdkReadOnlyDecisionToolBridge> readOnlyDecisionTools) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -156,6 +172,7 @@ public final class AdkAgentRunExecutor {
         this.authorizer = Objects.requireNonNull(authorizer, "authorizer");
         this.contextAssembler = Objects.requireNonNull(contextAssembler, "contextAssembler");
         this.contextOptions = Objects.requireNonNull(contextOptions, "contextOptions");
+        this.readOnlyDecisionToolSupplier = readOnlyDecisionTools;
         if (sessionDataSource != null && !ledger.usesDataSource(sessionDataSource)) {
             throw new IllegalArgumentException("Agent sessions and runs require the same DataSource");
         }
@@ -166,6 +183,27 @@ public final class AdkAgentRunExecutor {
 
     /** Lets a host verify that its dispatcher uses the intended authorization boundary. */
     public boolean usesAuthorization(AgentRunAuthorization candidate) { return authorizer == candidate; }
+
+    public boolean usesReadOnlyDecisionTools(AdkReadOnlyDecisionToolBridge candidate) {
+        return candidate != null && readOnlyDecisionToolSupplier != null && readOnlyDecisionTools() == candidate;
+    }
+
+    private AdkReadOnlyDecisionToolBridge readOnlyDecisionTools() {
+        var selected = readOnlyDecisionToolBridge;
+        if (selected == null) {
+            synchronized (this) {
+                selected = readOnlyDecisionToolBridge;
+                if (selected == null) {
+                    try { selected = Objects.requireNonNull(readOnlyDecisionToolSupplier.get(), "read-only decision tools"); }
+                    catch (RuntimeException failure) {
+                        throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "governed read-only tools are unavailable");
+                    }
+                    readOnlyDecisionToolBridge = selected;
+                }
+            }
+        }
+        return selected;
+    }
 
     /** Lets a host verify that discovery and execution use the same ledger. */
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
@@ -242,18 +280,27 @@ public final class AdkAgentRunExecutor {
         AgentRunDTO running = claimed.run();
         AgentRunLease lease = claimed.lease();
         AtomicReference<AgentRunDTO> current = new AtomicReference<>(running);
+        RunEventSink eventSink = new RunEventSink(actor, lease, current);
         Runner runner = null;
         PostgresAdkSessionService sessions = null;
         SessionLease sessionLease = null;
+        AdkReadOnlyDecisionToolBridge.RunScope toolScope = null;
+        boolean readOnlyToolsBound = false;
         boolean invocationStarted = false;
         try {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
             var input = contextAssembler.assemble(snapshot.input());
-            BaseAgent root = buildRoot(snapshot.definition());
-            requireNoTools(root);
+            var dependencies = snapshot.definition().dependencies();
+            if (!dependencies.tools().isEmpty() || !snapshot.effectivePolicy().allowedToolVersions().isEmpty()) {
+                toolScope = readOnlyDecisionTools().bind(material, lease, eventSink::tool);
+                readOnlyToolsBound = !toolScope.declaredTools().isEmpty() && "NONE".equals(toolScope.sideEffectOutcome());
+            }
+            List<BaseTool> tools = toolScope == null ? List.of() : toolScope.declaredTools();
+            BaseAgent root = buildRoot(snapshot.definition(), tools);
+            requireGovernedTools(root, tools);
             AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
-                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextOptions);
+                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextOptions, toolScope);
             String userId;
             String sessionId;
             if (running.sessionId() == null) {
@@ -306,9 +353,9 @@ public final class AdkAgentRunExecutor {
                         if (projected.completeAgentOutput()) {
                             agentOutputs.put(projected.author(), (String) projected.payload().get("text"));
                         }
-                        current.set(ledger.appendEvent(actor, lease, current.get().revision(),
-                                projected.type(), projected.author(), projected.payload()));
+                        eventSink.append(projected.type(), projected.author(), projected.payload());
                     }));
+            eventSink.seal();
             if (agentOutputs.isEmpty()) {
                 throw new IllegalStateException("ADK root completed without a usable agent output");
             }
@@ -319,12 +366,13 @@ public final class AdkAgentRunExecutor {
                 output.put("text", agentOutputs.get(finalAgent));
             }
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.COMPLETED,
-                    output, null, snapshot.definition().outputSchemaVersion(), null, null, "UNKNOWN");
+                    output, null, snapshot.definition().outputSchemaVersion(), null, null, readOnlyToolsBound ? "NONE" : "UNKNOWN");
             return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } catch (RuntimeException failure) {
+            eventSink.seal();
             AgentExecutionAuthorization.Failure authorizationFailure = findCause(failure, AgentExecutionAuthorization.Failure.class);
             if (authorizationFailure != null) {
-                return suspendForAuthorizationOrResolve(actor, lease, authorizationFailure.decision());
+                return suspendForAuthorizationOrResolve(actor, lease, authorizationFailure.decision(), readOnlyToolsBound ? "NONE" : "UNKNOWN");
             }
             if (failure instanceof AgentLedgerException conflict
                     && (conflict.code() == AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT
@@ -334,7 +382,7 @@ public final class AdkAgentRunExecutor {
                     return latest;
                 }
                 if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()) {
-                    return finishCancellation(actor, lease, latest);
+                    return finishCancellation(actor, lease, latest, readOnlyToolsBound ? "NONE" : "UNKNOWN");
                 }
                 if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
                     return ledger.expireDeadline(actor, query, latest.revision());
@@ -342,11 +390,11 @@ public final class AdkAgentRunExecutor {
                 throw failure;
             }
             if (hasCause(failure, CancellationSignal.class)) {
-                return finishCancellation(actor, lease, ledger.get(actor, query));
+                return finishCancellation(actor, lease, ledger.get(actor, query), readOnlyToolsBound ? "NONE" : "UNKNOWN");
             }
             if (hasCause(failure, AdkRunBudgetPlugin.ModelIdleTimeout.class)) {
                 AgentExecutionResult idle = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.TIMED_OUT,
-                        Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_MODEL_IDLE_TIMEOUT.name(), "UNKNOWN");
+                        Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_MODEL_IDLE_TIMEOUT.name(), readOnlyToolsBound ? "NONE" : "UNKNOWN");
                 return finishOrResolve(actor, query, lease, current.get().revision(), idle);
             }
             AgentRunStatusEnum status = isTimeout(failure) ? AgentRunStatusEnum.TIMED_OUT : AgentRunStatusEnum.FAILED;
@@ -354,7 +402,7 @@ public final class AdkAgentRunExecutor {
                     : failure instanceof AgentLedgerException ledgerFailure ? ledgerFailure.code().name()
                     : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), status, Map.of(), null, null,
-                    null, code, invocationStarted ? "UNKNOWN" : "NONE");
+                    null, code, readOnlyToolsBound || !invocationStarted ? "NONE" : "UNKNOWN");
             if (status == AgentRunStatusEnum.TIMED_OUT) {
                 AgentRunDTO latest = ledger.get(actor, query);
                 return AgentRunTransitions.terminal(latest.status()) ? latest
@@ -362,6 +410,7 @@ public final class AdkAgentRunExecutor {
             }
             return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } finally {
+            eventSink.seal();
             if (runner != null) {
                 try {
                     runner.close().timeout(5, TimeUnit.SECONDS).blockingAwait();
@@ -378,11 +427,12 @@ public final class AdkAgentRunExecutor {
                             releaseFailure.getClass().getSimpleName());
                 }
             }
+            if (toolScope != null) toolScope.close();
         }
     }
 
     private AgentRunDTO suspendForAuthorizationOrResolve(TrustedAgentActor actor, AgentRunLease lease,
-                                                          AgentRunAuthorization.Decision decision) {
+                                                          AgentRunAuthorization.Decision decision, String sideEffectOutcome) {
         GetAgentRunQuery query = new GetAgentRunQuery(lease.runId());
         try {
             return ledger.suspendForAuthorization(actor, lease, decision);
@@ -391,7 +441,7 @@ public final class AdkAgentRunExecutor {
             AgentRunDTO latest = ledger.get(actor, query);
             if (AgentRunTransitions.terminal(latest.status())) return latest;
             if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()) {
-                return finishCancellation(actor, lease, latest);
+                return finishCancellation(actor, lease, latest, sideEffectOutcome);
             }
             if (!latest.deadlineAt().isAfter(ledger.databaseNow())) {
                 return ledger.expireDeadline(actor, query, latest.revision());
@@ -400,12 +450,12 @@ public final class AdkAgentRunExecutor {
         }
     }
 
-    private AgentRunDTO finishCancellation(TrustedAgentActor actor, AgentRunLease lease, AgentRunDTO current) {
+    private AgentRunDTO finishCancellation(TrustedAgentActor actor, AgentRunLease lease, AgentRunDTO current, String sideEffectOutcome) {
         if (AgentRunTransitions.terminal(current.status())) {
             return current;
         }
         AgentExecutionResult result = new AgentExecutionResult(lease.runId(), AgentRunStatusEnum.CANCELLED,
-                Map.of(), null, null, null, null, "UNKNOWN");
+                Map.of(), null, null, null, null, sideEffectOutcome);
         return finishOrResolve(actor, new GetAgentRunQuery(lease.runId()), lease, current.revision(), result);
     }
 
@@ -423,7 +473,7 @@ public final class AdkAgentRunExecutor {
             }
             if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()
                     && result.status() != AgentRunStatusEnum.CANCELLED) {
-                return finishCancellation(actor, lease, latest);
+                return finishCancellation(actor, lease, latest, result.sideEffectOutcome());
             }
             throw race;
         }
@@ -439,13 +489,14 @@ public final class AdkAgentRunExecutor {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "versioned prompt and skill resolution is not available");
         }
-        if (!dependencies.tools().isEmpty() || !snapshot.effectivePolicy().allowedToolVersions().isEmpty()) {
+        if ((!dependencies.tools().isEmpty() || !snapshot.effectivePolicy().allowedToolVersions().isEmpty())
+                && (!"CONFIG".equals(snapshot.definition().executionMode()) || readOnlyDecisionToolSupplier == null)) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "governed tool execution is not available");
         }
     }
 
-    private BaseAgent buildRoot(AgentDefinitionSpecDTO definition) {
+    private BaseAgent buildRoot(AgentDefinitionSpecDTO definition, List<BaseTool> tools) {
         if ("CONFIG".equals(definition.executionMode())) {
             AgentFlowConfigDTO config = mapper.convertValue(definition.configuration(), AgentFlowConfigDTO.class);
             flowValidator.validate(new AgentFlowProperties(true, Duration.ofMinutes(2), Duration.ofSeconds(10),
@@ -459,7 +510,7 @@ public final class AdkAgentRunExecutor {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                         "model callbacks require governed tool execution");
             }
-            return flowFactory.compileRoot("tianji", config, chatModels, List.of());
+            return flowFactory.compileRoot("tianji", config, chatModels, tools);
         }
         if ("CODE_FIRST".equals(definition.executionMode()) && definition.codeRef() != null) {
             Function<Scheduler, ? extends BaseAgent> factory = codeFirstFactories.get(definition.codeRef());
@@ -472,22 +523,55 @@ public final class AdkAgentRunExecutor {
         throw new IllegalArgumentException("unsupported Agent definition mode");
     }
 
-    private static void requireNoTools(BaseAgent agent) {
+    private static void requireGovernedTools(BaseAgent agent, List<BaseTool> expectedTools) {
         if (agent instanceof LlmAgent llm) {
-            if (!llm.tools().blockingGet().isEmpty() || !llm.toolsets().isEmpty()) {
+            if (!llm.toolsets().isEmpty() || llm.codeExecutor().isPresent()) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
-                        "governed tool execution is not available");
+                        "Agent tools require the fixed governed declarations");
             }
-            // ADK invokes agent-level before-model callbacks after the runtime budget plugin.
-            // They could change the already-metered request or output limit.
-            if (!llm.canonicalBeforeModelCallbacks().isEmpty()) {
-                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
-                        "Agent model callbacks require final-request governance");
+            List<BaseTool> actualTools = llm.tools().blockingGet();
+            if (actualTools.size() != expectedTools.size()) throw unsupportedAgentCallbacks();
+            for (int index = 0; index < actualTools.size(); index++) {
+                if (actualTools.get(index) != expectedTools.get(index)) throw unsupportedAgentCallbacks();
             }
+            // Agent callbacks can change already-metered requests or governed tool results.
+            if (!llm.canonicalBeforeModelCallbacks().isEmpty() || !llm.canonicalAfterModelCallbacks().isEmpty()
+                    || !llm.canonicalOnModelErrorCallbacks().isEmpty() || !llm.canonicalBeforeToolCallbacks().isEmpty()
+                    || !llm.canonicalAfterToolCallbacks().isEmpty() || !llm.canonicalOnToolErrorCallbacks().isEmpty()) throw unsupportedAgentCallbacks();
         } else if (!(agent instanceof SequentialAgent || agent instanceof ParallelAgent || agent instanceof LoopAgent)) {
             throw new IllegalArgumentException("this Agent type requires additional execution governance");
         }
-        agent.subAgents().forEach(AdkAgentRunExecutor::requireNoTools);
+        agent.subAgents().forEach(child -> requireGovernedTools(child, expectedTools));
+    }
+
+    private static AgentLedgerException unsupportedAgentCallbacks() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Agent callbacks and tools require final-request governance");
+    }
+
+    private final class RunEventSink {
+        private final TrustedAgentActor actor;
+        private final AgentRunLease lease;
+        private final AtomicReference<AgentRunDTO> current;
+        private boolean sealed;
+
+        private RunEventSink(TrustedAgentActor actor, AgentRunLease lease, AtomicReference<AgentRunDTO> current) {
+            this.actor = actor; this.lease = lease; this.current = current;
+        }
+        private synchronized void append(String type, String author, Map<String, Object> payload) {
+            if (sealed) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent run event stream is closed");
+            current.set(ledger.appendEvent(actor, lease, current.get().revision(), type, author, payload));
+        }
+        private synchronized void seal() { sealed = true; }
+        private void tool(AdkReadOnlyDecisionToolBridge.ToolEventVO event) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            var tool = event.toolRef();
+            payload.put("toolRef", Map.of("key", tool.key(), "version", tool.version(), "contentSha256", tool.contentSha256()));
+            payload.put("hostInvocationId", event.hostInvocationId().toString()); payload.put("state", event.state());
+            if (!"UNAVAILABLE".equals(event.state())) payload.put("dispatchEpoch", event.dispatchEpoch());
+            if (event.accountingState() != null) payload.put("accountingState", event.accountingState().name());
+            if (event.errorCode() != null) payload.put("errorCode", event.errorCode());
+            append(event.phase() == AdkReadOnlyDecisionToolBridge.Phase.STARTED ? "TOOL_STARTED" : "TOOL_FINISHED", event.author(), Map.copyOf(payload));
+        }
     }
 
     private static String finalAgent(BaseAgent root) {

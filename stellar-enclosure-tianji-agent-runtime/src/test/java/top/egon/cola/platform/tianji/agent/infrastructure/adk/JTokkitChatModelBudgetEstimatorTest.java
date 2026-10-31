@@ -2,6 +2,9 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
+import com.google.adk.tools.BaseTool;
+import com.google.genai.types.FunctionDeclaration;
+import com.google.genai.types.Schema;
 import com.google.genai.types.Content;
 import com.google.genai.types.GenerateContentResponseUsageMetadata;
 import com.google.genai.types.GenerateContentConfig;
@@ -26,6 +29,7 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -94,6 +98,30 @@ class JTokkitChatModelBudgetEstimatorTest {
         assertTrue(estimator.estimate(snapshot, system).inputTokens() > estimator.estimate(snapshot, request).inputTokens());
         var media = request.toBuilder().contents(List.of(Content.fromParts(Part.builder().inlineData(Blob.builder().mimeType("image/png").data(new byte[]{1, 2}).build()).build()))).build();
         assertThrows(AgentLedgerException.class, () -> estimator.estimate(snapshot, media));
+    }
+
+    @Test
+    void native_tool_schema_is_counted_by_the_existing_converter_without_changing_model_options() {
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var snapshot = snapshot(estimator.descriptors().getFirst());
+        var text = request("hello");
+        var tool = new BaseTool("fixed_decision", "Evaluate a fixed reviewed decision") {
+            @Override
+            public Optional<FunctionDeclaration> declaration() {
+                return Optional.of(FunctionDeclaration.builder().name(name()).description(description())
+                        .parameters(Schema.builder().type("OBJECT").properties(Map.of("amount",
+                                Schema.builder().type("INTEGER").build())).required(List.of("amount")).build()).build());
+            }
+        };
+        var withTool = text.toBuilder().tools(Map.of(tool.name(), tool)).build();
+        var baseline = estimator.estimate(snapshot, text);
+        var withSchema = estimator.estimate(snapshot, withTool);
+        assertTrue(withSchema.inputTokens() > baseline.inputTokens());
+        assertEquals(baseline.maxOutputTokens(), withSchema.maxOutputTokens());
+        assertEquals(estimator.modelAdapterFingerprint(snapshot, text), estimator.modelAdapterFingerprint(snapshot, withTool));
+        verify(model, never()).call(any(Prompt.class));
+        verify(model, never()).stream(any(Prompt.class));
     }
 
     @Test
