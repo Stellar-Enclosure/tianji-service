@@ -233,6 +233,7 @@ public final class ProcessReleaseService {
         }
         for (PreparedModel processModel : prepared) {
             if (processModel.model().type() != Type.BPMN) continue;
+            if (!processModel.model().humanTasks().isEmpty()) throw invalid();
             PreparedModel decision = null;
             if (!processModel.model().decisionTasks().isEmpty()) {
                 if (!decisionTasksEnabled) throw invalid();

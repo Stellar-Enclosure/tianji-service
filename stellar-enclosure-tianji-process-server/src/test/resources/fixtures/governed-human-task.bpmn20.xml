@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xmlns:task="urn:stellar-enclosure:tianji:task:1" targetNamespace="urn:stellar-enclosure:tianji:fixtures">
+    <process id="humanReview" isExecutable="true">
+        <startEvent id="start"/>
+        <userTask id="review" name="Review" task:kind="APPROVAL" task:initialLane="finance" task:approvalVariable="reviewApproved">
+            <extensionElements>
+                <task:taskLane key="finance" roleIds="50,51"/>
+                <task:taskLane key="manager" roleIds="60"/>
+                <task:taskField name="approved" target="reviewApproved" type="BOOLEAN"/>
+                <task:taskField name="comment" target="reviewComment" type="STRING"/>
+            </extensionElements>
+        </userTask>
+        <exclusiveGateway id="route" default="rejectedFlow"/>
+        <endEvent id="approved"/>
+        <endEvent id="rejected"/>
+        <sequenceFlow id="startReview" sourceRef="start" targetRef="review"/>
+        <sequenceFlow id="reviewRoute" sourceRef="review" targetRef="route"/>
+        <sequenceFlow id="approvedFlow" sourceRef="route" targetRef="approved">
+            <conditionExpression xsi:type="tFormalExpression">${reviewApproved == true}</conditionExpression>
+        </sequenceFlow>
+        <sequenceFlow id="rejectedFlow" sourceRef="route" targetRef="rejected"/>
+    </process>
+</definitions>

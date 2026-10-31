@@ -93,6 +93,11 @@ class ProcessReleaseServiceTest {
             assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(modelWithWait)));
             assertThrows(IllegalArgumentException.class, () -> new ProcessReleaseService(process, decision, new ProcessModelValidator(), false, null, true));
         }
+        try (var human = getClass().getResourceAsStream("/fixtures/governed-human-task.bpmn20.xml")) {
+            assertNotNull(human);
+            var governed = new ProcessReleaseService.ModelResource(Type.BPMN, "humanReview", human.readAllBytes(), Map.of());
+            assertThrows(IllegalArgumentException.class, () -> service.publish(actor, "valid", List.of(governed)));
+        }
         verifyNoInteractions(source, process.getRepositoryService(), decision.getDmnRepositoryService());
     }
 
