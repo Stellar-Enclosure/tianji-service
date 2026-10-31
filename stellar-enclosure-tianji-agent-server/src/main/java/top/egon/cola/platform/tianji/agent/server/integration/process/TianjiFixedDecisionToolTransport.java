@@ -1,0 +1,282 @@
+package top.egon.cola.platform.tianji.agent.server.integration.process;
+
+import org.springframework.security.oauth2.core.OAuth2AccessToken;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.component.common.trace.TraceContext;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiFixedDecisionToolBindings.BackendVO;
+import top.egon.cola.platform.tianji.client.HttpProcessClient;
+import top.egon.cola.platform.tianji.client.ProcessClientException;
+import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
+import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianquan.shoubing.contract.PrincipalType;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRequest;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.ServiceAuthorizationKey;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.TenantIssuerAuthenticationManagerComponent;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedPrincipalConverter;
+
+import java.net.http.HttpClient;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
+
+/** Explicit fixed-backend transport; only a verified callback may consume its one-shot decision operation. */
+public final class TianjiFixedDecisionToolTransport implements ReadOnlyDecisionToolTransport, AutoCloseable {
+    private static final Set<String> SCOPES = Set.of(ProcessReleaseClient.READ_SCOPE, DecisionClient.EXECUTE_SCOPE);
+    private final TianjiFixedDecisionToolBindings bindings;
+    private final IdpServiceOAuth2Client oauth;
+    private final TenantIssuerAuthenticationManagerComponent authentication;
+    private final VerifiedPrincipalConverter converter;
+    private final TrustedIssuerRegistry issuers;
+    private final HttpClient http;
+    private final Clock clock;
+    private final LongSupplier nanoTime;
+    private final ThreadPoolExecutor calls;
+    private final AtomicBoolean closed = new AtomicBoolean();
+    private final Set<Runnable> cancellations = ConcurrentHashMap.newKeySet();
+
+    public TianjiFixedDecisionToolTransport(TianjiFixedDecisionToolBindings bindings, IdpServiceOAuth2Client oauth,
+            TenantIssuerAuthenticationManagerComponent authentication, VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers,
+            HttpClient http, int concurrency) {
+        this(bindings, oauth, authentication, converter, issuers, http, concurrency, Clock.systemUTC(), System::nanoTime);
+    }
+    TianjiFixedDecisionToolTransport(TianjiFixedDecisionToolBindings bindings, IdpServiceOAuth2Client oauth,
+            TenantIssuerAuthenticationManagerComponent authentication, VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers,
+            HttpClient http, int concurrency, Clock clock, LongSupplier nanoTime) {
+        this.bindings = Objects.requireNonNull(bindings, "bindings"); this.oauth = Objects.requireNonNull(oauth, "oauth");
+        this.authentication = Objects.requireNonNull(authentication, "authentication"); this.converter = Objects.requireNonNull(converter, "converter");
+        this.issuers = Objects.requireNonNull(issuers, "issuers"); this.http = Objects.requireNonNull(http, "http");
+        this.clock = Objects.requireNonNull(clock, "clock"); this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        if (concurrency < 1 || concurrency > 8 || http.followRedirects() != HttpClient.Redirect.NEVER) throw new IllegalArgumentException("Fixed decision transport configuration is invalid");
+        calls = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
+                Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-fixed-decision-", 0).factory(), new ThreadPoolExecutor.AbortPolicy());
+    }
+
+    @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+        if (request == null || callback == null) throw new IllegalArgumentException("Fixed decision request and callback are required");
+        if (closed.get() || Thread.currentThread().isInterrupted()) throw failure(FailureKind.CANCELLED);
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+        Instant startedAt = clock.instant(); long startedNanos = nanoTime.getAsLong();
+        TianjiFixedDecisionToolBindings.ResolvedBindingVO resolved;
+        try { resolved = Objects.requireNonNull(bindings.resolve(request)); }
+        catch (RuntimeException privateBinding) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
+        var backend = resolved.binding().backend();
+        Instant deadline = earlier(earlier(request.deadlineAt(), request.run().deadlineAt()), startedAt.plus(backend.timeout()));
+        var scope = new CallScope(new WindowVO(startedAt, startedNanos, deadline));
+        Runnable cancel = scope::cancel; cancellations.add(cancel);
+        try {
+            scope.remaining(); TraceContext trace = TraceContext.capture();
+            var task = new FutureTask<T>(() -> {
+                try (var ignored = trace.open()) { scope.remaining(); return verifiedCall(request, callback, backend, scope); }
+                finally { scope.clearBearer(); }
+            });
+            scope.future.set(task); scope.remaining(); calls.execute(task);
+            T value = task.get(scope.remaining(), TimeUnit.NANOSECONDS);
+            current(scope, backend); return value;
+        } catch (InterruptedException interrupted) {
+            scope.cancel(); Thread.currentThread().interrupt(); throw failure(FailureKind.CANCELLED);
+        } catch (TimeoutException timeout) {
+            scope.cancel(); throw failure(FailureKind.DEADLINE_EXCEEDED);
+        } catch (CancellationException cancelled) { throw failure(FailureKind.CANCELLED); }
+        catch (RejectedExecutionException busy) { throw failure(closed.get() ? FailureKind.CANCELLED : FailureKind.CREDENTIAL_UNAVAILABLE); }
+        catch (ExecutionException execution) {
+            if (execution.getCause() instanceof Failure rejected) throw failure(rejected.kind());
+            if (execution.getCause() instanceof AgentLedgerException rejected) throw ledgerFailure(rejected);
+            throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+        } catch (Failure rejected) { throw failure(rejected.kind()); }
+        catch (RuntimeException privateFailure) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
+        finally {
+            cancel.run(); cancellations.remove(cancel);
+        }
+    }
+
+    private <T> T verifiedCall(Request request, Callback<T> callback, BackendVO backend, CallScope scope) {
+        var credential = credentials(backend, scope); scope.credential = credential;
+        current(scope, backend);
+        ProcessReleaseDTO release;
+        try { release = client(backend, scope).get(new GetProcessReleaseQuery(backend.releaseVersion())); }
+        catch (ProcessClientException unavailable) {
+            throw failure("TIANJI_INVALID_RESPONSE".equals(unavailable.code()) ? FailureKind.RELEASE_CHANGED : FailureKind.RELEASE_UNAVAILABLE);
+        } catch (RuntimeException privateRelease) { throw failure(FailureKind.RELEASE_UNAVAILABLE); }
+        requireRelease(release, backend); current(scope, backend);
+        Thread owner = Thread.currentThread(); var callbackActive = new AtomicBoolean(true); var consumed = new AtomicBoolean();
+        OneShotDecision operation = () -> {
+            if (Thread.currentThread() != owner || !callbackActive.get() || TransactionSynchronizationManager.isActualTransactionActive()
+                    || !consumed.compareAndSet(false, true)) throw failure(FailureKind.CANCELLED);
+            current(scope, backend);
+            return evaluate(request, backend, scope);
+        };
+        T value;
+        try { value = callback.apply(new VerifiedExecutor(credential.actor(), credential.expiresAt()), operation); }
+        catch (Failure rejected) { throw failure(rejected.kind()); }
+        catch (AgentLedgerException rejected) { throw ledgerFailure(rejected); }
+        catch (RuntimeException privateCallback) { throw failure(consumed.get() ? FailureKind.OPERATION_RESULT_UNKNOWN : FailureKind.OPERATION_REJECTED); }
+        finally { callbackActive.set(false); }
+        current(scope, backend); return value;
+    }
+
+    private CredentialContextVO credentials(BackendVO backend, CallScope scope) {
+        try {
+            scope.remaining();
+            var request = new IdpServiceTokenRequest(backend.registrationId(), backend.expectedAppId(), backend.processResourceUri(), ServiceTokenContext.TENANT, Long.toString(backend.tenantId()), SCOPES);
+            var trust = trust(backend); var key = oauth.authorizationKey(request); requireKey(key, request, backend); scope.remaining();
+            var token = oauth.authorizeBounded(request, backend.processIssuer().toASCIIString(), Duration.ofNanos(scope.remaining()));
+            scope.remaining();
+            if (token == null || !OAuth2AccessToken.TokenType.BEARER.equals(token.getTokenType()) || token.getExpiresAt() == null || !token.getExpiresAt().isAfter(clock.instant())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+            scope.publishBearer(token.getTokenValue());
+            var proof = authentication.authenticate(scope.bearer.get(), backend.processResourceUri()); scope.remaining(); proof.validate();
+            var jwt = proof.getJwt(); var principal = converter.toServicePrincipal(jwt, backend.processResourceUri()); scope.remaining();
+            String tenant = Long.toString(backend.tenantId());
+            if (proof.getPrincipalType() != PrincipalType.SERVICE || !sameTrust(trust, proof.getTrustedIssuer()) || !Objects.equals(scope.bearer.get(), jwt.getTokenValue())
+                    || !backend.processIssuer().toASCIIString().equals(jwt.getClaimAsString("iss")) || !List.of(backend.processResourceUri().toASCIIString()).equals(jwt.getAudience())
+                    || !backend.expectedClientId().equals(proof.getSubject()) || !tenant.equals(proof.getTenantId()) || !backend.expectedClientId().equals(jwt.getSubject())
+                    || !tenant.equals(jwt.getClaimAsString("tenant_id")) || !proof.getTokenId().equals(jwt.getClaimAsString("jti"))
+                    || principal == null || !tenant.equals(principal.tenantId()) || !backend.expectedClientId().equals(principal.subject())
+                    || !key.clientId().equals(principal.clientId()) || !backend.expectedClientId().equals(principal.clientId()) || !backend.expectedAppId().equals(principal.appId())
+                    || principal.scopeContext() != ServiceTokenContext.TENANT || !backend.processResourceUri().toASCIIString().equals(principal.resourceUri().toASCIIString())
+                    || !backend.expectedSourceBiz().equals(principal.sourceBizCode()) || !backend.expectedSourceApp().equals(principal.sourceAppCode())
+                    || !backend.expectedEnvironment().equals(principal.sourceEnvironment()) || !SCOPES.equals(principal.scopes())
+                    || !proof.getTokenId().equals(principal.tokenId()) || !principal.issuedAt().equals(jwt.getIssuedAt()) || !principal.expiresAt().equals(jwt.getExpiresAt())
+                    || !proof.getExpiresAt().equals(jwt.getExpiresAt())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+            Instant expiry = earlier(earlier(token.getExpiresAt(), principal.expiresAt()), scope.window.deadlineAt());
+            var actor = TrustedAgentActor.verified(backend.tenantId(), TrustedAgentActor.SubjectType.SERVICE, principal.clientId(), proof.getTrustedIssuer().issuer().toASCIIString());
+            var result = new CredentialContextVO(request, key, trust, actor, expiry);
+            scope.credential = result; current(scope, backend); return result;
+        } catch (Failure rejected) { throw failure(rejected.kind()); }
+        catch (RuntimeException privateCredential) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
+    }
+
+    private DecisionObservation evaluate(Request request, BackendVO backend, CallScope scope) {
+        top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO result;
+        try {
+            result = client(backend, scope).evaluate(new EvaluateDecisionCommand(backend.decisionKey(), backend.releaseVersion(), request.downstreamRequestId(), request.correlationId(), request.arguments()));
+        } catch (Failure rejected) { throw failure(rejected.kind()); }
+        catch (ProcessClientException rejected) {
+            if ("TIANJI_INVALID_RESPONSE".equals(rejected.code()) || "TIANJI_RESPONSE_TOO_LARGE".equals(rejected.code())) throw failure(FailureKind.OPERATION_INVALID_RESPONSE);
+            int status = rejected.httpStatus();
+            if (status == 401 || status == 403) throw failure(FailureKind.OPERATION_DENIED);
+            if (status >= 400 && status < 500 && status != 408 && status != 429) throw failure(FailureKind.OPERATION_REJECTED);
+            throw failure(FailureKind.OPERATION_RESULT_UNKNOWN);
+        } catch (RuntimeException privateOperation) { throw failure(FailureKind.OPERATION_RESULT_UNKNOWN); }
+        // A valid returned response is a fact even if the caller/window/source changes now; the callback records it before outer postchecks.
+        try {
+            Instant receivedAt = clock.instant();
+            if (result.outputs().isEmpty() && result.matchedRuleIds().isEmpty()) return new DecisionObservation(Status.NO_MATCH, result.decisionExecutionId(), result.submittedAt(), receivedAt, Map.of(), null);
+            if (result.outputs().size() != 1 || result.matchedRuleIds().size() != 1) throw failure(FailureKind.OPERATION_INVALID_RESPONSE);
+            var output = request.descriptor().output().values(result.outputs().getFirst());
+            return new DecisionObservation(Status.MATCHED, result.decisionExecutionId(), result.submittedAt(), receivedAt, output, result.matchedRuleIds().getFirst());
+        } catch (RuntimeException invalidResponse) { throw failure(FailureKind.OPERATION_INVALID_RESPONSE); }
+    }
+
+    private HttpProcessClient client(BackendVO backend, CallScope scope) {
+        return new HttpProcessClient(backend.processBaseUri(), http, scope.bearer::get, Duration.ofNanos(scope.remaining()));
+    }
+    private void current(CallScope scope, BackendVO backend) {
+        scope.remaining();
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw failure(FailureKind.CANCELLED);
+        var credential = scope.credential;
+        if (credential == null) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+        try {
+            var key = oauth.authorizationKey(credential.request()); requireKey(key, credential.request(), backend);
+            if (!sameKey(credential.key(), key) || !sameTrust(credential.trust(), trust(backend))) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+        } catch (Failure rejected) { throw failure(rejected.kind()); }
+        catch (RuntimeException privateSource) { throw failure(FailureKind.CREDENTIAL_UNAVAILABLE); }
+        scope.remaining();
+    }
+
+    private TrustedIssuerRegistry.TrustedIssuerVO trust(BackendVO backend) {
+        var trust = issuers.findByIssuer(backend.processIssuer().toASCIIString()).orElseThrow(() -> failure(FailureKind.CREDENTIAL_UNAVAILABLE));
+        if (trust.status() != TrustedIssuerRegistry.Status.ACTIVE || trust.realmType() != TrustedIssuerRegistry.RealmType.TENANT || !Long.toString(backend.tenantId()).equals(trust.tenantId())
+                || !backend.processIssuer().toASCIIString().equals(trust.issuer().toASCIIString())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+        return trust;
+    }
+    private static void requireKey(ServiceAuthorizationKey key, IdpServiceTokenRequest request, BackendVO backend) {
+        if (key == null || !backend.processIssuer().toASCIIString().equals(key.issuer()) || !backend.registrationId().equals(key.registrationId())
+                || !backend.expectedClientId().equals(key.clientId()) || !backend.expectedAppId().equals(key.appId())
+                || !backend.processResourceUri().toASCIIString().equals(key.audience().toASCIIString()) || key.context() != ServiceTokenContext.TENANT
+                || !Long.toString(backend.tenantId()).equals(key.tenantId()) || !SCOPES.equals(key.scopes()) || !request.scopes().equals(key.scopes())) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+    }
+    private static boolean sameKey(ServiceAuthorizationKey expected, ServiceAuthorizationKey current) {
+        return expected.equals(current) && expected.audience().toASCIIString().equals(current.audience().toASCIIString());
+    }
+    private static boolean sameTrust(TrustedIssuerRegistry.TrustedIssuerVO expected, TrustedIssuerRegistry.TrustedIssuerVO current) {
+        return current != null && expected.equals(current) && expected.issuer().toASCIIString().equals(current.issuer().toASCIIString()) && expected.jwksUri().toASCIIString().equals(current.jwksUri().toASCIIString());
+    }
+    private static void requireRelease(ProcessReleaseDTO release, BackendVO backend) {
+        var models = release.models().stream().filter(model -> model.type() == ProcessModelTypeEnum.DMN && model.definitionKey().equals(backend.decisionKey())).toList();
+        if (!backend.releaseVersion().equals(release.releaseVersion()) || !backend.manifestSha256().equals(release.manifestSha256()) || models.size() != 1
+                || !backend.decisionModelSha256().equals(models.getFirst().contentSha256()) || !backend.inputSchema().equals(models.getFirst().inputs())) throw failure(FailureKind.RELEASE_CHANGED);
+    }
+
+    @Override public void close() {
+        closed.set(true);
+        for (var cancel : cancellations) cancel.run();
+        calls.shutdownNow();
+    }
+
+    /** Request-local lifecycle only; the shared set holds cleanup actions, never a token cache. */
+    private final class CallScope {
+        final WindowVO window;
+        final AtomicBoolean active = new AtomicBoolean(true);
+        final AtomicReference<String> bearer = new AtomicReference<>();
+        final AtomicReference<Future<?>> future = new AtomicReference<>();
+        final Object publishLock = new Object();
+        volatile CredentialContextVO credential;
+
+        CallScope(WindowVO window) { this.window = window; }
+        long remaining() {
+            if (!active.get() || closed.get() || Thread.currentThread().isInterrupted()) throw failure(FailureKind.CANCELLED);
+            Instant deadline = credential == null ? window.deadlineAt() : earlier(window.deadlineAt(), credential.expiresAt());
+            Instant now = clock.instant();
+            if (!deadline.isAfter(now)) throw failure(FailureKind.DEADLINE_EXCEEDED);
+            long remaining = window.startedNanos() + Duration.between(window.startedAt(), deadline).toNanos() - nanoTime.getAsLong();
+            if (remaining <= 0) throw failure(FailureKind.DEADLINE_EXCEEDED);
+            return Math.min(remaining, Duration.between(now, deadline).toNanos());
+        }
+        void publishBearer(String value) {
+            synchronized (publishLock) {
+                remaining();
+                if (value == null || value.isBlank()) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+                bearer.set(value);
+            }
+        }
+        void clearBearer() { synchronized (publishLock) { bearer.set(null); } }
+        void cancel() {
+            synchronized (publishLock) { active.set(false); bearer.set(null); }
+            var task = future.get(); if (task != null) task.cancel(true);
+        }
+    }
+    private record WindowVO(Instant startedAt, long startedNanos, Instant deadlineAt) { }
+    private record CredentialContextVO(IdpServiceTokenRequest request, ServiceAuthorizationKey key, TrustedIssuerRegistry.TrustedIssuerVO trust, TrustedAgentActor actor, Instant expiresAt) {
+        @Override public String toString() { return "FixedDecisionCredentialContext[redacted]"; }
+    }
+    private static Instant earlier(Instant left, Instant right) { return left.isBefore(right) ? left : right; }
+    private static Failure failure(FailureKind kind) { return new Failure(kind); }
+    private static AgentLedgerException ledgerFailure(AgentLedgerException failure) { return new AgentLedgerException(failure.code(), "Fixed decision callback could not complete"); }
+}

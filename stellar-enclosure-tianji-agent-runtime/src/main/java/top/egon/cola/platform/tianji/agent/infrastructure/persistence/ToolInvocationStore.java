@@ -13,14 +13,12 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorizatio
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
-import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -134,7 +132,7 @@ public final class ToolInvocationStore {
         }
         public String reservationId() { return "tool:" + invocationId; }
         public String parametersSha256() {
-            return OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_INVOCATION_PARAMETERS_V1", descriptor.key(), Long.toString(descriptor.version()), descriptor.reference().contentSha256()), arguments);
+            return descriptor.parametersSha256(arguments);
         }
         @Override public String toString() { return "ToolInvocationStore.PreparationRequestVO[redacted]"; }
     }
