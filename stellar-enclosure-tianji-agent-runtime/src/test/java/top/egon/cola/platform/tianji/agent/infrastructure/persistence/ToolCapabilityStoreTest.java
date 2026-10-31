@@ -4,7 +4,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -206,6 +208,53 @@ class ToolCapabilityStoreTest {
             assertThrows(AgentLedgerException.class, store::verifyStorage);
             clearInvocations(fixture.jdbc.get());
             assertThrows(AgentLedgerException.class, () -> store.current(fixture.binding, DESCRIPTOR));
+            verifyNoInteractions(fixture.jdbc.get());
+        }
+    }
+
+    @Test void internal_current_joins_only_the_verified_exact_source_transaction_without_an_early_commit() throws Exception {
+        var fixture = new Fixture(user(), DESCRIPTOR, true, 3); fixture.ticket(NOW.plusSeconds(20));
+        try (var templates = fixture.templates(); var verifiers = mockConstruction(ToolExecutionStorageVerifier.class)) {
+            var store = fixture.store(); store.verifyStorage();
+            assertThrows(AgentLedgerException.class, () -> store.currentInTransaction(fixture.binding, DESCRIPTOR));
+            verifyNoInteractions(fixture.source);
+            var outer = new TransactionTemplate(new DataSourceTransactionManager(fixture.source));
+            var result = outer.execute(status -> {
+                assertThrows(IllegalStateException.class, () -> store.current(fixture.binding, DESCRIPTOR));
+                var found = store.currentInTransaction(fixture.binding, DESCRIPTOR);
+                assertEquals(Optional.of(fixture.evidence()), found);
+                try { verify(fixture.connection, never()).commit(); }
+                catch (java.sql.SQLException failure) { throw new AssertionError(failure); }
+                return found;
+            });
+            assertEquals(Optional.of(fixture.evidence()), result);
+            verify(fixture.source).getConnection(); verify(fixture.connection).commit();
+            verify(fixture.connection, never()).rollback();
+            verify(fixture.jdbc.get()).query(contains("status IN ('QUEUED','RUNNING')"), org.mockito.ArgumentMatchers.<RowMapper<Instant>>any(), any(Object[].class));
+            verify(fixture.jdbc.get()).query(contains("owner_issuer=? AND owner_id=? FOR UPDATE"), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
+        }
+    }
+
+    @Test void internal_current_requires_readiness_and_its_own_data_source_binding_even_with_an_active_transaction() throws Exception {
+        var fixture = new Fixture(user(), DESCRIPTOR, true, 1); fixture.ticket(NOW.plusSeconds(20));
+        try (var templates = fixture.templates(); var verifiers = mockConstruction(ToolExecutionStorageVerifier.class)) {
+            var store = fixture.store();
+            clearInvocations(fixture.jdbc.get());
+            var outer = new TransactionTemplate(new DataSourceTransactionManager(fixture.source));
+            outer.execute(status -> {
+                assertThrows(AgentLedgerException.class, () -> store.currentInTransaction(fixture.binding, DESCRIPTOR));
+                return true;
+            });
+            verifyNoInteractions(fixture.jdbc.get());
+            store.verifyStorage();
+            var otherSource = mock(DataSource.class); var otherConnection = mock(Connection.class);
+            when(otherSource.getConnection()).thenReturn(otherConnection); when(otherConnection.getAutoCommit()).thenReturn(true);
+            new TransactionTemplate(new DataSourceTransactionManager(otherSource)).execute(status -> {
+                assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
+                assertFalse(TransactionSynchronizationManager.hasResource(fixture.source));
+                assertThrows(AgentLedgerException.class, () -> store.currentInTransaction(fixture.binding, DESCRIPTOR));
+                return true;
+            });
             verifyNoInteractions(fixture.jdbc.get());
         }
     }

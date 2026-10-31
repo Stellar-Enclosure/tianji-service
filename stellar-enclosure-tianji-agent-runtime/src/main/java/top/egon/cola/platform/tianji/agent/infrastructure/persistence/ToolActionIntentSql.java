@@ -44,6 +44,11 @@ final class ToolActionIntentSql {
 
     Row prepare(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
                 Instant requestedExpiry, Instant authorityDeadline) {
+        return prepareWithStatus(run, lease, action, descriptor, requestedExpiry, authorityDeadline).row();
+    }
+
+    PreparationResultVO prepareWithStatus(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
+                                          Instant requestedExpiry, Instant authorityDeadline) {
         binding(run, lease, action, descriptor); requireRun(run, lease, descriptor, authorityDeadline);
         UUID id = UUID.fromString(action.intentId());
         // Serialize first insertion even when distinct request bodies race the same stable business identity.
@@ -51,7 +56,8 @@ final class ToolActionIntentSql {
         requireRun(run, lease, descriptor, authorityDeadline);
         var existing = read(run.actor(), id, true, authorityDeadline);
         if (existing.isPresent()) {
-            same(existing.orElseThrow(), action); requireRun(run, lease, descriptor, authorityDeadline); return existing.orElseThrow();
+            same(existing.orElseThrow(), action); requireRun(run, lease, descriptor, authorityDeadline);
+            return new PreparationResultVO(existing.orElseThrow(), false);
         }
         Instant now = now(authorityDeadline);
         Instant expiry = Objects.requireNonNull(requestedExpiry, "requestedExpiry").truncatedTo(ChronoUnit.MICROS);
@@ -67,7 +73,13 @@ final class ToolActionIntentSql {
                 run.runId(), run.snapshotSha256(), descriptor.policy().risk().name(), descriptor.policy().approvalPolicyRef(), state, Timestamp.from(now), Timestamp.from(now), Timestamp.from(expiry));
         if (inserted != 1) throw unavailable();
         var row = read(run.actor(), id, true, authorityDeadline).orElseThrow(ToolActionIntentSql::unavailable);
-        same(row, action); requireRun(run, lease, descriptor, authorityDeadline); return row;
+        same(row, action); requireRun(run, lease, descriptor, authorityDeadline);
+        return new PreparationResultVO(row, true);
+    }
+
+    record PreparationResultVO(Row row, boolean newlyCreated) {
+        PreparationResultVO { Objects.requireNonNull(row, "row"); }
+        @Override public String toString() { return "ToolActionIntentPreparation[redacted]"; }
     }
 
     Optional<Row> current(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action,

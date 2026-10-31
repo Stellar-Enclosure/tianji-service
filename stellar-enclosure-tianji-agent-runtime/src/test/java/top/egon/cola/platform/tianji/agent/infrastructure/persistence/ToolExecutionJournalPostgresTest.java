@@ -29,6 +29,7 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
 import java.net.URI;
+import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -103,6 +104,85 @@ class ToolExecutionJournalPostgresTest {
         ledger.cancel(ACTOR, new CancelAgentRunCommand(queued.runId(), "cancel-test", beforeCancel.revision(), "controlled cancellation"));
         assertFalse(capabilities.attach(evidence(reservation, now(jdbc).plusSeconds(30)), DESCRIPTOR)); assertTrue(capabilities.current(queuedBinding, DESCRIPTOR).isEmpty());
         assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation", Integer.class));
+        invocationPreparation(source, jdbc, ledger, capabilities);
+    }
+
+    private static void invocationPreparation(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                              ToolCapabilityStore capabilities) throws Exception {
+        var run = start(ledger, ACTOR); var binding = binding(run);
+        var reserved = capabilities.reserve(binding, DESCRIPTOR).orElseThrow();
+        var ticket = evidence(reserved, now(jdbc).plusSeconds(120).truncatedTo(ChronoUnit.MICROS));
+        assertTrue(capabilities.attach(ticket, DESCRIPTOR));
+        var claim = ledger.claim(ACTOR, new GetAgentRunQuery(run.runId()), ledger.get(ACTOR, new GetAgentRunQuery(run.runId())).revision(),
+                "invocation-test", Duration.ofMinutes(5));
+        var authority = new ToolExecutionAuthorization() {
+            @Override public Decision authorize(Request request, Boundary boundary) { return check(request, boundary).decision(); }
+            @Override public CheckResult check(Request request, Boundary boundary) {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                assertEquals(run, request.run()); assertEquals(Boundary.PREPARE, boundary);
+                return new CheckResult(request, boundary, Decision.ALLOW, new AuditVO(1, UUID.randomUUID(), boundary, Decision.ALLOW,
+                        ACTOR.subjectType(), ticket.grantId(), 1L, null, 1L, Instant.now(), ticket.expiresAt()));
+            }
+        };
+        var invocations = new ToolInvocationStore(source, ledger, capabilities, authority); invocations.verifyStorage();
+        var action = new ToolActionRequest(ACTOR, DESCRIPTOR, "invocation-" + UUID.randomUUID(), "1", Map.of("amount", 20L));
+        var id = UUID.randomUUID(); var expiry = now(jdbc).plusSeconds(600); var cost = new BigDecimal("0.20");
+        var request = new ToolInvocationStore.PreparationRequestVO(binding, claim.lease(), DESCRIPTOR, action.arguments(), action, id, cost, expiry);
+        var gate = new CountDownLatch(1);
+        var results = new ArrayList<ToolInvocationStore.PreparationResult>();
+        try (var executor = Executors.newFixedThreadPool(8)) {
+            var futures = new ArrayList<java.util.concurrent.Future<ToolInvocationStore.PreparationResult>>();
+            for (int index = 0; index < 20; index++) futures.add(executor.submit(() -> { gate.await(); return invocations.prepare(request); }));
+            gate.countDown();
+            for (var future : futures) results.add(future.get(20, TimeUnit.SECONDS));
+        }
+        var first = results.getFirst(); assertNotNull(first); assertNotNull(first.invocation());
+        for (var result : results) {
+            assertNotNull(result);
+            var invocation = result.invocation(); assertNotNull(invocation);
+            assertEquals(run.runId(), invocation.runId()); assertEquals(id, invocation.invocationId());
+            assertEquals("tool:" + id, invocation.reservationId()); assertEquals("PREPARED", invocation.state());
+            assertEquals(1, invocation.revision()); assertEquals(reserved.issueEpoch(), invocation.capabilityIssueEpoch());
+            assertEquals(first.invocation().createdAt(), invocation.createdAt());
+            assertEquals(first.invocation().dispatchNotAfter(), invocation.dispatchNotAfter()); assertNull(invocation.finishedAt());
+            assertEquals(first.action(), result.action());
+        }
+        assertEquals(1, results.stream().filter(result -> result.invocation().newlyCreated()).count());
+        assertEquals(first.invocation().createdAt().plusSeconds(10), first.invocation().dispatchNotAfter());
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=?", Integer.class, ACTOR.tenantId(), run.runId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=?", Integer.class, ACTOR.tenantId(), run.runId()));
+        var changed = new ToolActionRequest(ACTOR, DESCRIPTOR, action.businessKey(), action.businessVersion(), Map.of("amount", 21L));
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> invocations.prepare(
+                new ToolInvocationStore.PreparationRequestVO(binding, claim.lease(), DESCRIPTOR, changed.arguments(), changed, id, cost, expiry))).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> invocations.prepare(
+                new ToolInvocationStore.PreparationRequestVO(binding, claim.lease(), DESCRIPTOR, action.arguments(), action, id, new BigDecimal("0.21"), expiry))).code());
+        var existing = invocations.prepare(new ToolInvocationStore.PreparationRequestVO(binding, claim.lease(), DESCRIPTOR, action.arguments(), action,
+                UUID.randomUUID(), cost, expiry.plusSeconds(60)));
+        assertNull(existing.invocation()); assertEquals(first.action(), existing.action());
+        Map<String, Object> counters = invocationCounters(jdbc, run.runId());
+        assertEquals(1, ((Number) counters.get("tool_calls_reserved")).intValue());
+        assertEquals(1, ((Number) counters.get("active_tool_calls")).intValue());
+        assertEquals(0, ((BigDecimal) counters.get("estimated_cost_reserved")).compareTo(cost));
+        var failedAction = new ToolActionRequest(ACTOR, DESCRIPTOR, "invocation-rollback-" + UUID.randomUUID(), "1", action.arguments());
+        var failedId = UUID.randomUUID();
+        jdbc.execute("CREATE FUNCTION tianji_agent.tool_invocation_test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled invocation insert failure'; END; $$");
+        jdbc.execute("CREATE TRIGGER tool_invocation_test_fail BEFORE INSERT ON tianji_agent.agent_tool_invocation FOR EACH ROW EXECUTE FUNCTION tianji_agent.tool_invocation_test_fail()");
+        try {
+            var failure = assertThrows(AgentLedgerException.class, () -> invocations.prepare(new ToolInvocationStore.PreparationRequestVO(binding,
+                    claim.lease(), DESCRIPTOR, failedAction.arguments(), failedAction, failedId, cost, expiry)));
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code()); assertNull(failure.getCause());
+            assertEquals(0, count(jdbc, failedAction)); assertEquals(counters, invocationCounters(jdbc, run.runId()));
+            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?", Integer.class, ACTOR.tenantId(), run.runId(), failedId));
+            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=? AND reservation_id=?", Integer.class, ACTOR.tenantId(), run.runId(), "tool:" + failedId));
+        } finally {
+            jdbc.execute("DROP TRIGGER tool_invocation_test_fail ON tianji_agent.agent_tool_invocation");
+            jdbc.execute("DROP FUNCTION tianji_agent.tool_invocation_test_fail()");
+        }
+        new ToolExecutionStorageVerifier(source).verify();
+    }
+
+    private static Map<String, Object> invocationCounters(JdbcTemplate jdbc, String runId) {
+        return jdbc.queryForMap("SELECT tool_calls_reserved,active_tool_calls,estimated_cost_reserved FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?", ACTOR.tenantId(), runId);
     }
 
     private static void capabilityEpochs(JdbcTemplate jdbc, ToolCapabilityStore capabilities, ToolExecutionGrant.BindingVO binding) {

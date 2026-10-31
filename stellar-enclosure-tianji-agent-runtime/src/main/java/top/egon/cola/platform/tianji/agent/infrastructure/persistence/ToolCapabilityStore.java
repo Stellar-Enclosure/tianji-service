@@ -124,12 +124,19 @@ public final class ToolCapabilityStore {
     /** Returns internal sealed evidence only. Its presence is not a current tool permission decision. */
     public Optional<ToolExecutionGrant.EvidenceVO> current(ToolExecutionGrant.BindingVO binding, ToolDescriptor descriptor) {
         requireDescriptor(binding, descriptor);
-        return transact(status -> {
-            if (!lockSource(binding, descriptor, false)) return Optional.empty();
-            var found = read(binding); if (found.isEmpty()) return Optional.empty();
-            var row = found.orElseThrow(); same(row.binding(), binding); Instant now = currentTime(binding.run());
-            return row.evidence() == null || !row.evidence().expiresAt().isAfter(now) ? Optional.empty() : Optional.of(row.evidence());
-        });
+        return transact(status -> currentInTransaction(binding, descriptor));
+    }
+
+    /** Internal participant; its owner fences the live run before taking this capability lock. */
+    Optional<ToolExecutionGrant.EvidenceVO> currentInTransaction(ToolExecutionGrant.BindingVO binding, ToolDescriptor descriptor) {
+        requireDescriptor(binding, descriptor);
+        if (!verified.get() || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
+        if (!lockSource(binding, descriptor, false)) return Optional.empty();
+        var found = read(binding); if (found.isEmpty()) return Optional.empty();
+        var row = found.orElseThrow(); same(row.binding(), binding); Instant now = currentTime(binding.run());
+        if (!verified.get()) throw unavailable();
+        return row.evidence() == null || !row.evidence().expiresAt().isAfter(now) ? Optional.empty() : Optional.of(row.evidence());
     }
 
     private boolean lockSource(ToolExecutionGrant.BindingVO binding, ToolDescriptor descriptor, boolean queuedOnly) {
