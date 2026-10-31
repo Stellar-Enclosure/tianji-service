@@ -45,6 +45,9 @@ stellar:
         extraction:
           background:
             enabled: false
+          intents:
+            http:
+              enabled: false
           http:
             enabled: false
         merge-suggestions:

@@ -572,6 +572,27 @@ class TianjiPermissionIntegrationTest {
                 owner, "research", MemoryAuthorization.Operation.GET, "memory", 0, null, null)));
     }
 
+    @Test
+    void preference_intent_resources_require_both_current_source_and_memory_permissions_with_their_independent_scopes() {
+        var servlet = new MockHttpServletRequest(); VerifiedUserTokenCarrier.set(servlet, "verified-test-token"); servlet.setAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE, snapshotIssuer.get()); RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(servlet));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_READ));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_READ_SCOPE), new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.READ));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())), List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_READ_SCOPE))));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_READ_SCOPE), new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertEquals("alice", access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API).actor().subjectId());
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_CANCEL_API));
+        granted.set(Set.of(TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.READ));
+        SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(granted.get())),
+                List.of(new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.MEMORY_FORGET_SCOPE), new SimpleGrantedAuthority("SCOPE_" + TianjiAgentPermissions.READ_SCOPE))));
+        assertEquals("alice", access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_CANCEL_API).actor().subjectId());
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access().require(TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API));
+    }
+
     private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion) { return memoryScope(rbacUser, org, authVersion, top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision.ALLOW); }
     private static DataScopeDecision memoryScope(String rbacUser, String org, long authVersion, top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision decision) {
         return new DataScopeDecision(decision, "CURRENT", "20", rbacUser,
@@ -684,7 +705,9 @@ class TianjiPermissionIntegrationTest {
                         memoryResource("candidates", TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE),
                         memoryResource("upsert", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
                         memoryResource("correct", TianjiAgentPermissions.MEMORY_WRITE, TianjiAgentPermissions.MEMORY_WRITE_SCOPE),
-                        memoryResource("forget", TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.MEMORY_FORGET_SCOPE)), List.of(), List.of());
+                        memoryResource("forget", TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.MEMORY_FORGET_SCOPE),
+                        preferenceIntentResource("status", TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API, TianjiAgentPermissions.MEMORY_READ, TianjiAgentPermissions.MEMORY_READ_SCOPE, "preferenceIntentStatus"),
+                        preferenceIntentResource("cancel", TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_CANCEL_API, TianjiAgentPermissions.MEMORY_FORGET, TianjiAgentPermissions.MEMORY_FORGET_SCOPE, "cancelPreferenceIntent")), List.of(), List.of());
     }
 
     private static PermissionManifest.ResourceDefinition memoryResource(String operation, String permission, String scope) {
@@ -693,6 +716,11 @@ class TianjiPermissionIntegrationTest {
                 ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(permission)), null,
                 List.of(PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE), List.of(scope),
                 new PermissionManifest.I18nReference("tianji.permissions", "api.memory." + operation), DefinitionLifecycle.ACTIVE);
+    }
+    private static PermissionManifest.ResourceDefinition preferenceIntentResource(String operation, String key, String permission, String scope, String label) {
+        return new PermissionManifest.ResourceDefinition(key, ResourceType.API, Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/memories/preference-intents/" + operation)),
+                ResourceAccess.PROTECTED, new PermissionRequirement(PermissionMode.ALL, List.of(permission, TianjiAgentPermissions.READ)), null,
+                List.of(PermissionManifest.PrincipalType.USER), List.of(scope, TianjiAgentPermissions.READ_SCOPE), new PermissionManifest.I18nReference("tianji.permissions", "api.memory." + label), DefinitionLifecycle.ACTIVE);
     }
 
     private static PermissionManifest.ResourceDefinition linkedResource(String key, String operation, String permission, String scope) {
@@ -718,7 +746,8 @@ class TianjiPermissionIntegrationTest {
                         TianjiAgentPermissions.START_API, TianjiAgentPermissions.SESSION_GET_API, TianjiAgentPermissions.SESSION_START_API,
                         TianjiAgentPermissions.SESSION_LIST_API, TianjiAgentPermissions.SESSION_DELETE_API,
                         TianjiAgentPermissions.LINKED_SUBMIT_API, TianjiAgentPermissions.LINKED_RESOLVE_API, TianjiAgentPermissions.LINKED_CLOSE_API,
-                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_CANDIDATES_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API),
+                            TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_CANDIDATES_API, TianjiAgentPermissions.MEMORY_UPSERT_API, TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API,
+                        TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_STATUS_API, TianjiAgentPermissions.MEMORY_PREFERENCE_INTENT_CANCEL_API),
                 memoryScopes.get(), Map.of(), "checksum",
                 NOW, view.snapshotExpiresAt(), view, binding());
     }

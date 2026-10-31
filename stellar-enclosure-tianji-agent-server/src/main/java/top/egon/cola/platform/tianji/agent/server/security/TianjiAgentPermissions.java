@@ -91,6 +91,10 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Prepare an approved owned preference source"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.mergeSuggestions", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Compare an unconfirmed Memory candidate with active facts"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.preferenceIntentStatus", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read owned preference extraction progress"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.cancelPreferenceIntent", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Cancel pending owned preference extraction"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.upsert", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Create or deduplicate a Memory fact"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.memory.correct", defaultLocale = "en-US",
@@ -110,6 +114,8 @@ public final class TianjiAgentPermissions {
     public static final String MEMORY_EXTRACT_PREFERENCES_API = "tianji.api.memory.extractPreferences";
     public static final String MEMORY_PREPARE_PREFERENCES_API = "tianji.api.memory.preparePreferences";
     public static final String MEMORY_MERGE_SUGGESTIONS_API = "tianji.api.memory.mergeSuggestions";
+    public static final String MEMORY_PREFERENCE_INTENT_STATUS_API = "tianji.api.memory.preferenceIntentStatus";
+    public static final String MEMORY_PREFERENCE_INTENT_CANCEL_API = "tianji.api.memory.cancelPreferenceIntent";
     public static final String MEMORY_UPSERT_API = "tianji.api.memory.upsert";
     public static final String MEMORY_CORRECT_API = "tianji.api.memory.correct";
     public static final String MEMORY_FORGET_API = "tianji.api.memory.forget";

@@ -13,6 +13,8 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentStatusDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentCancellationDTO;
 
 /** Memory responses have a closed typed decoder without changing existing Agent/Session wire compatibility. */
 final class MemoryResponseCodec {
@@ -51,6 +53,20 @@ final class MemoryResponseCodec {
     }
     private static void mutation(JsonNode node) {
         owner(node.path("owner")); strings(node, "commandId", "scopeId", "memoryId", "outcome", "stateAtMutation", "occurredAt"); integers(node, "revision");
+    }
+    MemoryPreferenceIntentStatusDTO preferenceIntent(byte[] bytes) {
+        var node = mapper.readTree(bytes); preferenceIntent(node); return mapper.treeToValue(node, MemoryPreferenceIntentStatusDTO.class);
+    }
+    MemoryPreferenceIntentCancellationDTO cancelPreferenceIntent(byte[] bytes) {
+        var node = mapper.readTree(bytes); strings(node, "commandId"); preferenceIntent(node.path("status")); return mapper.treeToValue(node, MemoryPreferenceIntentCancellationDTO.class);
+    }
+    private static void preferenceIntent(JsonNode node) {
+        owner(node.path("owner")); strings(node, "scopeId", "runId"); var intent = node.path("intent");
+        if (intent.isMissingNode()) throw invalid();
+        if (!intent.isNull()) {
+            strings(intent, "intentId", "bindingId", "policyRef", "state", "createdAt", "updatedAt"); integers(intent, "revision", "nextIndex", "attemptCount");
+            optional(intent.path("totalCount"), false); optional(intent.path("reasonCode"), true); optional(intent.path("closedAt"), true);
+        }
     }
     MemoryRetrievalPageDTO page(byte[] bytes) {
         var node = mapper.readTree(bytes); owner(node.path("owner")); strings(node, "scopeId"); optional(node.path("nextAfterMemoryId"), true);

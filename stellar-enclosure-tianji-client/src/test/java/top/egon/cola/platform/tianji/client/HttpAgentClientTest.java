@@ -20,6 +20,12 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergeHitDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergeRelationEnum;
+import top.egon.cola.platform.tianji.contract.memory.GetMemoryPreferenceIntentQuery;
+import top.egon.cola.platform.tianji.contract.memory.CancelMemoryPreferenceIntentCommand;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentStatusDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentCancellationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentStateEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemorySourceDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -684,6 +690,51 @@ class HttpAgentClientTest {
         response.set(mapper.writeValueAsString(semantic));
         handler.set(exchange -> respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8)));
         assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 0).memoryMergeSuggestions(new MemoryMergeQuery(owner, "research", "candidate", 1, true, null, 1, 0.8))).code());
+    }
+
+    @Test
+    void preference_intent_status_is_private_reference_only_closed_and_bound_to_the_requested_owner_scope_and_run() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var query = new GetMemoryPreferenceIntentQuery(owner, "research", "run");
+        var intent = new MemoryPreferenceIntentDTO("00000000-0000-0000-0000-000000000001", "source", "preferences@1#" + "a".repeat(64), MemoryPreferenceIntentStateEnum.READY, 3, 0, null, 0, null, NOW.minusSeconds(1), NOW, null);
+        var status = new MemoryPreferenceIntentStatusDTO(owner, "research", "run", intent); String encoded = mapper.writeValueAsString(status); var response = new AtomicReference<>(encoded); var calls = new AtomicInteger();
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/preference-intents/status", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            assertEquals(query, mapper.readValue(exchange.getRequestBody().readAllBytes(), GetMemoryPreferenceIntentQuery.class)); respond(exchange, 200, "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(status, client(Duration.ofSeconds(3), 3).memoryPreferenceIntent(query));
+        for (var invalid : List.of(encoded.replace("alice", "other"), encoded.replace("research", "other"), encoded.replace("\"run\"", "\"other\""), encoded.replace("\"READY\"", "\"UNKNOWN\""),
+                encoded.replace("\"revision\":3", "\"revision\":\"3\""), encoded.replace("\"nextIndex\":0", "\"nextIndex\":1"), encoded.replace("\"attemptCount\":0", "\"attemptCount\":101"),
+                encoded.replace("00000000-0000-0000-0000-000000000001", "1-1-1-1-1"), encoded.replace("\"closedAt\":null", "\"closedAt\":\"" + NOW + "\""),
+                encoded.replace("\"updatedAt\":\"" + NOW + "\"", "\"updatedAt\":\"" + NOW.minusSeconds(2) + "\""), encoded.substring(0, encoded.length() - 1) + ",\"ciphertext\":\"fixture-only\"}")) {
+            response.set(invalid); int before = calls.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).memoryPreferenceIntent(query)).code()); assertEquals(before + 1, calls.get());
+        }
+        var absent = new MemoryPreferenceIntentStatusDTO(owner, "research", "run", null); String empty = mapper.writeValueAsString(absent); response.set(empty);
+        assertEquals(absent, client(Duration.ofSeconds(3), 3).memoryPreferenceIntent(query)); response.set(empty.replace(",\"intent\":null", ""));
+        assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).memoryPreferenceIntent(query)).code());
+    }
+
+    @Test
+    void preference_intent_cancellation_matches_the_original_command_and_terminal_revision_without_post_replay() {
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.USER, "alice"); var command = new CancelMemoryPreferenceIntentCommand("cancel-1", owner, "research", "run", 3);
+        var intent = new MemoryPreferenceIntentDTO("00000000-0000-0000-0000-000000000001", "source", "preferences@1#" + "a".repeat(64), MemoryPreferenceIntentStateEnum.CANCELLED, 4, 0, null, 0, "USER_CANCELLED", NOW.minusSeconds(1), NOW, NOW);
+        var result = new MemoryPreferenceIntentCancellationDTO(command.commandId(), new MemoryPreferenceIntentStatusDTO(owner, "research", "run", intent)); String encoded = mapper.writeValueAsString(result);
+        var response = new AtomicReference<>(encoded); var calls = new AtomicInteger(); var status = new AtomicInteger(200);
+        handler.set(exchange -> {
+            calls.incrementAndGet(); assertEquals("POST", exchange.getRequestMethod()); assertEquals("/api/tianji/v1/memories/preference-intents/cancel", exchange.getRequestURI().getPath()); assertNull(exchange.getRequestURI().getRawQuery());
+            byte[] body = exchange.getRequestBody().readAllBytes(); assertEquals(command, mapper.readValue(body, CancelMemoryPreferenceIntentCommand.class));
+            assertEquals(5, mapper.readTree(body).size()); assertTrue(mapper.readTree(body).path("requestSha256").isMissingNode());
+            respond(exchange, status.get(), "application/json", response.get().getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(result, client(Duration.ofSeconds(3), 3).cancelMemoryPreferenceIntent(command));
+        for (var invalid : List.of(encoded.replace("cancel-1", "other"), encoded.replace("alice", "other"), encoded.replace("research", "other"), encoded.replace("\"run\"", "\"other\""),
+                encoded.replace("\"revision\":4", "\"revision\":5"), encoded.replace("\"CANCELLED\"", "\"REJECTED\""), encoded.replace("\"nextIndex\":0", "\"nextIndex\":1"),
+                encoded.substring(0, encoded.length() - 1) + ",\"commandId\":\"cancel-1\"}")) {
+            response.set(invalid); int before = calls.get(); assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).cancelMemoryPreferenceIntent(command)).code()); assertEquals(before + 1, calls.get());
+        }
+        var applied = new MemoryPreferenceIntentDTO(intent.intentId(), intent.bindingId(), intent.policyRef(), MemoryPreferenceIntentStateEnum.APPLIED, 3, 2, 2, 1, null, intent.createdAt(), NOW, NOW);
+        var terminal = new MemoryPreferenceIntentCancellationDTO(command.commandId(), new MemoryPreferenceIntentStatusDTO(owner, "research", "run", applied)); response.set(mapper.writeValueAsString(terminal));
+        assertEquals(terminal, client(Duration.ofSeconds(3), 3).cancelMemoryPreferenceIntent(command));
+        status.set(503); int before = calls.get(); assertThrows(AgentClientException.class, () -> client(Duration.ofSeconds(3), 3).cancelMemoryPreferenceIntent(command)); assertEquals(before + 1, calls.get());
     }
 
     private static MemoryEntryDTO memoryEntry(String id, MemoryOwnerDTO owner) {

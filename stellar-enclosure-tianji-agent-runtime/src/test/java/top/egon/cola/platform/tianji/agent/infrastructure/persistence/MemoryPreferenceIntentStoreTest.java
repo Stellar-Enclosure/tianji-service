@@ -94,6 +94,17 @@ class MemoryPreferenceIntentStoreTest {
         }
     }
 
+    @Test void cancellation_checks_the_current_request_deadline_again_after_waiting_for_the_intent_lock() throws Exception {
+        var source = source(); var ledger = ledger(source); var values = values(MemoryPreferenceIntent.State.RESERVED, 1); var jdbc = new AtomicReference<JdbcTemplate>();
+        try (var templates = templates(values, jdbc); var verifiers = mockConstruction(MemoryPreferenceIntentStorageVerifier.class)) {
+            var store = new MemoryPreferenceIntentStore(source, ledger); store.verifyStorage();
+            assertThrows(AgentLedgerException.class, () -> store.cancel(ACTOR, reservation(1).intentId(), 3, "cancel", HASH, NOW));
+            doReturn(Timestamp.from(NOW), Timestamp.from(NOW.plusSeconds(11))).when(jdbc.get()).queryForObject(eq("SELECT clock_timestamp()"), eq(Timestamp.class));
+            assertThrows(AgentLedgerException.class, () -> store.cancel(ACTOR, reservation(1).intentId(), 3, "cancel", HASH, NOW.plusSeconds(10)));
+            verify(jdbc.get(), never()).update(anyString(), any(Object[].class));
+        }
+    }
+
     private static org.mockito.MockedConstruction<JdbcTemplate> templates(Map<String, Object> values, AtomicReference<JdbcTemplate> captured) {
         return mockConstruction(JdbcTemplate.class, (template, context) -> {
             captured.set(template); when(template.queryForObject(startsWith("SELECT NOT pg_is_in_recovery()"), eq(Boolean.class))).thenReturn(true);

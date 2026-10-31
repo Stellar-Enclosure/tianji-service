@@ -11,6 +11,11 @@ import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQue
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergeQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMergePageDTO;
+import top.egon.cola.platform.tianji.contract.memory.GetMemoryPreferenceIntentQuery;
+import top.egon.cola.platform.tianji.contract.memory.CancelMemoryPreferenceIntentCommand;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentStatusDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentCancellationDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceIntentStateEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryEntryDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryRetrievalPageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
@@ -242,6 +247,27 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
         requireMemoryScope(command.owner(), command.scopeId(), result.owner(), result.scopeId());
         if (!command.runId().equals(result.runId()) || !command.sourceEventId().equals(result.sourceEventId())
                 || !command.bindingId().equals(result.bindingId()) || !command.policyRef().equals(result.policyRef())) throw invalidMemoryResponse();
+        return result;
+    }
+
+    @Override
+    public MemoryPreferenceIntentStatusDTO memoryPreferenceIntent(GetMemoryPreferenceIntentQuery query) {
+        Objects.requireNonNull(query, "query");
+        var result = call("POST", memoryPath("preference-intents/status"), query, MemoryPreferenceIntentStatusDTO.class, null, memories::preferenceIntent);
+        requireMemoryScope(query.owner(), query.scopeId(), result.owner(), result.scopeId());
+        if (!query.runId().equals(result.runId())) throw invalidMemoryResponse(); return result;
+    }
+
+    @Override
+    public MemoryPreferenceIntentCancellationDTO cancelMemoryPreferenceIntent(CancelMemoryPreferenceIntentCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", memoryPath("preference-intents/cancel"), command, MemoryPreferenceIntentCancellationDTO.class, null, memories::cancelPreferenceIntent);
+        var status = result.status(); requireMemoryScope(command.owner(), command.scopeId(), status.owner(), status.scopeId());
+        if (!command.runId().equals(status.runId()) || !command.commandId().equals(result.commandId())) throw invalidMemoryResponse();
+        var intent = status.intent();
+        if (intent.state() == MemoryPreferenceIntentStateEnum.CANCELLED) {
+            if (command.expectedRevision() == Long.MAX_VALUE || intent.revision() != command.expectedRevision() + 1) throw invalidMemoryResponse();
+        } else if (intent.revision() != command.expectedRevision()) throw invalidMemoryResponse();
         return result;
     }
 

@@ -246,16 +246,26 @@ public final class MemoryPreferenceIntentStore {
     }
 
     public MemoryPreferenceIntent.View cancel(TrustedAgentActor actor, UUID id, long expectedRevision, String commandId, String requestSha256) {
+        return cancel(actor, id, expectedRevision, commandId, requestSha256, Instant.MAX);
+    }
+
+    /** The HTTP boundary supplies its current identity deadline; waiting for a fence cannot extend that authority window. */
+    public MemoryPreferenceIntent.View cancel(TrustedAgentActor actor, UUID id, long expectedRevision, String commandId, String requestSha256, Instant requestedDeadline) {
         if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.USER || expectedRevision < 1 || !hash(requestSha256)) throw invalid(); identifier(commandId, 128);
+        Objects.requireNonNull(requestedDeadline, "requestedDeadline");
         return transact(status -> {
+            Instant now = databaseNow(); Instant maximum = now.plusSeconds(30); Instant deadline = requestedDeadline.isBefore(maximum) ? requestedDeadline : maximum;
+            if (!deadline.isAfter(now)) throw unavailable();
             var row = read(id, true).filter(value -> value.reservation().run().actor().equals(actor)).orElseThrow(MemoryPreferenceIntentStore::notFound);
+            if (!deadline.isAfter(databaseNow())) throw unavailable();
             if (row.state() == MemoryPreferenceIntent.State.CANCELLED) {
                 if (!commandId.equals(row.cancelCommandId()) || !requestSha256.equals(row.cancelRequestSha256())) throw conflict(); return row.view();
             }
             if (row.revision() != expectedRevision) throw conflict();
             if (row.state().terminal()) return row.view();
             closeRow(row, MemoryPreferenceIntent.State.CANCELLED, "USER_CANCELLED", databaseNow(), commandId, requestSha256);
-            return read(id, true).orElseThrow(MemoryPreferenceIntentStore::unavailable).view();
+            var result = read(id, true).orElseThrow(MemoryPreferenceIntentStore::unavailable).view();
+            if (!deadline.isAfter(databaseNow())) throw unavailable(); return result;
         });
     }
 

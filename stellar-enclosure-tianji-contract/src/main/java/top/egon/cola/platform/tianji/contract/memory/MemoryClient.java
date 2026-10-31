@@ -13,6 +13,8 @@ public interface MemoryClient {
     default MemoryPreferenceExtractionResultDTO extractMemoryPreferences(ExtractMemoryPreferencesCommand command) { throw new UnsupportedOperationException("Preference extraction is unavailable in this client"); }
     default MemoryPreferencePreparationDTO prepareMemoryPreferences(PrepareMemoryPreferencesQuery query) { throw new UnsupportedOperationException("Preference preparation is unavailable in this client"); }
     default MemoryMergePageDTO memoryMergeSuggestions(MemoryMergeQuery query) { throw new UnsupportedOperationException("Memory comparison is unavailable in this client"); }
+    default MemoryPreferenceIntentStatusDTO memoryPreferenceIntent(GetMemoryPreferenceIntentQuery query) { throw new UnsupportedOperationException("Preference extraction status is unavailable in this client"); }
+    default MemoryPreferenceIntentCancellationDTO cancelMemoryPreferenceIntent(CancelMemoryPreferenceIntentCommand command) { throw new UnsupportedOperationException("Preference extraction cancellation is unavailable in this client"); }
     MemoryMutationResultDTO upsertMemory(UpsertMemoryCommand command);
     MemoryMutationResultDTO correctMemory(CorrectMemoryCommand command);
     MemoryMutationResultDTO forgetMemory(ForgetMemoryCommand command);

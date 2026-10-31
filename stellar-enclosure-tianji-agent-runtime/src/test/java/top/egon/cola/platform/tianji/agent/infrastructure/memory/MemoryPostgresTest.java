@@ -416,7 +416,9 @@ class MemoryPostgresTest {
         var current = store.claim(20, ALICE.issuerFingerprint(), cancelReservation.intentId(), "new-worker", Duration.ofSeconds(30)).orElseThrow(); assertTrue(current.epoch() > old.epoch());
         var transaction = new org.springframework.transaction.support.TransactionTemplate(new org.springframework.jdbc.datasource.DataSourceTransactionManager(source));
         assertThrows(AgentLedgerException.class, () -> transaction.executeWithoutResult(status -> store.verifyFence(old)));
-        var cancelled = store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "cancel-background", "c".repeat(64));
+        assertThrows(AgentLedgerException.class, () -> store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "expired-cancel", "c".repeat(64), Instant.EPOCH));
+        assertDoesNotThrow(() -> transaction.executeWithoutResult(status -> store.verifyFence(current)));
+        var cancelled = store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "cancel-background", "c".repeat(64), Instant.now().plusSeconds(20));
         assertEquals(MemoryPreferenceIntent.State.CANCELLED, cancelled.state()); assertEquals(cancelled, store.cancel(ALICE, cancelReservation.intentId(), current.revision(), "cancel-background", "c".repeat(64)));
         assertThrows(AgentLedgerException.class, () -> transaction.executeWithoutResult(status -> store.verifyFence(current)));
         assertFalse(store.complete(cancelReservation, ticket));
