@@ -140,19 +140,24 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
         } catch (RuntimeException privateRelease) { throw failure(FailureKind.RELEASE_UNAVAILABLE); }
         requireRelease(release, backend); current(scope, backend);
         Thread owner = Thread.currentThread(); var callbackActive = new AtomicBoolean(true); var consumed = new AtomicBoolean();
-        OneShotStart operation = () -> {
-            if (Thread.currentThread() != owner || !callbackActive.get() || TransactionSynchronizationManager.isActualTransactionActive()
-                    || !consumed.compareAndSet(false, true)) throw failure(FailureKind.CANCELLED);
-            HttpProcessClient client; StartProcessCommand command;
-            try {
-                current(scope, backend);
-                client = client(backend, scope);
-                var action = request.action();
-                command = new StartProcessCommand(backend.processDefinitionKey(), backend.releaseVersion(), action.businessKey(),
-                        action.intentId(), action.intentId(), action.arguments());
-                scope.beginOperation();
-            } catch (RuntimeException notSent) { throw failure(FailureKind.OPERATION_NOT_SENT); }
-            return start(backend, credential.actor(), client, command);
+        OneShotStart operation = new OneShotStart() {
+            @Override public StartObservation start() { return execute(false, null); }
+            @Override public StartObservation start(Instant callDeadlineAt) { return execute(true, callDeadlineAt); }
+            private StartObservation execute(boolean bounded, Instant callDeadlineAt) {
+                if (Thread.currentThread() != owner || !callbackActive.get() || TransactionSynchronizationManager.isActualTransactionActive()
+                        || !consumed.compareAndSet(false, true)) throw failure(FailureKind.CANCELLED);
+                HttpProcessClient client; StartProcessCommand command;
+                try {
+                    if (bounded) scope.narrowCallDeadline(callDeadlineAt);
+                    current(scope, backend);
+                    client = client(backend, scope);
+                    var action = request.action();
+                    command = new StartProcessCommand(backend.processDefinitionKey(), backend.releaseVersion(), action.businessKey(),
+                            action.intentId(), action.intentId(), action.arguments());
+                    scope.beginOperation();
+                } catch (RuntimeException notSent) { throw failure(FailureKind.OPERATION_NOT_SENT); }
+                return TianjiFixedBpmnStartToolTransport.this.start(backend, credential.actor(), client, command);
+            }
         };
         T value;
         try {
@@ -238,16 +243,29 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
         final AtomicReference<Future<?>> future = new AtomicReference<>();
         final Object publishLock = new Object();
         volatile CredentialVO credential;
+        volatile Instant narrowedDeadline;
 
         CallScope(WindowVO window) { this.window = window; }
         long remaining() {
             if (!active.get() || closed.get() || Thread.currentThread().isInterrupted()) throw failure(FailureKind.CANCELLED);
             Instant deadline = credential == null ? window.deadlineAt() : earlier(window.deadlineAt(), credential.expiresAt());
+            if (narrowedDeadline != null) deadline = earlier(deadline, narrowedDeadline);
             Instant now = clock.instant();
             if (!deadline.isAfter(now)) throw failure(FailureKind.DEADLINE_EXCEEDED);
             long remaining = window.startedNanos() + Duration.between(window.startedAt(), deadline).toNanos() - nanoTime.getAsLong();
             if (remaining <= 0) throw failure(FailureKind.DEADLINE_EXCEEDED);
             return Math.min(remaining, Duration.between(now, deadline).toNanos());
+        }
+        void narrowCallDeadline(Instant value) {
+            synchronized (publishLock) {
+                remaining();
+                Instant maximum = credential == null ? window.deadlineAt() : earlier(window.deadlineAt(), credential.expiresAt());
+                Instant now = clock.instant();
+                if (value == null || value.getNano() % 1_000 != 0 || !value.isAfter(now) || value.isAfter(maximum)) {
+                    throw failure(FailureKind.OPERATION_NOT_SENT);
+                }
+                narrowedDeadline = value; remaining();
+            }
         }
         void publishBearer(String value) {
             synchronized (publishLock) {

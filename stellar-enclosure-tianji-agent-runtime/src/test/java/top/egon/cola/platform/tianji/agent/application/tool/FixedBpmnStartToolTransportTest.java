@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -119,6 +120,29 @@ class FixedBpmnStartToolTransportTest {
             assertEquals(kind, failure.kind()); assertEquals(kind.name(), failure.getMessage()); assertNull(failure.getCause());
             assertThrows(IllegalStateException.class, () -> failure.initCause(new IllegalArgumentException("private bearer")));
         }
+    }
+
+    @Test void bounded_default_refuses_without_delegating_and_legacy_no_argument_start_remains_available() {
+        var calls = new AtomicInteger(); var observation = new FixedBpmnStartToolTransport.StartObservation("tianji:ps-start:v1:" + HASH, "instance-1");
+        FixedBpmnStartToolTransport.OneShotStart legacy = () -> { calls.incrementAndGet(); return observation; };
+        for (var deadline : Arrays.asList(NOW.plusSeconds(2), null, NOW.plusNanos(1), NOW.minusSeconds(1))) {
+            var failure = assertThrows(FixedBpmnStartToolTransport.Failure.class, () -> legacy.start(deadline));
+            assertEquals(FixedBpmnStartToolTransport.FailureKind.OPERATION_NOT_SENT, failure.kind());
+            assertNull(failure.getCause()); assertEquals("OPERATION_NOT_SENT", failure.getMessage()); assertEquals(0, calls.get());
+        }
+        assertSame(observation, legacy.start()); assertEquals(1, calls.get());
+    }
+
+    @Test void bounded_overload_preserves_the_single_abstract_no_argument_operation_and_method_reference() throws Exception {
+        var operation = FixedBpmnStartToolTransport.OneShotStart.class;
+        assertTrue(operation.isAnnotationPresent(FunctionalInterface.class));
+        assertEquals(1, Arrays.stream(operation.getMethods()).filter(method -> java.lang.reflect.Modifier.isAbstract(method.getModifiers())).count());
+        assertTrue(java.lang.reflect.Modifier.isAbstract(operation.getMethod("start").getModifiers()));
+        assertTrue(operation.getMethod("start", Instant.class).isDefault());
+        var expected = new FixedBpmnStartToolTransport.StartObservation("tianji:ps-start:v1:" + HASH, "instance-1");
+        FixedBpmnStartToolTransport.OneShotStart legacy = () -> expected;
+        FixedBpmnStartToolTransport.OneShotStart referenced = legacy::start;
+        assertSame(expected, referenced.start());
     }
 
     private static ToolDescriptor descriptor(ToolPolicy.Risk risk, String description) {

@@ -254,6 +254,110 @@ class TianjiFixedBpmnStartToolTransportTest {
         }
     }
 
+    @Test void bounded_start_narrows_only_the_actual_post_timeout_and_keeps_the_release_get_on_its_original_window() {
+        try (var fixture = new Fixture()) {
+            var observation = fixture.transport.withVerifiedCall(fixture.request(),
+                    (executor, operation) -> operation.start(NOW.plusSeconds(2)));
+            assertEquals(INSTANCE_ID, observation.instanceId()); assertEquals(List.of("GET", "POST"), fixture.requests.stream().map(HttpRequest::method).toList());
+            assertEquals(Duration.ofSeconds(5), fixture.requests.getFirst().timeout().orElseThrow());
+            assertEquals(Duration.ofSeconds(2), fixture.requests.getLast().timeout().orElseThrow());
+        }
+    }
+
+    @Test void null_nonmicro_expired_or_overwide_bounded_deadlines_are_not_sent() {
+        for (String variant : List.of("null", "nonmicro", "expired", "window", "credential")) {
+            try (var fixture = new Fixture()) {
+                Instant deadline = switch (variant) {
+                    case "null" -> null;
+                    case "nonmicro" -> NOW.plusSeconds(2).plusNanos(1);
+                    case "expired" -> NOW;
+                    case "window" -> NOW.plusSeconds(6);
+                    case "credential" -> {
+                        fixture.token.set(new OAuth2AccessToken(OAuth2AccessToken.TokenType.BEARER, TOKEN, NOW.minusSeconds(20), NOW.plusSeconds(3), SCOPES));
+                        yield NOW.plusSeconds(4);
+                    }
+                    default -> throw new AssertionError("Unexpected bounded deadline fixture");
+                };
+                assertFailure(OPERATION_NOT_SENT, () -> fixture.transport.withVerifiedCall(fixture.request(),
+                        (executor, operation) -> operation.start(deadline)));
+                assertEquals(0, fixture.posts(), variant); assertEquals(List.of("GET"), fixture.requests.stream().map(HttpRequest::method).toList(), variant);
+            }
+        }
+    }
+
+    @Test void bounded_and_legacy_entries_share_one_consumed_capability_across_invalid_retry_thread_and_callback_escape() throws Exception {
+        try (var fixture = new Fixture()) {
+            fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                assertFailure(OPERATION_NOT_SENT, () -> operation.start(NOW.plusSeconds(2).plusNanos(1)));
+                assertFailure(CANCELLED, operation::start); assertFailure(CANCELLED, () -> operation.start(NOW.plusSeconds(1)));
+                return "spent";
+            });
+            assertEquals(0, fixture.posts());
+        }
+        try (var fixture = new Fixture()) {
+            fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                assertEquals(INSTANCE_ID, operation.start(NOW.plusSeconds(2)).instanceId());
+                assertFailure(CANCELLED, operation::start); assertFailure(CANCELLED, () -> operation.start(NOW.plusSeconds(1)));
+                return "sent";
+            });
+            assertEquals(1, fixture.posts());
+        }
+        try (var fixture = new Fixture()) {
+            var escaped = new AtomicReference<FixedBpmnStartToolTransport.OneShotStart>();
+            fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                var failure = new AtomicReference<Throwable>();
+                Thread other = Thread.ofVirtual().start(() -> { try { operation.start(NOW.plusSeconds(2)); } catch (Throwable rejected) { failure.set(rejected); } });
+                try { other.join(1000); } catch (InterruptedException interrupted) { throw new AssertionError(interrupted); }
+                assertEquals(CANCELLED, assertInstanceOf(FixedBpmnStartToolTransport.Failure.class, failure.get()).kind());
+                escaped.set(operation); return operation.start(NOW.plusSeconds(2));
+            });
+            assertFailure(CANCELLED, () -> escaped.get().start(NOW.plusSeconds(1))); assertEquals(1, fixture.posts());
+        }
+    }
+
+    @Test void bounded_deadline_uses_the_original_monotonic_origin_when_wall_time_moves_backwards() {
+        try (var fixture = new Fixture()) {
+            assertFailure(OPERATION_NOT_SENT, () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                fixture.wall.set(NOW.minusSeconds(60)); fixture.nano.set(Duration.ofSeconds(3).toNanos());
+                return operation.start(NOW.plusSeconds(2));
+            }));
+            assertEquals(0, fixture.posts());
+        }
+    }
+
+    @Test void bounded_ack_reaches_the_callback_before_expiry_suppresses_only_the_outer_return() throws Exception {
+        try (var fixture = new Fixture()) {
+            var observed = new AtomicReference<FixedBpmnStartToolTransport.StartObservation>(); var recorded = new CountDownLatch(1);
+            assertFailure(DEADLINE_EXCEEDED, () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                observed.set(operation.start(NOW.plusSeconds(2))); recorded.countDown();
+                fixture.wall.set(NOW.plusSeconds(3)); fixture.nano.set(Duration.ofSeconds(3).toNanos()); return "committed";
+            }));
+            assertTrue(recorded.await(1, TimeUnit.SECONDS)); assertEquals(INSTANCE_ID, observed.get().instanceId()); assertEquals(1, fixture.posts());
+        }
+    }
+
+    @Test void bounded_pending_post_preserves_unknown_cancel_cleanup_and_caller_resource_ownership() throws Exception {
+        for (boolean close : List.of(false, true)) {
+            try (var fixture = new Fixture()) {
+                var post = fixture.holdPost(); var failure = new AtomicReference<Throwable>(); var returned = new AtomicReference<FixedBpmnStartToolTransport.StartObservation>();
+                var interrupted = new AtomicBoolean();
+                Thread caller = Thread.ofPlatform().start(() -> {
+                    try {
+                        returned.set(fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> {
+                            try { return operation.start(NOW.plusSeconds(4)); } finally { post.callbackFinished.countDown(); }
+                        }));
+                    } catch (Throwable rejected) { failure.set(rejected); interrupted.set(Thread.currentThread().isInterrupted()); }
+                });
+                try {
+                    assertTrue(post.entered.await(1, TimeUnit.SECONDS));
+                    if (close) fixture.transport.close(); else caller.interrupt();
+                    assertCallerUnknown(fixture, caller, failure, returned); if (!close) assertTrue(interrupted.get());
+                } finally { post.release.countDown(); caller.join(2000); assertTrue(post.callbackFinished.await(1, TimeUnit.SECONDS)); }
+                verify(fixture.http, never()).close(); verify(fixture.oauth, never()).close();
+            }
+        }
+    }
+
     @Test void callback_failures_never_retain_private_payloads_or_causes_and_known_ledger_codes_are_preserved() {
         try (var fixture = new Fixture()) {
             var failure = assertFailure(OPERATION_NOT_SENT, () -> fixture.transport.withVerifiedCall(fixture.request(), (executor, operation) -> { throw new IllegalStateException("private " + TOKEN); }));

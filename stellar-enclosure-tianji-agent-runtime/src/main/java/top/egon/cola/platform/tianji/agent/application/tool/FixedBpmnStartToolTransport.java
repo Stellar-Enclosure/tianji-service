@@ -33,7 +33,11 @@ public interface FixedBpmnStartToolTransport {
     }
 
     @FunctionalInterface interface Callback<T> { T apply(ReadOnlyDecisionToolTransport.VerifiedExecutor executor, OneShotStart operation); }
-    @FunctionalInterface interface OneShotStart { StartObservation start(); }
+    @FunctionalInterface interface OneShotStart {
+        StartObservation start();
+        /** Implementations must opt in to deadline enforcement; unsupported hosts never fall back to an unbounded send. */
+        default StartObservation start(Instant callDeadlineAt) { throw new Failure(FailureKind.OPERATION_NOT_SENT); }
+    }
 
     record StartObservation(String hostReceiptReference, String instanceId) {
         public StartObservation {
