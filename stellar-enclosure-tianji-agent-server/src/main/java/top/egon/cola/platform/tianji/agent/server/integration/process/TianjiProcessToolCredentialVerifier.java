@@ -23,20 +23,20 @@ import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /** Shared identity verification only; each transport owns its original window and request-local bearer. */
-final class TianjiProcessToolCredentialVerifier {
+public final class TianjiProcessToolCredentialVerifier {
     private final IdpServiceOAuth2Client oauth;
     private final TenantIssuerAuthenticationManagerComponent authentication;
     private final VerifiedPrincipalConverter converter;
     private final TrustedIssuerRegistry issuers;
     private final Clock clock;
 
-    TianjiProcessToolCredentialVerifier(IdpServiceOAuth2Client oauth, TenantIssuerAuthenticationManagerComponent authentication,
+    public TianjiProcessToolCredentialVerifier(IdpServiceOAuth2Client oauth, TenantIssuerAuthenticationManagerComponent authentication,
             VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers, Clock clock) {
         this.oauth = Objects.requireNonNull(oauth, "oauth"); this.authentication = Objects.requireNonNull(authentication, "authentication");
         this.converter = Objects.requireNonNull(converter, "converter"); this.issuers = Objects.requireNonNull(issuers, "issuers"); this.clock = Objects.requireNonNull(clock, "clock");
     }
 
-    CredentialVO credentials(TargetVO target, Instant deadlineAt, LongSupplier remainingNanos, Consumer<String> publishBearer, Supplier<String> currentBearer) {
+    public CredentialVO credentials(TargetVO target, Instant deadlineAt, LongSupplier remainingNanos, Consumer<String> publishBearer, Supplier<String> currentBearer) {
         remainingNanos.getAsLong();
         var request = new IdpServiceTokenRequest(target.registrationId(), target.expectedAppId(), target.resource(), ServiceTokenContext.TENANT, Long.toString(target.tenantId()), target.scopes());
         var trust = trust(target); var key = oauth.authorizationKey(request); requireKey(key, request, target); remainingNanos.getAsLong();
@@ -63,7 +63,7 @@ final class TianjiProcessToolCredentialVerifier {
         return new CredentialVO(request, key, trust, actor, expiry);
     }
 
-    void requireCurrent(TargetVO target, CredentialVO credential) {
+    public void requireCurrent(TargetVO target, CredentialVO credential) {
         var key = oauth.authorizationKey(credential.request()); requireKey(key, credential.request(), target);
         if (!sameKey(credential.key(), key) || !sameTrust(credential.trust(), trust(target))) throw unavailable();
     }
@@ -87,12 +87,12 @@ final class TianjiProcessToolCredentialVerifier {
         return current != null && expected.equals(current) && expected.issuer().toASCIIString().equals(current.issuer().toASCIIString()) && expected.jwksUri().toASCIIString().equals(current.jwksUri().toASCIIString());
     }
 
-    record TargetVO(long tenantId, URI issuer, URI resource, String registrationId, String expectedClientId, String expectedAppId,
+    public record TargetVO(long tenantId, URI issuer, URI resource, String registrationId, String expectedClientId, String expectedAppId,
                     String expectedSourceBiz, String expectedSourceApp, String expectedEnvironment, Set<String> scopes) {
-        TargetVO { scopes = Set.copyOf(scopes); }
+        public TargetVO { scopes = Set.copyOf(scopes); }
         @Override public String toString() { return "ProcessToolCredentialTarget[redacted]"; }
     }
-    record CredentialVO(IdpServiceTokenRequest request, ServiceAuthorizationKey key, TrustedIssuerRegistry.TrustedIssuerVO trust,
+    public record CredentialVO(IdpServiceTokenRequest request, ServiceAuthorizationKey key, TrustedIssuerRegistry.TrustedIssuerVO trust,
                         TrustedAgentActor actor, Instant expiresAt) {
         @Override public String toString() { return "ProcessToolCredentialContext[redacted]"; }
     }
