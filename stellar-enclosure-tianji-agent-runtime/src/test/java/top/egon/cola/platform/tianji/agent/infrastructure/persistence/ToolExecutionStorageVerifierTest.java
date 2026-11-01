@@ -32,7 +32,34 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class ToolExecutionStorageVerifierTest {
-    private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation";
+    private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation",
+            ACCESS = "agent_tool_result_access";
+
+    @Test void the_result_access_companion_is_one_closed_insert_only_table_without_a_result_copy() throws Exception {
+        String sql = resultAccessSql(); var contract = ToolExecutionStorageVerifier.resultAccessContract(sql);
+        assertEquals(Set.of(ACCESS), contract.keySet());
+        var table = contract.get(ACCESS);
+        var columns = Set.of("tenant_id", "run_id", "access_id", "reservation_id", "owner_type", "owner_issuer", "owner_id", "capability_id",
+                "capability_binding_sha256", "capability_issue_epoch", "lease_epoch", "tool_key", "tool_version", "tool_sha256", "backend_binding_sha256",
+                "parameters_sha256", "intent_id", "request_sha256", "risk", "source_action_revision", "source_result_sha256", "authorization_audit",
+                "authorization_checked_at", "authorization_expires_at", "created_at");
+        assertEquals(columns, table.columns().keySet()); assertEquals(25, table.columns().size());
+        assertTrue(table.columns().values().stream().allMatch(MemoryStorageVerifier.Column::notNull));
+        for (String column : Set.of("reservation_id", "owner_type", "owner_issuer", "owner_id", "capability_binding_sha256", "tool_key", "tool_sha256",
+                "backend_binding_sha256", "parameters_sha256", "request_sha256", "risk", "source_result_sha256")) {
+            assertTrue(table.columns().get(column).cCollation(), column);
+        }
+        assertEquals(Set.of("tool_result_access_identity", "tool_result_access_source", "tool_result_access_authorization", "tool_result_access_time"), table.checks().keySet());
+        assertEquals(4, table.checks().size());
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_pkey PRIMARY KEY (tenant_id,run_id,access_id)"));
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_budget_key UNIQUE (tenant_id,run_id,reservation_id)"));
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_run_fkey FOREIGN KEY (tenant_id,run_id) REFERENCES tianji_agent.agent_run (tenant_id,run_id) ON DELETE NO ACTION"));
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_budget_fkey FOREIGN KEY (tenant_id,run_id,reservation_id) REFERENCES tianji_agent.agent_budget_reservation (tenant_id,run_id,reservation_id) ON DELETE NO ACTION"));
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_capability_fkey FOREIGN KEY (tenant_id,run_id,capability_id,capability_binding_sha256,tool_key,tool_version,tool_sha256,backend_binding_sha256) REFERENCES tianji_agent.agent_tool_capability (tenant_id,run_id,capability_id,binding_sha256,tool_key,tool_version,tool_sha256,backend_binding_sha256) ON DELETE NO ACTION"));
+        assertTrue(sql.contains("CONSTRAINT agent_tool_result_access_intent_fkey FOREIGN KEY (tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,backend_binding_sha256,risk) REFERENCES tianji_agent.agent_tool_action_intent (tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,binding_sha256,risk) ON DELETE NO ACTION"));
+        assertTrue(sql.contains("CREATE INDEX agent_tool_result_access_intent_idx ON tianji_agent.agent_tool_result_access (tenant_id,intent_id,created_at,run_id,access_id);"));
+        assertFalse(sql.contains("ON DELETE CASCADE")); assertFalse(sql.contains("DEFAULT"));
+    }
 
     @Test void the_three_table_contract_preserves_tool_slots_business_intents_and_invocation_receipts() throws Exception {
         String sql = sql(); var contract = ToolExecutionStorageVerifier.contract(sql);
@@ -106,6 +133,11 @@ class ToolExecutionStorageVerifierTest {
         assertEquals(new String(raw, StandardCharsets.UTF_8), ToolExecutionStorageVerifier.migration());
     }
 
+    @Test void the_finalized_result_access_journal_is_frozen_after_its_single_creation() throws Exception {
+        byte[] raw = resource(ToolExecutionStorageVerifier.RESULT_ACCESS_FILE);
+        assertEquals("88876815f5a6662c9b3378bb15f5a6ae6edebc92007a66f43e177a15dff3760a", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(raw)));
+    }
+
     @Test void readiness_uses_bounded_query_only_repeatable_read_on_the_primary() throws Exception {
         var catalog = new Catalog(); var captured = new AtomicReference<JdbcTemplate>(); var statements = new ArrayList<String>();
         var source = source(); var connection = source.getConnection();
@@ -117,6 +149,30 @@ class ToolExecutionStorageVerifierTest {
             assertTrue(statements.stream().allMatch(statement -> statement.startsWith("SELECT ")));
             assertTrue(statements.stream().anyMatch(statement -> statement.contains("NOT c.relrowsecurity AND NOT c.relforcerowsecurity") && statement.contains("pg_trigger")));
         }
+    }
+
+    @Test void result_access_readiness_is_optional_for_v13_but_requires_the_complete_v14_history() throws Exception {
+        var missing = new Catalog();
+        try (var templates = templates(source(), missing, new AtomicReference<>(), new ArrayList<>())) {
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class, () -> new ToolExecutionStorageVerifier(missing.source).verifyResultAccess()).code());
+        }
+        var catalog = new Catalog(true); catalog.updatePrivileges.put(ACCESS, false);
+        try (var templates = templates(source(), catalog, new AtomicReference<>(), new ArrayList<>())) {
+            new ToolExecutionStorageVerifier(catalog.source).verify();
+            new ToolExecutionStorageVerifier(catalog.source).verifyResultAccess();
+        }
+        assertResultAccessRejected(value -> value.history.getLast().put("checksum", 42));
+        assertResultAccessRejected(value -> value.history.add(new HashMap<>(Map.of("version", "15", "success", false))));
+    }
+
+    @Test void result_access_catalog_keys_indexes_checks_and_minimum_privileges_fail_closed_on_drift() throws Exception {
+        assertResultAccessRejected(catalog -> catalog.columns.get(ACCESS).removeFirst());
+        assertResultAccessRejected(catalog -> catalog.columns.get(ACCESS).getFirst().put("atthasdef", true));
+        assertResultAccessRejected(catalog -> find(catalog.checks.get(ACCESS), "conname", "tool_result_access_authorization").put("expression", "true"));
+        assertResultAccessRejected(catalog -> catalog.keys.get(ACCESS).removeIf(row -> INTENT.equals(row.get("target"))));
+        assertResultAccessRejected(catalog -> catalog.indexes.get(ACCESS).removeLast());
+        assertResultAccessRejected(catalog -> catalog.tablePrivileges.put(ACCESS, false));
     }
 
     @Test void changed_or_duplicate_known_history_is_not_ready_but_future_success_does_not_replace_known_versions() throws Exception {
@@ -180,6 +236,15 @@ class ToolExecutionStorageVerifierTest {
         }
     }
 
+    private static void assertResultAccessRejected(Consumer<Catalog> mutation) throws Exception {
+        var catalog = new Catalog(true); mutation.accept(catalog); var source = source(); var captured = new AtomicReference<JdbcTemplate>();
+        try (var templates = templates(source, catalog, captured, new ArrayList<>())) {
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class, () -> new ToolExecutionStorageVerifier(source).verifyResultAccess()).code());
+            verify(source.getConnection()).rollback();
+        }
+    }
+
     private static DataSource source() throws Exception {
         var source = mock(DataSource.class); var connection = mock(Connection.class);
         when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
@@ -214,8 +279,11 @@ class ToolExecutionStorageVerifierTest {
             doAnswer(call -> {
                 String statement = call.getArgument(0); statements.add(statement); RowMapper<?> mapper = call.getArgument(1);
                 String table = ((Object[]) call.getRawArguments()[2])[0].toString();
+                boolean mandatoryUpdate = statement.contains("AND has_table_privilege(current_user,c.oid,'UPDATE') AS safe");
                 var rows = statement.contains("FROM pg_constraint") ? catalog.keys.get(table) : statement.contains("FROM pg_index") ? catalog.indexes.get(table)
-                        : statement.contains("has_table_privilege") ? List.of(Map.<String, Object>of("safe", catalog.safePrivileges)) : null;
+                        : statement.contains("has_table_privilege") ? List.of(Map.<String, Object>of("safe", catalog.safePrivileges && catalog.tablePrivileges.getOrDefault(table, true)
+                        && (!mandatoryUpdate || catalog.updatePrivileges.getOrDefault(table, true)),
+                        "update_allowed", catalog.updatePrivileges.getOrDefault(table, true))) : null;
                 if (rows == null) throw new AssertionError("Unexpected controlled tool catalog query");
                 var result = new ArrayList<Object>(); for (var row : rows) result.add(mapper.mapRow(result(row), result.size())); return result;
             }).when(template).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
@@ -240,13 +308,17 @@ class ToolExecutionStorageVerifierTest {
     private static final class Catalog {
         final List<Map<String, Object>> history = new ArrayList<>();
         final Map<String, List<Map<String, Object>>> columns = new HashMap<>(), checks = new HashMap<>(), keys = new HashMap<>(), indexes = new HashMap<>();
+        final Map<String, Boolean> tablePrivileges = new HashMap<>(), updatePrivileges = new HashMap<>();
         DataSource source; boolean primary = true, safePrivileges = true; RuntimeException failure;
 
-        Catalog() throws Exception {
-            String sql = sql(); var shape = MemoryStorageVerifier.contract(sql);
-            var files = List.of("V1__create_agent_ledger.sql", "V2__add_run_governance.sql", "V3__add_adk_session_store.sql", "V4__add_adk_session_codec_versions.sql",
+        Catalog() throws Exception { this(false); }
+
+        Catalog(boolean resultAccess) throws Exception {
+            String sql = sql() + (resultAccess ? "\n" + resultAccessSql() : ""); var shape = MemoryStorageVerifier.contract(sql);
+            var files = new ArrayList<>(List.of("V1__create_agent_ledger.sql", "V2__add_run_governance.sql", "V3__add_adk_session_store.sql", "V4__add_adk_session_codec_versions.sql",
                     "V5__bind_agent_ownership_to_issuer.sql", "V6__add_execution_grant_evidence.sql", "V7__add_process_dispatch_fence.sql", "V8__add_service_execution_grant.sql",
-                    "V9__add_context_snapshots.sql", "V10__add_memory_facts_and_index.sql", "V11__bind_memory_grant_ticket_to_principal.sql", "V12__add_memory_preference_intent.sql", ToolExecutionStorageVerifier.FILE);
+                    "V9__add_context_snapshots.sql", "V10__add_memory_facts_and_index.sql", "V11__bind_memory_grant_ticket_to_principal.sql", "V12__add_memory_preference_intent.sql", ToolExecutionStorageVerifier.FILE));
+            if (resultAccess) files.add(ToolExecutionStorageVerifier.RESULT_ACCESS_FILE);
             for (int index = 0; index < files.size(); index++) history.add(new HashMap<>(Map.of("version", Integer.toString(index + 1), "type", "SQL", "script", files.get(index),
                     "success", true, "checksum", MemoryStorageVerifier.checksum(new String(resource(files.get(index)), StandardCharsets.UTF_8)))));
             var starts = Pattern.compile("CREATE TABLE tianji_agent\\.([a-z0-9_]+)\\s*\\(").matcher(sql);
@@ -265,6 +337,7 @@ class ToolExecutionStorageVerifierTest {
                 while (check.find()) checkRows.add(new HashMap<>(Map.of("conname", check.group(1), "convalidated", true, "enforced", true,
                         "expression", body.substring(check.end(), closing(body, check.end() - 1)))));
                 checks.put(table, checkRows); keys.put(table, new ArrayList<>()); indexes.put(table, new ArrayList<>());
+                tablePrivileges.put(table, true); updatePrivileges.put(table, true);
                 var key = Pattern.compile("CONSTRAINT\\s+[a-z0-9_]+\\s+(PRIMARY KEY|UNIQUE)\\s*\\(([^)]+)\\)").matcher(body);
                 while (key.find()) {
                     var keyRow = key(key.group(1).equals("PRIMARY KEY") ? "p" : "u", key.group(2), "", ""); keys.get(table).add(keyRow);
@@ -326,5 +399,9 @@ class ToolExecutionStorageVerifierTest {
         String draft = System.getProperty("tianji.tool.journal.ddl");
         if (draft == null) throw new IllegalStateException("Provide the reviewed tool DDL until the final V13 resource is created");
         return Files.readString(Path.of(draft));
+    }
+
+    private static String resultAccessSql() throws Exception {
+        return new String(resource(ToolExecutionStorageVerifier.RESULT_ACCESS_FILE), StandardCharsets.UTF_8);
     }
 }

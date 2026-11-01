@@ -26,29 +26,59 @@ import java.util.Set;
 /** Read-only readiness of the independent tool journal; never provisions or repairs storage. */
 public final class ToolExecutionStorageVerifier {
     static final String FILE = "V13__add_tool_execution_journal.sql";
-    private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation";
+    static final String RESULT_ACCESS_FILE = "V14__add_tool_result_access_journal.sql";
+    private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation",
+            ACCESS = "agent_tool_result_access";
     private static final Set<String> TABLES = Set.of(CAPABILITY, INTENT, INVOCATION);
+    private static final Set<String> RESULT_ACCESS_TABLES = Set.of(CAPABILITY, INTENT, INVOCATION, ACCESS);
+    private static final Set<String> RESULT_ACCESS_CHECKS = Set.of("tool_result_access_identity", "tool_result_access_source",
+            "tool_result_access_authorization", "tool_result_access_time");
+    private static final Map<String, MemoryStorageVerifier.Column> RESULT_ACCESS_COLUMNS = Map.ofEntries(
+            Map.entry("tenant_id", column("bigint", false)), Map.entry("run_id", column("character varying(64)", false)),
+            Map.entry("access_id", column("uuid", false)), Map.entry("reservation_id", column("character varying(128)", true)),
+            Map.entry("owner_type", column("character varying(16)", true)), Map.entry("owner_issuer", column("character(64)", true)),
+            Map.entry("owner_id", column("character varying(256)", true)), Map.entry("capability_id", column("uuid", false)),
+            Map.entry("capability_binding_sha256", column("character(64)", true)), Map.entry("capability_issue_epoch", column("bigint", false)),
+            Map.entry("lease_epoch", column("bigint", false)), Map.entry("tool_key", column("character varying(128)", true)),
+            Map.entry("tool_version", column("bigint", false)), Map.entry("tool_sha256", column("character(64)", true)),
+            Map.entry("backend_binding_sha256", column("character(64)", true)), Map.entry("parameters_sha256", column("character(64)", true)),
+            Map.entry("intent_id", column("uuid", false)), Map.entry("request_sha256", column("character(64)", true)),
+            Map.entry("risk", column("character varying(32)", true)), Map.entry("source_action_revision", column("bigint", false)),
+            Map.entry("source_result_sha256", column("character(64)", true)), Map.entry("authorization_audit", column("jsonb", false)),
+            Map.entry("authorization_checked_at", column("timestamp with time zone", false)),
+            Map.entry("authorization_expires_at", column("timestamp with time zone", false)), Map.entry("created_at", column("timestamp with time zone", false)));
     private static final List<String> MIGRATIONS = List.of("V1__create_agent_ledger.sql", "V2__add_run_governance.sql", "V3__add_adk_session_store.sql",
             "V4__add_adk_session_codec_versions.sql", "V5__bind_agent_ownership_to_issuer.sql", "V6__add_execution_grant_evidence.sql",
             "V7__add_process_dispatch_fence.sql", "V8__add_service_execution_grant.sql", "V9__add_context_snapshots.sql",
             "V10__add_memory_facts_and_index.sql", "V11__bind_memory_grant_ticket_to_principal.sql", "V12__add_memory_preference_intent.sql", FILE);
+    private static final List<String> RESULT_ACCESS_MIGRATIONS = resultAccessMigrations();
     private final DataSource source;
 
     public ToolExecutionStorageVerifier(DataSource source) { this.source = Objects.requireNonNull(source, "source"); }
 
     public void verify() {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool journal verification requires its own transaction");
-        var expected = contract(migration()); var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
+        verify(contract(migration()), TABLES, MIGRATIONS);
+    }
+
+    public void verifyResultAccess() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool journal verification requires its own transaction");
+        var expected = new HashMap<>(contract(migration())); expected.putAll(resultAccessContract(migration(RESULT_ACCESS_FILE)));
+        verify(Map.copyOf(expected), RESULT_ACCESS_TABLES, RESULT_ACCESS_MIGRATIONS);
+    }
+
+    private void verify(Map<String, MemoryStorageVerifier.Table> expected, Set<String> tables, List<String> migrations) {
+        var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(15);
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ); transaction.setReadOnly(false);
         try {
             transaction.executeWithoutResult(status -> {
                 if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))) throw invalid();
                 jdbc.queryForObject("SELECT set_config('search_path','pg_catalog,tianji_agent,public',true)", String.class);
-                history(jdbc);
-                for (String table : TABLES) {
+                history(jdbc, migrations);
+                for (String table : tables) {
                     columns(jdbc, table, expected.get(table)); checks(jdbc, table, expected.get(table));
-                    keys(jdbc, table); indexes(jdbc, table, expected.get(table)); privileges(jdbc, table);
+                    keys(jdbc, table); indexes(jdbc, table, expected.get(table)); privileges(jdbc, table, !ACCESS.equals(table));
                 }
             });
         } catch (DataAccessException | TransactionException failed) { throw invalid(); }
@@ -62,10 +92,18 @@ public final class ToolExecutionStorageVerifier {
         return Map.copyOf(tables);
     }
 
-    private static void history(JdbcTemplate jdbc) {
+    static Map<String, MemoryStorageVerifier.Table> resultAccessContract(String sql) {
+        var tables = MemoryStorageVerifier.contract(sql);
+        if (!tables.keySet().equals(Set.of(ACCESS))) throw invalid();
+        var access = tables.get(ACCESS);
+        if (!access.columns().equals(RESULT_ACCESS_COLUMNS) || !access.checks().keySet().equals(RESULT_ACCESS_CHECKS)) throw invalid();
+        return Map.copyOf(tables);
+    }
+
+    private static void history(JdbcTemplate jdbc, List<String> migrations) {
         var expected = new HashMap<String, Integer>(); var scripts = new HashMap<String, String>();
-        for (int index = 0; index < MIGRATIONS.size(); index++) {
-            String version = Integer.toString(index + 1), file = MIGRATIONS.get(index);
+        for (int index = 0; index < migrations.size(); index++) {
+            String version = Integer.toString(index + 1), file = migrations.get(index);
             expected.put(version, MemoryStorageVerifier.checksum(migration(file))); scripts.put(version, file);
         }
         var actual = new HashMap<String, Integer>();
@@ -151,6 +189,12 @@ public final class ToolExecutionStorageVerifier {
                             "tenant_id,run_id,capability_id,binding_sha256,tool_key,tool_version,tool_sha256,backend_binding_sha256"),
                     foreign("tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,binding_sha256,risk", INTENT,
                             "tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,binding_sha256,risk"));
+            case ACCESS -> Set.of(key("p", "tenant_id,run_id,access_id"), key("u", "tenant_id,run_id,reservation_id"),
+                    foreign("tenant_id,run_id", "agent_run", "tenant_id,run_id"), foreign("tenant_id,run_id,reservation_id", "agent_budget_reservation", "tenant_id,run_id,reservation_id"),
+                    foreign("tenant_id,run_id,capability_id,capability_binding_sha256,tool_key,tool_version,tool_sha256,backend_binding_sha256", CAPABILITY,
+                            "tenant_id,run_id,capability_id,binding_sha256,tool_key,tool_version,tool_sha256,backend_binding_sha256"),
+                    foreign("tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,backend_binding_sha256,risk", INTENT,
+                            "tenant_id,intent_id,owner_type,owner_issuer,owner_id,tool_key,tool_version,tool_sha256,binding_sha256,risk"));
             default -> throw invalid();
         };
     }
@@ -183,6 +227,8 @@ public final class ToolExecutionStorageVerifier {
         } else if (INVOCATION.equals(table)) {
             expected.add(index(expectedTable, columns("tenant_id,intent_id,created_at,invocation_id"), false, false, "intent_id IS NOT NULL"));
             expected.add(index(expectedTable, columns("tenant_id,state,updated_at,run_id,invocation_id"), false, false, "state = ANY (ARRAY['DISPATCHING','UNKNOWN'])"));
+        } else if (ACCESS.equals(table)) {
+            expected.add(index(expectedTable, columns("tenant_id,intent_id,created_at,run_id,access_id"), false, false, ""));
         }
         if (actual.size() != expected.size() || !Set.copyOf(actual).equals(expected)) throw invalid();
     }
@@ -199,14 +245,14 @@ public final class ToolExecutionStorageVerifier {
         return new Index(columns, unique, primary, predicate.isEmpty() ? "" : MemoryStorageVerifier.booleanSignature(predicate), opclasses);
     }
 
-    private static void privileges(JdbcTemplate jdbc, String table) {
+    private static void privileges(JdbcTemplate jdbc, String table, boolean updateRequired) {
         var safe = jdbc.query("""
                 SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity
                     AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
                     AND has_table_privilege(current_user,c.oid,'SELECT') AND has_table_privilege(current_user,c.oid,'INSERT')
-                    AND has_table_privilege(current_user,c.oid,'UPDATE') AS safe
+                    AS safe, has_table_privilege(current_user,c.oid,'UPDATE') AS update_allowed
                 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='tianji_agent' AND c.relname=?
-                """, (rs, row) -> rs.getBoolean("safe"), table);
+                """, (rs, row) -> rs.getBoolean("safe") && (!updateRequired || rs.getBoolean("update_allowed")), table);
         if (safe.size() != 1 || !safe.getFirst()) throw invalid();
     }
 
@@ -217,6 +263,8 @@ public final class ToolExecutionStorageVerifier {
         } catch (IOException failed) { throw invalid(); }
     }
     private static List<String> array(java.sql.Array value) throws SQLException { return value == null ? List.of() : List.copyOf(Arrays.asList((String[]) value.getArray())); }
+    private static MemoryStorageVerifier.Column column(String type, boolean cCollation) { return new MemoryStorageVerifier.Column(type, true, cCollation); }
+    private static List<String> resultAccessMigrations() { var migrations = new ArrayList<>(MIGRATIONS); migrations.add(RESULT_ACCESS_FILE); return List.copyOf(migrations); }
     private static List<String> columns(String value) { return List.of(value.split(",")); }
     private static Key key(String type, String fields) { return new Key(type, columns(fields), "", "", List.of(), "", "", ""); }
     private static Key foreign(String fields, String target, String targetFields) { return new Key("f", columns(fields), "tianji_agent", target, columns(targetFields), "a", "a", "s"); }
