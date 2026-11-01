@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -185,6 +186,133 @@ class AdkReadOnlyDecisionToolBridgeTest {
         assertThrows(IllegalArgumentException.class, () -> new AdkReadOnlyDecisionToolBridge.ToolEventVO(AdkReadOnlyDecisionToolBridge.Phase.STARTED, " ", TOOL.reference(), HOST, "REQUESTED", 0, null, null));
         assertThrows(IllegalArgumentException.class, () -> new AdkReadOnlyDecisionToolBridge.ToolEventVO(AdkReadOnlyDecisionToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "private arguments", 0, null, null));
         assertThrows(IllegalArgumentException.class, () -> new AdkReadOnlyDecisionToolBridge.ToolEventVO(AdkReadOnlyDecisionToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "REQUESTED", 1, ToolInvocationRecorder.AccountingState.SETTLED, null));
+    }
+
+    @Test void shared_declarations_preserve_the_closed_schema_and_never_execute_a_native_fallback() throws Exception {
+        var first = new AdkGovernedToolDeclaration(TOOL); var second = new AdkGovernedToolDeclaration(TOOL);
+        assertNotSame(first, second); assertEquals(TOOL.name(), first.name()); assertEquals(TOOL.description(), first.description());
+        var declaration = first.declaration().orElseThrow(); assertTrue(declaration.parameters().isEmpty());
+        var schema = (Map<?, ?>) declaration.parametersJsonSchema().orElseThrow();
+        assertEquals(Set.of("type", "properties", "required", "additionalProperties"), schema.keySet());
+        assertEquals("object", schema.get("type")); assertEquals(false, schema.get("additionalProperties")); assertEquals(List.of("amount"), schema.get("required"));
+        var properties = (Map<?, ?>) schema.get("properties"); assertEquals(List.of("amount", "approved", "note"), new ArrayList<>(properties.keySet()));
+        assertEquals(Map.of("type", "integer"), properties.get("amount")); assertEquals(Map.of("type", "boolean"), properties.get("approved")); assertEquals(Map.of("type", "string"), properties.get("note"));
+        assertThrows(UnsupportedOperationException.class, schema::clear); assertThrows(UnsupportedOperationException.class, properties::clear);
+        assertThrows(UnsupportedOperationException.class, () -> ((Map<?, ?>) properties.get("amount")).clear());
+        var converted = new ToolConverter().convertToSpringAiTools(Map.of(first.name(), first));
+        assertFalse(new ObjectMapper().readTree(converted.getFirst().getToolDefinition().inputSchema()).get("additionalProperties").booleanValue());
+        var denied = assertThrows(AgentLedgerException.class, () -> first.runAsync(ARGUMENTS, null).blockingGet());
+        assertEquals(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, denied.code()); assertNull(denied.getCause()); assertFalse(denied.getMessage().contains("private"));
+        var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class);
+        try (var scope = bridge(recorder, transport).bind(material(TOOL, "CONFIG", policy(Set.of(TOOL.versionKey()), 4)), lease(), event -> { })) {
+            assertInstanceOf(AdkGovernedToolDeclaration.class, scope.declaredTools().getFirst()); verifyNoInteractions(recorder, transport);
+        }
+    }
+
+    @Test void common_binding_calls_the_existing_bind_once_and_returns_its_identical_scope_and_boxed_events() {
+        var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class); var resolves = new AtomicInteger();
+        var bridge = spy(new AdkReadOnlyDecisionToolBridge(recorder, transport, List.of(TOOL), value -> { resolves.incrementAndGet(); return List.of(binding(value.authorization(), TOOL)); }));
+        var oldScope = new AtomicReference<AdkReadOnlyDecisionToolBridge.RunScope>();
+        doAnswer(call -> { var value = (AdkReadOnlyDecisionToolBridge.RunScope) call.callRealMethod(); oldScope.set(value); return value; }).when(bridge).bind(any(), any(), any());
+        var events = new ArrayList<AdkGovernedToolBridge.ToolEventVO>(); var material = material(TOOL, "CONFIG", policy(Set.of(TOOL.versionKey()), 4));
+        try (var scope = bridge.bindScope(material, lease(), events::add)) {
+            assertSame(oldScope.get(), scope); assertInstanceOf(AdkReadOnlyDecisionToolBridge.RunScope.class, scope); assertEquals(1, resolves.get());
+            when(recorder.executeReadOnly(eq(transport), any())).thenReturn(result("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED));
+            var response = scope.execute(scope.declaredTools().getFirst(), ARGUMENTS, HOST, "review_agent", () -> { });
+            assertEquals("SUCCEEDED", response.get("status")); assertEquals(2, events.size());
+            assertEquals(AdkGovernedToolBridge.Phase.STARTED, events.getFirst().phase()); assertEquals(Long.valueOf(0), events.getFirst().dispatchEpoch());
+            assertEquals(AdkGovernedToolBridge.Phase.FINISHED, events.getLast().phase()); assertEquals(Long.valueOf(1), events.getLast().dispatchEpoch());
+            assertEquals(TOOL.reference(), events.getLast().toolRef()); assertEquals(HOST, events.getLast().hostInvocationId()); assertFalse(events.toString().contains("private"));
+            verify(bridge, times(1)).bind(eq(material), eq(lease()), any());
+        }
+        assertThrows(AgentLedgerException.class, () -> oldScope.get().execute(oldScope.get().declaredTools().getFirst(), ARGUMENTS, HOST, "review_agent"));
+    }
+
+    @Test void common_execution_runs_the_fence_before_events_and_sanitizes_denials_without_recorder_io() {
+        var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class); var events = new ArrayList<AdkReadOnlyDecisionToolBridge.ToolEventVO>();
+        try (var scope = bridge(recorder, transport).bind(material(TOOL, "CONFIG", policy(Set.of(TOOL.versionKey()), 4)), lease(), events::add)) {
+            var nativeTool = scope.declaredTools().getFirst(); var calls = new AtomicInteger();
+            when(recorder.executeReadOnly(eq(transport), any())).thenAnswer(call -> { assertEquals(1, calls.get()); assertEquals(1, events.size()); return result("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED); });
+            var response = scope.execute(nativeTool, ARGUMENTS, HOST, "review_agent", () -> { assertTrue(events.isEmpty()); calls.incrementAndGet(); });
+            assertEquals("SUCCEEDED", response.get("status")); assertEquals(1, calls.get());
+            events.clear(); clearInvocations(recorder, transport);
+            for (String variant : List.of("null", "private", "ledger")) {
+                Runnable fence = variant.equals("null") ? null : () -> {
+                    if (variant.equals("ledger")) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private fence input");
+                    throw new IllegalStateException("private fence input");
+                };
+                var failure = assertThrows(AgentLedgerException.class, () -> scope.execute(nativeTool, ARGUMENTS, HOST, "review_agent", fence));
+                assertEquals(variant.equals("ledger") ? AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
+                assertNull(failure.getCause()); assertFalse(failure.getMessage().contains("private")); assertTrue(events.isEmpty());
+            }
+            verifyNoInteractions(recorder, transport);
+        }
+    }
+
+    @Test void already_resolved_readonly_subset_accepts_a_mixed_snapshot_without_resolving_the_full_registry_again() {
+        var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class); var material = mixedMaterial();
+        try (var first = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), event -> { }, List.of(TOOL), List.of(binding(material.authorization(), TOOL)));
+             var second = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), event -> { }, List.of(TOOL), List.of(binding(material.authorization(), TOOL)))) {
+            assertEquals(1, first.declaredTools().size()); assertEquals(TOOL.name(), first.declaredTools().getFirst().name()); assertNotSame(first.declaredTools().getFirst(), second.declaredTools().getFirst());
+            assertEquals("NONE", first.sideEffectOutcome()); assertInstanceOf(AdkGovernedToolBridge.Scope.class, first); verifyNoInteractions(recorder, transport);
+        }
+        try (var empty = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), event -> { }, List.of(), List.of())) {
+            assertTrue(empty.declaredTools().isEmpty()); assertEquals("UNKNOWN", empty.sideEffectOutcome());
+        }
+    }
+
+    @Test void resolved_subset_still_rejects_missing_extra_duplicate_wrong_material_and_backend_bindings() {
+        var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class); var material = mixedMaterial(); var correct = binding(material.authorization(), TOOL);
+        var changed = new ToolExecutionGrant.BindingVO(correct.run(), correct.tool(), "b".repeat(64), correct.purpose(), correct.resource(), correct.authorizationResourceKey(), null);
+        var other = new ToolDescriptor("other.read", 1, "other_read", "Other", TOOL.input(), TOOL.output(), TOOL.policy());
+        var auth = material.authorization(); var anotherRun = new AgentRunAuthorization.Request(auth.actor(), "10000000-0000-0000-0000-000000000002", auth.definitionKey(), auth.definitionVersion(), auth.definitionSha256(), auth.requestSha256(), auth.snapshotSha256(), auth.policyVersionRef(), false, auth.deadlineAt());
+        for (var supplied : List.of(List.<ToolExecutionGrant.BindingVO>of(), List.of(correct, correct), List.of(changed), List.of(binding(material.authorization(), other)), List.of(binding(anotherRun, TOOL)))) {
+            assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), event -> { }, List.of(TOOL), supplied));
+        }
+        for (var subset : List.of(List.of(TOOL, TOOL), List.of(other), List.of(descriptor(ToolPolicy.Risk.IDEMPOTENT_WRITE)))) {
+            var supplied = subset.stream().map(tool -> binding(material.authorization(), tool)).toList();
+            assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), event -> { }, subset, supplied));
+        }
+        assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material(TOOL, "CODE_FIRST", policy(Set.of(TOOL.versionKey()), 4)), lease(), event -> { }, List.of(TOOL), List.of(correct)));
+        assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, transport, material, lease(), null, List.of(TOOL), List.of(correct)));
+        verifyNoInteractions(recorder, transport);
+    }
+
+    @Test void common_events_allow_only_closed_metadata_and_distinguish_access_from_dispatch_epochs() {
+        var settled = ToolInvocationRecorder.AccountingState.SETTLED;
+        for (String state : List.of("SUCCEEDED", "REJECTED", "FAILED_KNOWN")) {
+            var event = new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, state, null, settled, state.equals("SUCCEEDED") ? null : "DECISION_NO_MATCH");
+            assertNull(event.dispatchEpoch()); assertEquals("AdkGovernedToolBridge.ToolEventVO[redacted]", event.toString());
+        }
+        for (String state : List.of("PREPARED", "DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN")) assertNotNull(new AdkGovernedToolBridge.ToolEventVO(
+                AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, state, 0L, settled, null));
+        for (Long epoch : new Long[]{null, 0L}) assertNotNull(new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", epoch, null, "TIANJI_DEPENDENCY_UNAVAILABLE"));
+        assertNotNull(new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "REQUESTED", 0L, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(null, "review_agent", TOOL.reference(), HOST, "REQUESTED", 0L, null, null));
+        for (String author : List.of(" ", " review_agent", "x".repeat(129), "line\nbreak", "\ud800")) assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, author, TOOL.reference(), HOST, "REQUESTED", 0L, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", null, HOST, "REQUESTED", 0L, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), null, "REQUESTED", 0L, null, null));
+        for (Long epoch : new Long[]{null, -1L, 1L}) assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "REQUESTED", epoch, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "SUCCEEDED", 0L, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "REQUESTED", 0L, settled, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.STARTED, "review_agent", TOOL.reference(), HOST, "REQUESTED", 0L, null, "UNAVAILABLE"));
+        for (String state : List.of("PREPARED", "DISPATCHING", "UNKNOWN", "private input")) assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, state, null, settled, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "SUCCEEDED", -1L, settled, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "SUCCEEDED", 1L, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "SUCCEEDED", 1L, settled, "private-error"));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", 1L, null, "UNAVAILABLE"));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", null, null, null));
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", null, settled, "UNAVAILABLE"));
+    }
+
+    private static AgentLedgerService.ExecutionMaterial mixedMaterial() {
+        var read = material(TOOL, "CONFIG", policy(Set.of(TOOL.versionKey()), 4));
+        var write = new ToolDescriptor("process.start", 1, "start_process", "Fixed process", TOOL.input(), new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
+                new ToolPolicy(ToolPolicy.Risk.IDEMPOTENT_WRITE, "process.invoice", "tianji.api.process.instance.start", HASH, null));
+        var policy = policy(Set.of(TOOL.versionKey(), write.versionKey()), 4);
+        var definition = new AgentDefinitionSpecDTO("assistant", 1, "CONFIG", null, "1", "1", new DefinitionDependenciesDTO(List.of(), List.of(), List.of(TOOL.reference(), write.reference()), "route", "policy-v1"), policy, Map.of());
+        var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, read.snapshot().input(), "invoice-1");
+        return new AgentLedgerService.ExecutionMaterial(read.run(), snapshot, read.authorization());
     }
 
     private static AdkReadOnlyDecisionToolBridge bridge(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport transport) {

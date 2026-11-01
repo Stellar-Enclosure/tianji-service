@@ -63,9 +63,10 @@ final class AdkRunBudgetPlugin implements Plugin {
     private DefaultContextAssembler.ResolvedSources contextSources;
     private final AdkContextSnapshotProjector snapshots;
     private final boolean trimming;
-    private final AdkReadOnlyDecisionToolBridge.RunScope toolScope;
+    private final AdkGovernedToolBridge.Scope toolScope;
     private final Set<InvocationContext> admittedContexts = Collections.newSetFromMap(new IdentityHashMap<>());
     private boolean closed;
+    private int toolEntries;
     private String nativeSessionId;
     private String nativeInvocationId;
     private final java.util.concurrent.atomic.AtomicReference<Runnable> sessionFence = new java.util.concurrent.atomic.AtomicReference<>();
@@ -109,7 +110,7 @@ final class AdkRunBudgetPlugin implements Plugin {
                        AgentExecutionAuthorization authorization, Scheduler retryScheduler,
                        ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
                        AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions,
-                       AdkReadOnlyDecisionToolBridge.RunScope toolScope) {
+                       AdkGovernedToolBridge.Scope toolScope) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
@@ -399,10 +400,19 @@ final class AdkRunBudgetPlugin implements Plugin {
         if (toolScope == null) return Maybe.error(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                 "governed tool execution is not available"));
         return safeErrors(Maybe.fromCallable(() -> {
-            requireNativeContext(context, true);
-            if (toolScope.declaredTools().stream().noneMatch(candidate -> candidate == tool)) throw nativeContextUnavailable();
-            requireSessionFence();
-            return Objects.requireNonNull(toolScope.execute(tool, arguments, UUID.randomUUID(), context.agentName()), "governed tool result");
+            Runnable callFence = () -> {
+                requireNativeContext(context, true);
+                if (toolScope.declaredTools().stream().noneMatch(candidate -> candidate == tool)) throw nativeContextUnavailable();
+                requireSessionFence();
+            };
+            callFence.run();
+            synchronized (admittedContexts) {
+                if (closed) throw nativeContextUnavailable();
+                if (toolEntries >= snapshot.effectivePolicy().maxToolCalls()) throw new AgentLedgerException(
+                        AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED, "Agent tool entry budget is exhausted");
+                toolEntries++;
+            }
+            return Objects.requireNonNull(toolScope.execute(tool, arguments, UUID.randomUUID(), context.agentName(), callFence), "governed tool result");
         }).subscribeOn(AgentFlowSchedulers.contextAwareIo()));
     }
 

@@ -1,9 +1,6 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.tools.BaseTool;
-import com.google.adk.tools.ToolContext;
-import com.google.genai.types.FunctionDeclaration;
-import io.reactivex.rxjava3.core.Single;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -22,15 +19,12 @@ import java.util.Collection;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
@@ -38,7 +32,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 
 /** Host-bound declarations whose direct native fallback never executes a transport. Initialize host telemetry before construction. */
-public final class AdkReadOnlyDecisionToolBridge {
+public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridge {
     private final ToolInvocationRecorder recorder;
     private final ReadOnlyDecisionToolTransport transport;
     private final ToolRegistry registry;
@@ -52,28 +46,52 @@ public final class AdkReadOnlyDecisionToolBridge {
     }
     public boolean usesRecorder(ToolInvocationRecorder candidate) { return recorder == candidate; }
     public boolean usesTransport(ReadOnlyDecisionToolTransport candidate) { return transport == candidate; }
-    RunScope bind(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease, ToolEventSink sink) {
+    @Override public AdkGovernedToolBridge.Scope bindScope(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease, AdkGovernedToolBridge.ToolEventSink sink) {
+        if (sink == null) throw dependency();
+        return bind(material, lease, event -> sink.append(toGovernedEvent(event)));
+    }
+    static RunScope bindResolved(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport transport, AgentLedgerService.ExecutionMaterial material,
+                                 AgentRunLease lease, ToolEventSink sink, List<ToolDescriptor> subset, List<ToolExecutionGrant.BindingVO> bindings) {
         AdkToolTelemetryPrivacy.requireSafe();
         try {
-            requireMaterial(material, lease); if (sink == null) throw unavailable();
-            var visible = registry.visible(material.snapshot()); var supplied = List.copyOf(hostBindings.apply(material));
-            if (supplied.size() != visible.size()) throw unavailable();
+            requireMaterial(material, lease);
+            if (recorder == null || transport == null || sink == null || subset == null || bindings == null || subset.size() > 32 || bindings.size() != subset.size()) throw unavailable();
+            var visible = new TreeMap<String, ToolDescriptor>(); var versions = new HashSet<String>();
+            for (var descriptor : List.copyOf(subset)) {
+                if (descriptor.policy().risk() != ToolPolicy.Risk.READ_ONLY || material.snapshot().effectivePolicy().maxToolCalls() < 1
+                        || !material.snapshot().effectivePolicy().allowedToolVersions().contains(descriptor.versionKey())
+                        || !material.snapshot().definition().dependencies().tools().contains(descriptor.reference())
+                        || !versions.add(descriptor.versionKey()) || visible.putIfAbsent(descriptor.name(), descriptor) != null) throw unavailable();
+            }
             var byReference = new HashMap<DefinitionResourceRef, ToolExecutionGrant.BindingVO>();
-            for (var binding : supplied) {
+            for (var binding : List.copyOf(bindings)) {
                 if (!binding.run().equals(material.authorization()) || byReference.putIfAbsent(binding.tool(), binding) != null) throw unavailable();
             }
             var selected = new IdentityHashMap<BaseTool, TargetVO>(); var declarations = new ArrayList<BaseTool>();
             for (var descriptor : visible.values()) {
                 var binding = byReference.remove(descriptor.reference());
-                if (descriptor.policy().risk() != ToolPolicy.Risk.READ_ONLY || binding == null || !descriptor.policy().bindingSha256().equals(binding.backendBindingSha256())) throw unavailable();
-                var declaration = new DeclarationTool(descriptor); declarations.add(declaration); selected.put(declaration, new TargetVO(descriptor, binding));
+                if (binding == null || !descriptor.policy().bindingSha256().equals(binding.backendBindingSha256())) throw unavailable();
+                var declaration = new AdkGovernedToolDeclaration(descriptor); declarations.add(declaration); selected.put(declaration, new TargetVO(descriptor, binding));
             }
             if (!byReference.isEmpty()) throw unavailable();
             return new RunScope(recorder, transport, lease, sink, declarations, selected);
         } catch (RuntimeException privateBinding) { throw dependency(); }
     }
+    static AdkGovernedToolBridge.ToolEventVO toGovernedEvent(ToolEventVO event) {
+        if (event == null) throw dependency();
+        return new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.valueOf(event.phase().name()), event.author(), event.toolRef(), event.hostInvocationId(),
+                event.state(), event.dispatchEpoch(), event.accountingState(), event.errorCode());
+    }
+    RunScope bind(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease, ToolEventSink sink) {
+        AdkToolTelemetryPrivacy.requireSafe();
+        try {
+            requireMaterial(material, lease); if (sink == null) throw unavailable();
+            var visible = registry.visible(material.snapshot()); var supplied = List.copyOf(hostBindings.apply(material));
+            return bindResolved(recorder, transport, material, lease, sink, List.copyOf(visible.values()), supplied);
+        } catch (RuntimeException privateBinding) { throw dependency(); }
+    }
 
-    private static void requireMaterial(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease) {
+    static void requireMaterial(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease) {
         if (material == null || material.run() == null || material.authorization() == null || material.snapshot() == null || lease == null) throw unavailable();
         var run = material.authorization(); var stored = material.run(); var snapshot = material.snapshot(); var definition = snapshot.definition();
         if ("LEGACY".equals(run.actor().issuerFingerprint()) || !"CONFIG".equals(definition.executionMode()) || !run.runId().equals(lease.runId()) || lease.epoch() < 1
@@ -98,7 +116,7 @@ public final class AdkReadOnlyDecisionToolBridge {
         }
         @Override public String toString() { return "AdkReadOnlyDecisionToolBridge.ToolEventVO[redacted]"; }
     }
-    static final class RunScope implements AutoCloseable {
+    static final class RunScope implements AdkGovernedToolBridge.Scope {
         private final ToolInvocationRecorder recorder;
         private final ReadOnlyDecisionToolTransport transport;
         private final AgentRunLease lease;
@@ -112,7 +130,12 @@ public final class AdkReadOnlyDecisionToolBridge {
             this.recorder = recorder; this.transport = transport; this.lease = lease; this.sink = sink;
             this.declarations = List.copyOf(declarations); this.selected = Collections.unmodifiableMap(new IdentityHashMap<>(selected));
         }
-        List<BaseTool> declaredTools() { return declarations; }
+        @Override public List<BaseTool> declaredTools() { return declarations; }
+        @Override public Map<String, Object> execute(BaseTool tool, Map<String, Object> arguments, UUID hostInvocationId, String author, Runnable callFence) {
+            if (callFence == null) throw dependency();
+            try { callFence.run(); } catch (RuntimeException privateFence) { throw safe(privateFence); }
+            return execute(tool, arguments, hostInvocationId, author);
+        }
         Map<String, Object> execute(BaseTool tool, Map<String, Object> arguments, UUID hostInvocationId, String author) {
             requireOpen(); AdkToolTelemetryPrivacy.requireSafe(); var target = selected.get(tool);
             if (target == null) throw unavailable();
@@ -146,22 +169,10 @@ public final class AdkReadOnlyDecisionToolBridge {
         }
         private void append(ToolEventVO event) { try { sink.append(event); } catch (RuntimeException privateFailure) { throw dependency(); } }
         private void requireOpen() { if (closed.get()) throw unavailable(); }
-        String sideEffectOutcome() { return declarations.isEmpty() ? "UNKNOWN" : "NONE"; }
+        @Override public String sideEffectOutcome() { return declarations.isEmpty() ? "UNKNOWN" : "NONE"; }
         @Override public void close() { closed.set(true); }
     }
     private record TargetVO(ToolDescriptor descriptor, ToolExecutionGrant.BindingVO binding) { }
-    private static final class DeclarationTool extends BaseTool {
-        private final FunctionDeclaration declaration;
-        private DeclarationTool(ToolDescriptor descriptor) {
-            super(descriptor.name(), descriptor.description());
-            var properties = new TreeMap<String, Object>(); descriptor.input().fields().forEach((key, value) -> properties.put(key, Map.of("type", value.name().toLowerCase(Locale.ROOT))));
-            var schema = new LinkedHashMap<String, Object>(); schema.put("type", "object"); schema.put("properties", Collections.unmodifiableMap(properties));
-            schema.put("required", List.copyOf(new TreeSet<>(descriptor.input().required()))); schema.put("additionalProperties", false);
-            declaration = FunctionDeclaration.builder().name(name()).description(description()).parametersJsonSchema(Collections.unmodifiableMap(schema)).build();
-        }
-        @Override public Optional<FunctionDeclaration> declaration() { return Optional.of(declaration); }
-        @Override public Single<Map<String, Object>> runAsync(Map<String, Object> arguments, ToolContext context) { return Single.error(unavailable()); }
-    }
     private static boolean text(String value, int maximum) {
         return value != null && !value.isBlank() && value.equals(value.trim()) && value.length() <= maximum && value.chars().noneMatch(Character::isISOControl) && StandardCharsets.UTF_8.newEncoder().canEncode(value);
     }

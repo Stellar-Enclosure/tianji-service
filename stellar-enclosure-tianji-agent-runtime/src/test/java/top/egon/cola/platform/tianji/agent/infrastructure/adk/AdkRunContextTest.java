@@ -286,7 +286,13 @@ class AdkRunContextTest {
         plugin.close().blockingAwait();
         var scope = mock(AdkReadOnlyDecisionToolBridge.RunScope.class); var tool = mock(BaseTool.class);
         when(tool.name()).thenReturn("fixed_decision"); when(scope.declaredTools()).thenReturn(List.of(tool));
-        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
+        doCallRealMethod().when(scope).execute(any(), anyMap(), any(), anyString(), any(Runnable.class));
+        var toolSnapshot = snapshot(2);
+        when(estimator.estimate(eq(toolSnapshot), any())).thenAnswer(call -> {
+            estimated.add(call.getArgument(1)); return new AgentModelBudgetEstimator.Estimate(20, 10, BigDecimal.ONE);
+        });
+        when(estimator.contextWindow(eq(toolSnapshot), any())).thenReturn(new AgentModelBudgetEstimator.ContextWindow("fixture-model", "route-v1", "policy-v1", 100, 5));
+        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, toolSnapshot, estimator,
                 new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
                 Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization,
                 new AgentContextRuntimeOptions(false, false), scope);
@@ -336,8 +342,9 @@ class AdkRunContextTest {
                 .config(GenerateContentConfig.builder().systemInstruction(Content.fromParts(Part.fromText("definition instruction"))).build());
     }
     private static Content message(String role, String text) { return Content.builder().role(role).parts(List.of(Part.fromText(text))).build(); }
-    private static AgentExecutionSnapshot snapshot() {
-        var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, 0, 1000, 100,
+    private static AgentExecutionSnapshot snapshot() { return snapshot(0); }
+    private static AgentExecutionSnapshot snapshot(int toolCalls) {
+        var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, toolCalls, 1000, 100,
                 BigDecimal.ONE, "USD", 1, Set.of(), "retry-v1", "approval-v1");
         var definition = new AgentDefinitionSpecDTO("assistant", 2, "CONFIG", null, "1", "1",
                 new DefinitionDependenciesDTO(List.of(new DefinitionResourceRef("fixed", 2, "d".repeat(64))), List.of(), List.of(), "route-v1", "policy-v1"), policy, Map.of());
