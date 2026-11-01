@@ -264,7 +264,7 @@ public final class ProcessModelValidator {
         } catch (RuntimeException badDuration) { throw invalid(); }
     }
 
-    private static HumanTask humanTask(Element task) {
+    static HumanTask humanTask(Element task) {
         HumanTaskKind kind;
         try { kind = HumanTaskKind.valueOf(task.getAttributeNS(TIANJI_TASK, "kind")); }
         catch (IllegalArgumentException unknown) { throw invalid(); }

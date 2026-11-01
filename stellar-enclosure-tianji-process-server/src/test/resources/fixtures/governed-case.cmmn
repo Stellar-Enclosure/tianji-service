@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/CMMN/20151109/MODEL"
+             xmlns:task="urn:stellar-enclosure:tianji:task:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <case id="governedCase" name="Governed Case">
+        <casePlanModel id="casePlan" name="Governed Case Plan" autoComplete="false">
+            <planItem id="primary" name="Primary" definitionRef="primaryTask">
+                <itemControl>
+                    <requiredRule id="primaryRequired"/>
+                    <manualActivationRule id="primaryManualActivation"/>
+                </itemControl>
+            </planItem>
+            <planItem id="supplemental" name="Supplemental" definitionRef="supplementalTask">
+                <itemControl>
+                    <requiredRule id="supplementalRequired"/>
+                    <manualActivationRule id="supplementalManualActivation"/>
+                </itemControl>
+                <entryCriterion id="supplementalEntry" sentryRef="primaryCompleted"/>
+            </planItem>
+            <planItem id="milestone" name="Milestone" definitionRef="completionMilestone">
+                <itemControl>
+                    <requiredRule id="milestoneRequired"/>
+                </itemControl>
+                <entryCriterion id="milestoneCompletedEntry" sentryRef="supplementalCompleted"/>
+                <entryCriterion id="milestoneTerminatedEntry" sentryRef="supplementalTerminated"/>
+            </planItem>
+
+            <sentry id="primaryCompleted">
+                <planItemOnPart id="primaryCompletedPart" sourceRef="primary">
+                    <standardEvent>complete</standardEvent>
+                </planItemOnPart>
+            </sentry>
+            <sentry id="supplementalCompleted">
+                <planItemOnPart id="supplementalCompletedPart" sourceRef="supplemental">
+                    <standardEvent>complete</standardEvent>
+                </planItemOnPart>
+            </sentry>
+            <sentry id="supplementalTerminated">
+                <planItemOnPart id="supplementalTerminatedPart" sourceRef="supplemental">
+                    <standardEvent>terminate</standardEvent>
+                </planItemOnPart>
+            </sentry>
+
+            <humanTask id="primaryTask" name="Primary Task"
+                       task:kind="ACTION" task:initialLane="operator">
+                <extensionElements>
+                    <task:taskLane key="operator" roleIds="7,8"/>
+                </extensionElements>
+            </humanTask>
+            <humanTask id="supplementalTask" name="Supplemental Task"
+                       task:kind="ACTION" task:initialLane="operator">
+                <extensionElements>
+                    <task:taskLane key="operator" roleIds="8,9"/>
+                </extensionElements>
+            </humanTask>
+            <milestone id="completionMilestone" name="Completion Milestone"/>
+        </casePlanModel>
+    </case>
+</definitions>
