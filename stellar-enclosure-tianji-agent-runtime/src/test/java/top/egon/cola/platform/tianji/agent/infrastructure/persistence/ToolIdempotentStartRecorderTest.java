@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
+import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
@@ -278,6 +279,110 @@ class ToolIdempotentStartRecorderTest {
         }
     }
 
+    @Test void committed_observer_is_status_only_and_null_is_rejected_before_any_work() throws Exception {
+        assertTrue(ToolCommittedFactObserver.class.isAnnotationPresent(FunctionalInterface.class));
+        assertEquals(0, ToolCommittedFactObserver.class.getDeclaredFields().length);
+        var methods = ToolCommittedFactObserver.class.getDeclaredMethods(); assertEquals(1, methods.length);
+        assertEquals("onCommitted", methods[0].getName()); assertEquals(void.class, methods[0].getReturnType());
+        assertArrayEquals(new Class<?>[]{ToolExecutionOutcome.Status.class}, methods[0].getParameterTypes());
+        try (var scene = new Scene()) {
+            clearInvocations(scene.preparations, scene.rig.base.capabilities, scene.rig.base.authority, scene.rig.base.source);
+            assertThrows(IllegalArgumentException.class, () -> scene.executeObserved(null));
+            verifyNoInteractions(scene.preparations, scene.rig.base.capabilities, scene.rig.base.authority, scene.rig.base.source);
+            assertEquals(0, scene.transport.calls.get()); assertEquals(0, scene.accounts.get());
+        }
+    }
+
+    @Test void fresh_start_committed_statuses_are_observed_once_after_commit_and_before_accounting() throws Exception {
+        for (var status : List.of(ToolExecutionOutcome.Status.SUCCEEDED, ToolExecutionOutcome.Status.REJECTED, ToolExecutionOutcome.Status.FAILED_KNOWN, ToolExecutionOutcome.Status.UNKNOWN)) try (var scene = new Scene()) {
+            if (status == ToolExecutionOutcome.Status.REJECTED) scene.transport.operationFailure.set(OPERATION_DENIED);
+            if (status == ToolExecutionOutcome.Status.FAILED_KNOWN) scene.transport.operationFailure.set(OPERATION_NOT_SENT);
+            if (status == ToolExecutionOutcome.Status.UNKNOWN) scene.transport.operationFailure.set(OPERATION_RESULT_UNKNOWN);
+            var observed = new ArrayList<ToolExecutionOutcome.Status>();
+            var result = scene.executeObserved(actual -> {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertTrue(scene.trace.contains("complete-ack"));
+                assertEquals(status.name(), scene.rig.base.row.get().get("state")); assertEquals(0, scene.accounts.get());
+                observed.add(actual); scene.trace.add("observer");
+            });
+            assertEquals(List.of(status), observed); assertEquals(status, result.ownAttempt().outcome().status());
+            assertTrue(scene.trace.indexOf("complete-ack") < scene.trace.indexOf("observer")); assertTrue(scene.trace.indexOf("observer") < scene.trace.indexOf("accounting"));
+            assertEquals(1, scene.transport.starts.get()); assertEquals(1, scene.accounts.get());
+        }
+        try (var scene = new Scene()) {
+            scene.afterBegin.set(() -> { scene.rig.base.wall.set(NOW.plusSeconds(11)); scene.rig.base.databaseNow.set(NOW.plusSeconds(11)); scene.rig.base.nano.set(11_000_000_000L); });
+            var observed = new ArrayList<ToolExecutionOutcome.Status>(); var result = scene.executeObserved(observed::add);
+            assertEquals(List.of(ToolExecutionOutcome.Status.FAILED_KNOWN), observed); assertFalse(result.ownAttempt().operationInvokedThisCall()); assertEquals(0, scene.transport.starts.get());
+        }
+    }
+
+    @Test void metadata_early_loser_and_failed_completion_never_notify_the_observer() throws Exception {
+        for (String state : List.of("DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN")) try (var scene = new Scene()) {
+            var prepared = scene.rig.prepare(scene.request); var begun = scene.rig.begin(scene.request, prepared.invocation(), "1".repeat(64), failed("ACTION_NOT_DISPATCHABLE"));
+            if (!state.equals("DISPATCHING")) scene.rig.complete(scene.request, begun.attempt(), "1".repeat(64), state.equals("SUCCEEDED") ? success()
+                    : new ToolExecutionOutcome(ToolExecutionOutcome.Status.valueOf(state), Map.of(), null, "CONTROLLED", BigDecimal.ZERO));
+            var calls = new AtomicInteger(); assertNull(scene.executeObserved(ignored -> calls.incrementAndGet()).ownAttempt().outcome());
+            var other = scene.request(OTHER_RUN, UUID.randomUUID());
+            assertNull(scene.rig.selected(other, () -> scene.recorder.executeIdempotentStart(scene.transport, other, ignored -> calls.incrementAndGet())).ownAttempt());
+            assertEquals(0, calls.get()); assertEquals(0, scene.transport.starts.get()); assertEquals(0, scene.accounts.get());
+        }
+        for (String variant : List.of("early", "loser", "completion", "precallback")) try (var scene = new Scene()) {
+            if (variant.equals("early")) {
+                scene.rig.prepare(scene.request); var other = scene.request(OTHER_RUN, UUID.randomUUID()); var prepared = scene.rig.prepare(other);
+                scene.rig.begin(other, prepared.invocation(), "2".repeat(64), failed("ACTION_NOT_DISPATCHABLE"));
+            }
+            if (variant.equals("loser")) scene.transport.beforeCallback.set(() -> scene.rig.store.closePreparedWriteFailure(scene.request, null, failed("CANCELLED")));
+            if (variant.equals("completion")) scene.failComplete.set(true);
+            if (variant.equals("precallback")) scene.transport.beforeFailure.set(RELEASE_UNAVAILABLE);
+            var calls = new AtomicInteger();
+            if (variant.equals("completion") || variant.equals("precallback")) assertFailure(variant.equals("completion") ? OPERATION_RESULT_UNKNOWN : RELEASE_UNAVAILABLE,
+                    () -> scene.executeObserved(ignored -> calls.incrementAndGet()));
+            else assertNull(scene.executeObserved(ignored -> calls.incrementAndGet()).ownAttempt().outcome());
+            assertEquals(0, calls.get()); assertEquals(0, scene.accounts.get());
+        }
+    }
+
+    @Test void observer_failure_after_ack_wins_over_transport_unknown_without_cleanup_accounting_or_fact_downgrade() throws Exception {
+        for (boolean ledgerFailure : List.of(false, true)) try (var scene = new Scene()) {
+            var calls = new AtomicInteger(); clearInvocations(scene.preparations);
+            var failure = assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.executeObserved(status -> {
+                calls.incrementAndGet(); assertEquals(ToolExecutionOutcome.Status.SUCCEEDED, status); assertTrue(scene.trace.contains("complete-ack"));
+                if (ledgerFailure) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "private observer " + INSTANCE);
+                throw new IllegalStateException("private observer " + INSTANCE, new IllegalArgumentException(RECEIPT));
+            }));
+            assertEquals(1, scene.transport.wrappedCallbackLedger.get(), "The controlled real-port ACK boundary must have converted callback Ledger to UNKNOWN");
+            assertEquals(1, calls.get()); assertEquals(0, scene.accounts.get()); assertEquals(0, failure.getSuppressed().length);
+            assertFalse(failure.getMessage().contains("private")); assertFalse(failure.getMessage().contains(RECEIPT));
+            assertEquals("APPLIED", scene.rig.base.intentRow.get().state()); assertEquals("SUCCEEDED", scene.rig.row(scene.request).get("state"));
+            assertEquals(RECEIPT, scene.rig.outcome(scene.request).businessReceiptId()); assertNull(scene.transport.callbackResult.get());
+            verify(scene.preparations, never()).closePreparedWriteFailure(any(), any(), any());
+            var replay = scene.executeObserved(ignored -> fail("Metadata must not notify a new observer"));
+            assertNull(replay.ownAttempt().outcome()); assertEquals(1, scene.transport.starts.get()); assertEquals(0, scene.accounts.get());
+        }
+    }
+
+    @Test void observed_facts_remain_observed_when_accounting_or_outer_postchecks_fail() throws Exception {
+        for (boolean outerFailure : List.of(false, true)) try (var scene = new Scene()) {
+            scene.failAccount.set(!outerFailure); if (outerFailure) scene.transport.afterFailure.set(CREDENTIAL_UNAVAILABLE);
+            var calls = new AtomicInteger(); ToolCommittedFactObserver observer = status -> { assertEquals(ToolExecutionOutcome.Status.SUCCEEDED, status); calls.incrementAndGet(); };
+            if (outerFailure) assertFailure(CREDENTIAL_UNAVAILABLE, () -> scene.executeObserved(observer));
+            else assertEquals(AccountingState.PENDING, scene.executeObserved(observer).ownAttempt().accountingState());
+            assertEquals(1, calls.get()); assertEquals(1, scene.accounts.get()); assertEquals("APPLIED", scene.rig.base.intentRow.get().state()); assertEquals(1, scene.transport.starts.get());
+        }
+    }
+
+    @Test void observer_interrupt_and_runtime_failure_preserve_the_flag_and_the_safe_dependency_failure() throws Exception {
+        try (var scene = new Scene()) {
+            try {
+                assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.executeObserved(status -> {
+                    Thread.currentThread().interrupt(); throw new IllegalStateException("private observer interrupted");
+                }));
+                assertTrue(Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+            assertEquals(0, scene.accounts.get()); assertEquals("APPLIED", scene.rig.base.intentRow.get().state());
+            verify(scene.preparations, never()).closePreparedWriteFailure(any(), any(), any());
+        }
+    }
+
     private static ToolDescriptor tool(ToolPolicy.Risk risk, String resource, boolean output) {
         return new ToolDescriptor(risk == ToolPolicy.Risk.READ_ONLY ? "process.readStart" : risk == ToolPolicy.Risk.APPROVAL_REQUIRED ? "process.approvedStart" : "process.fixedStart", 1, "start_process", "Fixed START recorder",
                 new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")), new ToolSchema(Map.of(output ? "instanceId" : "other", ToolSchema.ValueType.STRING), Set.of(output ? "instanceId" : "other")),
@@ -337,13 +442,14 @@ class ToolIdempotentStartRecorderTest {
         }
         IdempotentStartResultVO execute() { return execute(request); }
         IdempotentStartResultVO execute(PreparationRequestVO request) { return rig.selected(request, () -> recorder.executeIdempotentStart(transport, request)); }
+        IdempotentStartResultVO executeObserved(ToolCommittedFactObserver observer) { return rig.selected(request, () -> recorder.executeIdempotentStart(transport, request, observer)); }
         @Override public void close() { rig.close(); }
     }
 
     /** Controlled synchronous port stages; AS transport tests independently cover the actual SDK and noncooperative waits. */
     private static final class ProbeTransport implements FixedBpmnStartToolTransport {
         final Scene scene;
-        final AtomicInteger calls = new AtomicInteger(), starts = new AtomicInteger();
+        final AtomicInteger calls = new AtomicInteger(), starts = new AtomicInteger(), wrappedCallbackLedger = new AtomicInteger();
         final AtomicReference<Request> request = new AtomicReference<>();
         final AtomicReference<Object> callbackResult = new AtomicReference<>();
         final AtomicReference<FailureKind> beforeFailure = new AtomicReference<>(), operationFailure = new AtomicReference<>(), afterFailure = new AtomicReference<>();
@@ -371,7 +477,7 @@ class ToolIdempotentStartRecorderTest {
                 });
             } catch (Failure failure) { throw new Failure(failure.kind()); }
             catch (AgentLedgerException failure) {
-                if (acknowledged.get()) throw new Failure(FailureKind.OPERATION_RESULT_UNKNOWN);
+                if (acknowledged.get()) { wrappedCallbackLedger.incrementAndGet(); throw new Failure(FailureKind.OPERATION_RESULT_UNKNOWN); }
                 throw new AgentLedgerException(failure.code(), "Controlled START callback unavailable");
             }
             catch (RuntimeException failure) { throw new Failure(consumed.get() ? FailureKind.OPERATION_RESULT_UNKNOWN : FailureKind.OPERATION_NOT_SENT); }

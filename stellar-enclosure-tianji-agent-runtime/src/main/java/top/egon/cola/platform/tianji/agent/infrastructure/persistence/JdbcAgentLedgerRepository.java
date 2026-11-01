@@ -220,6 +220,22 @@ final class JdbcAgentLedgerRepository {
                 runId, expectedRevision).stream().findFirst();
     }
 
+    Optional<StoredRun> expireDeadline(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision,
+                                       String resultJson) {
+        return jdbc.query("""
+                UPDATE tianji_agent.agent_run
+                SET status = 'TIMED_OUT', revision = revision + 1, last_event_sequence = last_event_sequence + 1,
+                    result = CAST(? AS jsonb), error_code = 'TIANJI_RUN_TIMED_OUT', finished_at = clock_timestamp(),
+                    lease_epoch = lease_epoch + 1, lease_owner = NULL, lease_expires_at = NULL,
+                    active_model_calls = 0, active_tool_calls = 0
+                WHERE tenant_id = ? AND subject_type = ? AND subject_issuer = ? AND subject_id = ? AND run_id = ?
+                  AND revision = ? AND status = 'RUNNING' AND attempt > 0 AND lease_owner = ? AND lease_epoch = ?
+                  AND deadline_at <= clock_timestamp()
+                RETURNING *
+                """, runMapper(), resultJson, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                lease.runId(), expectedRevision, lease.owner(), lease.epoch()).stream().findFirst();
+    }
+
     Optional<StoredRun> suspendExpiredLease(TrustedAgentActor actor, String runId, long expectedRevision) {
         return jdbc.query("""
                 UPDATE tianji_agent.agent_run

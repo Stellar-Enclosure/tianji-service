@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -32,6 +33,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -46,6 +48,7 @@ public final class ToolInvocationRecorder {
     private final LongSupplier nanoTime;
     private final SecureRandom random = new SecureRandom();
     private final AtomicBoolean verified = new AtomicBoolean();
+    private static final ToolCommittedFactObserver NOOP_COMMITTED = status -> { };
 
     public ToolInvocationRecorder(DataSource source, AgentLedgerService ledger, ToolInvocationStore preparations, ToolCapabilityStore capabilities, ToolExecutionAuthorization authorization) {
         this(source, ledger, preparations, capabilities, authorization, Clock.systemUTC(), System::nanoTime);
@@ -93,6 +96,11 @@ public final class ToolInvocationRecorder {
     }
 
     public IdempotentStartResultVO executeIdempotentStart(FixedBpmnStartToolTransport transport, PreparationRequestVO request) {
+        return executeIdempotentStart(transport, request, NOOP_COMMITTED);
+    }
+
+    public IdempotentStartResultVO executeIdempotentStart(FixedBpmnStartToolTransport transport, PreparationRequestVO request, ToolCommittedFactObserver observer) {
+        if (observer == null) throw invalidStart();
         if (transport == null || request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE
                 || request.action() == null || request.intentExpiry() == null || request.estimatedCost() == null || request.estimatedCost().signum() != 0
                 || !ProcessClient.START_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey())
@@ -100,6 +108,14 @@ public final class ToolInvocationRecorder {
                 || !request.descriptor().output().required().equals(Set.of("instanceId"))) throw invalidStart();
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Fixed START recording requires its own transactions");
         if (!verified.get()) throw unavailableStart();
+        var observerFailure = new AtomicReference<AgentLedgerException>();
+        ToolCommittedFactObserver wrappedObserver = status -> {
+            try { observer.onCommitted(status); }
+            catch (RuntimeException privateObserver) {
+                var safe = new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Committed tool fact observation could not complete");
+                observerFailure.compareAndSet(null, safe); throw observerFailure.get();
+            }
+        };
         RecorderPreparationVO expected = null;
         try {
             var prepared = preparations.prepareOrLoadIdempotentWrite(request); expected = prepared.invocation();
@@ -114,21 +130,25 @@ public final class ToolInvocationRecorder {
             }
             var transportRequest = new FixedBpmnStartToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), request.invocationId(), expected.dispatchNotAfter());
             var original = expected;
-            var own = Objects.requireNonNull(transport.withVerifiedCall(transportRequest,
-                    (executor, operation) -> dispatchAndRecordStart(request, original, prepared.budget(), executor, operation)));
-            return startResult(snapshot, own);
+            var own = transport.withVerifiedCall(transportRequest,
+                    (executor, operation) -> dispatchAndRecordStart(request, original, prepared.budget(), executor, operation, wrappedObserver));
+            if (observerFailure.get() != null) throw observerFailure.get();
+            return startResult(snapshot, Objects.requireNonNull(own));
         } catch (FixedBpmnStartToolTransport.Failure rejected) {
+            if (observerFailure.get() != null) throw observerFailure.get();
             var safe = new FixedBpmnStartToolTransport.Failure(rejected.kind()); cleanupStart(request, expected, startCleanupCode(rejected.kind()), safe); throw safe;
         } catch (AgentLedgerException rejected) {
+            if (observerFailure.get() != null) throw observerFailure.get();
             var safe = new AgentLedgerException(rejected.code(), "Fixed START invocation could not complete");
             cleanupStart(request, expected, rejected.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
         } catch (RuntimeException privateFailure) {
+            if (observerFailure.get() != null) throw observerFailure.get();
             var safe = unavailableStart(); cleanupStart(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
         }
     }
 
     private WriteAttemptResultVO dispatchAndRecordStart(PreparationRequestVO request, RecorderPreparationVO expected, AgentBudgetReservation observedBudget,
-                                                       ReadOnlyDecisionToolTransport.VerifiedExecutor executor, FixedBpmnStartToolTransport.OneShotStart operation) {
+                                                       ReadOnlyDecisionToolTransport.VerifiedExecutor executor, FixedBpmnStartToolTransport.OneShotStart operation, ToolCommittedFactObserver observer) {
         if (executor == null || operation == null || executor.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(executor.actor().issuerFingerprint())
                 || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailableStart();
         Instant started = clock.instant(); long startedNanos = nanoTime.getAsLong();
@@ -169,6 +189,7 @@ public final class ToolInvocationRecorder {
         }
         var fact = observed;
         var recorded = bookkeeping(() -> preparations.completeIdempotentWrite(request, begin.attempt(), nonce, fact));
+        observer.onCommitted(recorded.outcome().status());
         var metadata = recorded.invocation();
         return new WriteAttemptResultVO(metadata.runId(), metadata.invocationId(), metadata.state(), metadata.revision(), metadata.dispatchEpoch(), metadata.dispatchedAt(), metadata.finishedAt(),
                 recorded.outcome(), invoked, account(request, recorded.budget()));

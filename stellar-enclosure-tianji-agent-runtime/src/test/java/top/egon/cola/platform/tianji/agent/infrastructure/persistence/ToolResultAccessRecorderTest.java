@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -167,6 +168,91 @@ class ToolResultAccessRecorderTest {
         }
     }
 
+    @Test void null_observer_is_rejected_before_any_store_or_accounting_work() {
+        try (var scene = new Scene(success(null))) {
+            clearInvocations(scene.store, scene.ledger, scene.budgets);
+            assertThrows(IllegalArgumentException.class, () -> scene.observe(null));
+            verifyNoInteractions(scene.store, scene.ledger, scene.budgets); assertTrue(scene.trace.isEmpty());
+        }
+    }
+
+    @Test void every_authorized_new_or_exact_access_observes_its_known_status_before_accounting_and_egress() {
+        for (var status : List.of(ToolExecutionOutcome.Status.SUCCEEDED, ToolExecutionOutcome.Status.REJECTED, ToolExecutionOutcome.Status.FAILED_KNOWN)) {
+            var source = status == ToolExecutionOutcome.Status.SUCCEEDED ? success(new BigDecimal("0.0300"))
+                    : new ToolExecutionOutcome(status, Map.of(), null, "ORIGINAL_NEGATIVE", new BigDecimal("0.0300"));
+            try (var scene = new Scene(source)) {
+                var observed = new ArrayList<ToolExecutionOutcome.Status>();
+                ToolCommittedFactObserver observer = actual -> {
+                    assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertEquals("fact-commit", scene.trace.getLast());
+                    observed.add(actual); scene.trace.add("observer");
+                };
+                for (int read = 0; read < 2; read++) {
+                    var result = scene.observe(observer); assertSame(source, result.sourceOutcome()); assertEquals(new BigDecimal("0.0300"), result.sourceOutcome().actualCost());
+                }
+                assertEquals(List.of(status, status), observed);
+                assertEquals(List.of("fact-commit", "observer", "access-account", "egress", "fact-commit", "observer", "access-account", "egress"), scene.trace);
+                verify(scene.store, times(2)).recordKnownStartResultAccess(scene.request);
+                verify(scene.budgets, times(2)).settleBudget(any(), any(), eq(scene.request.reservationId()), any());
+            }
+        }
+    }
+
+    @Test void an_already_settled_access_is_still_observed_before_egress_without_settlement() {
+        try (var scene = new Scene(success(null))) {
+            scene.recorded = scene.recorded(budget(scene.request, AgentBudgetReservation.State.SETTLED, BigDecimal.ZERO));
+            var observed = new ArrayList<ToolExecutionOutcome.Status>();
+            var result = scene.observe(status -> { observed.add(status); scene.trace.add("observer"); });
+            assertEquals(List.of(ToolExecutionOutcome.Status.SUCCEEDED), observed); assertEquals(AccountingState.SETTLED, result.accessAccountingState());
+            assertEquals(List.of("fact-commit", "observer", "egress"), scene.trace); verifyNoInteractions(scene.budgets);
+        }
+    }
+
+    @Test void throwing_observer_keeps_the_fact_but_returns_safe_dependency_without_accounting_or_egress() {
+        for (boolean interrupted : List.of(false, true)) try (var scene = new Scene(success(BigDecimal.ONE))) {
+            var original = scene.recorded;
+            try {
+                var failure = assertThrows(AgentLedgerException.class, () -> scene.observe(status -> {
+                    assertEquals(ToolExecutionOutcome.Status.SUCCEEDED, status); scene.trace.add("observer");
+                    if (interrupted) Thread.currentThread().interrupt();
+                    throw new IllegalStateException("private observer source-instance", new IllegalArgumentException(RECEIPT));
+                }));
+                assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code()); assertNull(failure.getCause()); assertEquals(0, failure.getSuppressed().length);
+                assertFalse(failure.getMessage().contains("private")); assertFalse(failure.getMessage().contains(RECEIPT)); assertFalse(failure.getMessage().contains("source-instance"));
+                assertEquals(interrupted, Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+            assertSame(original, scene.recorded); assertEquals(List.of("fact-commit", "observer"), scene.trace); verifyNoInteractions(scene.budgets);
+            verify(scene.store, never()).checkDisclosureWindow(any()); verify(scene.store).recordKnownStartResultAccess(scene.request);
+        }
+    }
+
+    @Test void denial_or_mismatched_fact_identity_never_notifies_an_observer() {
+        for (boolean denied : List.of(false, true)) try (var scene = new Scene(success(null))) {
+            if (denied) doThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current access denied")).when(scene.store).recordKnownStartResultAccess(scene.request);
+            else {
+                var prior = scene.recorded;
+                scene.recorded = new RecordedAccessVO("10000000-0000-0000-0000-000000000002", prior.accessId(), prior.actionIntentId(), prior.sourceActionRevision(), prior.sourceResultSha256(), prior.sourceOutcome(), prior.accessBudget(), prior.window());
+            }
+            var observed = new ArrayList<ToolExecutionOutcome.Status>();
+            var failure = assertThrows(AgentLedgerException.class, () -> scene.observe(observed::add));
+            assertEquals(denied ? AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
+            assertTrue(observed.isEmpty()); verifyNoInteractions(scene.budgets); verify(scene.store, never()).checkDisclosureWindow(any());
+        }
+    }
+
+    @Test void committed_access_stays_observed_when_later_disclosure_fails_or_the_observer_sets_interrupt() {
+        for (boolean interrupted : List.of(false, true)) try (var scene = new Scene(success(null))) {
+            scene.rejectEgress.set(!interrupted); var observed = new ArrayList<ToolExecutionOutcome.Status>();
+            try {
+                assertThrows(AgentLedgerException.class, () -> scene.observe(status -> {
+                    observed.add(status); scene.trace.add("observer"); if (interrupted) Thread.currentThread().interrupt();
+                }));
+                assertEquals(interrupted, Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+            assertEquals(List.of(ToolExecutionOutcome.Status.SUCCEEDED), observed); assertEquals(List.of("fact-commit", "observer", "access-account", "egress"), scene.trace);
+            verify(scene.store).recordKnownStartResultAccess(scene.request); verify(scene.budgets).settleBudget(any(), any(), eq(scene.request.reservationId()), any());
+        }
+    }
+
     private static StartResultAccessRequestVO request() {
         var actor = ToolInvocationStoreTest.ACTOR;
         var run = new AgentRunAuthorization.Request(actor, RUN, "assistant", 1, HASH, HASH, HASH, "policy-1", false, NOW.plusSeconds(60));
@@ -190,6 +276,7 @@ class ToolResultAccessRecorderTest {
         final List<String> trace = new ArrayList<>();
         final AtomicBoolean failAccounting = new AtomicBoolean(), rejectEgress = new AtomicBoolean(), interruptAccounting = new AtomicBoolean();
         RecordedAccessVO recorded;
+        boolean observerCall;
 
         Scene(ToolExecutionOutcome source) {
             this.source = source; recorded = recorded(budget(request, AgentBudgetReservation.State.RESERVED, null));
@@ -198,7 +285,7 @@ class ToolResultAccessRecorderTest {
                 assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); trace.add("fact-commit"); return recorded;
             });
             when(budgets.settleBudget(eq(request.binding().run().actor()), eq(request.lease()), eq(request.reservationId()), any())).thenAnswer(call -> {
-                assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertFalse(trace.isEmpty()); assertEquals("fact-commit", trace.getLast());
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); assertFalse(trace.isEmpty()); assertEquals(observerCall ? "observer" : "fact-commit", trace.getLast());
                 trace.add("access-account"); assertEquals(new AgentBudgetSettlement(0L, 0L, BigDecimal.ZERO), call.getArgument(3));
                 if (interruptAccounting.get()) Thread.currentThread().interrupt();
                 if (failAccounting.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Private accounting failure");
@@ -212,6 +299,11 @@ class ToolResultAccessRecorderTest {
             recorder = new ToolResultAccessRecorder(store, ledger);
         }
         RecordedAccessVO recorded(AgentBudgetReservation budget) { return new RecordedAccessVO(RUN, request.accessId(), request.action().intentId(), 7, HASH, source, budget, window); }
+        StartResultAccessVO observe(ToolCommittedFactObserver observer) {
+            observerCall = true;
+            try { return recorder.recordKnownStartResultAccess(request, observer); }
+            finally { observerCall = false; }
+        }
         @Override public void close() { Thread.interrupted(); }
     }
 }

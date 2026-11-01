@@ -161,6 +161,64 @@ class AgentRunGovernancePostgresTest {
     }
 
     @Test
+    void current_generation_deadline_preserves_each_frozen_effect_after_lease_expiry() {
+        for (String effect : List.of("CONFIRMED", "NONE", "UNKNOWN")) {
+            TrustedAgentActor owner = actor();
+            GetAgentRunQuery query = queued(owner);
+            ClaimedAgentRun claim = ledger.claim(owner, query, 0, "worker-current", Duration.ofSeconds(10));
+            ledger.budgets().reserveBudget(owner, claim.lease(), new AgentBudgetRequest("deadline-model",
+                    AgentBudgetRequest.Kind.MODEL, null, 10, 10, new java.math.BigDecimal("0.10")));
+            if (effect.equals("NONE")) ledger.cancel(owner, new CancelAgentRunCommand(query.runId(), "deadline-cancel", claim.run().revision(), "stop"));
+            long revision = ledger.get(owner, query).revision();
+            jdbc.update("""
+                    UPDATE tianji_agent.agent_run
+                    SET deadline_at = clock_timestamp() - interval '1 second',
+                        lease_expires_at = clock_timestamp() - interval '2 seconds'
+                    WHERE tenant_id = ? AND run_id = ?
+                    """, owner.tenantId(), query.runId());
+            var expiredHint = new AgentRunLease(query.runId(), claim.lease().owner(), claim.lease().epoch(), java.time.Instant.EPOCH);
+            AgentRunDTO expired = ledger.expireDeadline(owner, expiredHint, query, revision, effect);
+            assertEquals(TIMED_OUT, expired.status());
+            assertEquals(revision + 1, expired.revision());
+            assertEquals(effect, ledger.getResult(owner, query).orElseThrow().sideEffectOutcome());
+            assertEquals("UNKNOWN", jdbc.queryForObject("""
+                    SELECT state FROM tianji_agent.agent_budget_reservation WHERE tenant_id = ? AND run_id = ? AND reservation_id = ?
+                    """, String.class, owner.tenantId(), query.runId(), "deadline-model"));
+            assertEquals(1, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 20)).stream()
+                    .filter(event -> "TIMED_OUT".equals(event.payload().get("status"))).count());
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> ledger.expireDeadline(owner, expiredHint, query, expired.revision(), "UNKNOWN")).code());
+            assertEquals(effect, ledger.getResult(owner, query).orElseThrow().sideEffectOutcome());
+        }
+    }
+
+    @Test
+    void deadline_fence_rejects_old_owner_epoch_revision_and_an_unexpired_database_deadline() {
+        TrustedAgentActor owner = actor();
+        GetAgentRunQuery query = queued(owner);
+        ClaimedAgentRun claim = ledger.claim(owner, query, 0, "worker-current", Duration.ofSeconds(10));
+        assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> ledger.expireDeadline(owner, claim.lease(), query, claim.run().revision(), "CONFIRMED")).code());
+        jdbc.update("""
+                UPDATE tianji_agent.agent_run
+                SET deadline_at = clock_timestamp() - interval '1 second', lease_expires_at = clock_timestamp() - interval '2 seconds'
+                WHERE tenant_id = ? AND run_id = ?
+                """, owner.tenantId(), query.runId());
+        for (var stale : List.of(new AgentRunLease(query.runId(), "older-worker", claim.lease().epoch(), java.time.Instant.EPOCH),
+                new AgentRunLease(query.runId(), claim.lease().owner(), claim.lease().epoch() + 1, java.time.Instant.EPOCH))) {
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> ledger.expireDeadline(owner, stale, query, claim.run().revision(), "CONFIRMED")).code());
+        }
+        assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> ledger.expireDeadline(owner, claim.lease(), query, claim.run().revision() + 1, "CONFIRMED")).code());
+        assertEquals(RUNNING, ledger.get(owner, query).status());
+        assertTrue(ledger.getResult(owner, query).isEmpty());
+        assertEquals(0, ledger.events(owner, new AgentEventsQuery(query.runId(), 0, 20)).stream()
+                .filter(event -> "TIMED_OUT".equals(event.payload().get("status"))).count());
+        assertEquals(TIMED_OUT, ledger.expireDeadline(owner, claim.lease(), query, claim.run().revision(), "NONE").status());
+    }
+
+    @Test
     void reconciliation_finds_due_runs_and_never_requeues_an_expired_lease() {
         TrustedAgentActor staleOwner = actor();
         GetAgentRunQuery stale = queued(staleOwner);

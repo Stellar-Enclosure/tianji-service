@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -20,6 +21,7 @@ import java.util.UUID;
 public final class ToolResultAccessRecorder {
     private final ToolResultAccessStore store;
     private final AgentLedgerService ledger;
+    private static final ToolCommittedFactObserver NOOP_COMMITTED = status -> { };
 
     public ToolResultAccessRecorder(ToolResultAccessStore store, AgentLedgerService ledger) {
         this.store = Objects.requireNonNull(store, "store"); this.ledger = Objects.requireNonNull(ledger, "ledger");
@@ -29,6 +31,11 @@ public final class ToolResultAccessRecorder {
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
 
     public StartResultAccessVO recordKnownStartResultAccess(StartResultAccessRequestVO request) {
+        return recordKnownStartResultAccess(request, NOOP_COMMITTED);
+    }
+
+    public StartResultAccessVO recordKnownStartResultAccess(StartResultAccessRequestVO request, ToolCommittedFactObserver observer) {
+        if (observer == null) throw invalid();
         if (request == null) throw invalid();
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("START result access requires its own transactions");
         var fact = store.recordKnownStartResultAccess(request); var budget = fact.accessBudget();
@@ -36,6 +43,10 @@ public final class ToolResultAccessRecorder {
                 || !request.action().intentId().equals(fact.actionIntentId()) || budget == null || !request.reservationId().equals(budget.reservationId())
                 || budget.leaseEpoch() != request.lease().epoch() || budget.kind() != AgentBudgetRequest.Kind.TOOL || !request.descriptor().versionKey().equals(budget.toolVersion())
                 || budget.inputTokens() != 0 || budget.outputTokens() != 0 || budget.estimatedCost() == null || budget.estimatedCost().signum() != 0) throw unavailable();
+        try { observer.onCommitted(fact.sourceOutcome().status()); }
+        catch (RuntimeException privateObserver) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Committed tool fact observation could not complete");
+        }
         AccountingState accounting = settledZero(budget) ? AccountingState.SETTLED : AccountingState.PENDING;
         if (accounting != AccountingState.SETTLED) {
             try {

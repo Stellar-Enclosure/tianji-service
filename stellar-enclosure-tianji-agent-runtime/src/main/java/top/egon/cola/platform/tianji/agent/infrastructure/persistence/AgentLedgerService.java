@@ -482,6 +482,28 @@ public final class AgentLedgerService {
         });
     }
 
+    /** Expires the current execution generation with a trusted, frozen tool-ledger effect. */
+    public AgentRunDTO expireDeadline(TrustedAgentActor actor, AgentRunLease lease, GetAgentRunQuery query,
+                                      long expectedRevision, String sideEffectOutcome) {
+        if (actor == null || lease == null || query == null || expectedRevision < 0
+                || !lease.runId().equals(query.runId()) || sideEffectOutcome == null
+                || !Set.of("CONFIRMED", "NONE", "UNKNOWN").contains(sideEffectOutcome)) {
+            throw invalid("invalid leased Agent deadline result");
+        }
+        return transaction.execute(status -> {
+            JdbcAgentLedgerRepository.StoredRun previous = requireRun(actor, query);
+            AgentExecutionResult result = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.TIMED_OUT,
+                    Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(), sideEffectOutcome);
+            JdbcAgentLedgerRepository.StoredRun updated = repository.expireDeadline(actor, lease,
+                    expectedRevision, json.write(result, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(
+                    () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                            "Agent run deadline or execution generation has changed"));
+            repository.markOutstandingBudgetUnknown(actor.tenantId(), query.runId());
+            appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.TIMED_OUT, null);
+            return updated.run();
+        });
+    }
+
     /** An expired worker is fenced and suspended for reconciliation, never silently retried. */
     public AgentRunDTO suspendExpiredLease(TrustedAgentActor actor, GetAgentRunQuery query, long expectedRevision) {
         Objects.requireNonNull(actor, "actor");
