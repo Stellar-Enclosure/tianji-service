@@ -4,6 +4,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -38,10 +39,11 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
-/** Owns preparation, dispatch and receipt ordering for fixed nonbillable decision and BPMN START calls. */
+/** Owns preparation, dispatch and receipt ordering for fixed nonbillable decision, MCP and BPMN START calls. */
 public final class ToolInvocationRecorder {
     private final DataSource source;
     private final AgentLedgerService ledger;
@@ -88,11 +90,50 @@ public final class ToolInvocationRecorder {
             if (metadataOnly(expected)) return metadata(expected, prepared.budget());
             var transportRequest = new ReadOnlyDecisionToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.arguments(), request.invocationId(), expected.dispatchNotAfter());
             var original = expected;
-            return transport.withVerifiedCall(transportRequest, (executor, operation) -> dispatchAndRecord(request, original, prepared.budget(), executor, operation));
+            return transport.withVerifiedCall(transportRequest, (executor, operation) -> {
+                if (operation == null) throw unavailable();
+                return dispatchAndRecord(request, original, prepared.budget(), executor, deadline -> decisionOperationOutcome(request, operation));
+            });
         } catch (ReadOnlyDecisionToolTransport.Failure rejected) {
             var safe = new ReadOnlyDecisionToolTransport.Failure(rejected.kind()); cleanup(request, expected, cleanupCode(rejected.kind()), safe); throw safe;
         } catch (AgentLedgerException rejected) {
             var safe = new AgentLedgerException(rejected.code(), "Read-only tool invocation could not complete");
+            cleanup(request, expected, rejected.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
+        } catch (RuntimeException privateFailure) {
+            var safe = unavailable(); cleanup(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
+        }
+    }
+
+    /** Records one fixed nonbillable read-only MCP call through the existing invocation journal. */
+    public RecordResult executeReadOnlyMcp(ReadOnlyMcpToolTransport transport, PreparationRequestVO request) {
+        if (transport == null || request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.READ_ONLY
+                || !ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey())
+                || request.action() != null || request.intentExpiry() != null || request.estimatedCost() == null
+                || request.estimatedCost().compareTo(BigDecimal.ZERO) != 0) throw invalid();
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Read-only MCP invocation recording requires its own transactions");
+        if (!verified.get()) throw unavailable();
+        RecorderPreparationVO expected = null;
+        try {
+            var prepared = preparations.prepareOrLoadForRecorder(request); expected = prepared.invocation();
+            if (metadataOnly(expected)) return metadata(expected, prepared.budget());
+            var transportRequest = new ReadOnlyMcpToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.arguments(), request.invocationId(), expected.dispatchNotAfter());
+            var original = expected;
+            return transport.withVerifiedCall(transportRequest, (executor, operation) -> {
+                if (operation == null) throw unavailable();
+                try {
+                    return dispatchAndRecord(request, original, prepared.budget(), executor, deadline -> mcpOperationOutcome(request, operation, deadline));
+                } catch (ReadOnlyDecisionToolTransport.Failure shared) {
+                    throw new ReadOnlyMcpToolTransport.Failure(switch (shared.kind()) {
+                        case CANCELLED -> ReadOnlyMcpToolTransport.FailureKind.CANCELLED;
+                        case DEADLINE_EXCEEDED -> ReadOnlyMcpToolTransport.FailureKind.DEADLINE_EXCEEDED;
+                        default -> ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT;
+                    });
+                }
+            });
+        } catch (ReadOnlyMcpToolTransport.Failure rejected) {
+            var safe = new ReadOnlyMcpToolTransport.Failure(rejected.kind()); cleanup(request, expected, cleanupCode(rejected.kind()), safe); throw safe;
+        } catch (AgentLedgerException rejected) {
+            var safe = new AgentLedgerException(rejected.code(), "Read-only MCP tool invocation could not complete");
             cleanup(request, expected, rejected.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED ? "AUTHORIZATION_DENIED" : "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
         } catch (RuntimeException privateFailure) {
             var safe = unavailable(); cleanup(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
@@ -381,7 +422,7 @@ public final class ToolInvocationRecorder {
     }
 
     private RecordResult dispatchAndRecord(PreparationRequestVO request, RecorderPreparationVO expected, AgentBudgetReservation originalBudget,
-                                          ReadOnlyDecisionToolTransport.VerifiedExecutor executor, ReadOnlyDecisionToolTransport.OneShotDecision operation) {
+                                          ReadOnlyDecisionToolTransport.VerifiedExecutor executor, Function<Instant, ToolExecutionOutcome> operation) {
         if (executor == null || operation == null || executor.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(executor.actor().issuerFingerprint())
                 || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailable();
         Instant started = clock.instant(); long startedNanos = nanoTime.getAsLong();
@@ -392,7 +433,11 @@ public final class ToolInvocationRecorder {
         catch (RuntimeException privateEvidence) { throw unavailable(); }
         check(initialWindow);
         if (!request.binding().equals(evidence.reservation().binding())) throw unavailable();
-        var window = window(started, startedNanos, earlier(initialDeadline, evidence.expiresAt())); check(window);
+        Instant deadline = ToolInvocationStore.dispatchCallDeadline(request, expected.dispatchNotAfter(), evidence.expiresAt(), executor.expiresAt());
+        if (request.descriptor().policy().risk() == ToolPolicy.Risk.READ_ONLY
+                && ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey()) && !deadline.isAfter(clock.instant()))
+            throw new ReadOnlyDecisionToolTransport.Failure(ReadOnlyDecisionToolTransport.FailureKind.DEADLINE_EXCEEDED);
+        var window = window(started, startedNanos, deadline); check(window);
         var expectedCheck = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(),
                 request.parametersSha256(), null, window.callDeadlineAt());
         ToolExecutionAuthorization.CheckResult checked;
@@ -416,9 +461,7 @@ public final class ToolInvocationRecorder {
         try {
             check(window);
             invoked = true;
-            try { outcome = observation(request, operation.evaluate()); }
-            catch (ReadOnlyDecisionToolTransport.Failure rejected) { outcome = operationFailure(rejected.kind()); }
-            catch (RuntimeException privateOperation) { outcome = outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN"); }
+            outcome = operation.apply(window.callDeadlineAt());
         } catch (RuntimeException notSent) {
             outcome = outcome(invoked ? ToolExecutionOutcome.Status.UNKNOWN : ToolExecutionOutcome.Status.FAILED_KNOWN, invoked ? "OUTCOME_UNKNOWN" : "DISPATCH_NOT_SENT");
         }
@@ -489,6 +532,34 @@ public final class ToolInvocationRecorder {
         return value != null && value.state() == AgentBudgetReservation.State.SETTLED && Long.valueOf(0).equals(value.actualInputTokens()) && Long.valueOf(0).equals(value.actualOutputTokens())
                 && value.actualCost() != null && value.actualCost().compareTo(BigDecimal.ZERO) == 0;
     }
+    private static ToolExecutionOutcome decisionOperationOutcome(PreparationRequestVO request, ReadOnlyDecisionToolTransport.OneShotDecision operation) {
+        try { return observation(request, operation.evaluate()); }
+        catch (ReadOnlyDecisionToolTransport.Failure rejected) { return operationFailure(rejected.kind()); }
+        catch (RuntimeException privateOperation) { return outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN"); }
+    }
+    private static ToolExecutionOutcome mcpOperationOutcome(PreparationRequestVO request, ReadOnlyMcpToolTransport.OneShotCall operation, Instant deadline) {
+        try { return mcpObservation(request, operation.call(deadline)); }
+        catch (ReadOnlyMcpToolTransport.Failure rejected) { return mcpOperationFailure(rejected.kind()); }
+        catch (RuntimeException privateOperation) { return outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN"); }
+    }
+    private static ToolExecutionOutcome mcpObservation(PreparationRequestVO request, ReadOnlyMcpToolTransport.CallObservation observation) {
+        try {
+            if (observation == null) throw invalid();
+            return switch (observation.status()) {
+                case SUCCESS -> new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, observation.output(), null, null, BigDecimal.ZERO).validated(request.descriptor());
+                case TOOL_ERROR -> outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, "DOWNSTREAM_TOOL_ERROR");
+                case UNKNOWN -> outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN");
+            };
+        } catch (RuntimeException invalidResponse) { return outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_INVALID_RESPONSE"); }
+    }
+    private static ToolExecutionOutcome mcpOperationFailure(ReadOnlyMcpToolTransport.FailureKind kind) {
+        return switch (kind) {
+            case OPERATION_NOT_SENT -> outcome(ToolExecutionOutcome.Status.FAILED_KNOWN, "DISPATCH_NOT_SENT");
+            case OPERATION_DENIED -> outcome(ToolExecutionOutcome.Status.REJECTED, "DOWNSTREAM_PERMISSION_DENIED");
+            case OPERATION_INVALID_RESPONSE -> outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_INVALID_RESPONSE");
+            default -> outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN");
+        };
+    }
     private static ToolExecutionOutcome observation(PreparationRequestVO request, ReadOnlyDecisionToolTransport.DecisionObservation observation) {
         try {
             if (observation == null) throw invalid();
@@ -509,6 +580,12 @@ public final class ToolInvocationRecorder {
     private static String cleanupCode(ReadOnlyDecisionToolTransport.FailureKind kind) {
         return switch (kind) {
             case CANCELLED, DEADLINE_EXCEEDED, CREDENTIAL_UNAVAILABLE, RELEASE_UNAVAILABLE, RELEASE_CHANGED -> kind.name();
+            default -> "DISPATCH_NOT_SENT";
+        };
+    }
+    private static String cleanupCode(ReadOnlyMcpToolTransport.FailureKind kind) {
+        return switch (kind) {
+            case CANCELLED, DEADLINE_EXCEEDED, CREDENTIAL_UNAVAILABLE, PROFILE_UNAVAILABLE, PROFILE_CHANGED -> kind.name();
             default -> "DISPATCH_NOT_SENT";
         };
     }

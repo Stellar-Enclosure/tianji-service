@@ -5,6 +5,7 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
@@ -26,6 +27,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.HexFormat;
 import java.util.Objects;
@@ -47,7 +49,7 @@ public final class ToolInvocationStore {
     private final Clock clock;
     private final LongSupplier nanoTime;
     private final AtomicBoolean verified = new AtomicBoolean();
-    private static final Set<String> CLEANUP_CODES = Set.of("CANCELLED", "DEADLINE_EXCEEDED", "CREDENTIAL_UNAVAILABLE", "RELEASE_UNAVAILABLE", "RELEASE_CHANGED", "AUTHORIZATION_DENIED", "AUTHORIZATION_UNAVAILABLE", "DISPATCH_NOT_SENT");
+    private static final Set<String> CLEANUP_CODES = Set.of("CANCELLED", "DEADLINE_EXCEEDED", "CREDENTIAL_UNAVAILABLE", "RELEASE_UNAVAILABLE", "RELEASE_CHANGED", "PROFILE_UNAVAILABLE", "PROFILE_CHANGED", "AUTHORIZATION_DENIED", "AUTHORIZATION_UNAVAILABLE", "DISPATCH_NOT_SENT");
 
     public ToolInvocationStore(DataSource source, AgentLedgerService ledger, ToolCapabilityStore capabilities, ToolExecutionAuthorization authorization) {
         this(source, ledger, capabilities, authorization, Clock.systemUTC(), System::nanoTime);
@@ -226,7 +228,7 @@ public final class ToolInvocationStore {
         if (expected == null || evidence == null || checked == null || executor == null || !request.binding().equals(evidence.reservation().binding())
                 || !request.binding().run().runId().equals(expected.runId()) || !request.invocationId().equals(expected.invocationId()) || !request.reservationId().equals(expected.reservationId())
                 || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailable();
-        Instant deadline = earlier(expected.dispatchNotAfter(), earlier(request.binding().run().deadlineAt(), earlier(evidence.expiresAt(), executor.expiresAt())));
+        Instant deadline = dispatchCallDeadline(request, expected.dispatchNotAfter(), evidence.expiresAt(), executor.expiresAt());
         var original = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(), request.parametersSha256(),
                 request.action() == null ? null : request.action().intentId(), deadline);
         if (!deadline.equals(window.callDeadlineAt()) || !original.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.DISPATCH) throw unavailable();
@@ -255,6 +257,14 @@ public final class ToolInvocationStore {
     private void checkFact(WindowVO window) {
         if (!verified.get() || !window.deadlineAt().isAfter(clock.instant()) || window.nanoDeadline() - nanoTime.getAsLong() <= 0) throw unavailable();
     }
+    static Instant dispatchCallDeadline(PreparationRequestVO request, Instant dispatchNotAfter, Instant evidenceExpiresAt, Instant executorExpiresAt) {
+        if (request == null || dispatchNotAfter == null || evidenceExpiresAt == null || executorExpiresAt == null) throw invalid();
+        Instant deadline = earlier(dispatchNotAfter, earlier(request.binding().run().deadlineAt(), earlier(evidenceExpiresAt, executorExpiresAt)));
+        return request.descriptor().policy().risk() == ToolPolicy.Risk.READ_ONLY
+                && ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey())
+                ? deadline.truncatedTo(ChronoUnit.MICROS) : deadline;
+    }
+
     private static void readOnly(PreparationRequestVO request) {
         if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.READ_ONLY || request.action() != null
                 || request.estimatedCost() == null || request.estimatedCost().signum() != 0) throw invalid();

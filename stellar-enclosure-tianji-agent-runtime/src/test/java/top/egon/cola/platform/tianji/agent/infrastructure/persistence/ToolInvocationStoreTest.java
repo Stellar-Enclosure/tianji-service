@@ -9,6 +9,7 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -535,6 +536,115 @@ class ToolInvocationStoreTest {
             var failure = assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> begin(fixture, store, request, prepared.invocation()));
             assertNull(failure.getCause()); assertEquals("PREPARED", fixture.row.get().get("state")); assertFalse(fixture.trace.contains("dispatch-update")); verify(fixture.connection).rollback();
         }
+    }
+
+    @Test void mcp_floor_is_the_same_dispatch_pdp_begin_and_known_replay_deadline_in_real_store_and_sql() throws Exception {
+        try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY))) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); assertNotNull(prepared);
+            var executor = mcpExecutor(NOW.plusSeconds(3).plusNanos(999));
+            var window = explicitDispatchWindow(fixture, NOW.plusSeconds(3)); var checked = checkedDispatch(fixture, request, window);
+            var started = store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checked, executor,
+                    ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), window);
+            assertTrue(started.started()); assertEquals(NOW.plusSeconds(3), checked.request().deadlineAt());
+            assertEquals(NOW.plusSeconds(3), started.attempt().callDeadlineAt()); assertEquals("DISPATCHING", fixture.row.get().get("state"));
+            assertTrue(fixture.trace.indexOf("dispatch-update") < fixture.trace.lastIndexOf("commit"));
+            var saved = store.completeReadOnly(request, started.attempt(), "1".repeat(64), success());
+            var replay = store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checked, executor, window).orElseThrow();
+            assertEquals(saved.outcome(), replay.outcome()); assertEquals(saved.invocation(), replay.invocation());
+            assertEquals(1, fixture.trace.stream().filter("dispatch-update"::equals).count());
+            assertEquals(1, fixture.budgetInserts.get()); assertEquals(1, fixture.invocationInserts.get());
+            var raw = explicitDispatchWindow(fixture, executor.expiresAt());
+            assertThrows(AgentLedgerException.class, () -> store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checkedDispatch(fixture, request, raw), executor, raw));
+            assertEquals("SUCCEEDED", fixture.row.get().get("state")); assertEquals(1, fixture.trace.stream().filter("outcome-update"::equals).count());
+        }
+    }
+
+    @Test void mcp_unfloored_dispatch_deadline_is_refused_before_begin_and_cannot_leave_a_nonce() throws Exception {
+        try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY))) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); var executor = mcpExecutor(NOW.plusSeconds(3).plusNanos(999));
+            var raw = explicitDispatchWindow(fixture, executor.expiresAt()); fixture.trace.clear();
+            assertThrows(AgentLedgerException.class, () -> store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checkedDispatch(fixture, request, raw), executor,
+                    ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), raw));
+            assertEquals("PREPARED", fixture.row.get().get("state")); assertEquals(0L, fixture.row.get().get("dispatch_epoch"));
+            assertNull(fixture.row.get().get("dispatch_nonce_sha256")); assertFalse(fixture.trace.contains("dispatch-update")); assertFalse(fixture.trace.contains("run-lock"));
+        }
+    }
+
+    @Test void mcp_a_future_raw_ceiling_that_floors_into_the_past_cannot_commit_begin() throws Exception {
+        try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY))) {
+            var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+            var prepared = store.prepareOrLoadForRecorder(request); var executor = mcpExecutor(NOW.plusNanos(999));
+            var raw = explicitDispatchWindow(fixture, executor.expiresAt());
+            fixture.wall.set(NOW.plusNanos(900)); fixture.nano.set(900); fixture.databaseNow.set(NOW.plusNanos(900)); fixture.trace.clear();
+            assertTrue(executor.expiresAt().isAfter(fixture.wall.get()));
+            assertThrows(AgentLedgerException.class, () -> store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checkedDispatch(fixture, request, raw), executor,
+                    ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), raw));
+            assertEquals("PREPARED", fixture.row.get().get("state")); assertEquals(0L, fixture.row.get().get("dispatch_epoch"));
+            assertNull(fixture.row.get().get("dispatch_nonce_sha256")); assertFalse(fixture.trace.contains("dispatch-update"));
+        }
+    }
+
+    @Test void existing_dmn_and_nearby_resource_names_keep_exact_nanoseconds_in_actual_begin_and_replay() throws Exception {
+        for (String resource : List.of("tianji.api.process.decision.evaluate", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY + ".other")) {
+            try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, resource))) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); var executor = mcpExecutor(NOW.plusSeconds(3).plusNanos(999));
+                var raw = explicitDispatchWindow(fixture, executor.expiresAt()); var checked = checkedDispatch(fixture, request, raw);
+                var started = store.beginReadOnlyDispatch(request, prepared.invocation(), fixture.evidence.get(), checked, executor,
+                        ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), raw);
+                assertTrue(started.started()); assertEquals(executor.expiresAt(), started.attempt().callDeadlineAt());
+                var saved = store.completeReadOnly(request, started.attempt(), "1".repeat(64), success());
+                assertEquals(saved.outcome(), store.readRecorded(request, saved.invocation(), fixture.evidence.get(), checked, executor, raw).orElseThrow().outcome());
+                assertEquals(1, fixture.trace.stream().filter("dispatch-update"::equals).count());
+            }
+        }
+    }
+
+    @Test void idempotent_write_keeps_exact_nanoseconds_through_existing_real_store_and_sql_dispatch() throws Exception {
+        try (var rig = new ToolWriteInvocationStoreTest.Rig()) {
+            var request = rig.request(RUN, INVOCATION); var prepared = rig.prepare(request);
+            var executor = mcpExecutor(NOW.plusSeconds(3).plusNanos(999));
+            var raw = explicitDispatchWindow(rig.base, executor.expiresAt()); var checked = rig.checked(request, raw);
+            var notSent = new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "ACTION_NOT_DISPATCHABLE", BigDecimal.ZERO);
+            var started = rig.selected(request, () -> rig.store.beginIdempotentWriteDispatch(request, prepared.invocation(), rig.evidence(request), checked, executor,
+                    ToolInvocationStore.dispatchNonceSha256("1".repeat(64)), notSent, raw));
+            assertTrue(started.started()); assertEquals(executor.expiresAt(), started.attempt().callDeadlineAt());
+            assertEquals("DISPATCHING", rig.row(request).get("state")); assertEquals("DISPATCHING", rig.base.intentRow.get().state());
+            assertEquals(1, rig.base.trace.stream().filter("inv-write-dispatch"::equals).count());
+        }
+    }
+
+    @Test void mcp_profile_cleanup_closes_only_prepared_rows_and_retains_existing_release_cleanup_codes() throws Exception {
+        for (String code : List.of("PROFILE_UNAVAILABLE", "PROFILE_CHANGED", "RELEASE_UNAVAILABLE", "RELEASE_CHANGED")) {
+            try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY))) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); String audit = (String) fixture.row.get().get("authorization_audit");
+                var closed = store.closePreparedFailure(request, prepared.invocation(), code).orElseThrow();
+                assertEquals("FAILED_KNOWN", closed.state()); assertEquals(0L, closed.dispatchEpoch());
+                assertEquals(code, new ToolExecutionJsonCodec().outcome((String) fixture.row.get().get("outcome"), fixture.tool).errorCode());
+                assertEquals(audit, fixture.row.get().get("authorization_audit")); assertNull(fixture.row.get().get("dispatch_nonce_sha256")); assertNull(fixture.row.get().get("executor_id"));
+                assertEquals(AgentBudgetReservation.State.RESERVED, fixture.budgetRows.get(request.reservationId()).state());
+            }
+            try (var fixture = new Fixture(mcpDescriptor(ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY))) {
+                var store = fixture.store(true, fixture.authority); var request = fixture.recorderRequest(INVOCATION);
+                var prepared = store.prepareOrLoadForRecorder(request); var started = begin(fixture, store, request, prepared.invocation());
+                assertEquals("DISPATCHING", store.closePreparedFailure(request, null, code).orElseThrow().state());
+                assertEquals(0, fixture.trace.stream().filter("prepared-close"::equals).count());
+                assertEquals(started.attempt().dispatchNonceSha256(), fixture.row.get().get("dispatch_nonce_sha256"));
+            }
+        }
+    }
+
+    private static ToolDescriptor mcpDescriptor(ToolPolicy.Risk risk, String resource) {
+        return new ToolDescriptor("mcp.read", 1, "mcp_read", "Fixed nonbillable MCP lookup", READ.input(), READ.output(),
+                new ToolPolicy(risk, "mcp.lookup", resource, HASH, risk == ToolPolicy.Risk.APPROVAL_REQUIRED ? "approval-1" : null));
+    }
+    private static VerifiedExecutor mcpExecutor(Instant expiry) { return new VerifiedExecutor(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "mcp-executor", "https://mcp.example/20"), expiry); }
+    private static ToolInvocationStore.DispatchWindowVO explicitDispatchWindow(Fixture fixture, Instant call) {
+        Instant started = fixture.wall.get(), ceiling = started.plusSeconds(10);
+        return new ToolInvocationStore.DispatchWindowVO(started, fixture.nano.get(), call.isBefore(ceiling) ? call : ceiling, call);
     }
 
     private static VerifiedExecutor executor() { return new VerifiedExecutor(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "decision-executor", "https://process.example/20"), NOW.plusSeconds(40)); }

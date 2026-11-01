@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -44,6 +45,11 @@ class ToolInvocationRecorderTest {
             new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "decision.lookup", "tianji.api.process.decision.evaluate", "a".repeat(64), null));
     private static final ReadOnlyDecisionToolTransport.VerifiedExecutor EXECUTOR = new ReadOnlyDecisionToolTransport.VerifiedExecutor(
             TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "dmn-executor", "https://process-idp.example/20"), NOW.plusSeconds(15));
+
+    private static final ToolDescriptor MCP_TOOL = new ToolDescriptor("mcp.lookup", 1, "lookup_catalog", "Fixed nonbillable MCP lookup",
+            TOOL.input(), TOOL.output(), new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "mcp.lookup", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, "b".repeat(64), null));
+    private static final ReadOnlyDecisionToolTransport.VerifiedExecutor MCP_EXECUTOR = new ReadOnlyDecisionToolTransport.VerifiedExecutor(
+            TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "mcp-executor", "https://mcp-idp.example/20"), NOW.plusSeconds(15));
 
     @Test void affinity_readiness_ambient_transactions_and_nonzero_prices_are_rejected_before_preparation() throws Exception {
         try (var scene = new Scene(false)) {
@@ -281,12 +287,201 @@ class ToolInvocationRecorderTest {
         }
     }
 
+    @Test void decision_null_operation_keeps_its_existing_prebegin_unavailable_cleanup() throws Exception {
+        try (var scene = new Scene()) {
+            scene.transport.nullOperation.set(true);
+            var failure = assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.recorder.executeReadOnly(scene.transport, scene.request));
+            assertNull(failure.getCause()); assertEquals("Read-only tool invocation could not complete", failure.getMessage());
+            assertEquals(0, scene.dispatchChecks.get()); assertFalse(scene.trace.contains("begin-ack")); assertEquals(0, scene.transport.evaluations.get());
+            assertEquals("FAILED_KNOWN", scene.storage.row.get().get("state")); assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertNull(scene.storage.row.get().get("dispatch_nonce_sha256"));
+            assertEquals("AUTHORIZATION_UNAVAILABLE", scene.storage.row.get().get("error_code"));
+        }
+    }
+
+    @Test void mcp_requires_readiness_own_transactions_exact_resource_and_explicit_zero_cost_before_preparation() throws Exception {
+        try (var scene = new Scene(MCP_TOOL, false)) {
+            assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            scene.recorder.verifyStorage();
+            TransactionSynchronizationManager.setActualTransactionActive(true);
+            try { assertThrows(IllegalStateException.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request)); assertTrue(TransactionSynchronizationManager.isActualTransactionActive()); }
+            finally { TransactionSynchronizationManager.setActualTransactionActive(false); }
+            assertThrows(IllegalArgumentException.class, () -> scene.recorder.executeReadOnlyMcp(null, scene.request));
+            assertThrows(IllegalArgumentException.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, null));
+            for (BigDecimal cost : java.util.Arrays.asList(null, new BigDecimal("0.20"))) {
+                var request = new PreparationRequestVO(scene.request.binding(), scene.request.lease(), MCP_TOOL, scene.request.arguments(), null, INVOCATION, cost, null);
+                assertThrows(IllegalArgumentException.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, request));
+            }
+            assertEquals(0, scene.storage.invocationInserts.get()); assertEquals(0, scene.mcp.calls.get());
+        }
+        try (var scene = new Scene()) {
+            assertThrows(IllegalArgumentException.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals(0, scene.storage.invocationInserts.get()); assertEquals(0, scene.mcp.calls.get());
+        }
+    }
+
+    @Test void mcp_dispatch_commits_before_consuming_the_typed_call_and_records_its_fact_before_accounting() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            assertEquals("SUCCEEDED", result.state()); assertTrue(result.operationInvoked()); assertEquals(1, result.dispatchEpoch());
+            assertEquals(Map.of("value", PRIVATE_OUTPUT), result.outcome().output()); assertNull(result.outcome().businessReceiptId()); assertEquals(BigDecimal.ZERO, result.outcome().actualCost());
+            assertEquals(ToolInvocationRecorder.AccountingState.SETTLED, result.accountingState());
+            assertTrue(scene.trace.indexOf("begin-ack") < scene.trace.indexOf("mcp-operation")); assertTrue(scene.trace.indexOf("mcp-operation") < scene.trace.indexOf("complete-ack")); assertTrue(scene.trace.indexOf("complete-ack") < scene.trace.indexOf("accounting"));
+            assertEquals(1, scene.mcp.evaluations.get()); assertEquals(0, scene.transport.evaluations.get()); assertEquals(1, scene.storage.budgetInserts.get());
+            assertEquals(ToolInvocationStore.dispatchNonceSha256(scene.nonce.get()), scene.storage.row.get().get("dispatch_nonce_sha256"));
+            assertEquals(MCP_EXECUTOR.actor().issuerFingerprint(), scene.storage.row.get().get("executor_issuer")); assertEquals(MCP_EXECUTOR.actor().subjectId(), scene.storage.row.get().get("executor_id"));
+            assertEquals(scene.request.binding().run(), scene.mcp.request.get().run()); assertEquals(scene.request.arguments(), scene.mcp.request.get().arguments());
+            assertEquals(scene.request.invocationId(), scene.mcp.request.get().invocationId()); assertEquals(NOW.plusSeconds(20), scene.mcp.request.get().deadlineAt()); assertEquals(NOW.plusSeconds(15), scene.mcp.callDeadline.get());
+        }
+    }
+
+    @Test void mcp_nullable_typed_operation_is_rejected_before_begin_even_when_executor_is_verified() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.nullOperation.set(true);
+            assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals("FAILED_KNOWN", scene.storage.row.get().get("state")); assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertNull(scene.storage.row.get().get("dispatch_nonce_sha256"));
+            assertEquals(0, scene.mcp.evaluations.get()); assertFalse(scene.trace.contains("begin-ack"));
+        }
+    }
+
+    @Test void mcp_invalid_executor_and_current_requester_denial_do_not_begin_or_consume_a_call() throws Exception {
+        for (int variant = 0; variant < 3; variant++) try (var scene = new Scene(MCP_TOOL)) {
+            if (variant == 0) scene.mcp.executor.set(null);
+            else if (variant == 1) scene.mcp.executor.set(new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "other-executor", "https://mcp-idp.example/21"), NOW.plusSeconds(15)));
+            else scene.check.set(request -> new ToolExecutionAuthorization.CheckResult(request, ToolExecutionAuthorization.Boundary.DISPATCH, ToolExecutionAuthorization.Decision.DENY, null));
+            assertCode(variant == 2 ? AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertEquals(0, scene.mcp.evaluations.get());
+        }
+    }
+
+    @Test void mcp_success_tool_error_unknown_and_invalid_observations_have_distinct_fixed_outcomes() throws Exception {
+        for (String variant : List.of("success", "tool-error", "unknown", "null", "bad-output")) try (var scene = new Scene(MCP_TOOL)) {
+            String state = "SUCCEEDED", code = null;
+            switch (variant) {
+                case "tool-error" -> { scene.mcp.observation.set(new ReadOnlyMcpToolTransport.CallObservation(ReadOnlyMcpToolTransport.Status.TOOL_ERROR, Map.of())); state = "FAILED_KNOWN"; code = "DOWNSTREAM_TOOL_ERROR"; }
+                case "unknown" -> { scene.mcp.observation.set(new ReadOnlyMcpToolTransport.CallObservation(ReadOnlyMcpToolTransport.Status.UNKNOWN, Map.of())); state = "UNKNOWN"; code = "OUTCOME_UNKNOWN"; }
+                case "null" -> { scene.mcp.observation.set(null); state = "UNKNOWN"; code = "OUTCOME_INVALID_RESPONSE"; }
+                case "bad-output" -> { scene.mcp.observation.set(new ReadOnlyMcpToolTransport.CallObservation(ReadOnlyMcpToolTransport.Status.SUCCESS, Map.of("wrong", PRIVATE_OUTPUT))); state = "UNKNOWN"; code = "OUTCOME_INVALID_RESPONSE"; }
+                default -> { }
+            }
+            var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            assertEquals(state, result.state()); assertEquals(code, result.outcome().errorCode()); assertTrue(result.operationInvoked()); assertEquals(1, scene.mcp.evaluations.get());
+            assertEquals(state.equals("SUCCEEDED") ? Map.of("value", PRIVATE_OUTPUT) : Map.of(), result.outcome().output()); assertNull(result.outcome().businessReceiptId()); assertEquals(BigDecimal.ZERO, result.outcome().actualCost());
+        }
+    }
+
+    @Test void mcp_only_explicit_not_sent_proves_no_dispatch_after_the_typed_operation_is_invoked() throws Exception {
+        for (var kind : ReadOnlyMcpToolTransport.FailureKind.values()) try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.operationFailure.set(kind); var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            String state = "UNKNOWN", code = kind == ReadOnlyMcpToolTransport.FailureKind.OPERATION_INVALID_RESPONSE ? "OUTCOME_INVALID_RESPONSE" : "OUTCOME_UNKNOWN";
+            if (kind == ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT) { state = "FAILED_KNOWN"; code = "DISPATCH_NOT_SENT"; }
+            else if (kind == ReadOnlyMcpToolTransport.FailureKind.OPERATION_DENIED) { state = "REJECTED"; code = "DOWNSTREAM_PERMISSION_DENIED"; }
+            assertEquals(state, result.state(), kind.name()); assertEquals(code, result.outcome().errorCode(), kind.name()); assertTrue(result.operationInvoked()); assertEquals(1, scene.mcp.evaluations.get()); assertEquals(Map.of(), result.outcome().output());
+        }
+        try (var scene = new Scene(MCP_TOOL)) { scene.mcp.privateRuntime.set(true); var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request); assertEquals("UNKNOWN", result.state()); assertEquals("OUTCOME_UNKNOWN", result.outcome().errorCode()); }
+    }
+
+    @Test void mcp_floors_the_effective_dispatch_deadline_and_passes_the_same_value_to_authority_store_and_call() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            Instant raw = NOW.plusSeconds(15).plusNanos(123_456_789), floor = raw.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            scene.mcp.executor.set(new ReadOnlyDecisionToolTransport.VerifiedExecutor(MCP_EXECUTOR.actor(), raw)); scene.dispatchDeadline.set(floor);
+            var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            assertEquals("SUCCEEDED", result.state()); assertEquals(floor, scene.mcp.callDeadline.get()); assertEquals(floor, scene.attempt.get().callDeadlineAt());
+            var audit = new ToolExecutionJsonCodec().audit((String) scene.storage.row.get().get("authorization_audit")); assertFalse(audit.expiresAt().isBefore(floor));
+        }
+    }
+
+    @Test void mcp_a_future_submicrosecond_capability_floor_expires_before_dispatch_authorization_or_begin() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            doAnswer(call -> {
+                var prepared = call.callRealMethod(); var old = scene.storage.evidence.get();
+                scene.storage.evidence.set(new ToolExecutionGrant.EvidenceVO(old.reservation(), old.grantId(), old.ciphertext(), NOW.plusNanos(500))); return prepared;
+            }).when(scene.preparations).prepareOrLoadForRecorder(any());
+            var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals(ReadOnlyMcpToolTransport.FailureKind.DEADLINE_EXCEEDED, failure.kind()); assertNull(failure.getCause());
+            assertEquals(0, scene.dispatchChecks.get()); assertFalse(scene.trace.contains("begin-ack")); assertEquals(0, scene.mcp.evaluations.get());
+            assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertEquals("FAILED_KNOWN", scene.storage.row.get().get("state"));
+        }
+    }
+
+    @Test void mcp_shared_prebegin_deadline_and_cancel_checks_are_translated_to_its_own_port_failure() throws Exception {
+        for (boolean cancelled : List.of(true, false)) try (var scene = new Scene(MCP_TOOL)) {
+            scene.beforeCheck.set(() -> { if (cancelled) Thread.currentThread().interrupt(); else scene.storage.nano.set(10_000_000_001L); });
+            try {
+                var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+                assertEquals(cancelled ? ReadOnlyMcpToolTransport.FailureKind.CANCELLED : ReadOnlyMcpToolTransport.FailureKind.DEADLINE_EXCEEDED, failure.kind()); assertNull(failure.getCause());
+                assertEquals("FAILED_KNOWN", scene.storage.row.get().get("state")); assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertEquals(0, scene.mcp.evaluations.get());
+                if (cancelled) assertTrue(Thread.currentThread().isInterrupted());
+            } finally { Thread.interrupted(); }
+        }
+    }
+
+    @Test void mcp_begin_ack_window_expiry_records_known_no_send_without_consuming_a_native_operation() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.afterBegin.set(() -> { scene.storage.wall.set(NOW.plusSeconds(11)); scene.storage.databaseNow.set(NOW.plusSeconds(11)); scene.storage.nano.set(11_000_000_000L); });
+            var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            assertEquals("FAILED_KNOWN", result.state()); assertEquals("DISPATCH_NOT_SENT", result.outcome().errorCode()); assertFalse(result.operationInvoked()); assertEquals(0, scene.mcp.evaluations.get());
+            assertEquals(ToolInvocationStore.dispatchNonceSha256(scene.nonce.get()), scene.storage.row.get().get("dispatch_nonce_sha256"));
+        }
+    }
+
+    @Test void mcp_pre_callback_profile_and_credential_failures_close_only_the_matching_prepared_row() throws Exception {
+        for (var kind : List.of(ReadOnlyMcpToolTransport.FailureKind.CREDENTIAL_UNAVAILABLE, ReadOnlyMcpToolTransport.FailureKind.PROFILE_UNAVAILABLE, ReadOnlyMcpToolTransport.FailureKind.PROFILE_CHANGED)) try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.beforeFailure.set(kind); var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals(kind, failure.kind()); assertNull(failure.getCause()); assertEquals("FAILED_KNOWN", scene.storage.row.get().get("state")); assertEquals(kind.name(), scene.storage.row.get().get("error_code"));
+            assertEquals(0L, scene.storage.row.get().get("dispatch_epoch")); assertEquals(0, scene.mcp.evaluations.get()); assertEquals(AgentBudgetReservation.State.SETTLED, scene.storage.budgetRows.get(scene.request.reservationId()).state());
+        }
+    }
+
+    @Test void mcp_known_replay_rechecks_requester_access_and_unknown_replay_never_resends_or_recharges() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            var first = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request); var replay = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            assertEquals(first.outcome(), replay.outcome()); assertFalse(replay.operationInvoked()); assertEquals(1, scene.mcp.evaluations.get()); assertEquals(2, scene.dispatchChecks.get());
+            scene.check.set(request -> new ToolExecutionAuthorization.CheckResult(request, ToolExecutionAuthorization.Boundary.DISPATCH, ToolExecutionAuthorization.Decision.DENY, null));
+            assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request)); assertEquals("SUCCEEDED", scene.storage.row.get().get("state")); assertEquals(1, scene.mcp.evaluations.get());
+        }
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.operationFailure.set(ReadOnlyMcpToolTransport.FailureKind.CANCELLED); scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request);
+            var replay = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request); assertEquals("UNKNOWN", replay.state()); assertNull(replay.outcome()); assertFalse(replay.operationInvoked()); assertEquals(1, scene.mcp.calls.get()); assertEquals(1, scene.mcp.evaluations.get());
+            verify(scene.storage.budgets).settleBudget(any(), any(), anyString(), any());
+        }
+    }
+
+    @Test void mcp_outer_suppression_and_late_cancellation_preserve_a_committed_fact_before_accounting() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.afterFailure.set(ReadOnlyMcpToolTransport.FailureKind.CREDENTIAL_UNAVAILABLE);
+            var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request)); assertEquals(ReadOnlyMcpToolTransport.FailureKind.CREDENTIAL_UNAVAILABLE, failure.kind());
+            assertEquals("SUCCEEDED", scene.storage.row.get().get("state")); assertEquals(Map.of("value", PRIVATE_OUTPUT), new ToolExecutionJsonCodec().outcome((String) scene.storage.row.get().get("outcome"), MCP_TOOL).output());
+        }
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.mcp.beforeOutcome.set(() -> { scene.storage.sourceActive.set(false); scene.storage.wall.set(NOW.plusSeconds(70)); scene.storage.databaseNow.set(NOW.plusSeconds(70)); scene.storage.nano.set(70_000_000_000L); when(scene.storage.budgetRepository.lockLeaseForSettlement(any(), any())).thenReturn(false); Thread.currentThread().interrupt(); });
+            try {
+                var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request)); assertEquals(ReadOnlyMcpToolTransport.FailureKind.CANCELLED, failure.kind()); assertTrue(Thread.currentThread().isInterrupted());
+                assertEquals("SUCCEEDED", scene.storage.row.get().get("state")); assertFalse(scene.completionSawInterrupt.get()); assertEquals(ToolInvocationRecorder.AccountingState.PENDING, ((ToolInvocationRecorder.RecordResult) scene.mcp.callbackResult.get()).accountingState());
+                assertTrue(scene.trace.indexOf("complete-ack") < scene.trace.indexOf("accounting")); assertEquals(1, scene.mcp.evaluations.get());
+            } finally { Thread.interrupted(); }
+        }
+    }
+
+    @Test void mcp_missing_completion_ack_stays_dispatching_and_accounting_failure_keeps_a_known_fact() throws Exception {
+        try (var scene = new Scene(MCP_TOOL)) {
+            scene.failCompletion.set(true); assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request));
+            assertEquals("DISPATCHING", scene.storage.row.get().get("state")); scene.failCompletion.set(false);
+            var replay = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request); assertNull(replay.outcome()); assertFalse(replay.operationInvoked()); assertEquals(1, scene.mcp.evaluations.get()); verify(scene.storage.budgets, never()).settleBudget(any(), any(), anyString(), any());
+        }
+        try (var scene = new Scene(MCP_TOOL)) {
+            when(scene.storage.budgetRepository.lockLeaseForSettlement(any(), any())).thenReturn(false);
+            var result = scene.recorder.executeReadOnlyMcp(scene.mcp, scene.request); assertEquals("SUCCEEDED", result.state()); assertEquals("SUCCEEDED", scene.storage.row.get().get("state")); assertEquals(ToolInvocationRecorder.AccountingState.PENDING, result.accountingState());
+        }
+    }
+
     private static final class Scene implements AutoCloseable {
         final ToolInvocationStoreTest.Fixture storage;
         final ToolInvocationStore preparations;
         final PreparationRequestVO request;
         final ToolInvocationRecorder recorder;
         final ProbeTransport transport;
+        final McpProbeTransport mcp;
+        final AtomicReference<Instant> dispatchDeadline = new AtomicReference<>(NOW.plusSeconds(15));
         final List<String> trace = new ArrayList<>();
         final AtomicInteger dispatchChecks = new AtomicInteger();
         final AtomicReference<Function<ToolExecutionAuthorization.Request, ToolExecutionAuthorization.CheckResult>> check = new AtomicReference<>();
@@ -296,8 +491,10 @@ class ToolInvocationRecorderTest {
         final AtomicBoolean completionSawInterrupt = new AtomicBoolean(), failCompletion = new AtomicBoolean();
 
         Scene() throws Exception { this(true); }
-        Scene(boolean ready) throws Exception {
-            storage = new ToolInvocationStoreTest.Fixture(TOOL);
+        Scene(boolean ready) throws Exception { this(TOOL, ready); }
+        Scene(ToolDescriptor tool) throws Exception { this(tool, true); }
+        Scene(ToolDescriptor tool, boolean ready) throws Exception {
+            storage = new ToolInvocationStoreTest.Fixture(tool);
             request = storage.recorderRequest(INVOCATION);
             preparations = spy(storage.store(true, storage.authority));
             check.set(value -> new ToolExecutionAuthorization.CheckResult(value, ToolExecutionAuthorization.Boundary.DISPATCH, ToolExecutionAuthorization.Decision.ALLOW,
@@ -305,7 +502,7 @@ class ToolInvocationRecorderTest {
                             value.run().actor().subjectType(), storage.evidence.get().grantId(), 5L, null, 7L, storage.wall.get(), storage.evidence.get().expiresAt())));
             when(storage.authority.check(any(), eq(ToolExecutionAuthorization.Boundary.DISPATCH))).thenAnswer(call -> {
                 assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); var value = (ToolExecutionAuthorization.Request) call.getArgument(0);
-                assertEquals(request.binding().run().actor(), value.run().actor()); assertEquals(NOW.plusSeconds(15), value.deadlineAt()); assertNull(value.actionIntentId());
+                assertEquals(request.binding().run().actor(), value.run().actor()); assertEquals(dispatchDeadline.get(), value.deadlineAt()); assertNull(value.actionIntentId());
                 assertEquals(request.parametersSha256(), value.parametersSha256()); dispatchChecks.incrementAndGet(); beforeCheck.get().run(); return check.get().apply(value);
             });
             doAnswer(call -> {
@@ -325,7 +522,7 @@ class ToolInvocationRecorderTest {
             }).when(storage.budgets).settleBudget(any(), any(), anyString(), any());
             recorder = new ToolInvocationRecorder(storage.source, storage.ledger, preparations, storage.capabilities, storage.authority, storage.clock(), storage.nano::get);
             if (ready) recorder.verifyStorage();
-            transport = new ProbeTransport(this);
+            transport = new ProbeTransport(this); mcp = new McpProbeTransport(this);
         }
         @Override public void close() { storage.close(); }
     }
@@ -336,7 +533,7 @@ class ToolInvocationRecorderTest {
         final AtomicReference<Request> request = new AtomicReference<>();
         final AtomicReference<Object> callbackResult = new AtomicReference<>();
         final AtomicReference<FailureKind> beforeFailure = new AtomicReference<>(), operationFailure = new AtomicReference<>(), afterFailure = new AtomicReference<>();
-        final AtomicBoolean privateRuntime = new AtomicBoolean();
+        final AtomicBoolean privateRuntime = new AtomicBoolean(), nullOperation = new AtomicBoolean();
         final AtomicReference<Runnable> beforeOutcome = new AtomicReference<>(() -> { });
         final AtomicReference<DecisionObservation> observation = new AtomicReference<>(new DecisionObservation(Status.MATCHED,
                 "30000000-0000-0000-0000-000000000001", NOW, NOW, Map.of("value", PRIVATE_OUTPUT), "row:1"));
@@ -346,7 +543,7 @@ class ToolInvocationRecorderTest {
             calls.incrementAndGet(); this.request.set(request); assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
             if (beforeFailure.get() != null) throw new Failure(beforeFailure.get());
             if (!request.deadlineAt().isAfter(scene.storage.wall.get()) || !EXECUTOR.expiresAt().isAfter(scene.storage.wall.get())) throw new Failure(FailureKind.DEADLINE_EXCEEDED);
-            T result = callback.apply(EXECUTOR, () -> {
+            T result = callback.apply(EXECUTOR, nullOperation.get() ? null : () -> {
                 evaluations.incrementAndGet(); scene.trace.add("operation"); assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
                 assertEquals("DISPATCHING", scene.storage.row.get().get("state")); assertTrue(scene.trace.contains("begin-ack")); assertTrue(scene.storage.trace.contains("commit"));
                 beforeOutcome.get().run();
@@ -358,6 +555,38 @@ class ToolInvocationRecorderTest {
             if (afterFailure.get() != null) throw new Failure(afterFailure.get());
             if (Thread.currentThread().isInterrupted()) throw new Failure(FailureKind.CANCELLED);
             if (!request.deadlineAt().isAfter(scene.storage.wall.get()) || !EXECUTOR.expiresAt().isAfter(scene.storage.wall.get())) throw new Failure(FailureKind.DEADLINE_EXCEEDED);
+            return result;
+        }
+    }
+
+    private static final class McpProbeTransport implements ReadOnlyMcpToolTransport {
+        final Scene scene;
+        final AtomicInteger calls = new AtomicInteger(), evaluations = new AtomicInteger();
+        final AtomicReference<Request> request = new AtomicReference<>();
+        final AtomicReference<Object> callbackResult = new AtomicReference<>();
+        final AtomicReference<FailureKind> beforeFailure = new AtomicReference<>(), operationFailure = new AtomicReference<>(), afterFailure = new AtomicReference<>();
+        final AtomicReference<ReadOnlyDecisionToolTransport.VerifiedExecutor> executor = new AtomicReference<>(MCP_EXECUTOR);
+        final AtomicReference<Instant> callDeadline = new AtomicReference<>();
+        final AtomicBoolean privateRuntime = new AtomicBoolean(), nullOperation = new AtomicBoolean();
+        final AtomicReference<Runnable> beforeOutcome = new AtomicReference<>(() -> { });
+        final AtomicReference<CallObservation> observation = new AtomicReference<>(new CallObservation(Status.SUCCESS, Map.of("value", PRIVATE_OUTPUT)));
+        McpProbeTransport(Scene scene) { this.scene = scene; }
+        @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+            calls.incrementAndGet(); this.request.set(request); assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            if (beforeFailure.get() != null) throw new Failure(beforeFailure.get());
+            if (!request.deadlineAt().isAfter(scene.storage.wall.get())) throw new Failure(FailureKind.DEADLINE_EXCEEDED);
+            OneShotCall operation = deadline -> {
+                evaluations.incrementAndGet(); callDeadline.set(deadline); scene.trace.add("mcp-operation"); assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                assertNotNull(deadline); assertEquals(0, deadline.getNano() % 1_000); assertFalse(deadline.isAfter(executor.get().expiresAt())); assertFalse(deadline.isAfter(request.deadlineAt()));
+                assertEquals("DISPATCHING", scene.storage.row.get().get("state")); assertTrue(scene.trace.contains("begin-ack")); assertTrue(scene.storage.trace.contains("commit"));
+                beforeOutcome.get().run(); if (operationFailure.get() != null) throw new Failure(operationFailure.get());
+                if (privateRuntime.get()) throw new IllegalStateException("private MCP operation " + PRIVATE_OUTPUT);
+                return observation.get();
+            };
+            T result = callback.apply(executor.get(), nullOperation.get() ? null : operation); callbackResult.set(result);
+            if (afterFailure.get() != null) throw new Failure(afterFailure.get());
+            if (Thread.currentThread().isInterrupted()) throw new Failure(FailureKind.CANCELLED);
+            if (!request.deadlineAt().isAfter(scene.storage.wall.get()) || !executor.get().expiresAt().isAfter(scene.storage.wall.get())) throw new Failure(FailureKind.DEADLINE_EXCEEDED);
             return result;
         }
     }

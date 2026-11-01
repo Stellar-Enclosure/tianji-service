@@ -411,9 +411,7 @@ final class ToolInvocationSql {
     }
     private void callBounds(PreparationRequestVO request, StoredInvocationRow stored, ToolExecutionGrant.EvidenceVO evidence, ToolExecutionAuthorization.AuditVO audit,
                             VerifiedExecutor executor, Instant callDeadline, RunSourceVO live, Instant authorityDeadline) {
-        Instant bound = stored.invocation().dispatchNotAfter();
-        if (request.binding().run().deadlineAt().isBefore(bound)) bound = request.binding().run().deadlineAt();
-        if (evidence.expiresAt().isBefore(bound)) bound = evidence.expiresAt(); if (executor.expiresAt().isBefore(bound)) bound = executor.expiresAt();
+        Instant bound = ToolInvocationStore.dispatchCallDeadline(request, stored.invocation().dispatchNotAfter(), evidence.expiresAt(), executor.expiresAt());
         if (!bound.equals(callDeadline) || !callDeadline.isAfter(now(authorityDeadline)) || audit.expiresAt().isBefore(callDeadline)
                 || !evidence.grantId().equals(audit.grantId()) || audit.expiresAt().isAfter(evidence.expiresAt())
                 || stored.invocation().dispatchNotAfter().isAfter(stored.invocation().createdAt().plus(live.toolTimeout()))) throw unavailable();
