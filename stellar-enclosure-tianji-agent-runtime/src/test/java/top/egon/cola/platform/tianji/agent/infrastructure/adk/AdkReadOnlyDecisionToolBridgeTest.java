@@ -6,6 +6,7 @@ import com.google.adk.tools.BaseTool;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -38,8 +39,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -53,6 +59,9 @@ class AdkReadOnlyDecisionToolBridgeTest {
     private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/21");
     private static final ToolDescriptor TOOL = descriptor(ToolPolicy.Risk.READ_ONLY);
     private static final Map<String, Object> ARGUMENTS = Map.of("amount", 20, "approved", true, "note", "private arguments");
+    private static final ToolDescriptor MCP = mcpDescriptor(ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY);
+    private static final String MCP_PRIVATE = "private MCP output";
+    private static final Instant MCP_CALL = NOW.plusSeconds(5).plusNanos(123_456_000);
 
     @Test void each_binding_owns_fresh_exact_native_declarations_with_closed_primitive_schema_and_no_fallback() throws Exception {
         var recorder = mock(ToolInvocationRecorder.class); var transport = mock(ReadOnlyDecisionToolTransport.class); var bridge = bridge(recorder, transport);
@@ -304,6 +313,283 @@ class AdkReadOnlyDecisionToolBridgeTest {
         assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", null, null, null));
         assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "review_agent", TOOL.reference(), HOST, "UNAVAILABLE", null, settled, "UNAVAILABLE"));
     }
+
+    @Test void mcp_binding_owns_fresh_closed_declarations_and_routes_only_to_the_typed_mcp_recorder() throws Exception {
+        try (var scene = new McpScene(); var second = new McpScene()) {
+            assertNotSame(scene.scope.declaredTools().getFirst(), second.scope.declaredTools().getFirst());
+            var nativeTool = scene.scope.declaredTools().getFirst(); var schema = (Map<?, ?>) nativeTool.declaration().orElseThrow().parametersJsonSchema().orElseThrow();
+            assertEquals(false, schema.get("additionalProperties")); assertEquals(List.of("amount"), schema.get("required"));
+            assertEquals(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, assertThrows(AgentLedgerException.class, () -> nativeTool.runAsync(ARGUMENTS, null).blockingGet()).code());
+            var fences = new AtomicInteger();
+            var value = scene.scope.execute(nativeTool, ARGUMENTS, HOST, "review_agent", fences::incrementAndGet);
+            assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("value", MCP_PRIVATE)), value);
+            assertEquals(2, fences.get()); assertEquals(1, scene.mcp.operations.get()); assertEquals(MCP_CALL, scene.mcp.deadline.get());
+            assertEquals(BigDecimal.ZERO, scene.request.get().estimatedCost()); assertNull(scene.request.get().action()); assertNull(scene.request.get().intentExpiry());
+            assertEquals(Map.of("amount", 20L, "approved", true, "note", "private arguments"), scene.request.get().arguments());
+            assertEquals(HOST, scene.request.get().invocationId()); assertEquals(MCP.reference(), scene.request.get().descriptor().reference());
+            assertNotSame(scene.mcp, scene.guarded.get()); assertEquals(2, scene.events.size());
+            assertEquals("REQUESTED", scene.events.getFirst().state()); assertEquals("SUCCEEDED", scene.events.getLast().state());
+            assertEquals(MCP.reference(), scene.events.getLast().toolRef()); assertEquals(HOST, scene.events.getLast().hostInvocationId());
+            assertFalse(scene.events.toString().contains("private")); assertEquals("NONE", scene.scope.sideEffectOutcome());
+            verify(scene.recorder).executeReadOnlyMcp(any(), any()); verify(scene.recorder, never()).executeReadOnly(any(), any()); verifyNoInteractions(scene.decision);
+        }
+    }
+
+    @Test void mcp_missing_transport_and_legacy_binding_fail_before_a_scope_or_recorder_call() {
+        var recorder = mock(ToolInvocationRecorder.class); var decision = mock(ReadOnlyDecisionToolTransport.class);
+        var source = material(MCP, "CONFIG", policy(Set.of(MCP.versionKey()), 4)); var bindings = List.of(mcpBinding(source.authorization(), MCP));
+        assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decision, null, source, lease(), event -> { }, List.of(MCP), bindings));
+        assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decision, source, lease(), event -> { }, List.of(MCP), bindings));
+        assertThrows(AgentLedgerException.class, () -> AdkReadOnlyDecisionToolBridge.bindResolved(recorder, null, new ProbeMcp(), source, lease(), event -> { }, List.of(MCP), bindings));
+        verifyNoInteractions(recorder, decision);
+    }
+
+    @Test void nearby_resource_names_and_existing_readonly_descriptors_keep_the_decision_route_even_with_mcp_present() {
+        for (var descriptor : List.of(TOOL, mcpDescriptor(ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY + ".other"))) {
+            var recorder = mock(ToolInvocationRecorder.class); var decision = mock(ReadOnlyDecisionToolTransport.class); var mcp = new ProbeMcp();
+            var source = material(descriptor, "CONFIG", policy(Set.of(descriptor.versionKey()), 4)); var events = new ArrayList<AdkReadOnlyDecisionToolBridge.ToolEventVO>();
+            try (var scope = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decision, mcp, source, lease(), events::add, List.of(descriptor), List.of(binding(source.authorization(), descriptor)))) {
+                when(recorder.executeReadOnly(eq(decision), any())).thenReturn(result("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED));
+                assertEquals("SUCCEEDED", scope.execute(scope.declaredTools().getFirst(), ARGUMENTS, HOST, "review_agent").get("status"));
+                assertEquals(2, events.size()); verify(recorder).executeReadOnly(eq(decision), any()); verify(recorder, never()).executeReadOnlyMcp(any(), any());
+                assertEquals(0, mcp.scopes.get()); assertEquals(0, mcp.operations.get());
+            }
+            assertEquals(0, mcp.closes.get());
+        }
+    }
+
+    @Test void mcp_requires_a_real_five_argument_fence_before_started_or_recorder() {
+        try (var scene = new McpScene()) {
+            var tool = scene.scope.declaredTools().getFirst();
+            assertEquals(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, assertThrows(AgentLedgerException.class, () -> scene.scope.execute(tool, ARGUMENTS, HOST, "review_agent")).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class, () -> scene.scope.execute(tool, ARGUMENTS, HOST, "review_agent", null)).code());
+            assertTrue(scene.events.isEmpty()); verifyNoInteractions(scene.recorder); assertEquals(0, scene.mcp.scopes.get());
+        }
+    }
+
+    @Test void mcp_identity_argument_and_initial_fence_rejections_never_reach_recorder_or_events() {
+        try (var scene = new McpScene()) {
+            var tool = scene.scope.declaredTools().getFirst(); var alias = new BaseTool(tool.name(), tool.description()) { @Override public boolean equals(Object other) { return true; } @Override public int hashCode() { return tool.hashCode(); } };
+            assertThrows(AgentLedgerException.class, () -> scene.scope.execute(alias, ARGUMENTS, HOST, "review_agent", () -> { }));
+            assertThrows(AgentLedgerException.class, () -> scene.scope.execute(tool, Map.of("amount", 20L, "tenantId", 22), HOST, "review_agent", () -> { }));
+            assertThrows(AgentLedgerException.class, () -> scene.scope.execute(tool, Map.of("amount", "20"), HOST, "review_agent", () -> { }));
+            var failure = assertThrows(AgentLedgerException.class, () -> scene.scope.execute(tool, ARGUMENTS, HOST, "review_agent", () -> { throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private fence"); }));
+            assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, failure.code()); assertSafeMcpFailure(failure);
+            assertTrue(scene.events.isEmpty()); verifyNoInteractions(scene.recorder); assertEquals(0, scene.mcp.operations.get());
+        }
+    }
+
+    @Test void mcp_guard_forwards_a_null_operation_without_fabricating_a_nonnull_capability() {
+        try (var scene = new McpScene()) {
+            scene.mcp.nullOperation = true; var observed = new AtomicInteger();
+            scene.answer(operation -> { assertNull(operation); observed.incrementAndGet(); throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "private null operation"); });
+            assertSafeMcpFailure(assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { })));
+            assertEquals(1, observed.get()); assertEquals(0, scene.mcp.operations.get()); assertEquals("UNAVAILABLE", scene.events.getLast().state());
+            verify(scene.recorder, never()).executeReadOnly(any(), any());
+        }
+    }
+
+    @Test void mcp_second_fence_runs_before_the_real_operation_and_preserves_the_supplied_deadline() {
+        try (var scene = new McpScene()) {
+            var sequence = new ArrayList<String>(); var supplied = NOW.plusSeconds(4).plusNanos(123_456_789);
+            scene.mcp.beforeOperation = () -> sequence.add("delegate");
+            scene.answer(operation -> { sequence.add("recorder"); operation.call(supplied); return mcpResult("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED); });
+            scene.execute(() -> sequence.add("fence"));
+            assertEquals(List.of("fence", "recorder", "fence", "delegate"), sequence);
+            assertEquals(supplied, scene.mcp.deadline.get()); assertEquals(1, scene.mcp.operations.get());
+        }
+    }
+
+    @Test void mcp_pre_delegate_fence_failure_is_not_sent_and_its_safe_stop_code_wins_over_recorder_or_event_failures() {
+        for (String variant : List.of("result", "recorder", "event")) {
+            try (var scene = new McpScene(event -> { if (variant.equals("event") && event.phase() == AdkReadOnlyDecisionToolBridge.Phase.FINISHED) throw new IllegalStateException("private append failure"); })) {
+                var fences = new AtomicInteger(); var committed = new AtomicInteger();
+                scene.answer(operation -> {
+                    var rejected = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> operation.call(MCP_CALL));
+                    assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT, rejected.kind()); assertNull(rejected.getCause()); committed.incrementAndGet();
+                    if (variant.equals("recorder")) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "private recorder failure");
+                    return mcpNotSentResult();
+                });
+                var failure = assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { if (fences.incrementAndGet() == 2) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private stopped session"); }));
+                assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, failure.code()); assertSafeMcpFailure(failure);
+                assertEquals(1, committed.get()); assertEquals(0, scene.mcp.operations.get()); assertEquals(2, fences.get());
+                assertEquals("UNAVAILABLE", scene.events.getLast().state()); assertFalse(scene.events.toString().contains("private"));
+                verify(scene.recorder).executeReadOnlyMcp(any(), any());
+            }
+        }
+    }
+
+    @Test void mcp_real_delegate_failure_is_never_captured_as_a_pre_admission_not_sent_failure() {
+        try (var scene = new McpScene()) {
+            scene.mcp.operationFailure = new ReadOnlyMcpToolTransport.Failure(ReadOnlyMcpToolTransport.FailureKind.OPERATION_RESULT_UNKNOWN);
+            var fences = new AtomicInteger();
+            scene.answer(operation -> {
+                var rejected = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> operation.call(MCP_CALL));
+                assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_RESULT_UNKNOWN, rejected.kind());
+                return mcpResult("UNKNOWN", ToolInvocationRecorder.AccountingState.SETTLED);
+            });
+            assertSafeMcpFailure(assertThrows(AgentLedgerException.class, () -> scene.execute(fences::incrementAndGet)));
+            assertEquals(1, scene.mcp.operations.get()); assertEquals(2, fences.get()); assertEquals("UNKNOWN", scene.events.getLast().state());
+        }
+    }
+
+    @Test void mcp_close_after_second_fence_prevents_delegate_and_suppresses_late_finished_events() {
+        try (var scene = new McpScene()) {
+            var fences = new AtomicInteger();
+            scene.answer(operation -> {
+                var rejected = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> operation.call(MCP_CALL));
+                assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT, rejected.kind());
+                return mcpNotSentResult();
+            });
+            var failure = assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { if (fences.incrementAndGet() == 2) scene.scope.close(); }));
+            assertEquals(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, failure.code()); assertSafeMcpFailure(failure);
+            assertEquals(0, scene.mcp.operations.get()); assertEquals(1, scene.events.size()); assertEquals("REQUESTED", scene.events.getFirst().state());
+            assertEquals("NONE", scene.scope.sideEffectOutcome()); assertEquals(0, scene.mcp.closes.get());
+        }
+    }
+
+    @Test void mcp_scope_can_close_while_the_second_fence_is_blocked_without_closing_borrowed_transport() throws Exception {
+        try (var scene = new McpScene(); var pool = Executors.newFixedThreadPool(2)) {
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var fences = new AtomicInteger();
+            scene.answer(operation -> {
+                var rejected = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> operation.call(MCP_CALL));
+                assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT, rejected.kind()); return mcpNotSentResult();
+            });
+            var execution = pool.submit(() -> scene.execute(() -> { if (fences.incrementAndGet() == 2) { entered.countDown(); awaitMcp(release); } }));
+            try {
+                assertTrue(entered.await(2, TimeUnit.SECONDS)); pool.submit(scene.scope::close).get(1, TimeUnit.SECONDS); release.countDown();
+                var failure = assertThrows(ExecutionException.class, () -> execution.get(2, TimeUnit.SECONDS));
+                assertInstanceOf(AgentLedgerException.class, failure.getCause()); assertEquals(0, scene.mcp.operations.get()); assertEquals(1, scene.events.size()); assertEquals(0, scene.mcp.closes.get());
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void mcp_close_during_recorder_completion_or_failure_never_appends_finished_or_unavailable_after_close() {
+        for (boolean failed : List.of(false, true)) {
+            try (var scene = new McpScene()) {
+                var facts = new AtomicInteger();
+                scene.answer(operation -> {
+                    operation.call(MCP_CALL); facts.incrementAndGet(); scene.scope.close();
+                    if (failed) throw new IllegalStateException("private outer recorder failure");
+                    return mcpResult("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED);
+                });
+                assertSafeMcpFailure(assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { })));
+                assertEquals(1, facts.get()); assertEquals(1, scene.mcp.operations.get()); assertEquals(1, scene.events.size()); assertEquals("REQUESTED", scene.events.getFirst().state());
+                assertEquals("NONE", scene.scope.sideEffectOutcome());
+            }
+        }
+    }
+
+    @Test void mcp_only_settled_known_and_locally_validated_results_cross_the_model_boundary() {
+        for (String variant : List.of("SUCCEEDED", "FAILED_KNOWN", "REJECTED", "UNKNOWN", "PENDING", "DISPATCHING", "bad-output", "bad-cost", "null-outcome")) {
+            try (var scene = new McpScene()) {
+                String state = Set.of("PENDING", "bad-output", "bad-cost", "null-outcome").contains(variant) ? "SUCCEEDED" : variant;
+                var accounting = variant.equals("PENDING") || variant.equals("DISPATCHING") ? ToolInvocationRecorder.AccountingState.PENDING : ToolInvocationRecorder.AccountingState.SETTLED;
+                var supplied = mcpResult(state, accounting);
+                if (variant.equals("bad-output")) supplied = new ToolInvocationRecorder.RecordResult(RUN, HOST, "SUCCEEDED", 3, 1, NOW, NOW.plusSeconds(1), new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("value", 20L), null, null, BigDecimal.ZERO), true, accounting);
+                if (variant.equals("null-outcome")) supplied = new ToolInvocationRecorder.RecordResult(RUN, HOST, "SUCCEEDED", 3, 1, NOW, NOW.plusSeconds(1), null, true, accounting);
+                if (variant.equals("bad-cost")) { supplied = spy(supplied); doReturn(new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("value", MCP_PRIVATE), null, null, BigDecimal.ONE)).when(supplied).outcome(); }
+                doReturn(supplied).when(scene.recorder).executeReadOnlyMcp(any(), any());
+                if (Set.of("SUCCEEDED", "FAILED_KNOWN", "REJECTED").contains(variant)) {
+                    var value = scene.execute(() -> { });
+                    if (variant.equals("SUCCEEDED")) assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("value", MCP_PRIVATE)), value);
+                    else { assertEquals(Set.of("status", "errorCode"), value.keySet()); assertFalse(value.containsKey("output")); }
+                } else {
+                    var failure = assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { }));
+                    assertEquals(accounting == ToolInvocationRecorder.AccountingState.PENDING ? AgentErrorCodeEnum.TIANJI_USAGE_UNKNOWN : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code()); assertSafeMcpFailure(failure);
+                }
+                assertEquals(2, scene.events.size()); assertFalse(scene.events.toString().contains(MCP_PRIVATE)); assertEquals(0, scene.mcp.operations.get());
+            }
+        }
+    }
+
+    @Test void mcp_wrong_recorded_identity_and_private_recorder_failures_expose_only_safe_metadata() {
+        for (String variant : List.of("null", "run", "invocation", "private")) {
+            try (var scene = new McpScene()) {
+                if (variant.equals("private")) doThrow(new IllegalStateException("private MCP recorder body")).when(scene.recorder).executeReadOnlyMcp(any(), any());
+                else if (variant.equals("null")) doReturn(null).when(scene.recorder).executeReadOnlyMcp(any(), any());
+                else {
+                    var original = mcpResult("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED);
+                    doReturn(new ToolInvocationRecorder.RecordResult(variant.equals("run") ? "other-run" : RUN, variant.equals("invocation") ? UUID.randomUUID() : HOST,
+                            original.state(), original.revision(), original.dispatchEpoch(), original.dispatchedAt(), original.finishedAt(), original.outcome(), original.operationInvoked(), original.accountingState())).when(scene.recorder).executeReadOnlyMcp(any(), any());
+                }
+                assertSafeMcpFailure(assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { })));
+                assertEquals("UNAVAILABLE", scene.events.getLast().state()); assertFalse(scene.events.toString().contains("private")); assertEquals(0, scene.mcp.operations.get());
+            }
+        }
+    }
+
+    @Test void mcp_started_and_finished_event_failures_never_duplicate_or_retry_the_recorded_fact() {
+        for (int failAt : List.of(1, 2)) {
+            var appends = new AtomicInteger();
+            try (var scene = new McpScene(event -> { if (appends.incrementAndGet() == failAt) throw new IllegalStateException("private event body"); })) {
+                assertSafeMcpFailure(assertThrows(AgentLedgerException.class, () -> scene.execute(() -> { })));
+                verify(scene.recorder, times(failAt == 1 ? 0 : 1)).executeReadOnlyMcp(any(), any());
+                assertEquals(failAt == 1 ? 0 : 1, scene.mcp.operations.get()); assertEquals(failAt, appends.get());
+            }
+        }
+    }
+
+    private static final class McpScene implements AutoCloseable {
+        final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
+        final ReadOnlyDecisionToolTransport decision = mock(ReadOnlyDecisionToolTransport.class);
+        final ProbeMcp mcp = new ProbeMcp();
+        final List<AdkReadOnlyDecisionToolBridge.ToolEventVO> events = new ArrayList<>();
+        final AtomicReference<ToolInvocationStore.PreparationRequestVO> request = new AtomicReference<>();
+        final AtomicReference<ReadOnlyMcpToolTransport> guarded = new AtomicReference<>();
+        final AdkReadOnlyDecisionToolBridge.RunScope scope;
+        McpScene() { this(event -> { }); }
+        McpScene(AdkReadOnlyDecisionToolBridge.ToolEventSink observer) {
+            var source = material(MCP, "CONFIG", policy(Set.of(MCP.versionKey()), 4));
+            scope = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decision, mcp, source, lease(), event -> { events.add(event); observer.append(event); }, List.of(MCP), List.of(mcpBinding(source.authorization(), MCP)));
+            answer(operation -> { operation.call(MCP_CALL); return mcpResult("SUCCEEDED", ToolInvocationRecorder.AccountingState.SETTLED); });
+        }
+        void answer(Function<ReadOnlyMcpToolTransport.OneShotCall, ToolInvocationRecorder.RecordResult> callback) {
+            doAnswer(call -> {
+                assertEquals(AdkReadOnlyDecisionToolBridge.Phase.STARTED, events.getFirst().phase());
+                ToolInvocationStore.PreparationRequestVO value = call.getArgument(1); ReadOnlyMcpToolTransport scoped = call.getArgument(0); request.set(value); guarded.set(scoped);
+                var transportRequest = new ReadOnlyMcpToolTransport.Request(value.binding().run(), value.lease(), value.descriptor(), value.arguments(), value.invocationId(), DEADLINE);
+                return scoped.withVerifiedCall(transportRequest, (executor, operation) -> { assertSame(ProbeMcp.EXECUTOR, executor); return callback.apply(operation); });
+            }).when(recorder).executeReadOnlyMcp(any(), any());
+        }
+        Map<String, Object> execute(Runnable fence) { return scope.execute(scope.declaredTools().getFirst(), ARGUMENTS, HOST, "review_agent", fence); }
+        @Override public void close() { scope.close(); assertEquals(0, mcp.closes.get()); }
+    }
+    private static final class ProbeMcp implements ReadOnlyMcpToolTransport, AutoCloseable {
+        private static final ReadOnlyDecisionToolTransport.VerifiedExecutor EXECUTOR = new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "mcp-executor", "https://mcp.example/21"), DEADLINE);
+        final AtomicInteger scopes = new AtomicInteger(), operations = new AtomicInteger(), closes = new AtomicInteger();
+        final AtomicReference<Instant> deadline = new AtomicReference<>();
+        boolean nullOperation;
+        Runnable beforeOperation = () -> { };
+        RuntimeException operationFailure;
+        @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+            scopes.incrementAndGet();
+            return callback.apply(EXECUTOR, nullOperation ? null : bound -> {
+                beforeOperation.run(); operations.incrementAndGet(); deadline.set(bound);
+                if (operationFailure != null) throw operationFailure;
+                return new CallObservation(Status.SUCCESS, Map.of("value", MCP_PRIVATE));
+            });
+        }
+        @Override public void close() { closes.incrementAndGet(); }
+    }
+    private static ToolInvocationRecorder.RecordResult mcpResult(String state, ToolInvocationRecorder.AccountingState accounting) {
+        ToolExecutionOutcome outcome = switch (state) {
+            case "SUCCEEDED" -> new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("value", MCP_PRIVATE), null, null, BigDecimal.ZERO);
+            case "FAILED_KNOWN" -> new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "DOWNSTREAM_TOOL_ERROR", BigDecimal.ZERO);
+            case "REJECTED" -> new ToolExecutionOutcome(ToolExecutionOutcome.Status.REJECTED, Map.of(), null, "DOWNSTREAM_PERMISSION_DENIED", BigDecimal.ZERO);
+            case "UNKNOWN" -> new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OUTCOME_UNKNOWN", BigDecimal.ZERO);
+            default -> null;
+        };
+        return new ToolInvocationRecorder.RecordResult(RUN, HOST, state, 3, 1, NOW, state.equals("DISPATCHING") ? null : NOW.plusSeconds(1), outcome, !state.equals("DISPATCHING"), accounting);
+    }
+    private static ToolInvocationRecorder.RecordResult mcpNotSentResult() {
+        return new ToolInvocationRecorder.RecordResult(RUN, HOST, "FAILED_KNOWN", 3, 1, NOW, NOW.plusSeconds(1),
+                new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "DISPATCH_NOT_SENT", BigDecimal.ZERO), true, ToolInvocationRecorder.AccountingState.SETTLED);
+    }
+    private static ToolDescriptor mcpDescriptor(String resource) { return new ToolDescriptor("mcp.read", 1, "read_mcp", "Read fixed host MCP metadata", TOOL.input(), TOOL.output(), new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "mcp.read", resource, HASH, null)); }
+    private static ToolExecutionGrant.BindingVO mcpBinding(AgentRunAuthorization.Request run, ToolDescriptor tool) { return new ToolExecutionGrant.BindingVO(run, tool.reference(), tool.policy().bindingSha256(), "TIANJI_TOOL_MCP", URI.create("https://agent.example/api"), ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, null); }
+    private static void assertSafeMcpFailure(AgentLedgerException failure) { assertNull(failure.getCause()); assertFalse(failure.getMessage().contains("private")); assertFalse(failure.getMessage().contains(MCP_PRIVATE)); }
+    private static void awaitMcp(CountDownLatch latch) { try { assertTrue(latch.await(3, TimeUnit.SECONDS)); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); } }
 
     private static AgentLedgerService.ExecutionMaterial mixedMaterial() {
         var read = material(TOOL, "CONFIG", policy(Set.of(TOOL.versionKey()), 4));

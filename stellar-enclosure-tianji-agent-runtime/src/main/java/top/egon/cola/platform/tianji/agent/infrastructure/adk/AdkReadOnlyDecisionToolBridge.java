@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.tools.BaseTool;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
@@ -27,6 +28,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
@@ -52,15 +54,21 @@ public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridg
     }
     static RunScope bindResolved(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport transport, AgentLedgerService.ExecutionMaterial material,
                                  AgentRunLease lease, ToolEventSink sink, List<ToolDescriptor> subset, List<ToolExecutionGrant.BindingVO> bindings) {
+        return bindResolved(recorder, transport, null, material, lease, sink, subset, bindings);
+    }
+    static RunScope bindResolved(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport decisionTransport, ReadOnlyMcpToolTransport mcpTransport,
+                                 AgentLedgerService.ExecutionMaterial material, AgentRunLease lease, ToolEventSink sink,
+                                 List<ToolDescriptor> subset, List<ToolExecutionGrant.BindingVO> bindings) {
         AdkToolTelemetryPrivacy.requireSafe();
         try {
             requireMaterial(material, lease);
-            if (recorder == null || transport == null || sink == null || subset == null || bindings == null || subset.size() > 32 || bindings.size() != subset.size()) throw unavailable();
+            if (recorder == null || decisionTransport == null || sink == null || subset == null || bindings == null || subset.size() > 32 || bindings.size() != subset.size()) throw unavailable();
             var visible = new TreeMap<String, ToolDescriptor>(); var versions = new HashSet<String>();
             for (var descriptor : List.copyOf(subset)) {
                 if (descriptor.policy().risk() != ToolPolicy.Risk.READ_ONLY || material.snapshot().effectivePolicy().maxToolCalls() < 1
                         || !material.snapshot().effectivePolicy().allowedToolVersions().contains(descriptor.versionKey())
                         || !material.snapshot().definition().dependencies().tools().contains(descriptor.reference())
+                        || isMcp(descriptor) && mcpTransport == null
                         || !versions.add(descriptor.versionKey()) || visible.putIfAbsent(descriptor.name(), descriptor) != null) throw unavailable();
             }
             var byReference = new HashMap<DefinitionResourceRef, ToolExecutionGrant.BindingVO>();
@@ -74,7 +82,7 @@ public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridg
                 var declaration = new AdkGovernedToolDeclaration(descriptor); declarations.add(declaration); selected.put(declaration, new TargetVO(descriptor, binding));
             }
             if (!byReference.isEmpty()) throw unavailable();
-            return new RunScope(recorder, transport, lease, sink, declarations, selected);
+            return new RunScope(recorder, decisionTransport, mcpTransport, lease, sink, declarations, selected);
         } catch (RuntimeException privateBinding) { throw dependency(); }
     }
     static AdkGovernedToolBridge.ToolEventVO toGovernedEvent(ToolEventVO event) {
@@ -119,26 +127,32 @@ public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridg
     static final class RunScope implements AdkGovernedToolBridge.Scope {
         private final ToolInvocationRecorder recorder;
         private final ReadOnlyDecisionToolTransport transport;
+        private final ReadOnlyMcpToolTransport mcpTransport;
         private final AgentRunLease lease;
         private final ToolEventSink sink;
         private final List<BaseTool> declarations;
         private final Map<BaseTool, TargetVO> selected;
         private final AtomicBoolean closed = new AtomicBoolean();
 
-        private RunScope(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport transport, AgentRunLease lease, ToolEventSink sink,
+        private RunScope(ToolInvocationRecorder recorder, ReadOnlyDecisionToolTransport transport, ReadOnlyMcpToolTransport mcpTransport, AgentRunLease lease, ToolEventSink sink,
                          List<BaseTool> declarations, IdentityHashMap<BaseTool, TargetVO> selected) {
-            this.recorder = recorder; this.transport = transport; this.lease = lease; this.sink = sink;
+            this.recorder = recorder; this.transport = transport; this.mcpTransport = mcpTransport; this.lease = lease; this.sink = sink;
             this.declarations = List.copyOf(declarations); this.selected = Collections.unmodifiableMap(new IdentityHashMap<>(selected));
         }
         @Override public List<BaseTool> declaredTools() { return declarations; }
         @Override public Map<String, Object> execute(BaseTool tool, Map<String, Object> arguments, UUID hostInvocationId, String author, Runnable callFence) {
             if (callFence == null) throw dependency();
             try { callFence.run(); } catch (RuntimeException privateFence) { throw safe(privateFence); }
-            return execute(tool, arguments, hostInvocationId, author);
+            return executeResolved(tool, arguments, hostInvocationId, author, callFence);
         }
         Map<String, Object> execute(BaseTool tool, Map<String, Object> arguments, UUID hostInvocationId, String author) {
+            return executeResolved(tool, arguments, hostInvocationId, author, null);
+        }
+        private Map<String, Object> executeResolved(BaseTool tool, Map<String, Object> arguments, UUID hostInvocationId, String author, Runnable callFence) {
             requireOpen(); AdkToolTelemetryPrivacy.requireSafe(); var target = selected.get(tool);
             if (target == null) throw unavailable();
+            boolean mcp = isMcp(target.descriptor());
+            if (mcp && callFence == null) throw unavailable();
             ToolInvocationStore.PreparationRequestVO request; ToolEventVO started;
             try {
                 request = new ToolInvocationStore.PreparationRequestVO(target.binding(), lease, target.descriptor(), arguments, null, hostInvocationId, BigDecimal.ZERO, null);
@@ -146,14 +160,22 @@ public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridg
             } catch (RuntimeException malformed) { throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_INVALID_COMMAND, "Governed tool input is invalid"); }
             append(started);
             ToolInvocationRecorder.RecordResult result; ToolExecutionOutcome outcome;
+            var heldFence = mcp ? new AtomicReference<AgentLedgerException>() : null;
             try {
-                requireOpen(); result = recorder.executeReadOnly(transport, request);
+                requireOpen();
+                result = mcp ? recorder.executeReadOnlyMcp(guardedMcpTransport(callFence, heldFence), request) : recorder.executeReadOnly(transport, request);
+                if (mcp && heldFence.get() != null) throw heldFence.get();
                 if (result == null || !target.binding().run().runId().equals(result.runId()) || !hostInvocationId.equals(result.invocationId())) throw dependency();
                 outcome = checkedOutcome(result, target.descriptor());
             } catch (RuntimeException privateFailure) {
-                var safe = safe(privateFailure);
-                append(new ToolEventVO(Phase.FINISHED, author, target.descriptor().reference(), hostInvocationId, "UNAVAILABLE", 0, null, safe.code().name())); throw safe;
+                var safe = mcp && heldFence.get() != null ? heldFence.get() : safe(privateFailure);
+                if (mcp) {
+                    try { appendUnavailableIfOpen(author, target.descriptor().reference(), hostInvocationId, safe); }
+                    catch (RuntimeException eventFailure) { if (heldFence.get() != null) throw heldFence.get(); throw eventFailure; }
+                } else append(new ToolEventVO(Phase.FINISHED, author, target.descriptor().reference(), hostInvocationId, "UNAVAILABLE", 0, null, safe.code().name()));
+                throw safe;
             }
+            if (mcp) requireOpen();
             append(new ToolEventVO(Phase.FINISHED, author, target.descriptor().reference(), hostInvocationId, result.state(), result.dispatchEpoch(), result.accountingState(), outcome == null ? null : outcome.errorCode()));
             requireOpen();
             if (result.accountingState() != ToolInvocationRecorder.AccountingState.SETTLED) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_USAGE_UNKNOWN, "Governed tool accounting is pending");
@@ -162,16 +184,37 @@ public final class AdkReadOnlyDecisionToolBridge implements AdkGovernedToolBridg
             if (Set.of("REJECTED", "FAILED_KNOWN").contains(result.state())) return Map.of("status", result.state(), "errorCode", outcome.errorCode());
             throw dependency();
         }
+        private ReadOnlyMcpToolTransport guardedMcpTransport(Runnable callFence, AtomicReference<AgentLedgerException> heldFence) {
+            return new ReadOnlyMcpToolTransport() {
+                @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+                    return mcpTransport.withVerifiedCall(request, (executor, operation) -> callback.apply(executor, operation == null ? null : bound -> {
+                        try { callFence.run(); }
+                        catch (RuntimeException privateFence) {
+                            heldFence.compareAndSet(null, safe(privateFence)); throw new Failure(FailureKind.OPERATION_NOT_SENT);
+                        }
+                        if (closed.get()) {
+                            heldFence.compareAndSet(null, unavailable()); throw new Failure(FailureKind.OPERATION_NOT_SENT);
+                        }
+                        return operation.call(bound);
+                    }));
+                }
+            };
+        }
         private static ToolExecutionOutcome checkedOutcome(ToolInvocationRecorder.RecordResult result, ToolDescriptor descriptor) {
             var outcome = result.outcome(); if (outcome == null) return null;
             if (!outcome.status().name().equals(result.state()) || outcome.businessReceiptId() != null || outcome.actualCost() == null || outcome.actualCost().signum() != 0) throw dependency();
             return new ToolExecutionOutcome(outcome.status(), outcome.output(), outcome.businessReceiptId(), outcome.errorCode(), outcome.actualCost()).validated(descriptor);
         }
         private void append(ToolEventVO event) { try { sink.append(event); } catch (RuntimeException privateFailure) { throw dependency(); } }
+        private void appendUnavailableIfOpen(String author, DefinitionResourceRef tool, UUID id, AgentLedgerException safe) {
+            if (closed.get()) return;
+            append(new ToolEventVO(Phase.FINISHED, author, tool, id, "UNAVAILABLE", 0, null, safe.code().name()));
+        }
         private void requireOpen() { if (closed.get()) throw unavailable(); }
         @Override public String sideEffectOutcome() { return declarations.isEmpty() ? "UNKNOWN" : "NONE"; }
         @Override public void close() { closed.set(true); }
     }
+    private static boolean isMcp(ToolDescriptor descriptor) { return ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY.equals(descriptor.policy().executionResourceKey()); }
     private record TargetVO(ToolDescriptor descriptor, ToolExecutionGrant.BindingVO binding) { }
     private static boolean text(String value, int maximum) {
         return value != null && !value.isBlank() && value.equals(value.trim()) && value.length() <= maximum && value.chars().noneMatch(Character::isISOControl) && StandardCharsets.UTF_8.newEncoder().canEncode(value);

@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -63,6 +64,7 @@ class AdkGovernedProcessToolBridgeTest {
     private static final String RECEIPT = "tianji:ps-start:v1:" + "b".repeat(64), INSTANCE = "private-process-instance";
     private static final ToolDescriptor READ = descriptor("decision.read", "read_decision", ToolPolicy.Risk.READ_ONLY,
             DecisionClient.EXECUTE_RESOURCE_KEY, Map.of("value", ToolSchema.ValueType.STRING));
+    private static final ToolDescriptor MCP = descriptor("mcp.read", "read_mcp", ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, Map.of("value", ToolSchema.ValueType.STRING));
     private static final ToolDescriptor START = descriptor("process.start", "start_process", ToolPolicy.Risk.IDEMPOTENT_WRITE,
             ProcessClient.START_RESOURCE_KEY, Map.of("instanceId", ToolSchema.ValueType.STRING));
     private static final Map<String, Object> ARGUMENTS = Map.of("amount", 20L);
@@ -725,6 +727,112 @@ class AdkGovernedProcessToolBridgeTest {
         }
         AdkGovernedToolBridge.Scope bind() { return bridge.bindScope(material, lease(), events::add); }
         @Override public void close() { }
+    }
+
+    @Test void additive_mcp_constructors_preserve_legacy_affinities_and_require_the_exact_new_transport() {
+        try (var fixture = new McpFixture(true)) {
+            assertTrue(fixture.bridge.usesMcpTransport(fixture.mcp)); assertFalse(fixture.bridge.usesMcpTransport(null));
+            assertFalse(fixture.bridge.usesMcpTransport(mock(ReadOnlyMcpToolTransport.class)));
+            assertTrue(fixture.bridge.usesDecisionTransport(fixture.decision)); assertTrue(fixture.bridge.usesStartTransport(fixture.start));
+            assertThrows(IllegalArgumentException.class, () -> new AdkGovernedProcessToolBridge(fixture.ledger, fixture.recorder, fixture.decision, null, fixture.start, fixture.access, fixture.tools, fixture.bindings, fixture.resolver));
+            var approvals = mock(FixedToolApprovalVerifier.class); AdkGovernedProcessToolBridge.ApprovalReceiptResolver receipts = request -> null;
+            var approved = new AdkGovernedProcessToolBridge(fixture.ledger, fixture.recorder, fixture.decision, fixture.mcp, fixture.start, fixture.access, fixture.tools, fixture.bindings, fixture.resolver, approvals, receipts);
+            assertTrue(approved.usesMcpTransport(fixture.mcp)); assertTrue(approved.usesApprovalVerifier(approvals)); assertTrue(approved.usesApprovalReceiptResolver(receipts));
+            assertThrows(IllegalArgumentException.class, () -> new AdkGovernedProcessToolBridge(fixture.ledger, fixture.recorder, fixture.decision, null, fixture.start, fixture.access, fixture.tools, fixture.bindings, fixture.resolver, approvals, receipts));
+            verifyNoInteractions(fixture.mcp, fixture.decision, fixture.start);
+        }
+        try (var legacy = new Fixture()) { assertFalse(legacy.bridge.usesMcpTransport(null)); assertFalse(legacy.bridge.usesMcpTransport(mock(ReadOnlyMcpToolTransport.class))); }
+    }
+
+    @Test void one_readonly_subset_routes_mcp_and_decision_without_start_context_or_database_time() {
+        try (var fixture = new McpFixture(true)) {
+            var scope = fixture.bind();
+            assertEquals(List.of(MCP.name(), READ.name()).stream().sorted().toList(), scope.declaredTools().stream().map(BaseTool::name).toList());
+            assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("value", "private-mcp-output")), scope.execute(tool(scope, MCP.name()), ARGUMENTS, HOST, "review_agent", () -> {}));
+            scope.execute(tool(scope, READ.name()), ARGUMENTS, UUID.randomUUID(), "review_agent", () -> {});
+            assertEquals(1, fixture.mcpCalls.get()); assertEquals(1, fixture.decisionCalls.get()); assertEquals(1, fixture.mcpDelegates.get());
+            assertEquals(0, fixture.databaseTimes.get()); assertEquals(0, fixture.contextCalls.get()); assertEquals("NONE", scope.sideEffectOutcome());
+            for (var event : fixture.events) { assertFalse(event.toString().contains("private-mcp-output")); assertFalse(event.toString().contains("amount")); }
+            scope.close();
+        }
+    }
+
+    @Test void mcp_only_fence_between_recorder_begin_and_delegate_survives_conservative_recorder_folding() {
+        try (var fixture = new McpFixture(false)) {
+            var scope = fixture.bind(); var live = new java.util.concurrent.atomic.AtomicBoolean(true); var checks = new AtomicInteger();
+            fixture.beforeOperation = () -> live.set(false); fixture.swallowFence = true;
+            var failure = assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, MCP.name()), ARGUMENTS, HOST, "review_agent", () -> {
+                checks.incrementAndGet(); if (!live.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private lost Session fence");
+            }));
+            assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, failure.code()); assertFalse(failure.getMessage().contains("private")); assertTrue(checks.get() >= 2);
+            assertEquals(1, fixture.mcpCalls.get()); assertEquals(0, fixture.mcpDelegates.get()); assertEquals(1, fixture.mcpNoSendFacts.get()); assertEquals("NONE", scope.sideEffectOutcome());
+            assertEquals(AdkGovernedToolBridge.Phase.FINISHED, fixture.events.getLast().phase()); assertEquals("UNAVAILABLE", fixture.events.getLast().state());
+            scope.close();
+        }
+    }
+
+    @Test void legacy_process_constructor_rejects_a_visible_mcp_tool_instead_of_falling_back_to_decision() {
+        try (var fixture = new McpFixture(true)) {
+            var old = new AdkGovernedProcessToolBridge(fixture.ledger, fixture.recorder, fixture.decision, fixture.start, fixture.access, fixture.tools, fixture.bindings, fixture.resolver);
+            assertThrows(AgentLedgerException.class, () -> old.bindScope(fixture.material, lease(), fixture.events::add));
+            assertEquals(0, fixture.mcpCalls.get()); assertEquals(0, fixture.decisionCalls.get()); assertTrue(fixture.events.isEmpty());
+            var onlyDecision = material(null, fixture.tools, Set.of(READ.versionKey()), 4);
+            var compatible = new AdkGovernedProcessToolBridge(fixture.ledger, fixture.recorder, fixture.decision, fixture.start, fixture.access, fixture.tools,
+                    value -> List.of(binding(value.authorization(), READ)), fixture.resolver);
+            var scope = compatible.bindScope(onlyDecision, lease(), fixture.events::add);
+            scope.execute(tool(scope, READ.name()), ARGUMENTS, HOST, "review_agent", () -> {}); assertEquals(1, fixture.decisionCalls.get()); assertEquals(0, fixture.mcpCalls.get()); scope.close();
+        }
+    }
+
+    private static final class McpFixture implements AutoCloseable {
+        final AgentLedgerService ledger = mock(AgentLedgerService.class);
+        final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
+        final ReadOnlyDecisionToolTransport decision = mock(ReadOnlyDecisionToolTransport.class);
+        final ReadOnlyMcpToolTransport mcp = mock(ReadOnlyMcpToolTransport.class);
+        final FixedBpmnStartToolTransport start = mock(FixedBpmnStartToolTransport.class);
+        final ToolResultAccessRecorder access = mock(ToolResultAccessRecorder.class);
+        final List<ToolDescriptor> tools;
+        final AgentLedgerService.ExecutionMaterial material;
+        final List<AdkGovernedToolBridge.ToolEventVO> events = new ArrayList<>();
+        final AtomicInteger mcpNoSendFacts = new AtomicInteger(), mcpCalls = new AtomicInteger(), decisionCalls = new AtomicInteger(), mcpDelegates = new AtomicInteger(), databaseTimes = new AtomicInteger(), contextCalls = new AtomicInteger();
+        final Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>> bindings;
+        final AdkGovernedProcessToolBridge.StartActionContextResolver resolver;
+        final AdkGovernedProcessToolBridge bridge;
+        Runnable beforeOperation = () -> {};
+        boolean swallowFence;
+        McpFixture(boolean onlyRead) {
+            tools = onlyRead ? List.of(READ, MCP) : List.of(READ, MCP, START);
+            material = material(onlyRead ? null : "invoice-1", tools, tools.stream().map(ToolDescriptor::versionKey).collect(java.util.stream.Collectors.toSet()), 8);
+            bindings = value -> tools.stream().map(descriptor -> binding(value.authorization(), descriptor)).toList();
+            resolver = request -> { contextCalls.incrementAndGet(); return new AdkGovernedProcessToolBridge.StartActionContextVO("business-v1", Duration.ofDays(1)); };
+            when(ledger.databaseNow()).thenAnswer(call -> { databaseTimes.incrementAndGet(); return NOW; }); when(recorder.usesLedger(ledger)).thenReturn(true); when(access.usesLedger(ledger)).thenReturn(true);
+            when(recorder.executeReadOnly(eq(decision), any())).thenAnswer(call -> { decisionCalls.incrementAndGet(); return readResult(call.getArgument(1, ToolInvocationStore.PreparationRequestVO.class).invocationId(), false); });
+            when(mcp.withVerifiedCall(any(), any())).thenAnswer(call -> call.getArgument(1, ReadOnlyMcpToolTransport.Callback.class).apply(
+                    new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "mcp-service", "https://mcp-idp.example/21"), RUN_DEADLINE),
+                    deadline -> { mcpDelegates.incrementAndGet(); return new ReadOnlyMcpToolTransport.CallObservation(ReadOnlyMcpToolTransport.Status.SUCCESS, Map.of("value", "private-mcp-output")); }));
+            when(recorder.executeReadOnlyMcp(any(), any())).thenAnswer(call -> {
+                mcpCalls.incrementAndGet(); var request = call.getArgument(1, ToolInvocationStore.PreparationRequestVO.class);
+                var transport = call.getArgument(0, ReadOnlyMcpToolTransport.class);
+                return transport.withVerifiedCall(new ReadOnlyMcpToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.arguments(), request.invocationId(), RUN_DEADLINE), (executor, operation) -> {
+                    beforeOperation.run();
+                    try { operation.call(RUN_DEADLINE); return readResult(request.invocationId(), false); }
+                    catch (ReadOnlyMcpToolTransport.Failure failure) {
+                        if (!swallowFence) throw failure; assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT, failure.kind()); mcpNoSendFacts.incrementAndGet();
+                        var outcome = new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "DISPATCH_NOT_SENT", BigDecimal.ZERO);
+                        return new ToolInvocationRecorder.RecordResult(RUN, request.invocationId(), "FAILED_KNOWN", 3, 1, NOW, NOW.plusSeconds(1), outcome, true, ToolInvocationRecorder.AccountingState.SETTLED);
+                    }
+                });
+            });
+            bridge = new AdkGovernedProcessToolBridge(ledger, recorder, decision, mcp, start, access, tools, bindings, resolver);
+            clearInvocations(recorder, decision, mcp, start, access);
+        }
+        AdkGovernedToolBridge.Scope bind() { return bridge.bindScope(material, lease(), events::add); }
+        @Override public void close() {}
+    }
+    private static ToolInvocationRecorder.RecordResult readResult(UUID id, boolean unknown) {
+        var status = unknown ? ToolExecutionOutcome.Status.UNKNOWN : ToolExecutionOutcome.Status.SUCCEEDED;
+        var outcome = new ToolExecutionOutcome(status, unknown ? Map.of() : Map.of("value", "private-mcp-output"), null, unknown ? "OUTCOME_UNKNOWN" : null, BigDecimal.ZERO);
+        return new ToolInvocationRecorder.RecordResult(RUN, id, status.name(), 3, 1, NOW, NOW.plusSeconds(1), outcome, true, ToolInvocationRecorder.AccountingState.SETTLED);
     }
 
     private static AdkGovernedProcessToolBridge construct(Object[] values) {

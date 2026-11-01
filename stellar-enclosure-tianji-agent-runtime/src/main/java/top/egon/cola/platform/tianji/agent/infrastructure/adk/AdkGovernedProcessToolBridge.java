@@ -4,6 +4,7 @@ import com.google.adk.tools.BaseTool;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -42,12 +43,13 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
-/** Programmatic union of governed Decision and explicit idempotent or approved BPMN START tools. */
+/** Programmatic union of governed Decision, MCP and explicit idempotent or approved BPMN START tools. */
 public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge {
     private static final Duration MAX_INTENT_TTL = Duration.ofDays(7);
     private final AgentLedgerService ledger;
     private final ToolInvocationRecorder recorder;
     private final ReadOnlyDecisionToolTransport decisionTransport;
+    private final ReadOnlyMcpToolTransport mcpTransport;
     private final FixedBpmnStartToolTransport startTransport;
     private final ToolResultAccessRecorder resultAccessRecorder;
     private final ToolRegistry registry;
@@ -63,11 +65,11 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
                                         Collection<ToolDescriptor> descriptors,
                                         Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>> hostBindings,
                                         StartActionContextResolver actionContexts) {
-        this(ledger, recorder, decisionTransport, startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, null, null, false);
+        this(ledger, recorder, decisionTransport, null, startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, null, null, false);
     }
 
     private AdkGovernedProcessToolBridge(AgentLedgerService ledger, ToolInvocationRecorder recorder,
-                                         ReadOnlyDecisionToolTransport decisionTransport, FixedBpmnStartToolTransport startTransport,
+                                         ReadOnlyDecisionToolTransport decisionTransport, ReadOnlyMcpToolTransport mcpTransport, FixedBpmnStartToolTransport startTransport,
                                          ToolResultAccessRecorder resultAccessRecorder, Collection<ToolDescriptor> descriptors,
                                          Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>> hostBindings,
                                          StartActionContextResolver actionContexts, FixedToolApprovalVerifier approvalVerifier,
@@ -76,7 +78,7 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
                 || descriptors == null || hostBindings == null || actionContexts == null || !recorder.usesLedger(ledger)
                 || !resultAccessRecorder.usesLedger(ledger) || approved && (approvalVerifier == null || approvalReceipts == null)) throw invalid();
         AdkToolTelemetryPrivacy.requireSafe();
-        this.ledger = ledger; this.recorder = recorder; this.decisionTransport = decisionTransport; this.startTransport = startTransport;
+        this.ledger = ledger; this.recorder = recorder; this.decisionTransport = decisionTransport; this.mcpTransport = mcpTransport; this.startTransport = startTransport;
         this.resultAccessRecorder = resultAccessRecorder; this.registry = new ToolRegistry(new ArrayList<>(descriptors));
         this.hostBindings = hostBindings; this.actionContexts = actionContexts;
         this.approvalVerifier = approvalVerifier; this.approvalReceipts = approvalReceipts;
@@ -91,8 +93,29 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
                                         StartActionContextResolver actionContexts,
                                         FixedToolApprovalVerifier approvalVerifier,
                                         ApprovalReceiptResolver approvalReceipts) {
-        this(ledger, recorder, decisionTransport, startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, approvalVerifier, approvalReceipts, true);
+        this(ledger, recorder, decisionTransport, null, startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, approvalVerifier, approvalReceipts, true);
     }
+
+    public AdkGovernedProcessToolBridge(AgentLedgerService ledger, ToolInvocationRecorder recorder,
+                                        ReadOnlyDecisionToolTransport decisionTransport, ReadOnlyMcpToolTransport mcpTransport,
+                                        FixedBpmnStartToolTransport startTransport, ToolResultAccessRecorder resultAccessRecorder,
+                                        Collection<ToolDescriptor> descriptors,
+                                        Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>> hostBindings,
+                                        StartActionContextResolver actionContexts) {
+        this(ledger, recorder, decisionTransport, requireMcp(mcpTransport), startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, null, null, false);
+    }
+
+    public AdkGovernedProcessToolBridge(AgentLedgerService ledger, ToolInvocationRecorder recorder,
+                                        ReadOnlyDecisionToolTransport decisionTransport, ReadOnlyMcpToolTransport mcpTransport,
+                                        FixedBpmnStartToolTransport startTransport, ToolResultAccessRecorder resultAccessRecorder,
+                                        Collection<ToolDescriptor> descriptors,
+                                        Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>> hostBindings,
+                                        StartActionContextResolver actionContexts, FixedToolApprovalVerifier approvalVerifier,
+                                        ApprovalReceiptResolver approvalReceipts) {
+        this(ledger, recorder, decisionTransport, requireMcp(mcpTransport), startTransport, resultAccessRecorder, descriptors, hostBindings, actionContexts, approvalVerifier, approvalReceipts, true);
+    }
+
+    public boolean usesMcpTransport(ReadOnlyMcpToolTransport candidate) { return candidate != null && mcpTransport == candidate; }
 
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
     public boolean usesRecorder(ToolInvocationRecorder candidate) { return recorder == candidate; }
@@ -131,7 +154,7 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
                 if (!expiry.isAfter(databaseNow) || expiry.isAfter(databaseNow.plus(MAX_INTENT_TTL))) throw unavailable();
                 starts.add(new StartTargetVO(input.descriptor(), input.binding(), businessKey, input.context().businessVersion(), expiry));
             }
-            var read = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decisionTransport, material, lease,
+            var read = AdkReadOnlyDecisionToolBridge.bindResolved(recorder, decisionTransport, mcpTransport, material, lease,
                     event -> sink.append(AdkReadOnlyDecisionToolBridge.toGovernedEvent(event)), List.copyOf(readDescriptors), List.copyOf(readBindings));
             return new RunScope(recorder, startTransport, resultAccessRecorder, lease, sink, read, starts, List.copyOf(visible.keySet()), approvalVerifier, approvalReceipts, material.snapshot());
         } catch (AgentLedgerException scoped) { throw safe(scoped); }
@@ -359,6 +382,7 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
     private static AgentLedgerException safe(RuntimeException failure) {
         return failure instanceof AgentLedgerException scoped ? new AgentLedgerException(scoped.code(), "Governed process tool execution could not complete") : dependency();
     }
+    private static ReadOnlyMcpToolTransport requireMcp(ReadOnlyMcpToolTransport transport) { if (transport == null) throw invalid(); return transport; }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Governed process tool metadata is invalid"); }
     private static AgentLedgerException invalidCommand() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_INVALID_COMMAND, "Governed process tool input is invalid"); }
     private static AgentLedgerException usageUnknown() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_USAGE_UNKNOWN, "Governed process tool accounting is pending"); }
