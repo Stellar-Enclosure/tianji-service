@@ -15,7 +15,6 @@ import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
-import org.springframework.context.annotation.Configuration;
 import org.springframework.mock.env.MockEnvironment;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
@@ -219,7 +218,6 @@ class TianjiToolAuthorityConfigurationTest {
         verifyNoInteractions(fixture.source); fixture.noOwnerCalls();
     }
 
-    @Configuration(proxyBeanMethods = false)
     static class LazyBeans {
         @Bean static BeanFactoryPostProcessor lazyDefinitions() { return factory -> {
             for (var name : factory.getBeanDefinitionNames()) if (!name.equals("tianjiToolAuthorityChainVerifier")) factory.getBeanDefinition(name).setLazyInit(true);
