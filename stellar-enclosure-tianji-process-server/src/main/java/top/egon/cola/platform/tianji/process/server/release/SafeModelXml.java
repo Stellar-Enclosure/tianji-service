@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /** Parses bounded UTF-8 without entity resolution and validates against packaged Flowable schemas. */
 final class SafeModelXml {
@@ -38,7 +39,15 @@ final class SafeModelXml {
 
     private SafeModelXml() { }
 
+    static Document parseCmmn(byte[] bytes) {
+        return parse(bytes, () -> CmmnSchema.CMMN);
+    }
+
     static Document parse(byte[] bytes, boolean bpmn) {
+        return parse(bytes, () -> bpmn ? Schemas.BPMN : Schemas.DMN);
+    }
+
+    private static Document parse(byte[] bytes, Supplier<Schema> schemaSupplier) {
         if (bytes == null || bytes.length == 0 || bytes.length > MAX_BYTES) throw invalid();
         try {
             String xml = StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
@@ -61,7 +70,7 @@ final class SafeModelXml {
             Document document = builder.parse(new InputSource(new StringReader(xml)));
             String declaredEncoding = document.getXmlEncoding();
             if (declaredEncoding != null && !declaredEncoding.equalsIgnoreCase("UTF-8")) throw invalid();
-            var validator = (bpmn ? Schemas.BPMN : Schemas.DMN).newValidator();
+            var validator = schemaSupplier.get().newValidator();
             validator.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
             validator.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
             validator.setErrorHandler(ERRORS);
@@ -133,5 +142,10 @@ final class SafeModelXml {
         private static final Schema BPMN = schema("BPMN20.xsd", "org/flowable/impl/bpmn/parser/",
                 Set.of("BPMN20.xsd", "Semantic.xsd", "BPMNDI.xsd", "DC.xsd", "DI.xsd"));
         private static final Schema DMN = schema("dmn.xsd", "org/flowable/impl/dmn/parser/", Set.of("dmn.xsd"));
+    }
+
+    private static final class CmmnSchema {
+        private static final Schema CMMN = schema("CMMN11.xsd", "org/flowable/impl/cmmn/parser/",
+                Set.of("CMMN11.xsd", "CMMN11CaseModel.xsd", "CMMNDI11.xsd", "DC.xsd", "DI.xsd"));
     }
 }
