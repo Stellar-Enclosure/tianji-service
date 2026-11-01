@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
@@ -9,6 +10,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
@@ -23,6 +25,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
 import java.math.BigDecimal;
 import java.lang.reflect.Modifier;
+import java.sql.ResultSet;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
@@ -257,24 +261,150 @@ class ToolApprovedInvocationStoreTest {
         }
     }
 
+    @Test void approved_metadata_preparation_commits_the_first_finished_wait_and_settled_zero_budget() throws Exception {
+        try (var f = new Fixture(TOOL, false)) {
+            var result = f.prepare(f.waiting, entry(NOW, 0, NOW.plusSeconds(20)));
+            assertFalse(result.started()); assertNull(result.attempt()); assertEquals("AWAITING_APPROVAL", result.action().state());
+            assertEquals("AWAITING_APPROVAL", result.invocation().state()); assertEquals(NOW, result.invocation().finishedAt());
+            assertEquals(AgentBudgetReservation.State.SETTLED, result.budget().state()); assertEquals(BigDecimal.ZERO, result.budget().actualCost());
+            assertEquals(1, f.rig.base.invocationInserts.get()); assertEquals(1, f.rig.base.budgetInserts.get());
+            verify(f.rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.PREPARE));
+            assertTrue(f.rig.base.trace.indexOf("authorize") < f.rig.base.trace.indexOf("run-lock"));
+        }
+    }
+
+    @Test void approved_wait_metadata_does_not_readmit_old_capability_epoch_or_expired_dispatch_window() throws Exception {
+        try (var f = new Fixture()) {
+            var old = new HashMap<>(f.rig.row(f.waiting)); var budget = f.rig.base.budgetRows.get(f.waiting.reservationId());
+            var previous = f.rig.evidence(f.waiting);
+            var current = new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(previous.reservation().binding(), 4),
+                    "9" + "4".repeat(62), "ENC:v1:key:new:ticket", NOW.plusSeconds(50));
+            f.rig.evidences.put(RUN, current); f.rig.base.wall.set(NOW.plusSeconds(21)); f.rig.base.databaseNow.set(NOW.plusSeconds(21)); f.rig.base.nano.set(21_000_000_000L);
+            var result = f.prepare(f.waiting, entry(NOW.plusSeconds(21), 21_000_000_000L, NOW.plusSeconds(40)));
+            assertEquals("AWAITING_APPROVAL", result.invocation().state()); assertEquals(3, result.invocation().capabilityIssueEpoch());
+            assertTrue(result.invocation().dispatchNotAfter().isBefore(f.rig.base.wall.get())); assertNull(result.attempt());
+            assertEquals(old, f.rig.row(f.waiting)); assertEquals(budget, result.budget()); assertEquals(1, f.rig.base.budgetInserts.get());
+        }
+    }
+
+    @Test void approved_advanced_own_metadata_never_discloses_outcome_or_changes_the_legacy_projection() throws Exception {
+        for (String state : List.of("DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN")) try (var f = new Fixture()) {
+            var request = f.request(RUN); var started = f.begin(request);
+            if (!state.equals("DISPATCHING")) {
+                var outcome = state.equals("SUCCEEDED") ? success(null) : new ToolExecutionOutcome(ToolExecutionOutcome.Status.valueOf(state), Map.of(), null, "CONTROLLED", null);
+                f.complete(request, started.attempt(), NONCE, outcome);
+            }
+            var row = new HashMap<>(f.rig.row(request)); var action = f.rig.base.intentRow.get();
+            var result = f.prepare(request, entry(NOW, 0, NOW.plusSeconds(20)));
+            assertEquals(state, result.invocation().state()); assertNull(result.attempt()); assertFalse(result.started());
+            assertSame(action, f.rig.base.intentRow.get()); assertEquals(row, f.rig.row(request)); assertEquals(2, f.rig.base.budgetInserts.get());
+            assertThrows(AgentLedgerException.class, () -> f.rig.selected(request, () -> f.rig.store.prepare(request)));
+        }
+    }
+
+    @Test void existing_approved_action_and_a_new_host_uuid_return_action_only_without_reservation() throws Exception {
+        try (var f = new Fixture()) {
+            var before = f.rig.base.intentRow.get(); var result = f.prepare(f.request(OTHER_RUN), entry(NOW, 0, NOW.plusSeconds(20)));
+            assertEquals("AWAITING_APPROVAL", result.action().state()); assertNull(result.invocation()); assertNull(result.budget()); assertNull(result.attempt());
+            assertSame(before, f.rig.base.intentRow.get()); assertEquals(1, f.rig.base.invocationInserts.get()); assertEquals(1, f.rig.base.budgetInserts.get());
+        }
+    }
+
+    @Test void approved_metadata_still_requires_current_prepare_authority_and_full_evidence_equality() throws Exception {
+        for (String failure : List.of("deny", "evidence")) try (var f = new Fixture(TOOL, false)) {
+            if (failure.equals("deny")) doAnswer(call -> new ToolExecutionAuthorization.CheckResult(call.getArgument(0), ToolExecutionAuthorization.Boundary.PREPARE, ToolExecutionAuthorization.Decision.DENY, null))
+                    .when(f.rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.PREPARE));
+            else { var old = f.rig.evidence(f.waiting); f.rig.base.insideEvidence.set(new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(old.reservation().binding(), 4), old.grantId(), old.ciphertext(), old.expiresAt())); }
+            assertThrows(AgentLedgerException.class, () -> f.prepare(f.waiting, entry(NOW, 0, NOW.plusSeconds(20))));
+            assertEquals(0, f.rig.base.budgetInserts.get()); assertEquals(0, f.rig.base.invocationInserts.get());
+        }
+    }
+
+    @Test void original_short_entry_deadline_and_monotonic_origin_cover_capability_and_prepare_pdp() throws Exception {
+        for (String stage : List.of("capability", "pdp")) try (var f = new Fixture(TOOL, false)) {
+            var entry = entry(NOW, 0, NOW.plusMillis(100)); f.rig.base.wall.set(NOW.plusMillis(20)); f.rig.base.nano.set(20_000_000L);
+            Runnable expire = () -> { f.rig.base.wall.set(NOW.minusSeconds(60)); f.rig.base.nano.set(101_000_000L); };
+            if (stage.equals("capability")) f.rig.base.afterOutsideCap.set(expire);
+            else doAnswer(call -> {
+                ToolExecutionAuthorization.Request request = call.getArgument(0); assertEquals(entry.deadlineAt(), request.deadlineAt());
+                var checked = f.rig.allowed(request, ToolExecutionAuthorization.Boundary.PREPARE); expire.run(); return checked;
+            }).when(f.rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.PREPARE));
+            assertThrows(AgentLedgerException.class, () -> f.prepare(f.waiting, entry));
+            assertEquals(0, f.rig.base.budgetInserts.get()); assertEquals(0, f.rig.base.invocationInserts.get());
+            assertFalse(f.rig.base.trace.contains("run-lock"));
+        }
+    }
+
+    @Test void original_entry_expiry_inside_preparation_rolls_back_action_invocation_and_settled_budget() throws Exception {
+        try (var f = new Fixture(TOOL, false)) {
+            f.rig.base.beforeRunLock.set(() -> { f.rig.base.wall.set(NOW.minusSeconds(60)); f.rig.base.nano.set(101_000_000L); });
+            assertThrows(AgentLedgerException.class, () -> f.prepare(f.waiting, entry(NOW, 0, NOW.plusMillis(100))));
+            assertTrue(f.rig.base.trace.contains("rollback")); assertEquals(0, f.rig.base.invocationInserts.get()); assertEquals(0, f.rig.base.budgetInserts.get());
+            assertNull(f.rig.base.intentRow.get()); assertNull(f.rig.row(f.waiting)); assertTrue(f.rig.base.budgetRows.isEmpty());
+        }
+    }
+
+    @Test void approved_metadata_preserves_lease_budget_identity_and_requires_a_dispatch_backlink() throws Exception {
+        try (var f = new Fixture()) {
+            var raw = f.waiting; var changed = new ToolInvocationStore.PreparationRequestVO(raw.binding(), new AgentRunLease(RUN, "worker", 2, NOW.minusSeconds(1)), TOOL, raw.arguments(), raw.action(), raw.invocationId(), raw.estimatedCost(), raw.intentExpiry());
+            doAnswer(call -> {
+                RowMapper<?> mapper = call.getArgument(1); var rs = mock(ResultSet.class); when(rs.getTimestamp("lease_expires_at")).thenReturn(Timestamp.from(NOW.plusSeconds(30)));
+                return List.of(mapper.mapRow(rs, 0));
+            }).when(f.rig.base.jdbc.get()).query(startsWith("SELECT lease_expires_at"), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> f.prepare(changed, entry(NOW, 0, NOW.plusSeconds(20)))).code());
+            assertEquals(1, f.rig.base.budgetInserts.get());
+        }
+        try (var f = new Fixture()) {
+            var request = f.request(RUN); f.begin(request); var old = f.rig.base.intentRow.get();
+            f.rig.base.intentRow.set(new ToolActionIntentSql.Row(old.action(), old.descriptor(), old.originRunId(), old.originSnapshotSha256(), "AWAITING_APPROVAL", old.revision()+1,
+                    old.createdAt(), old.updatedAt(), old.expiresAt(), null, null, "NONE", null, null, null));
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> f.prepare(request, entry(NOW, 0, NOW.plusSeconds(20)))).code());
+        }
+    }
+
+    @Test void approved_preparation_rejects_unready_ambient_and_non_aa_callers_before_work() throws Exception {
+        try (var f = new Fixture(TOOL, false)) {
+            var entry = entry(NOW, 0, NOW.plusSeconds(20)); var unready = f.rig.base.store(false, f.rig.base.authority);
+            assertThrows(AgentLedgerException.class, () -> unready.prepareOrLoadApprovedWrite(f.waiting, entry));
+            TransactionSynchronizationManager.setActualTransactionActive(true);
+            try { assertThrows(IllegalStateException.class, () -> f.prepare(f.waiting, entry)); }
+            finally { TransactionSynchronizationManager.setActualTransactionActive(false); }
+            assertThrows(IllegalArgumentException.class, () -> f.prepare(f.waiting, null));
+            assertEquals(0, f.rig.base.budgetInserts.get());
+        }
+        try (var old = new ToolWriteInvocationStoreTest.Rig()) {
+            var request = old.request(RUN, UUID.randomUUID());
+            assertThrows(IllegalArgumentException.class, () -> old.store.prepareOrLoadApprovedWrite(request, entry(NOW, 0, NOW.plusSeconds(20))));
+        }
+    }
+
+    private static ToolInvocationStore.DispatchWindowVO entry(Instant started, long nanos, Instant callDeadline) {
+        return new ToolInvocationStore.DispatchWindowVO(started, nanos, started.plusSeconds(10).isBefore(callDeadline) ? started.plusSeconds(10) : callDeadline, callDeadline);
+    }
+
     private static ToolExecutionOutcome success(BigDecimal cost) { return new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("reference", "business-value"), "business-receipt", null, cost); }
     static final class Fixture implements AutoCloseable {
-        final ToolWriteInvocationStoreTest.Rig rig = new ToolWriteInvocationStoreTest.Rig(TOOL);
-        final ToolInvocationStore.PreparationRequestVO waiting = rig.request(RUN, UUID.randomUUID());
+        final ToolDescriptor tool;
+        final BigDecimal estimatedCost;
+        final ToolWriteInvocationStoreTest.Rig rig;
+        final ToolInvocationStore.PreparationRequestVO waiting;
         final ApprovedObservation approval;
         final AtomicBoolean duplicate = new AtomicBoolean();
-        Fixture() throws Exception {
+        Fixture() throws Exception { this(TOOL, true, new BigDecimal("0.20")); }
+        Fixture(ToolDescriptor selectedTool, boolean initializeWaiting) throws Exception { this(selectedTool, initializeWaiting, new BigDecimal("0.20")); }
+        Fixture(ToolDescriptor selectedTool, boolean initializeWaiting, BigDecimal estimatedCost) throws Exception {
+            tool = selectedTool; this.estimatedCost = estimatedCost; rig = new ToolWriteInvocationStoreTest.Rig(tool); waiting = request(RUN);
             // The reused IDW rig prepares PREPARED actions; this fixture supplies the real AA waiting shape.
             doAnswer(call -> {
                 boolean created = rig.base.intentNew.getAndSet(false); var row = rig.base.intentRow.get();
                 if (row == null || created) {
                     AgentRunAuthorization.Request run = call.getArgument(0);
-                    row = new ToolActionIntentSql.Row(rig.base.action,TOOL,run.runId(),run.snapshotSha256(),"AWAITING_APPROVAL",1,NOW,NOW,call.getArgument(4),null,null,"NONE",null,null,null);
+                    row = new ToolActionIntentSql.Row(rig.base.action,tool,run.runId(),run.snapshotSha256(),"AWAITING_APPROVAL",1,NOW,NOW,call.getArgument(4),null,null,"NONE",null,null,null);
                     rig.base.intentRow.set(row); created = true;
                 }
                 return new ToolActionIntentSql.PreparationResultVO(row,created);
             }).when(rig.actionSql).prepareWithStatus(any(), any(), any(), any(), any(), any());
-            try { rig.selected(waiting, () -> rig.store.prepare(waiting)); }
+            try { if (initializeWaiting) rig.selected(waiting, () -> rig.store.prepare(waiting)); }
             catch (RuntimeException | Error initializationFailure) { rig.close(); throw initializationFailure; }
             approval = observation(NOW.plusSeconds(20).plusNanos(987_654_321), NOW.plusSeconds(19).plusNanos(123_456_789));
             when(rig.actionSql.lockForApproval(any(), any(), any())).thenAnswer(call -> {
@@ -318,10 +448,16 @@ class ToolApprovedInvocationStoreTest {
             }).when(rig.base.jdbc.get()).update(argThat((String sql) -> sql.startsWith("INSERT INTO tianji_agent.agent_tool_invocation") && sql.contains("dispatch_nonce_sha256")), any(Object[].class));
             rig.base.trace.clear();
         }
-        ToolInvocationStore.PreparationRequestVO request(String run) { return rig.request(run, UUID.randomUUID()); }
+        ToolInvocationStore.PreparationRequestVO request(String run) {
+            var raw = rig.request(run, UUID.randomUUID());
+            return new ToolInvocationStore.PreparationRequestVO(raw.binding(), raw.lease(), raw.descriptor(), raw.arguments(), raw.action(), raw.invocationId(), estimatedCost, raw.intentExpiry());
+        }
         ToolInvocationStore.DispatchWindowVO window() { return window(NOW.plusSeconds(10)); }
         ToolInvocationStore.DispatchWindowVO window(Instant call) { return new ToolInvocationStore.DispatchWindowVO(NOW,0,call.isBefore(NOW.plusSeconds(10))?call:NOW.plusSeconds(10),call); }
         ToolInvocationStore.ApprovedWriteDispatchBeginResultVO begin(ToolInvocationStore.PreparationRequestVO request) { var window = window(); return consume(request,approval,rig.checked(request,window),EXECUTOR,window); }
+        ToolInvocationStore.ApprovedWriteDispatchBeginResultVO prepare(ToolInvocationStore.PreparationRequestVO request, ToolInvocationStore.DispatchWindowVO entry) {
+            return rig.selected(request, () -> rig.store.prepareOrLoadApprovedWrite(request, entry));
+        }
         ToolInvocationStore.ApprovedWriteDispatchBeginResultVO consume(ToolInvocationStore.PreparationRequestVO request,ApprovedObservation observed,ToolExecutionAuthorization.CheckResult checked,VerifiedExecutor executor,ToolInvocationStore.DispatchWindowVO window) {
             return rig.selected(request,() -> rig.store.consumeApprovalAndBeginDispatch(request,observed,rig.evidence(request),checked,executor,ToolInvocationStore.dispatchNonceSha256(NONCE),window));
         }
@@ -329,7 +465,7 @@ class ToolApprovedInvocationStoreTest {
             return rig.selected(request,() -> rig.store.completeApprovedWrite(request,attempt,nonce,outcome));
         }
         ApprovedObservation observation(Instant expiry,Instant consumerExpiry) {
-            var binding = new ToolApprovalBinding(CONSUMER,"approval-1",HASH,"v1","approval_flow","b".repeat(64),"approve");
+            var binding = new ToolApprovalBinding(CONSUMER,tool.policy().approvalPolicyRef(),HASH,"v1","approval_flow","b".repeat(64),"approve");
             var query = binding.query(waiting.action(),"approval-receipt"); var source = query.sourceStart();
             var dto = new VerifiedApprovalDTO(binding.policyRef(),binding.policyBindingSha256(),query.fingerprint(),query.approvalReceiptId(),query.requesterType(),query.requesterSubjectId(),
                     source.commandId(),"scope-1","task-1",source.releaseVersion(),source.definitionKey(),binding.definitionSha256(),binding.taskDefinitionKey(),OrchestrationRequestDigests.start(source),true,NOW.minusSeconds(2),NOW.minusSeconds(1),expiry);

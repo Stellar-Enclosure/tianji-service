@@ -82,11 +82,17 @@ public final class ToolInvocationStore {
     }
 
     private ToolInvocationSql.PreparedRowsVO prepareInternal(PreparationRequestVO request, ToolInvocationSql.Projection projection) {
+        return prepareInternal(request, projection, null);
+    }
+
+    private ToolInvocationSql.PreparedRowsVO prepareInternal(PreparationRequestVO request, ToolInvocationSql.Projection projection, DispatchWindowVO entryWindow) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool invocation preparation requires its own transaction");
         if (request == null) throw invalid();
         if (!verified.get()) throw unavailable();
-        Instant startedAt = clock.instant(); long startedNanos = nanoTime.getAsLong();
-        var initialWindow = window(startedAt, startedNanos, request.binding().run().deadlineAt());
+        Instant startedAt = entryWindow == null ? clock.instant() : entryWindow.startedAt();
+        long startedNanos = entryWindow == null ? nanoTime.getAsLong() : entryWindow.startedNanos();
+        Instant bound = entryWindow == null ? request.binding().run().deadlineAt() : earlier(request.binding().run().deadlineAt(), entryWindow.deadlineAt());
+        var initialWindow = window(startedAt, startedNanos, bound);
         try {
             check(initialWindow);
             var first = capabilities.current(request.binding(), request.descriptor()).orElseThrow(ToolInvocationStore::unavailable);
@@ -112,7 +118,7 @@ public final class ToolInvocationStore {
                 var value = invocations.prepare(request, first, audit, window.deadlineAt(), projection);
                 check(window); return value;
             }));
-            if (projection == ToolInvocationSql.Projection.LEGACY_PREPARATION) check(window);
+            if (projection == ToolInvocationSql.Projection.LEGACY_PREPARATION || projection == ToolInvocationSql.Projection.APPROVED_RECORDER_METADATA) check(window);
             return prepared;
         } catch (AgentLedgerException failure) {
             throw new AgentLedgerException(failure.code(), "Tool invocation preparation is unavailable or changed");
@@ -124,6 +130,14 @@ public final class ToolInvocationStore {
         var rows = prepareInternal(request, ToolInvocationSql.Projection.RECORDER_METADATA);
         if (rows.invocation() == null) throw unavailable();
         return new RecorderPreparationResultVO(rows.invocation().invocation(), rows.invocation().budget());
+    }
+    ApprovedWriteDispatchBeginResultVO prepareOrLoadApprovedWrite(PreparationRequestVO request, DispatchWindowVO entryWindow) {
+        approvalWrite(request);
+        if (entryWindow == null || entryWindow.callDeadlineAt().isAfter(request.binding().run().deadlineAt()) || entryWindow.startedAt().isAfter(clock.instant())) throw invalid();
+        checkDispatch(entryWindow);
+        var rows = prepareInternal(request, ToolInvocationSql.Projection.APPROVED_RECORDER_METADATA, entryWindow);
+        return new ApprovedWriteDispatchBeginResultVO(rows.action(), rows.invocation() == null ? null : rows.invocation().invocation(),
+                rows.invocation() == null ? null : rows.invocation().budget(), null);
     }
     ApprovedWriteDispatchBeginResultVO consumeApprovalAndBeginDispatch(PreparationRequestVO request, ApprovedObservation approval,
             ToolExecutionGrant.EvidenceVO evidence, ToolExecutionAuthorization.CheckResult checked, VerifiedExecutor executor,

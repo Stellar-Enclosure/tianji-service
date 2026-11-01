@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
@@ -19,14 +20,17 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvoca
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecordedResultVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore.RecorderPreparationVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.Objects;
@@ -93,6 +97,139 @@ public final class ToolInvocationRecorder {
         } catch (RuntimeException privateFailure) {
             var safe = unavailable(); cleanup(request, expected, "AUTHORIZATION_UNAVAILABLE", safe); throw safe;
         }
+    }
+
+    /** The nullable receipt comes from a trusted host; neither model arguments nor constructed observations establish approval authority. */
+    public ApprovedStartResultVO executeApprovedStart(FixedToolApprovalVerifier verifier, FixedBpmnStartToolTransport transport,
+                                                     PreparationRequestVO request, String hostApprovalReceiptId) {
+        return executeApprovedStart(verifier, transport, request, hostApprovalReceiptId, NOOP_COMMITTED);
+    }
+
+    public ApprovedStartResultVO executeApprovedStart(FixedToolApprovalVerifier verifier, FixedBpmnStartToolTransport transport,
+                                                     PreparationRequestVO request, String hostApprovalReceiptId, ToolCommittedFactObserver observer) {
+        if (verifier == null || transport == null || observer == null || request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED
+                || request.action() == null || request.intentExpiry() == null || request.estimatedCost() == null || request.estimatedCost().signum() != 0
+                || !ProcessClient.START_RESOURCE_KEY.equals(request.descriptor().policy().executionResourceKey())
+                || !request.descriptor().output().fields().equals(Map.of("instanceId", ToolSchema.ValueType.STRING))
+                || !request.descriptor().output().required().equals(Set.of("instanceId"))) throw invalidStart();
+        if (hostApprovalReceiptId != null && (hostApprovalReceiptId.isBlank() || !hostApprovalReceiptId.equals(hostApprovalReceiptId.trim())
+                || hostApprovalReceiptId.length() > 255 || hostApprovalReceiptId.chars().anyMatch(Character::isISOControl)
+                || !StandardCharsets.UTF_8.newEncoder().canEncode(hostApprovalReceiptId))) throw invalidStart();
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Approved START recording requires its own transactions");
+        if (!verified.get()) throw unavailableStart();
+        Instant started = clock.instant(); long startedNanos = nanoTime.getAsLong();
+        var observerFailure = new AtomicReference<AgentLedgerException>();
+        ToolCommittedFactObserver committed = status -> {
+            try { observer.onCommitted(status); }
+            catch (RuntimeException privateObserver) {
+                var safe = new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Committed tool fact observation could not complete");
+                observerFailure.compareAndSet(null, safe); throw observerFailure.get();
+            }
+        };
+        var observed = new AtomicReference<ToolActionIntentStore.PreparedActionResult>();
+        var fact = new AtomicReference<RecordedResultVO>();
+        try {
+            var material = ledger.executionMaterial(request.binding().run().actor(), new GetAgentRunQuery(request.binding().run().runId()));
+            if (material == null || !request.binding().run().equals(material.authorization())) throw unavailableStart();
+            var entry = window(started, startedNanos, earlier(started.plus(material.snapshot().effectivePolicy().toolTimeout()), request.binding().run().deadlineAt()));
+            checkApprovedCall(entry);
+            var prepared = preparations.prepareOrLoadApprovedWrite(request, entry); observed.set(prepared.action()); checkApprovedCall(entry);
+            if (!"AWAITING_APPROVAL".equals(prepared.action().state()) || prepared.invocation() != null || hostApprovalReceiptId == null) {
+                var own = prepared.invocation() == null || "AWAITING_APPROVAL".equals(prepared.invocation().state()) ? null : startMetadata(prepared.invocation(), prepared.budget());
+                if ("AWAITING_APPROVAL".equals(prepared.action().state()) && own == null) committed.onCommitted(ToolExecutionOutcome.Status.AWAITING_APPROVAL);
+                checkApprovedCall(entry); return approvedResult(prepared.action(), own);
+            }
+            var e0 = capabilities.current(request.binding(), request.descriptor()).orElseThrow(ToolInvocationRecorder::unavailableStart);
+            checkApprovedCall(entry);
+            if (!request.binding().equals(e0.reservation().binding())) throw unavailableStart();
+            Instant initialCall = earlier(earlier(entry.callDeadlineAt(), prepared.action().expiresAt()), e0.expiresAt()).truncatedTo(ChronoUnit.MICROS);
+            var callWindow = new AtomicReference<>(window(started, startedNanos, initialCall)); checkApprovedCall(callWindow.get());
+            var verification = new FixedToolApprovalVerifier.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), hostApprovalReceiptId, initialCall);
+            var own = verifier.withVerifiedApproval(verification, approval -> {
+                checkApprovedCall(callWindow.get());
+                if (approval == null || approval.tenantId() != request.binding().run().actor().tenantId()
+                        || !hostApprovalReceiptId.equals(approval.approval().approvalReceiptId())) throw unavailableStart();
+                approval.binding().requireApproved(request.action(), approval.approval(), clock.instant());
+                Instant bound = earlier(initialCall, approval.expiresAt()).truncatedTo(ChronoUnit.MICROS);
+                callWindow.set(window(started, startedNanos, bound)); checkApprovedCall(callWindow.get());
+                var business = new FixedBpmnStartToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), request.invocationId(), bound);
+                return transport.withVerifiedCall(business, (executor, operation) -> dispatchAndRecordApprovedStart(request, approval, e0,
+                        executor, operation, callWindow, observed, fact, committed));
+            });
+            if (observerFailure.get() != null) throw observerFailure.get();
+            checkApprovedCall(callWindow.get());
+            if (own != null && own.outcome() != null && (fact.get() == null || !own.outcome().equals(fact.get().outcome())
+                    || !own.invocationId().equals(fact.get().invocation().invocationId()))) throw unavailableStart();
+            return approvedResult(observed.get(), own);
+        } catch (FixedToolApprovalVerifier.Failure rejected) {
+            if (observerFailure.get() != null) throw observerFailure.get();
+            throw new FixedToolApprovalVerifier.Failure(rejected.kind());
+        } catch (FixedBpmnStartToolTransport.Failure rejected) {
+            if (observerFailure.get() != null) throw observerFailure.get();
+            throw new FixedBpmnStartToolTransport.Failure(rejected.kind());
+        } catch (AgentLedgerException rejected) {
+            if (observerFailure.get() != null) throw observerFailure.get();
+            throw new AgentLedgerException(rejected.code(), "Approved START invocation could not complete");
+        } catch (RuntimeException privateFailure) {
+            if (observerFailure.get() != null) throw observerFailure.get();
+            throw unavailableStart();
+        }
+    }
+
+    private WriteAttemptResultVO dispatchAndRecordApprovedStart(PreparationRequestVO request, FixedToolApprovalVerifier.ApprovedObservation approval,
+            ToolExecutionGrant.EvidenceVO e0, ReadOnlyDecisionToolTransport.VerifiedExecutor executor, FixedBpmnStartToolTransport.OneShotStart operation,
+            AtomicReference<DispatchWindowVO> callWindow, AtomicReference<ToolActionIntentStore.PreparedActionResult> observed,
+            AtomicReference<RecordedResultVO> fact, ToolCommittedFactObserver observer) {
+        if (executor == null || operation == null || executor.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(executor.actor().issuerFingerprint())
+                || executor.actor().tenantId() != request.binding().run().actor().tenantId()) throw unavailableStart();
+        checkApprovedCall(callWindow.get());
+        Instant authStarted = clock.instant(); long authNanos = nanoTime.getAsLong();
+        var e1 = capabilities.current(request.binding(), request.descriptor()).orElseThrow(ToolInvocationRecorder::unavailableStart);
+        checkApprovedCall(callWindow.get()); if (!e0.equals(e1)) throw unavailableStart();
+        Instant deadline = earlier(callWindow.get().callDeadlineAt(), executor.expiresAt()).truncatedTo(ChronoUnit.MICROS);
+        var original = callWindow.get(); callWindow.set(window(original.startedAt(), original.startedNanos(), deadline)); checkApprovedCall(callWindow.get());
+        var authorizationWindow = window(authStarted, authNanos, deadline); checkStart(authorizationWindow);
+        var expected = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(), request.descriptor().policy().bindingSha256(),
+                request.parametersSha256(), request.action().intentId(), deadline);
+        var checked = authorization.check(expected, ToolExecutionAuthorization.Boundary.DISPATCH);
+        if (checked == null || !expected.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.DISPATCH) throw unavailableStart();
+        if (checked.decision() == ToolExecutionAuthorization.Decision.DENY) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current approved START access was denied");
+        checkApprovedCall(callWindow.get()); checkStart(authorizationWindow);
+        String nonce = nonce();
+        var begin = preparations.consumeApprovalAndBeginDispatch(request, approval, e1, checked, executor, ToolInvocationStore.dispatchNonceSha256(nonce), authorizationWindow);
+        observed.set(begin.action());
+        if (!begin.started()) {
+            if ("AWAITING_APPROVAL".equals(begin.action().state()) && (begin.invocation() == null || "AWAITING_APPROVAL".equals(begin.invocation().state()))) {
+                observer.onCommitted(ToolExecutionOutcome.Status.AWAITING_APPROVAL); return null;
+            }
+            return begin.invocation() == null ? null : startMetadata(begin.invocation(), begin.budget());
+        }
+        boolean invoked = false; ToolExecutionOutcome outcome;
+        try {
+            checkApprovedCall(callWindow.get()); checkStart(authorizationWindow); invoked = true;
+            try { outcome = startObservation(request, operation.start(deadline)); }
+            catch (FixedBpmnStartToolTransport.Failure rejected) { outcome = startOperationFailure(rejected.kind()); }
+            catch (RuntimeException privateOperation) { outcome = outcome(ToolExecutionOutcome.Status.UNKNOWN, "OUTCOME_UNKNOWN"); }
+        } catch (RuntimeException notSent) {
+            outcome = outcome(invoked ? ToolExecutionOutcome.Status.UNKNOWN : ToolExecutionOutcome.Status.FAILED_KNOWN, invoked ? "OUTCOME_UNKNOWN" : "DISPATCH_NOT_SENT");
+        }
+        var completion = outcome;
+        var recorded = bookkeeping(() -> preparations.completeApprovedWrite(request, begin.attempt(), nonce, completion)); fact.set(recorded);
+        observer.onCommitted(recorded.outcome().status());
+        var metadata = recorded.invocation();
+        return new WriteAttemptResultVO(metadata.runId(), metadata.invocationId(), metadata.state(), metadata.revision(), metadata.dispatchEpoch(), metadata.dispatchedAt(), metadata.finishedAt(),
+                recorded.outcome(), invoked, account(request, recorded.budget()));
+    }
+
+    private void checkApprovedCall(DispatchWindowVO window) {
+        if (!verified.get()) throw unavailableStart();
+        if (Thread.currentThread().isInterrupted()) throw new FixedBpmnStartToolTransport.Failure(FixedBpmnStartToolTransport.FailureKind.CANCELLED);
+        if (!window.callDeadlineAt().isAfter(clock.instant()) || window.startedNanos() + Duration.between(window.startedAt(), window.callDeadlineAt()).toNanos() - nanoTime.getAsLong() <= 0)
+            throw new FixedBpmnStartToolTransport.Failure(FixedBpmnStartToolTransport.FailureKind.DEADLINE_EXCEEDED);
+    }
+
+    private static ApprovedStartResultVO approvedResult(ToolActionIntentStore.PreparedActionResult snapshot, WriteAttemptResultVO own) {
+        return new ApprovedStartResultVO(snapshot.intentId(), snapshot.state(), snapshot.revision(), own);
     }
 
     public IdempotentStartResultVO executeIdempotentStart(FixedBpmnStartToolTransport transport, PreparationRequestVO request) {
@@ -388,6 +525,17 @@ public final class ToolInvocationRecorder {
                     || operationInvoked && dispatchEpoch == 0 || outcome != null && (!outcome.status().name().equals(state) || outcome.businessReceiptId() != null || outcome.actualCost() == null || outcome.actualCost().compareTo(BigDecimal.ZERO) != 0)) throw invalid();
         }
         @Override public String toString() { return "ToolInvocationRecorder.RecordResult[redacted]"; }
+    }
+
+    public record ApprovedStartResultVO(String actionIntentId, String actionStateObserved, long actionRevisionObserved, WriteAttemptResultVO ownAttempt) {
+        public ApprovedStartResultVO {
+            try {
+                if (actionIntentId == null || !UUID.fromString(actionIntentId).toString().equals(actionIntentId)
+                        || !ToolActionIntentSql.STATES.contains(actionStateObserved) || actionRevisionObserved < 1
+                        || "AWAITING_APPROVAL".equals(actionStateObserved) && ownAttempt != null) throw invalidStart();
+            } catch (RuntimeException invalidValue) { throw invalidStart(); }
+        }
+        @Override public String toString() { return "ToolInvocationRecorder.ApprovedStartResultVO[redacted]"; }
     }
 
     public record IdempotentStartResultVO(String actionIntentId, String actionStateAtPreparation, long actionRevisionAtPreparation, WriteAttemptResultVO ownAttempt) {

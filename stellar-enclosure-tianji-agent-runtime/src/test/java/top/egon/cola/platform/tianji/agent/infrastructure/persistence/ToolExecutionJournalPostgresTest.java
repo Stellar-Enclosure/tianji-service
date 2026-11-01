@@ -12,6 +12,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
@@ -131,6 +132,89 @@ class ToolExecutionJournalPostgresTest {
         fixedStartRecording(source, jdbc, ledger, capabilities);
         knownStartResultAccess(source, jdbc, ledger, capabilities);
         approvedWriteJournal(source, jdbc, ledger, capabilities);
+        approvedStartRecording(source, jdbc, ledger, capabilities);
+    }
+
+    /** Controlled ports prove Recorder composition over the real journal; no IAM or Process HTTP call is made. */
+    private static void approvedStartRecording(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                               ToolCapabilityStore capabilities) {
+        var fixture = new ApprovalFixture(source, jdbc, ledger, capabilities);
+        var recorder = new ToolInvocationRecorder(source, ledger, fixture.store, capabilities, fixture.authority); recorder.verifyStorage();
+        var approvals = new ControlledApprovalVerifier(fixture); var transport = new ControlledApprovedStartTransport(jdbc);
+        var action = new ToolActionRequest(ACTOR, fixture.descriptor, "approved-recorder-" + UUID.randomUUID(), "business-v1", Map.of("amount", 20L));
+        var waiting = zeroCost(fixture.request(0, action)); var statuses = new ArrayList<ToolExecutionOutcome.Status>();
+        var first = recorder.executeApprovedStart(approvals, transport, waiting, "approval-" + UUID.randomUUID(), statuses::add);
+        assertEquals("AWAITING_APPROVAL", first.actionStateObserved()); assertNull(first.ownAttempt());
+        assertEquals(List.of(ToolExecutionOutcome.Status.AWAITING_APPROVAL), statuses); assertEquals(0, approvals.calls.get()); assertEquals(0, transport.calls.get());
+        assertEquals("SETTLED", startBudgetState(jdbc, waiting)); var oldWait = approvalInvocationFacts(jdbc, waiting);
+        var replay = recorder.executeApprovedStart(approvals, transport, waiting, null);
+        assertEquals("AWAITING_APPROVAL", replay.actionStateObserved()); assertNull(replay.ownAttempt()); assertEquals(oldWait, approvalInvocationFacts(jdbc, waiting));
+        assertEquals(0, approvals.calls.get()); assertEquals(0, transport.calls.get());
+
+        var fresh = zeroCost(fixture.request(1, action)); statuses.clear();
+        var completed = recorder.executeApprovedStart(approvals, transport, fresh, "approval-" + UUID.randomUUID(), statuses::add);
+        assertEquals("DISPATCHING", completed.actionStateObserved()); var own = completed.ownAttempt(); assertNotNull(own);
+        assertEquals("SUCCEEDED", own.state()); assertEquals(ToolExecutionOutcome.Status.SUCCEEDED, own.outcome().status());
+        assertEquals(BigDecimal.ZERO, own.outcome().actualCost()); assertEquals(ToolInvocationRecorder.AccountingState.SETTLED, own.accountingState());
+        assertEquals(List.of(ToolExecutionOutcome.Status.SUCCEEDED), statuses); assertEquals(1, approvals.calls.get()); assertEquals(1, transport.calls.get());
+        assertEquals(1, transport.boundedStarts.get()); assertEquals(0, transport.legacyStarts.get()); assertEquals("SETTLED", startBudgetState(jdbc, fresh));
+        assertEquals("APPLIED", approvedActionFacts(jdbc, action).get("state")); assertEquals("SUCCEEDED", invocationState(jdbc, fresh));
+        var counters = invocationCounters(jdbc, fresh.binding().run().runId());
+        var duplicate = recorder.executeApprovedStart(approvals, transport, fresh, "approval-" + UUID.randomUUID());
+        assertEquals("APPLIED", duplicate.actionStateObserved()); assertNotNull(duplicate.ownAttempt()); assertNull(duplicate.ownAttempt().outcome());
+        assertEquals(1, approvals.calls.get()); assertEquals(1, transport.calls.get()); assertEquals(counters, invocationCounters(jdbc, fresh.binding().run().runId()));
+
+        var maskedAction = new ToolActionRequest(ACTOR, fixture.descriptor, "approved-masked-" + UUID.randomUUID(), "business-v1", Map.of("amount", 20L));
+        var maskedWait = zeroCost(fixture.request(0, maskedAction)); recorder.executeApprovedStart(approvals, transport, maskedWait, null);
+        var masked = zeroCost(fixture.request(1, maskedAction)); var maskedApprovals = new ControlledApprovalVerifier(fixture); maskedApprovals.failAfterCallback = true;
+        var maskedTransport = new ControlledApprovedStartTransport(jdbc); var observed = new ArrayList<ToolExecutionOutcome.Status>();
+        var failure = assertThrows(FixedToolApprovalVerifier.Failure.class,
+                () -> recorder.executeApprovedStart(maskedApprovals, maskedTransport, masked, "approval-" + UUID.randomUUID(), observed::add));
+        assertEquals(FixedToolApprovalVerifier.FailureKind.APPROVAL_UNAVAILABLE, failure.kind()); assertEquals(List.of(ToolExecutionOutcome.Status.SUCCEEDED), observed);
+        assertEquals("APPLIED", approvedActionFacts(jdbc, maskedAction).get("state")); assertEquals("SUCCEEDED", invocationState(jdbc, masked));
+        assertEquals(1, maskedApprovals.calls.get()); assertEquals(1, maskedTransport.boundedStarts.get()); assertEquals(0, maskedTransport.legacyStarts.get());
+        var maskedFacts = approvalInvocationFacts(jdbc, masked); var maskedBudget = accessBudgetFacts(jdbc, masked.reservationId(), masked.binding().run().runId());
+        var metadata = recorder.executeApprovedStart(maskedApprovals, maskedTransport, masked, "approval-" + UUID.randomUUID());
+        assertNotNull(metadata.ownAttempt()); assertNull(metadata.ownAttempt().outcome()); assertEquals(maskedFacts, approvalInvocationFacts(jdbc, masked));
+        assertEquals(maskedBudget, accessBudgetFacts(jdbc, masked.reservationId(), masked.binding().run().runId()));
+        assertEquals(1, maskedApprovals.calls.get()); assertEquals(1, maskedTransport.boundedStarts.get());
+    }
+
+    private static ToolInvocationStore.PreparationRequestVO zeroCost(ToolInvocationStore.PreparationRequestVO request) {
+        return new ToolInvocationStore.PreparationRequestVO(request.binding(), request.lease(), request.descriptor(), request.arguments(), request.action(),
+                request.invocationId(), BigDecimal.ZERO, request.intentExpiry());
+    }
+
+    private static final class ControlledApprovalVerifier implements FixedToolApprovalVerifier {
+        final ApprovalFixture fixture;
+        final AtomicInteger calls = new AtomicInteger();
+        boolean failAfterCallback;
+        ControlledApprovalVerifier(ApprovalFixture fixture) { this.fixture = fixture; }
+        @Override public <T> T withVerifiedApproval(Request request, Callback<T> callback) {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); calls.incrementAndGet();
+            T value = callback.apply(fixture.observation(request.action(), request.approvalReceiptId(), Duration.ofSeconds(20)));
+            if (failAfterCallback) throw new Failure(FailureKind.APPROVAL_UNAVAILABLE); return value;
+        }
+    }
+
+    private static final class ControlledApprovedStartTransport implements FixedBpmnStartToolTransport {
+        final JdbcTemplate jdbc;
+        final AtomicInteger calls = new AtomicInteger(), boundedStarts = new AtomicInteger(), legacyStarts = new AtomicInteger();
+        ControlledApprovedStartTransport(JdbcTemplate jdbc) { this.jdbc = jdbc; }
+        @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); calls.incrementAndGet();
+            return callback.apply(new ReadOnlyDecisionToolTransport.VerifiedExecutor(EXECUTOR, request.deadlineAt()), new OneShotStart() {
+                @Override public StartObservation start() { legacyStarts.incrementAndGet(); throw new Failure(FailureKind.OPERATION_NOT_SENT); }
+                @Override public StartObservation start(Instant callDeadlineAt) {
+                    assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); boundedStarts.incrementAndGet();
+                    assertEquals(0, callDeadlineAt.getNano() % 1_000); assertFalse(callDeadlineAt.isAfter(request.deadlineAt()));
+                    var fact = jdbc.queryForMap("SELECT state,dispatch_not_after FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?",
+                            ACTOR.tenantId(), request.run().runId(), request.invocationId());
+                    assertEquals("DISPATCHING", fact.get("state")); assertEquals(callDeadlineAt, ((Timestamp) fact.get("dispatch_not_after")).toInstant());
+                    return new StartObservation("tianji:ps-start:v1:" + "a".repeat(64), "controlled-approved-start");
+                }
+            });
+        }
     }
 
     /** Controlled source projections exercise the real journal and constraints; no live approval or START endpoint is called. */

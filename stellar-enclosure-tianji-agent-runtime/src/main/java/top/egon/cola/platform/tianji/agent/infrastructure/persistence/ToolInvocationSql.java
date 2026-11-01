@@ -52,7 +52,7 @@ final class ToolInvocationSql {
         intents = new ToolActionIntentSql(source, ledger);
     }
 
-    enum Projection { LEGACY_PREPARATION, RECORDER_METADATA, IDEMPOTENT_WRITE_METADATA }
+    enum Projection { LEGACY_PREPARATION, RECORDER_METADATA, IDEMPOTENT_WRITE_METADATA, APPROVED_RECORDER_METADATA }
 
     WriteDispatchBeginResultVO beginIdempotentWriteDispatch(PreparationRequestVO request, RecorderPreparationVO expected, ToolExecutionGrant.EvidenceVO evidence,
             ToolExecutionAuthorization.AuditVO audit, VerifiedExecutor executor, String nonceSha256, ToolExecutionOutcome notDispatchedOutcome,
@@ -227,6 +227,11 @@ final class ToolInvocationSql {
         var existing = read(request, authorityDeadline, false);
         if (existing.isPresent()) {
             var stored = existing.orElseThrow();
+            if (projection == Projection.APPROVED_RECORDER_METADATA) {
+                if (stored.invocation().dispatchEpoch() > 0 && actionRow.dispatch() == null) throw conflict();
+                requireRun(request, authorityDeadline);
+                return new PreparedRowsVO(stored, projection(actionRow), false);
+            }
             if (Set.of("PREPARED", "AWAITING_APPROVAL").contains(stored.invocation().state())) {
                 if (projection != Projection.IDEMPOTENT_WRITE_METADATA || "PREPARED".equals(actionRow.state())) requirePreparationState(request, current, live, actionRow, stored);
             }
