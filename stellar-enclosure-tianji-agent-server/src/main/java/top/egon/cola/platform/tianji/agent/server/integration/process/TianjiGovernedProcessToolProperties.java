@@ -10,6 +10,8 @@ import org.springframework.context.EnvironmentAware;
 import org.springframework.core.env.Environment;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolBindings;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 
 import java.util.List;
@@ -19,11 +21,18 @@ import java.util.List;
 public record TianjiGovernedProcessToolProperties(boolean enabled, int concurrency,
         List<TianjiFixedDecisionToolBindings.BindingVO> decisionBindings,
         List<TianjiFixedBpmnStartToolBindings.BindingVO> startBindings,
-        List<TianjiFixedToolApprovalBindings.BindingVO> approvalBindings) implements EnvironmentAware {
+        List<TianjiFixedToolApprovalBindings.BindingVO> approvalBindings,
+        List<TianjiFixedReadOnlyMcpToolBindings.BindingVO> mcpBindings) implements EnvironmentAware {
     public TianjiGovernedProcessToolProperties(boolean enabled, int concurrency,
             List<TianjiFixedDecisionToolBindings.BindingVO> decisionBindings,
             List<TianjiFixedBpmnStartToolBindings.BindingVO> startBindings) {
-        this(enabled, concurrency, decisionBindings, startBindings, null);
+        this(enabled, concurrency, decisionBindings, startBindings, null, List.of());
+    }
+    public TianjiGovernedProcessToolProperties(boolean enabled, int concurrency,
+            List<TianjiFixedDecisionToolBindings.BindingVO> decisionBindings,
+            List<TianjiFixedBpmnStartToolBindings.BindingVO> startBindings,
+            List<TianjiFixedToolApprovalBindings.BindingVO> approvalBindings) {
+        this(enabled, concurrency, decisionBindings, startBindings, approvalBindings, List.of());
     }
     @ConstructorBinding
     public TianjiGovernedProcessToolProperties {
@@ -31,7 +40,8 @@ public record TianjiGovernedProcessToolProperties(boolean enabled, int concurren
         decisionBindings = decisionBindings == null ? List.of() : List.copyOf(decisionBindings);
         startBindings = startBindings == null ? List.of() : List.copyOf(startBindings);
         approvalBindings = approvalBindings == null ? List.of() : List.copyOf(approvalBindings);
-        if (concurrency < 1 || concurrency > 8 || decisionBindings.size() > 256 || startBindings.size() > 256 || approvalBindings.size() > 256
+        mcpBindings = mcpBindings == null ? List.of() : List.copyOf(mcpBindings);
+        if (concurrency < 1 || concurrency > 8 || decisionBindings.size() > 256 || startBindings.size() > 256 || approvalBindings.size() > 256 || mcpBindings.size() > 256
                 || enabled && (decisionBindings.isEmpty() || startBindings.isEmpty())) throw invalid();
     }
     @Override public void setEnvironment(Environment environment) {
@@ -67,6 +77,20 @@ public record TianjiGovernedProcessToolProperties(boolean enabled, int concurren
                 var expected = approvalBindings.get(index);
                 if (!expected.backend().equals(backend) || !expected.tool().equals(tool) || !expected.approval().equals(approval)
                         || !expected.approval().consumer().equals(consumer)) throw invalid();
+            }
+            for (int index = 0; index < mcpBindings.size(); index++) {
+                String prefix = "stellar.tianji.agent.tools.governed-process.mcp-bindings[" + index + ']';
+                var backend = binder.bind(prefix + ".backend", Bindable.of(TianjiFixedReadOnlyMcpToolBindings.BackendVO.class),
+                        new NoUnboundElementsBindHandler(BindHandler.DEFAULT)).orElseThrow(TianjiGovernedProcessToolProperties::invalid);
+                var tool = binder.bind(prefix + ".tool", Bindable.of(DefinitionResourceRef.class),
+                        new NoUnboundElementsBindHandler(BindHandler.DEFAULT)).orElseThrow(TianjiGovernedProcessToolProperties::invalid);
+                var input = binder.bind(prefix + ".backend.input-schema", Bindable.of(ToolSchema.class),
+                        new NoUnboundElementsBindHandler(BindHandler.DEFAULT)).orElseThrow(TianjiGovernedProcessToolProperties::invalid);
+                var output = binder.bind(prefix + ".backend.output-schema", Bindable.of(ToolSchema.class),
+                        new NoUnboundElementsBindHandler(BindHandler.DEFAULT)).orElseThrow(TianjiGovernedProcessToolProperties::invalid);
+                var expected = mcpBindings.get(index);
+                if (!expected.backend().equals(backend) || !expected.tool().equals(tool) || !expected.backend().inputSchema().equals(input)
+                        || !expected.backend().outputSchema().equals(output)) throw invalid();
             }
         } catch (RuntimeException privateConfiguration) { throw invalid(); }
     }

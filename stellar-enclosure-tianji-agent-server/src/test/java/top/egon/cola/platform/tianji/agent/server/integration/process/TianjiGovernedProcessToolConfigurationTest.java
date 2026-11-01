@@ -24,6 +24,9 @@ import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolBindings;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -74,6 +77,7 @@ import javax.sql.DataSource;
 import java.math.BigDecimal;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -112,6 +116,12 @@ class TianjiGovernedProcessToolConfigurationTest {
     private static final ToolDescriptor UNUSED_READ = tool("fixed.decision", 2, ToolPolicy.Risk.READ_ONLY, DecisionClient.EXECUTE_RESOURCE_KEY, DMN.bindingSha256());
     private static final ToolDescriptor UNUSED_START = tool("fixed.start", 2, ToolPolicy.Risk.IDEMPOTENT_WRITE, ProcessClient.START_RESOURCE_KEY, BPMN.bindingSha256());
     private static final List<ToolDescriptor> DESCRIPTORS = List.of(READ, START, QUERY, UNUSED_READ, UNUSED_START);
+    private static final TianjiFixedReadOnlyMcpToolBindings.BackendVO MCP_BACKEND = new TianjiFixedReadOnlyMcpToolBindings.BackendVO(20,
+            URI.create("https://mcp-idp.example/20"), URI.create("https://mcp.example/mcp"), URI.create("https://mcp.example/api"), "mcp-client", "mcp-service", "mcp-app", "platform", "agent", "test",
+            Set.of("catalog:read", "price:read"), "yuheng", "1.0", "catalog.read", TianjiFixedReadOnlyMcpToolBindings.remoteToolDocumentSha256(Map.of("name", "catalog.read", "inputSchema", Map.of("type", "object", "properties", Map.of("amount", Map.of("type", "integer")), "required", List.of("amount")))),
+            new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")), new ToolSchema(Map.of("value", ToolSchema.ValueType.STRING), Set.of("value")), true, Duration.ofSeconds(2));
+    private static final ToolDescriptor MCP = tool("fixed.mcp", 1, ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, MCP_BACKEND.bindingSha256());
+    private static final ToolDescriptor UNUSED_MCP = tool("fixed.mcp", 2, ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, MCP_BACKEND.bindingSha256());
     private final TianjiGovernedProcessToolConfiguration configuration = new TianjiGovernedProcessToolConfiguration();
 
     @Test void disabled_configuration_requires_no_dependencies_or_host_resolver() {
@@ -234,7 +244,7 @@ class TianjiGovernedProcessToolConfigurationTest {
             var order = inOrder(resolvers, telemetry); order.verify(resolvers).getObject(); order.verify(telemetry).getIfAvailable(); captured.set(invocation.arguments());
         })) {
             var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, decision, start, access, f.authority,
-                    f.decisions, f.starts, f.grants, resolvers, properties(), provider(null), provider(null), null, telemetry, environment());
+                    f.decisions, f.starts, provider(null), provider(null), f.grants, resolvers, properties(), provider(null), provider(null), null, telemetry, environment());
             assertSame(construction.constructed().getFirst(), bridge); var args = captured.get();
             assertSame(f.ledger, args.get(0)); assertSame(recorder, args.get(1)); assertSame(decision, args.get(2)); assertSame(start, args.get(3)); assertSame(access, args.get(4));
             assertEquals(Set.of(READ, START), Set.copyOf((List<?>) args.get(5))); assertSame(f.resolver, args.get(7));
@@ -253,7 +263,7 @@ class TianjiGovernedProcessToolConfigurationTest {
         AdkToolTelemetryPrivacy.requireSafe();
         try (var global = mockStatic(GlobalOpenTelemetry.class)) {
             var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, mock(TianjiFixedDecisionToolTransport.class),
-                    mock(TianjiFixedBpmnStartToolTransport.class), access, f.authority, f.decisions, f.starts, f.grants, provider(f.resolver), properties(), provider(null), provider(null), null, telemetry, environment());
+                    mock(TianjiFixedBpmnStartToolTransport.class), access, f.authority, f.decisions, f.starts, provider(null), provider(null), f.grants, provider(f.resolver), properties(), provider(null), provider(null), null, telemetry, environment());
             assertTrue(bridge.usesActionContextResolver(f.resolver)); verify(telemetry).getIfAvailable(); global.verifyNoInteractions();
         }
         f.noExternalCalls();
@@ -396,9 +406,9 @@ class TianjiGovernedProcessToolConfigurationTest {
         f.noExternalCalls(); verifyNoInteractions(f.source, f.issuers);
     }
 
-    @Test void thirteen_distinct_named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
+    @Test void fifteen_distinct_named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
         var methods = Arrays.stream(TianjiGovernedProcessToolConfiguration.class.getDeclaredMethods()).filter(method -> method.isAnnotationPresent(Bean.class)).toList();
-        assertEquals(13, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
+        assertEquals(15, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
             var bean = method.getAnnotation(Bean.class); return bean.value().length == 0 ? method.getName() : bean.value()[0];
         }).collect(java.util.stream.Collectors.toSet()));
         var bridge = methods.stream().filter(method -> method.getName().equals("tianjiAdkGovernedProcessTools")).findFirst().orElseThrow(); assertTrue(bridge.getAnnotation(Lazy.class).value());
@@ -406,7 +416,11 @@ class TianjiGovernedProcessToolConfigurationTest {
         var host = Arrays.stream(bridge.getParameters()).filter(value -> value.getParameterizedType().getTypeName().contains("StartActionContextResolver")).findFirst().orElseThrow(); assertEquals(HOST, host.getAnnotation(Qualifier.class).value());
         var verifier = methods.stream().filter(method -> method.getName().equals("tianjiGovernedProcessToolRuntimeChainVerifier")).findFirst().orElseThrow(); assertFalse(verifier.getAnnotation(Lazy.class).value());
         for (var method : methods) if (method.getReturnType() == HttpClient.class) assertEquals("shutdownNow", method.getAnnotation(Bean.class).destroyMethod());
-        else if (method.getReturnType() == TianjiFixedDecisionToolTransport.class || method.getReturnType() == TianjiFixedBpmnStartToolTransport.class || method.getReturnType() == TianjiFixedToolApprovalVerifier.class) assertEquals("close", method.getAnnotation(Bean.class).destroyMethod());
+        else if (method.getReturnType() == TianjiFixedDecisionToolTransport.class || method.getReturnType() == TianjiFixedBpmnStartToolTransport.class || method.getReturnType() == TianjiFixedToolApprovalVerifier.class || method.getReturnType() == TianjiFixedReadOnlyMcpToolTransport.class) assertEquals("close", method.getAnnotation(Bean.class).destroyMethod());
+        for (String name : List.of("tianjiGovernedProcessMcpBindings", "tianjiGovernedProcessMcpTransport")) assertTrue(methods.stream().filter(method -> method.getName().equals(name)).findFirst().orElseThrow().getAnnotation(Lazy.class).value());
+        var mcp = methods.stream().filter(method -> method.getName().equals("tianjiGovernedProcessMcpTransport")).findFirst().orElseThrow();
+        assertEquals(List.of("tianjiGovernedProcessMcpBindings", "idpServiceOAuth2Client", "tenantIssuerAuthenticationManagerComponent", "verifiedPrincipalConverter", "trustedIssuerRegistry", "tianjiGovernedProcessHttpClient"),
+                Arrays.stream(mcp.getParameters()).filter(parameter -> parameter.getType() == ObjectProvider.class).map(parameter -> parameter.getAnnotation(Qualifier.class).value()).toList());
         assertFalse(methods.stream().anyMatch(method -> method.getReturnType() == StartActionContextResolver.class));
     }
 
@@ -532,7 +546,7 @@ class TianjiGovernedProcessToolConfigurationTest {
         var recorder = mock(ToolInvocationRecorder.class); var access = mock(ToolResultAccessRecorder.class);
         when(recorder.usesLedger(f.ledger)).thenReturn(true); when(access.usesLedger(f.ledger)).thenReturn(true);
         var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, mock(TianjiFixedDecisionToolTransport.class), mock(TianjiFixedBpmnStartToolTransport.class), access,
-                unused, f.decisions, starts, grants, provider(f.resolver), properties(), verifiers, receipts, beans, provider((OpenTelemetry) null), environment());
+                unused, f.decisions, starts, provider(null), provider(null), grants, provider(f.resolver), properties(), verifiers, receipts, beans, provider((OpenTelemetry) null), environment());
         assertFalse(bridge.usesApprovalVerifier(f.verifier)); assertFalse(bridge.usesApprovalReceiptResolver(f.receipts));
         verifyNoInteractions(verifiers, receipts, beans, f.receipts); f.noExternalCalls();
     }
@@ -581,7 +595,187 @@ class TianjiGovernedProcessToolConfigurationTest {
         assertEquals(FixedToolApprovalVerifier.FailureKind.CANCELLED, failure.kind()); verify(f.oauth, never()).close(); f.noExternalCalls(); verifyNoInteractions(f.receipts);
     }
 
-    private static final class ApprovedFixture extends Fixture {
+    @Test void empty_mcp_factories_return_before_registry_transport_or_six_optional_provider_resolutions() {
+        var f = new Fixture(); var fixed = provider((TianjiFixedReadOnlyMcpToolBindings) null);
+        var oauth = provider(f.oauth); var authentication = provider(f.authentication); var converter = provider(f.converter); var issuers = provider(f.issuers); var http = provider(mock(HttpClient.class));
+        try (var bindings = mockConstruction(TianjiFixedReadOnlyMcpToolBindings.class); var transports = mockConstruction(TianjiFixedReadOnlyMcpToolTransport.class)) {
+            assertNull(configuration.tianjiGovernedProcessMcpBindings(f.authority, properties(), f.grants, environment()));
+            assertNull(configuration.tianjiGovernedProcessMcpTransport(properties(), fixed, oauth, authentication, converter, issuers, http, environment()));
+            assertTrue(bindings.constructed().isEmpty()); assertTrue(transports.constructed().isEmpty());
+        }
+        verifyNoInteractions(fixed, oauth, authentication, converter, issuers, http); f.noExternalCalls();
+    }
+
+    @Test void empty_mcp_bridge_and_eager_readiness_keep_both_optional_providers_unresolved() {
+        var f = new Chain();
+        try (var construction = mockConstruction(AdkGovernedProcessToolBridge.class)) {
+            configuration.tianjiAdkGovernedProcessTools(f.ledger, f.recorder, f.decision, f.start, f.access, f.authority, f.decisions, f.starts,
+                    f.optionalMcpBindings, f.optionalMcpTransports, f.grants, f.resolvers, properties(), provider(null), provider(null), null, provider((OpenTelemetry) null), environment());
+            assertEquals(1, construction.constructed().size());
+        }
+        assertDoesNotThrow(f.proof(configuration, environment())::afterSingletonsInstantiated);
+        verifyNoInteractions(f.optionalMcpBindings, f.optionalMcpTransports); f.noExternalCalls();
+    }
+
+    @Test void configured_mcp_factory_uses_the_exact_shared_identity_and_http_instances_without_startup_io() {
+        var f = new McpFixture(false); var http = mock(HttpClient.class);
+        when(http.followRedirects()).thenReturn(HttpClient.Redirect.NEVER); when(http.cookieHandler()).thenReturn(java.util.Optional.empty()); when(http.authenticator()).thenReturn(java.util.Optional.empty());
+        var bindings = configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, f.mcpProperties, f.mcpGrants, environment());
+        assertEquals(List.of(mcpProfile()), bindings.bindings());
+        try (var transport = configuration.tianjiGovernedProcessMcpTransport(f.mcpProperties, provider(bindings), provider(f.oauth), provider(f.authentication), provider(f.converter), provider(f.issuers), provider(http), environment())) {
+            assertTrue(transport.usesBindings(bindings)); assertTrue(transport.usesOAuth(f.oauth)); assertTrue(transport.usesAuthentication(f.authentication));
+            assertTrue(transport.usesConverter(f.converter)); assertTrue(transport.usesIssuerRegistry(f.issuers)); assertTrue(transport.usesHttpClient(http));
+        }
+        verify(http, never()).sendAsync(any(), org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<byte[]>>any()); verify(http, never()).close(); verify(http, never()).shutdownNow(); f.noExternalCalls();
+    }
+
+    @Test void mcp_union_chooses_the_new_constructor_and_keeps_the_full_authority_resolver_unfiltered() {
+        var f = new McpFixture(false); var recorder = mock(ToolInvocationRecorder.class); var access = mock(ToolResultAccessRecorder.class);
+        var decision = mock(TianjiFixedDecisionToolTransport.class); var start = mock(TianjiFixedBpmnStartToolTransport.class); var transport = mock(TianjiFixedReadOnlyMcpToolTransport.class);
+        var captured = new AtomicReference<List<?>>();
+        try (var construction = mockConstruction(AdkGovernedProcessToolBridge.class, (bridge, invocation) -> captured.set(invocation.arguments()))) {
+            configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, decision, start, access, f.mcpAuthority, f.decisions, f.starts,
+                    provider(f.mcpBindings), provider(transport), f.mcpGrants, provider(f.resolver), f.mcpProperties, provider(null), provider(null), null, provider((OpenTelemetry) null), environment());
+            assertEquals(1, construction.constructed().size()); var args = captured.get(); assertEquals(9, args.size());
+            assertSame(decision, args.get(2)); assertSame(transport, args.get(3)); assertSame(start, args.get(4)); assertSame(access, args.get(5));
+            assertEquals(Set.of(READ, START, MCP), Set.copyOf((List<?>) args.get(6))); assertSame(f.resolver, args.get(8));
+            @SuppressWarnings("unchecked") var resolver = (Function<AgentLedgerService.ExecutionMaterial, List<ToolExecutionGrant.BindingVO>>) args.get(7);
+            var material = material(List.of(READ, START, MCP, QUERY)); assertEquals(4, resolver.apply(material).size());
+            assertEquals(f.mcpGrants.resolve(material).stream().map(TianjiToolGrantBindings.ResolvedToolResult::binding).toList(), resolver.apply(material));
+        }
+        f.noExternalCalls();
+    }
+
+    @Test void actual_graph_supports_all_approval_mcp_combinations_under_normal_and_global_lazy_startup() {
+        for (boolean approved : List.of(false, true)) for (boolean mcp : List.of(false, true)) for (boolean lazy : List.of(false, true)) {
+            Fixture f = mcp ? new McpFixture(approved) : approved ? new ApprovedFixture() : new Fixture();
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+                var runner = f.runner(lazy, true, "stable");
+                if (!approved) runner = runner.withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class, () -> { throw new AssertionError("empty approval profiles resolved a receipt host"); }, definition -> definition.setLazyInit(true));
+                runner.run(context -> {
+                    assertNull(context.getStartupFailure()); var bridge = context.getBean("tianjiAdkGovernedProcessTools", AdkGovernedProcessToolBridge.class);
+                    var worker = context.getBean("tianjiAdkAgentRunExecutor", AdkAgentRunExecutor.class);
+                    assertTrue(worker.usesGovernedProcessTools(bridge)); assertTrue(worker.usesLedger(f.ledger)); assertTrue(worker.usesAuthorization(f.runAuthorization));
+                    assertTrue(bridge.usesRecorder(context.getBean("governedProcessToolInvocationRecorder", ToolInvocationRecorder.class)));
+                    assertTrue(bridge.usesDecisionTransport(context.getBean("tianjiGovernedProcessDecisionTransport", TianjiFixedDecisionToolTransport.class))); assertTrue(bridge.usesStartTransport(context.getBean("tianjiGovernedProcessStartTransport", TianjiFixedBpmnStartToolTransport.class)));
+                    assertTrue(bridge.usesResultAccessRecorder(context.getBean("governedProcessToolResultAccessRecorder", ToolResultAccessRecorder.class))); assertTrue(bridge.usesActionContextResolver(f.resolver));
+                    var transport = context.getBeanProvider(TianjiFixedReadOnlyMcpToolTransport.class).getIfAvailable(); var bindings = context.getBeanProvider(TianjiFixedReadOnlyMcpToolBindings.class).getIfAvailable();
+                    if (mcp) {
+                        assertNotNull(transport); assertNotNull(bindings); assertTrue(bridge.usesMcpTransport(transport)); assertTrue(transport.usesBindings(bindings));
+                        assertTrue(transport.usesOAuth(f.oauth)); assertTrue(transport.usesAuthentication(f.authentication)); assertTrue(transport.usesConverter(f.converter)); assertTrue(transport.usesIssuerRegistry(f.issuers));
+                        assertTrue(transport.usesHttpClient(context.getBean("tianjiGovernedProcessHttpClient", HttpClient.class)));
+                    } else { assertNull(transport); assertNull(bindings); assertFalse(bridge.usesMcpTransport(null)); }
+                    var approval = context.getBeanProvider(TianjiFixedToolApprovalVerifier.class).getIfAvailable(); assertEquals(approved, approval != null);
+                    if (approved) { assertTrue(bridge.usesApprovalVerifier(approval)); assertTrue(bridge.usesApprovalReceiptResolver(context.getBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class))); }
+                    else { assertFalse(bridge.usesApprovalVerifier(null)); assertFalse(bridge.usesApprovalReceiptResolver(null)); }
+                    assertEquals(3, storage.constructed().size());
+                });
+            }
+            f.noExternalCalls(); verifyNoInteractions(f.source, f.resolver);
+        }
+    }
+
+    @Test void mcp_slot_closure_is_required_at_all_four_boundaries_even_when_the_profile_list_is_empty() {
+        var f = new McpChain(); var empty = new TianjiGovernedProcessToolProperties(true, 2, List.of(decisionProfile()), List.of(startProfile()), List.of(), List.of());
+        var bindingProvider = provider(f.mcpBindings); var transportProvider = provider(f.mcp);
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessDecisionBindings(f.profiles.mcpAuthority, empty, f.profiles.mcpGrants, environment()));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.profiles.mcpAuthority, empty, f.profiles.mcpGrants, environment()));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiAdkGovernedProcessTools(f.ledger, f.recorder, f.decision, f.start, f.access, f.profiles.mcpAuthority,
+                f.decisions, f.starts, bindingProvider, transportProvider, f.profiles.mcpGrants, f.resolvers, empty, provider(null), provider(null), null, provider((OpenTelemetry) null), environment()));
+        assertThrows(IllegalStateException.class, () -> f.proof(configuration, environment(), empty).afterSingletonsInstantiated());
+        verifyNoInteractions(bindingProvider, transportProvider, f.bridges, f.executors, f.resolvers); f.noExternalCalls();
+    }
+
+    @Test void complete_mcp_profile_origin_and_full_tool_reference_are_closed_against_grants() {
+        var f = new McpFixture(false); var base = mapping(MCP);
+        var variants = List.of(new TianjiToolGrantBindings.BindingVO(21, ISSUER, base.principalType(), "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, "9".repeat(64), base.principalType(), "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.SERVICE, "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "other", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "assistant", 2, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "assistant", 1, "8".repeat(64), base.tool(), base.purpose(), base.authorizationResourceKey()), mapping(UNUSED_MCP));
+        for (var variant : variants) {
+            var rows = List.of(mapping(READ), mapping(START), mapping(QUERY), variant); TianjiToolGrantBindings grants;
+            if (!SHA.equals(variant.definitionSha256())) {
+                assertThrows(IllegalArgumentException.class, () -> new TianjiToolGrantBindings(f.mcpDescriptors, rows, RESOURCE, null));
+                // Exercise the AS boundary even though the grant registry rejects mixed hashes for this origin.
+                grants = mock(TianjiToolGrantBindings.class); when(grants.bindings()).thenReturn(rows);
+            } else grants = new TianjiToolGrantBindings(f.mcpDescriptors, rows, RESOURCE,
+                    variant.principalType() == TrustedAgentActor.SubjectType.SERVICE ? mock(TianjiServiceExecutionBindings.class) : null);
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, f.mcpProperties, grants, environment()));
+        }
+        var drift = new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "assistant", 1, SHA, new DefinitionResourceRef(MCP.key(), MCP.version(), "9".repeat(64)), base.purpose(), base.authorizationResourceKey());
+        var drifted = mock(TianjiToolGrantBindings.class); when(drifted.bindings()).thenReturn(List.of(mapping(READ), mapping(START), mapping(QUERY), drift));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, f.mcpProperties, drifted, environment()));
+        var duplicate = mock(TianjiToolGrantBindings.class); when(duplicate.bindings()).thenReturn(List.of(base, base));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, f.mcpProperties, duplicate, environment()));
+        var missing = new TianjiToolGrantBindings(f.mcpDescriptors, List.of(mapping(READ), mapping(START), mapping(QUERY)), RESOURCE, null);
+        var duplicateProfiles = new TianjiGovernedProcessToolProperties(true, 2, List.of(decisionProfile()), List.of(startProfile()), List.of(), List.of(mcpProfile(), mcpProfile()));
+        try (var construction = mockConstruction(TianjiFixedReadOnlyMcpToolBindings.class)) {
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, f.mcpProperties, missing, environment()));
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessMcpBindings(f.mcpAuthority, duplicateProfiles, f.mcpGrants, environment()));
+            assertTrue(construction.constructed().isEmpty());
+        }
+        f.noExternalCalls();
+    }
+
+    @Test void an_unreferenced_mcp_descriptor_does_not_construct_optional_profiles_or_transports() {
+        var f = new McpFixture(false);
+        var nearKey = tool("near.mcp", 1, ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY + ".other", "f".repeat(64));
+        var otherRisk = tool("write.mcp", 1, ToolPolicy.Risk.IDEMPOTENT_WRITE, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, "e".repeat(64));
+        var descriptors = java.util.stream.Stream.concat(f.mcpDescriptors.stream(), java.util.stream.Stream.of(nearKey, otherRisk)).toList();
+        var authority = new TianjiToolAuthorityProperties(true, Duration.ofSeconds(1), 2, descriptors, List.of(mapping(READ), mapping(START), mapping(QUERY), mapping(nearKey), mapping(otherRisk)));
+        var grants = new TianjiToolGrantBindings(descriptors, authority.bindings(), RESOURCE, null);
+        try (var bindings = mockConstruction(TianjiFixedReadOnlyMcpToolBindings.class)) {
+            assertNull(configuration.tianjiGovernedProcessMcpBindings(authority, properties(), grants, environment())); assertTrue(bindings.constructed().isEmpty());
+        }
+        f.noExternalCalls();
+    }
+
+    @Test void eager_readiness_rejects_all_six_mcp_affinity_breaks_and_the_actual_bridge_pointer() {
+        var mutations = List.<Consumer<McpChain>>of(c -> when(c.mcp.usesBindings(c.mcpBindings)).thenReturn(false), c -> when(c.mcp.usesOAuth(c.oauth)).thenReturn(false),
+                c -> when(c.mcp.usesAuthentication(c.authentication)).thenReturn(false), c -> when(c.mcp.usesConverter(c.converter)).thenReturn(false),
+                c -> when(c.mcp.usesIssuerRegistry(c.issuers)).thenReturn(false), c -> when(c.mcp.usesHttpClient(c.http)).thenReturn(false), c -> when(c.bridge.usesMcpTransport(c.mcp)).thenReturn(false));
+        var healthy = new McpChain(); assertDoesNotThrow(healthy.proof(configuration, environment())::afterSingletonsInstantiated);
+        for (var mutation : mutations) { var broken = new McpChain(); mutation.accept(broken); assertThrows(IllegalStateException.class, broken.proof(configuration, environment())::afterSingletonsInstantiated); broken.noExternalCalls(); }
+    }
+
+    @Test void configured_mcp_keeps_qualified_alias_and_invalid_host_resolver_semantics_under_global_lazy() {
+        for (String mode : List.of("qualified", "alias", "constant-prototype", "missing", "prototype", "ambiguous")) {
+            var f = new McpFixture(false);
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+                f.runner(true, true, mode).run(context -> {
+                    if (Set.of("qualified", "alias", "constant-prototype").contains(mode)) { assertNull(context.getStartupFailure(), mode); assertTrue(context.getBean(AdkGovernedProcessToolBridge.class).usesActionContextResolver(f.resolver)); }
+                    else assertNotNull(context.getStartupFailure(), mode);
+                });
+            }
+            f.noExternalCalls();
+        }
+    }
+
+    @Test void mcp_shutdown_closes_its_pool_and_the_single_owned_http_but_not_borrowed_iam() throws Exception {
+        var f = new McpFixture(false); var transport = new AtomicReference<TianjiFixedReadOnlyMcpToolTransport>(); var http = new AtomicReference<HttpClient>();
+        try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+            f.runner(true, true, "stable").run(context -> {
+                assertNull(context.getStartupFailure()); transport.set(context.getBean(TianjiFixedReadOnlyMcpToolTransport.class)); http.set(context.getBean("tianjiGovernedProcessHttpClient", HttpClient.class));
+                assertTrue(transport.get().usesHttpClient(http.get())); assertEquals(1, context.getBeansOfType(HttpClient.class).size());
+            });
+        }
+        assertTrue(http.get().awaitTermination(Duration.ofSeconds(2)));
+        var material = material(List.of(READ, START, MCP)); var lease = new AgentRunLease(material.run().runId(), "worker", 1, NOW.plusSeconds(30));
+        var request = new ReadOnlyMcpToolTransport.Request(material.authorization(), lease, MCP, Map.of("amount", 7L), UUID.randomUUID(), NOW.plusSeconds(20));
+        var failure = assertThrows(ReadOnlyMcpToolTransport.Failure.class, () -> transport.get().withVerifiedCall(request, (executor, operation) -> fail("closed MCP transport dispatched")));
+        assertEquals(ReadOnlyMcpToolTransport.FailureKind.CANCELLED, failure.kind()); f.noExternalCalls(); verifyNoInteractions(f.source, f.issuers);
+    }
+
+    @Test void base_yaml_keeps_optional_mcp_profiles_explicitly_empty_and_the_mode_disabled() throws Exception {
+        var resource = new org.springframework.core.io.ClassPathResource("application.yml");
+        try (var input = resource.getInputStream()) { assertTrue(new String(input.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).contains("mcp-bindings: []")); }
+        var source = new org.springframework.boot.env.YamlPropertySourceLoader().load("base", resource).getFirst();
+        assertEquals(Boolean.FALSE, source.getProperty(PREFIX + "enabled"));
+    }
+
+    private static class ApprovedFixture extends Fixture {
         final ToolDescriptor approved = new ToolDescriptor("approved.start", 1, "approved_start", "Fixed approved START", START.input(), START.output(),
                 new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "approved.start.action", ProcessClient.START_RESOURCE_KEY, BPMN.bindingSha256(), "approval-v1"));
         final List<ToolDescriptor> descriptors = java.util.stream.Stream.concat(DESCRIPTORS.stream(), java.util.stream.Stream.of(approved)).toList();
@@ -625,7 +819,7 @@ class TianjiGovernedProcessToolConfigurationTest {
             var recorder = mock(ToolInvocationRecorder.class); var access = mock(ToolResultAccessRecorder.class);
             when(recorder.usesLedger(ledger)).thenReturn(true); when(access.usesLedger(ledger)).thenReturn(true);
             return cfg.tianjiAdkGovernedProcessTools(ledger, recorder, mock(TianjiFixedDecisionToolTransport.class), mock(TianjiFixedBpmnStartToolTransport.class), access,
-                    aaAuthority, decisions, aaStarts, aaGrants, provider(resolver), properties, provider(verifier), receiptProvider, beans, provider((OpenTelemetry) null), environment());
+                    aaAuthority, decisions, aaStarts, provider(null), provider(null), aaGrants, provider(resolver), properties, provider(verifier), receiptProvider, beans, provider((OpenTelemetry) null), environment());
         }
         String[] extraValues() {
             var values = new ArrayList<String>();
@@ -640,6 +834,71 @@ class TianjiGovernedProcessToolConfigurationTest {
                     p+"approval.policy-ref="+policy.policyRef(),p+"approval.policy-binding-sha256="+policy.policyBindingSha256(),p+"approval.release-version="+policy.releaseVersion(),p+"approval.definition-key="+policy.definitionKey(),p+"approval.definition-sha256="+policy.definitionSha256(),p+"approval.task-definition-key="+policy.taskDefinitionKey()));
             return values.toArray(String[]::new);
         }
+    }
+
+    private static final class McpFixture extends ApprovedFixture {
+        final boolean withApproval;
+        final List<ToolDescriptor> mcpDescriptors;
+        final TianjiToolAuthorityProperties mcpAuthority;
+        final TianjiToolGrantBindings mcpGrants;
+        final TianjiGovernedProcessToolProperties mcpProperties;
+        final TianjiFixedReadOnlyMcpToolBindings mcpBindings;
+        McpFixture(boolean withApproval) {
+            this.withApproval = withApproval;
+            mcpDescriptors = java.util.stream.Stream.concat((withApproval ? descriptors : DESCRIPTORS).stream(), java.util.stream.Stream.of(MCP, UNUSED_MCP)).toList();
+            var mappings = new ArrayList<>((withApproval ? aaAuthority : authority).bindings()); mappings.add(mapping(MCP));
+            mcpAuthority = new TianjiToolAuthorityProperties(true, Duration.ofSeconds(1), 2, mcpDescriptors, mappings);
+            mcpGrants = new TianjiToolGrantBindings(mcpDescriptors, mappings, RESOURCE, null);
+            mcpProperties = new TianjiGovernedProcessToolProperties(true, 2, List.of(decisionProfile()), withApproval ? properties.startBindings() : List.of(startProfile()), withApproval ? List.of(approvalProfile) : List.of(), List.of(mcpProfile()));
+            mcpBindings = new TianjiFixedReadOnlyMcpToolBindings(mcpDescriptors, mcpProperties.mcpBindings()); when(authorization.usesBindings(mcpGrants)).thenReturn(true);
+        }
+        @Override ApplicationContextRunner dependencies(ApplicationContextRunner runner, boolean identity, String resolverMode) {
+            var configured = runner.withBean(DataSource.class, () -> source).withBean(AgentLedgerService.class, () -> ledger)
+                    .withBean("toolCapabilityStore", ToolCapabilityStore.class, () -> capabilities).withBean("tianjiToolGrantAuthorizer", TianjiToolGrantAuthorizer.class, () -> authorization)
+                    .withBean("tianjiExecutionGrantAuthorizer", TianjiExecutionGrantAuthorizer.class, () -> runAuthorization).withBean("tianjiToolGrantBindings", TianjiToolGrantBindings.class, () -> mcpGrants)
+                    .withInitializer(context -> { context.getBeanFactory().registerSingleton("fixtureToolAuthorityProperties", mcpAuthority); context.getBeanFactory().registerSingleton("idpServiceOAuth2Client", oauth); })
+                    .withBean("tenantIssuerAuthenticationManagerComponent", TenantIssuerAuthenticationManagerComponent.class, () -> authentication).withBean("trustedIssuerRegistry", TrustedIssuerRegistry.class, () -> issuers).withPropertyValues(mcpValues());
+            if (identity) configured = configured.withBean("verifiedPrincipalConverter", VerifiedPrincipalConverter.class, () -> converter);
+            if (resolverMode.equals("stable")) configured = configured.withBean(HOST, StartActionContextResolver.class, () -> resolver);
+            else if (resolverMode.equals("prototype")) configured = configured.withBean(HOST, StartActionContextResolver.class, () -> mock(StartActionContextResolver.class), definition -> definition.setScope("prototype"));
+            else if (resolverMode.equals("constant-prototype")) configured = configured.withBean(HOST, StartActionContextResolver.class, () -> resolver, definition -> definition.setScope("prototype"));
+            else if (resolverMode.equals("ambiguous")) for (String name : List.of("firstMcpHost", "secondMcpHost")) configured = configured.withBean(name, StartActionContextResolver.class, () -> mock(StartActionContextResolver.class), definition -> ((AbstractBeanDefinition) definition).addQualifier(new AutowireCandidateQualifier(Qualifier.class, HOST)));
+            else if (resolverMode.equals("qualified")) configured = configured.withBean("operatorMcpActionHost", StartActionContextResolver.class, () -> resolver, definition -> ((AbstractBeanDefinition) definition).addQualifier(new AutowireCandidateQualifier(Qualifier.class, HOST)));
+            else if (resolverMode.equals("alias")) configured = configured.withBean("operatorMcpActionHost", StartActionContextResolver.class, () -> resolver).withInitializer(context -> context.getBeanFactory().registerAlias("operatorMcpActionHost", HOST));
+            if (withApproval) configured = configured.withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class, () -> receipts);
+            return configured;
+        }
+        String[] mcpValues() {
+            var values = new ArrayList<String>(); if (withApproval) values.addAll(List.of(extraValues())); String p = PREFIX + "mcp-bindings[0].";
+            values.addAll(List.of(p+"tenant-id=20",p+"owner-issuer-fingerprint="+ISSUER,p+"principal-type=USER",p+"definition-key=assistant",p+"definition-version=1",p+"definition-content-sha256="+SHA,
+                    p+"tool.key="+MCP.key(),p+"tool.version=1",p+"tool.content-sha256="+MCP.reference().contentSha256(),
+                    p+"backend.tenant-id=20",p+"backend.issuer="+MCP_BACKEND.issuer(),p+"backend.endpoint="+MCP_BACKEND.endpoint(),p+"backend.resource-uri="+MCP_BACKEND.resourceUri(),
+                    p+"backend.registration-id="+MCP_BACKEND.registrationId(),p+"backend.expected-client-id="+MCP_BACKEND.expectedClientId(),p+"backend.expected-app-id="+MCP_BACKEND.expectedAppId(),
+                    p+"backend.expected-source-biz="+MCP_BACKEND.expectedSourceBiz(),p+"backend.expected-source-app="+MCP_BACKEND.expectedSourceApp(),p+"backend.expected-environment="+MCP_BACKEND.expectedEnvironment(),
+                    p+"backend.business-scopes[0]=catalog:read",p+"backend.business-scopes[1]=price:read",p+"backend.expected-server-name=yuheng",p+"backend.expected-server-version=1.0",p+"backend.remote-tool-name=catalog.read",
+                    p+"backend.remote-tool-document-sha256="+MCP_BACKEND.remoteToolDocumentSha256(),p+"backend.non-billable=true",p+"backend.timeout=2s",
+                    p+"backend.input-schema.fields.amount=INTEGER",p+"backend.input-schema.required[0]=amount",p+"backend.output-schema.fields.value=STRING",p+"backend.output-schema.required[0]=value"));
+            return values.toArray(String[]::new);
+        }
+    }
+
+    private static final class McpChain extends Chain {
+        final McpFixture profiles = new McpFixture(false);
+        final TianjiFixedReadOnlyMcpToolBindings mcpBindings = profiles.mcpBindings;
+        final TianjiFixedReadOnlyMcpToolTransport mcp = mock(TianjiFixedReadOnlyMcpToolTransport.class);
+        McpChain() {
+            when(authorization.usesBindings(profiles.mcpGrants)).thenReturn(true); when(mcp.usesBindings(mcpBindings)).thenReturn(true); when(mcp.usesOAuth(oauth)).thenReturn(true);
+            when(mcp.usesAuthentication(authentication)).thenReturn(true); when(mcp.usesConverter(converter)).thenReturn(true); when(mcp.usesIssuerRegistry(issuers)).thenReturn(true); when(mcp.usesHttpClient(http)).thenReturn(true); when(bridge.usesMcpTransport(mcp)).thenReturn(true);
+        }
+        @Override SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) { return proof(cfg, env, profiles.mcpProperties); }
+        SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env, TianjiGovernedProcessToolProperties properties) {
+            return cfg.tianjiGovernedProcessToolRuntimeChainVerifier(env, source, ledger, capabilities, authorization, profiles.mcpGrants, prep, recorder, accesses, access,
+                    decisions, starts, provider(mcpBindings), provider(mcp), http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
+                    profiles.mcpAuthority, properties, provider(null), provider(null), provider(null), null, runAuthorization);
+        }
+    }
+    private static TianjiFixedReadOnlyMcpToolBindings.BindingVO mcpProfile() {
+        return new TianjiFixedReadOnlyMcpToolBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, SHA, MCP.reference(), MCP_BACKEND);
     }
 
     private Object profileFactory(ToolDescriptor descriptor, TianjiToolAuthorityProperties authority, TianjiGovernedProcessToolProperties props, TianjiToolGrantBindings grants) {
@@ -692,6 +951,8 @@ class TianjiGovernedProcessToolConfigurationTest {
         final ToolInvocationStore prep = mock(ToolInvocationStore.class); final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
         final ToolResultAccessStore accesses = mock(ToolResultAccessStore.class); final ToolResultAccessRecorder access = mock(ToolResultAccessRecorder.class);
         final HttpClient http = mock(HttpClient.class); final TianjiFixedDecisionToolTransport decision = mock(TianjiFixedDecisionToolTransport.class); final TianjiFixedBpmnStartToolTransport start = mock(TianjiFixedBpmnStartToolTransport.class);
+        final ObjectProvider<TianjiFixedReadOnlyMcpToolBindings> optionalMcpBindings = provider(null);
+        final ObjectProvider<TianjiFixedReadOnlyMcpToolTransport> optionalMcpTransports = provider(null);
         final AdkGovernedProcessToolBridge bridge = mock(AdkGovernedProcessToolBridge.class); final AdkAgentRunExecutor worker = mock(AdkAgentRunExecutor.class);
         final ObjectProvider<AdkGovernedProcessToolBridge> bridges = provider(bridge); final ObjectProvider<AdkAgentRunExecutor> executors = provider(worker); final ObjectProvider<StartActionContextResolver> resolvers = provider(resolver);
         Chain() {
@@ -707,8 +968,8 @@ class TianjiGovernedProcessToolConfigurationTest {
         }
         SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
             return cfg.tianjiGovernedProcessToolRuntimeChainVerifier(env, source, ledger, capabilities, authorization, grants, prep, recorder, accesses, access,
-                    decisions, starts, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
-                    properties(), provider(null), provider(null), provider(null), null, runAuthorization);
+                    decisions, starts, optionalMcpBindings, optionalMcpTransports, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
+                    authority, properties(), provider(null), provider(null), provider(null), null, runAuthorization);
         }
         List<Executable> operations(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
             return List.of(() -> cfg.governedProcessToolInvocationStore(source, ledger, capabilities, authorization, env),
@@ -716,10 +977,12 @@ class TianjiGovernedProcessToolConfigurationTest {
                     () -> cfg.governedProcessToolResultAccessStore(source, ledger, capabilities, authorization, env),
                     () -> cfg.governedProcessToolResultAccessRecorder(accesses, ledger, env),
                     () -> cfg.tianjiGovernedProcessDecisionBindings(authority, properties(), grants, env), () -> cfg.tianjiGovernedProcessStartBindings(authority, properties(), grants, env),
+                    () -> cfg.tianjiGovernedProcessMcpBindings(authority, properties(), grants, env),
+                    () -> cfg.tianjiGovernedProcessMcpTransport(properties(), provider(null), provider(oauth), provider(authentication), provider(converter), provider(issuers), provider(http), env),
                     () -> cfg.tianjiGovernedProcessHttpClient(env).shutdownNow(),
                     () -> cfg.tianjiGovernedProcessDecisionTransport(decisions, oauth, authentication, converter, issuers, http, properties(), env).close(),
                     () -> cfg.tianjiGovernedProcessStartTransport(starts, oauth, authentication, converter, issuers, http, properties(), env).close(),
-                    () -> cfg.tianjiAdkGovernedProcessTools(ledger, recorder, decision, start, access, authority, decisions, starts, grants, resolvers, properties(), provider(null), provider(null), null, provider((OpenTelemetry) null), env),
+                    () -> cfg.tianjiAdkGovernedProcessTools(ledger, recorder, decision, start, access, authority, decisions, starts, provider(null), provider(null), grants, resolvers, properties(), provider(null), provider(null), null, provider((OpenTelemetry) null), env),
                     () -> cfg.tianjiGovernedProcessApprovalBindings(authority, properties(), grants, env),
                     () -> cfg.tianjiGovernedProcessApprovalVerifier(properties(), provider(null), provider(oauth), provider(authentication), provider(converter), provider(issuers), provider(http), env),
                     () -> proof(cfg, env).afterSingletonsInstantiated());
@@ -742,8 +1005,8 @@ class TianjiGovernedProcessToolConfigurationTest {
         }
         @Override SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
             return cfg.tianjiGovernedProcessToolRuntimeChainVerifier(env, source, ledger, capabilities, authorization, profiles.aaGrants, prep, recorder, accesses, access,
-                    decisions, profiles.aaStarts, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
-                    profiles.properties, provider(approvalBindings), provider(approvals), provider(receipts), beans, runAuthorization);
+                    decisions, profiles.aaStarts, provider(null), provider(null), http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
+                    profiles.aaAuthority, profiles.properties, provider(approvalBindings), provider(approvals), provider(receipts), beans, runAuthorization);
         }
     }
 
@@ -759,7 +1022,7 @@ class TianjiGovernedProcessToolConfigurationTest {
     private static List<String> prerequisites() { return List.of("api", "storage", "execution-grants", "execution-authorization", "runtime", "tools.authority"); }
     private static MockEnvironment environment() { var env = new MockEnvironment(); prerequisites().forEach(feature -> env.setProperty("stellar.tianji.agent." + feature + ".enabled", "true")); env.setProperty(PREFIX + "enabled", "true"); return env; }
     @SuppressWarnings("unchecked") private static <T> ObjectProvider<T> provider(T value) { var provider = (ObjectProvider<T>) mock(ObjectProvider.class); when(provider.getObject()).thenReturn(value); when(provider.getIfAvailable()).thenReturn(value); return provider; }
-    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessApprovalBindings", "tianjiGovernedProcessApprovalVerifier", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier"); }
+    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessApprovalBindings", "tianjiGovernedProcessApprovalVerifier", "tianjiGovernedProcessMcpBindings", "tianjiGovernedProcessMcpTransport", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier"); }
     private static String[] values() {
         var values = new ArrayList<String>(); prerequisites().forEach(feature -> values.add("stellar.tianji.agent." + feature + ".enabled=true"));
         values.add(PREFIX + "enabled=true"); values.add(PREFIX + "concurrency=2");

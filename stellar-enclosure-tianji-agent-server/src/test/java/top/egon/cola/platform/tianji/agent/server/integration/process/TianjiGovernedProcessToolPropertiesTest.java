@@ -3,30 +3,37 @@ package top.egon.cola.platform.tianji.agent.server.integration.process;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.BindException;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.util.TestPropertyValues;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.mock.env.MockEnvironment;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolBindings;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class TianjiGovernedProcessToolPropertiesTest {
     private static final String PREFIX = "stellar.tianji.agent.tools.governed-process.";
+    private static final String MCP_SCHEMA_SENTINEL = "MCP_SCHEMA_PRIVATE_SENTINEL";
     private static final Map<String, ProcessValueTypeEnum> INPUT = Map.of("amount", ProcessValueTypeEnum.INTEGER, "approved", ProcessValueTypeEnum.BOOLEAN, "note", ProcessValueTypeEnum.STRING);
     private static final TianjiFixedDecisionToolBindings.BackendVO DECISION = new TianjiFixedDecisionToolBindings.BackendVO(21,
             URI.create("https://idp.example/21"), URI.create("https://process.example/private-base"), URI.create("https://process.example/api/21"),
@@ -50,6 +57,14 @@ class TianjiGovernedProcessToolPropertiesTest {
     private static final TianjiFixedToolApprovalBindings.BindingVO APPROVAL_BINDING = new TianjiFixedToolApprovalBindings.BindingVO(21,
             APPROVAL_CONSUMER.issuerFingerprint(), TrustedAgentActor.SubjectType.USER, "review", 1, "d".repeat(64),
             new DefinitionResourceRef("process.approved", 1, "3".repeat(64)), APPROVAL, APPROVAL_BACKEND);
+    private static final ToolSchema MCP_INPUT = new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER, "approved", ToolSchema.ValueType.BOOLEAN, "note", ToolSchema.ValueType.STRING), Set.of("amount"));
+    private static final ToolSchema MCP_OUTPUT = new ToolSchema(Map.of("value", ToolSchema.ValueType.STRING), Set.of("value"));
+    private static final TianjiFixedReadOnlyMcpToolBindings.BackendVO MCP_BACKEND = new TianjiFixedReadOnlyMcpToolBindings.BackendVO(21,
+            URI.create("https://mcp-idp.example/21"), URI.create("https://mcp.example/mcp"), URI.create("https://mcp.example/api"),
+            "mcp-registration", "mcp-client", "mcp-app", "mcp-business", "mcp-source", "test", Set.of("catalog:read", "price:read"),
+            "yuheng", "1.0", "catalog.read", "9".repeat(64), MCP_INPUT, MCP_OUTPUT, true, Duration.ofMillis(750));
+    private static final TianjiFixedReadOnlyMcpToolBindings.BindingVO MCP_BINDING = new TianjiFixedReadOnlyMcpToolBindings.BindingVO(21,
+            "c".repeat(64), TrustedAgentActor.SubjectType.USER, "review", 1, "d".repeat(64), new DefinitionResourceRef("mcp.catalog", 1, "8".repeat(64)), MCP_BACKEND);
 
     @Test void absent_configuration_is_disabled_with_finite_defaults_and_empty_immutable_profiles() {
         var value = new TianjiGovernedProcessToolProperties(false, 0, null, null);
@@ -94,14 +109,15 @@ class TianjiGovernedProcessToolPropertiesTest {
         assertThrows(NullPointerException.class, () -> new TianjiGovernedProcessToolProperties(false, 4, List.of(), Collections.singletonList(null)));
     }
 
-    @Test void canonical_five_components_preserve_the_old_four_argument_constructor_and_copy_the_optional_approval_list() throws Exception {
-        assertEquals(List.of("enabled", "concurrency", "decisionBindings", "startBindings", "approvalBindings"),
+    @Test void canonical_six_components_preserve_the_old_four_and_five_argument_constructors_and_copy_the_optional_approval_list() throws Exception {
+        assertEquals(List.of("enabled", "concurrency", "decisionBindings", "startBindings", "approvalBindings", "mcpBindings"),
                 Arrays.stream(TianjiGovernedProcessToolProperties.class.getRecordComponents()).map(component -> component.getName()).toList());
         var old = new TianjiGovernedProcessToolProperties(true, 2, List.of(DECISION_BINDING), List.of(START_BINDING));
         var canonical = new TianjiGovernedProcessToolProperties(true, 2, List.of(DECISION_BINDING), List.of(START_BINDING), null);
         assertEquals(canonical, old); assertEquals(List.of(), old.approvalBindings());
         assertNotNull(TianjiGovernedProcessToolProperties.class.getDeclaredConstructor(boolean.class, int.class, List.class, List.class));
-        var bindingConstructor = TianjiGovernedProcessToolProperties.class.getDeclaredConstructor(boolean.class, int.class, List.class, List.class, List.class);
+        assertNull(TianjiGovernedProcessToolProperties.class.getDeclaredConstructor(boolean.class, int.class, List.class, List.class, List.class).getAnnotation(ConstructorBinding.class));
+        var bindingConstructor = TianjiGovernedProcessToolProperties.class.getDeclaredConstructor(boolean.class, int.class, List.class, List.class, List.class, List.class);
         assertNotNull(bindingConstructor.getAnnotation(ConstructorBinding.class));
         var approvals = new ArrayList<>(List.of(APPROVAL_BINDING));
         var copied = new TianjiGovernedProcessToolProperties(true, 2, List.of(DECISION_BINDING), List.of(START_BINDING), approvals); approvals.clear();
@@ -146,7 +162,7 @@ class TianjiGovernedProcessToolPropertiesTest {
     }
 
     @Test void root_schema_rejects_parallel_descriptor_identity_timeout_and_context_models() {
-        assertEquals(List.of("enabled", "concurrency", "decisionBindings", "startBindings", "approvalBindings"),
+        assertEquals(List.of("enabled", "concurrency", "decisionBindings", "startBindings", "approvalBindings", "mcpBindings"),
                 Arrays.stream(TianjiGovernedProcessToolProperties.class.getRecordComponents()).map(component -> component.getName()).toList());
         for (String unknown : List.of("unexpected=true", "timeout=PT5S", "descriptors[0].key=other", "tenant-id=21", "intent-ttl=PT1H",
                 "business-version=private-version", "resolver=private-resolver", "token=private-token")) {
@@ -249,6 +265,222 @@ class TianjiGovernedProcessToolPropertiesTest {
             assertNull(context.getStartupFailure());
             assertEquals(new TianjiGovernedProcessToolProperties(false, 0, null, null), context.getBean(TianjiGovernedProcessToolProperties.class));
         });
+    }
+
+    @Test void optional_mcp_list_has_immutable_empty_defaults_and_both_compatibility_constructors_remain() throws Exception {
+        var old4 = new TianjiGovernedProcessToolProperties(false, 0, null, null);
+        var old5 = new TianjiGovernedProcessToolProperties(false, 0, null, null, null);
+        var current = new TianjiGovernedProcessToolProperties(false, 0, null, null, null, null);
+        assertEquals(List.of(), current.mcpBindings()); assertEquals(current, old4); assertEquals(current, old5);
+        assertEquals(4, current.concurrency()); assertFalse(current.enabled());
+        assertNotNull(TianjiGovernedProcessToolProperties.class.getConstructor(boolean.class, int.class, List.class, List.class));
+        assertNotNull(TianjiGovernedProcessToolProperties.class.getConstructor(boolean.class, int.class, List.class, List.class, List.class));
+        assertNotNull(TianjiGovernedProcessToolProperties.class.getConstructor(boolean.class, int.class, List.class, List.class, List.class, List.class).getAnnotation(ConstructorBinding.class));
+        assertThrows(UnsupportedOperationException.class, () -> current.mcpBindings().add(MCP_BINDING));
+        runner().run(context -> { assertNull(context.getStartupFailure()); assertEquals(current, context.getBean(TianjiGovernedProcessToolProperties.class)); });
+    }
+
+    @Test void mcp_profiles_are_defensive_snapshots_reject_null_elements_and_have_an_independent_256_limit() {
+        var profiles = new ArrayList<>(List.of(MCP_BINDING));
+        var current = new TianjiGovernedProcessToolProperties(true, 2, List.of(DECISION_BINDING), List.of(START_BINDING), List.of(APPROVAL_BINDING), profiles);
+        profiles.clear(); assertEquals(List.of(MCP_BINDING), current.mcpBindings()); assertEquals(List.of(APPROVAL_BINDING), current.approvalBindings());
+        assertThrows(UnsupportedOperationException.class, () -> current.mcpBindings().clear());
+        assertThrows(NullPointerException.class, () -> new TianjiGovernedProcessToolProperties(false, 2, List.of(), List.of(), List.of(), Collections.singletonList(null)));
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGovernedProcessToolProperties(false, 2, List.of(), List.of(), List.of(), Collections.nCopies(257, MCP_BINDING)));
+        var bounded = new TianjiGovernedProcessToolProperties(true, 2, Collections.nCopies(256, DECISION_BINDING), Collections.nCopies(256, START_BINDING), Collections.nCopies(256, APPROVAL_BINDING), Collections.nCopies(256, MCP_BINDING));
+        assertEquals(256, bounded.mcpBindings().size()); assertEquals(256, bounded.approvalBindings().size());
+    }
+
+    @Test void optional_mcp_does_not_create_a_new_mode_or_replace_required_decision_and_start_profiles() {
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGovernedProcessToolProperties(true, 2, List.of(), List.of(), List.of(), List.of(MCP_BINDING)));
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGovernedProcessToolProperties(true, 2, List.of(DECISION_BINDING), List.of(), List.of(), List.of(MCP_BINDING)));
+        assertThrows(IllegalArgumentException.class, () -> new TianjiGovernedProcessToolProperties(true, 2, List.of(), List.of(START_BINDING), List.of(), List.of(MCP_BINDING)));
+        for (int concurrency : new int[]{-1, 9}) assertThrows(IllegalArgumentException.class, () -> new TianjiGovernedProcessToolProperties(false, concurrency, List.of(), List.of(), List.of(), List.of(MCP_BINDING)));
+        assertEquals(4, new TianjiGovernedProcessToolProperties(false, 0, List.of(), List.of(), List.of(), List.of(MCP_BINDING)).concurrency());
+    }
+
+    @Test void actual_binding_reuses_all_nineteen_mcp_backend_fields_the_local_schemas_and_complete_origin_tool_reference() {
+        runner().withPropertyValues(mcpValues(false)).run(context -> {
+            assertNull(context.getStartupFailure()); var value = context.getBean(TianjiGovernedProcessToolProperties.class);
+            assertEquals(List.of(MCP_BINDING), value.mcpBindings()); var binding = value.mcpBindings().getFirst();
+            assertEquals(MCP_BACKEND, binding.backend()); assertEquals(MCP_INPUT, binding.backend().inputSchema()); assertEquals(MCP_OUTPUT, binding.backend().outputSchema());
+            assertEquals(MCP_BACKEND.bindingSha256(), binding.backend().bindingSha256()); assertEquals(MCP_BINDING.tool(), binding.tool());
+            assertEquals(21, binding.tenantId()); assertEquals("c".repeat(64), binding.ownerIssuerFingerprint()); assertEquals(TrustedAgentActor.SubjectType.USER, binding.principalType());
+            assertEquals("review", binding.definitionKey()); assertEquals(1, binding.definitionVersion()); assertEquals("d".repeat(64), binding.definitionContentSha256());
+            assertEquals(Boolean.TRUE, binding.backend().nonBillable());
+            assertThrows(UnsupportedOperationException.class, () -> value.mcpBindings().clear());
+            assertThrows(UnsupportedOperationException.class, () -> binding.backend().businessScopes().clear());
+            assertThrows(UnsupportedOperationException.class, () -> binding.backend().inputSchema().fields().clear());
+            assertThrows(UnsupportedOperationException.class, () -> binding.backend().inputSchema().required().clear());
+        });
+    }
+
+    @Test void every_mcp_index_closes_binding_backend_tool_and_both_schema_record_roots() {
+        runner().withPropertyValues(mcpValues(true)).run(context -> { assertNull(context.getStartupFailure()); assertEquals(List.of(MCP_BINDING, MCP_BINDING), context.getBean(TianjiGovernedProcessToolProperties.class).mcpBindings()); });
+        for (int index : new int[]{0, 1}) for (String suffix : List.of("unexpected", "backend.unexpected", "tool.unexpected", "backend.input-schema.unexpected", "backend.output-schema.unexpected",
+                "backend.input-schema.fields.amount.unexpected", "backend.output-schema.fields.value.unexpected")) {
+            String unknown = PREFIX + "mcp-bindings[" + index + "]." + suffix + '=' + MCP_SCHEMA_SENTINEL;
+            runner().withPropertyValues(mcpValues(true)).withPropertyValues(unknown).run(context -> {
+                var failure = context.getStartupFailure(); assertNotNull(failure, index + ":" + suffix);
+                if (index == 1 && suffix.equals("backend.unexpected")) {
+                    var deepest = failure; while (deepest.getCause() != null) deepest = deepest.getCause();
+                    assertEquals("TIANJI_GOVERNED_PROCESS_TOOL_CONFIGURATION_INVALID", deepest.getMessage()); assertNoMcpSchemaSentinel(failure);
+                }
+            });
+        }
+    }
+
+    @Test void mcp_profile_binding_accepts_standard_relaxed_spellings_without_introducing_new_semantic_aliases() {
+        var aliases = Arrays.stream(mcpValues(true)).map(value -> value.replace("mcp-bindings", "mcpBindings").replace("owner-issuer-fingerprint", "ownerIssuerFingerprint")
+                .replace("expected-client-id", "expectedClientId").replace("expected-server-version", "expectedServerVersion").replace("input-schema", "inputSchema").replace("output-schema", "outputSchema")).toArray(String[]::new);
+        runner().withPropertyValues(aliases).run(context -> { assertNull(context.getStartupFailure()); assertEquals(List.of(MCP_BINDING, MCP_BINDING), context.getBean(TianjiGovernedProcessToolProperties.class).mcpBindings()); });
+        for (String unknown : List.of("mcp-profiles[0].tenant-id=21", "mcp-binding[0].tenant-id=21")) {
+            runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + unknown).run(context -> assertNotNull(context.getStartupFailure(), unknown));
+        }
+    }
+
+    @Test void fixed_mcp_mode_protocol_limits_and_arbitrary_headers_are_not_operator_profile_fields() {
+        for (int index : new int[]{0, 1}) for (String field : List.of("transport-mode", "protocol-version", "max-response-bytes", "max-json-depth", "headers.authorization", "headers.cookie", "client-secret", "token", "server-version")) {
+            runner().withPropertyValues(mcpValues(true)).withPropertyValues(PREFIX + "mcp-bindings[" + index + "].backend." + field + "=private-pseudo-value")
+                    .run(context -> assertNotNull(context.getStartupFailure(), field));
+        }
+    }
+
+    @Test void mcp_non_billable_must_be_explicit_true_and_identity_scopes_cannot_replace_business_scopes() {
+        runner().withPropertyValues(withoutMcpField("backend.non-billable")).run(context -> assertNotNull(context.getStartupFailure()));
+        runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "mcp-bindings[0].backend.non-billable=false").run(context -> assertNotNull(context.getStartupFailure()));
+        for (String scope : List.of("openid", "profile", "email", "phone", "address", "offline_access")) {
+            runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "mcp-bindings[0].backend.business-scopes[0]=" + scope).run(context -> assertNotNull(context.getStartupFailure(), scope));
+        }
+    }
+
+    @Test void mcp_metadata_origin_uri_schema_and_timing_guards_are_preserved_by_real_binder() {
+        for (String malformed : List.of("tenant-id=22", "owner-issuer-fingerprint=LEGACY", "principal-type=UNKNOWN", "definition-version=0", "definition-content-sha256=bad", "tool.key=bad/tool", "tool.version=0", "tool.content-sha256=bad",
+                "backend.tenant-id=22", "backend.registration-id=", "backend.expected-client-id=", "backend.expected-app-id=", "backend.expected-source-biz=", "backend.expected-source-app=", "backend.expected-environment=",
+                "backend.issuer=http://mcp-idp.example/21", "backend.endpoint=http://mcp.example/mcp", "backend.endpoint=https://mcp.example/mcp?token=private",
+                "backend.resource-uri=http://mcp.example/api", "backend.expected-server-name=", "backend.expected-server-version=", "backend.remote-tool-name=bad/tool", "backend.remote-tool-document-sha256=BAD",
+                "backend.input-schema.fields.amount=NUMBER", "backend.input-schema.required[0]=unknown", "backend.output-schema.fields.value=ARRAY", "backend.timeout=99ms", "backend.timeout=PT30.000000001S")) {
+            runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "mcp-bindings[0]." + malformed).run(context -> assertNotNull(context.getStartupFailure(), malformed));
+        }
+        for (String timeout : List.of("100ms", "PT30S")) runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "mcp-bindings[0].backend.timeout=" + timeout).run(context -> assertNull(context.getStartupFailure(), timeout));
+        runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "mcp-bindings[0].backend.endpoint=http://127.0.0.1:8123/mcp").run(context -> assertNull(context.getStartupFailure()));
+    }
+
+    @Test void configured_mcp_profiles_remain_strict_and_redacted_when_the_mode_is_disabled() {
+        runner().withPropertyValues(mcpValues(false)).withPropertyValues(PREFIX + "enabled=false").run(context -> {
+            assertNull(context.getStartupFailure()); var value = context.getBean(TianjiGovernedProcessToolProperties.class);
+            assertFalse(value.enabled()); assertEquals(List.of(MCP_BINDING), value.mcpBindings()); assertEquals("TianjiGovernedProcessToolProperties[redacted]", value.toString());
+            for (String privateValue : List.of("mcp-registration", "mcp-client", "mcp-app", "catalog.read", "review", "9".repeat(64))) assertFalse(value.toString().contains(privateValue));
+        });
+        for (String suffix : List.of("backend.unexpected", "tool.unexpected", "backend.input-schema.unexpected", "backend.output-schema.unexpected")) {
+            runner().withPropertyValues(mcpValues(true)).withPropertyValues(PREFIX + "enabled=false", PREFIX + "mcp-bindings[1]." + suffix + "=private-disabled-value").run(context -> assertNotNull(context.getStartupFailure(), suffix));
+        }
+    }
+
+    @Test void in_memory_yaml_represents_empty_input_and_output_schemas_without_global_tool_schema_normalization() throws Exception {
+        yamlMcp("empty", "empty").run(context -> {
+            assertNull(context.getStartupFailure()); var backend = context.getBean(TianjiGovernedProcessToolProperties.class).mcpBindings().getFirst().backend();
+            assertEquals(new ToolSchema(Map.of(), Set.of()), backend.inputSchema()); assertEquals(new ToolSchema(Map.of(), Set.of()), backend.outputSchema());
+        });
+        for (String empty : List.of("input", "output")) yamlMcp(empty.equals("input") ? "empty" : "nonempty", empty.equals("output") ? "empty" : "nonempty").run(context -> {
+            assertNull(context.getStartupFailure()); var backend = context.getBean(TianjiGovernedProcessToolProperties.class).mcpBindings().getFirst().backend();
+            assertEquals(empty.equals("input"), backend.inputSchema().fields().isEmpty()); assertEquals(empty.equals("output"), backend.outputSchema().fields().isEmpty());
+        });
+    }
+
+    @Test void in_memory_yaml_preserves_explicit_empty_required_sets_for_optional_primitive_fields() throws Exception {
+        yamlMcp("optional", "optional").run(context -> {
+            assertNull(context.getStartupFailure()); var backend = context.getBean(TianjiGovernedProcessToolProperties.class).mcpBindings().getFirst().backend();
+            assertEquals(new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of()), backend.inputSchema());
+            assertEquals(new ToolSchema(Map.of("value", ToolSchema.ValueType.STRING), Set.of()), backend.outputSchema());
+        });
+    }
+
+    @Test void actual_yaml_binding_rejects_omitted_bare_and_incomplete_tool_schema_records() throws Exception {
+        for (String malformed : List.of("omitted", "bare", "fields-only", "required-only")) {
+            yamlMcp(malformed, "empty").run(context -> assertInitialMcpSchemaBindingRejected(context.getStartupFailure()));
+            yamlMcp("empty", malformed).run(context -> assertInitialMcpSchemaBindingRejected(context.getStartupFailure()));
+        }
+    }
+
+    private static String[] mcpValues(boolean secondIndex) {
+        var values = new ArrayList<>(Arrays.asList(values(false)));
+        for (int index = 0; index < (secondIndex ? 2 : 1); index++) appendMcpBinding(values, index);
+        return values.toArray(String[]::new);
+    }
+    private static String[] withoutMcpField(String field) {
+        String key = PREFIX + "mcp-bindings[0]." + field + '=';
+        return Arrays.stream(mcpValues(false)).filter(value -> !value.startsWith(key)).toArray(String[]::new);
+    }
+    private static void appendMcpBinding(List<String> values, int index) {
+        String p = PREFIX + "mcp-bindings[" + index + "].";
+        values.addAll(List.of(p + "tenant-id=21", p + "owner-issuer-fingerprint=" + "c".repeat(64), p + "principal-type=USER", p + "definition-key=review", p + "definition-version=1", p + "definition-content-sha256=" + "d".repeat(64),
+                p + "tool.key=mcp.catalog", p + "tool.version=1", p + "tool.content-sha256=" + "8".repeat(64),
+                p + "backend.tenant-id=21", p + "backend.issuer=https://mcp-idp.example/21", p + "backend.endpoint=https://mcp.example/mcp", p + "backend.resource-uri=https://mcp.example/api",
+                p + "backend.registration-id=mcp-registration", p + "backend.expected-client-id=mcp-client", p + "backend.expected-app-id=mcp-app", p + "backend.expected-source-biz=mcp-business", p + "backend.expected-source-app=mcp-source", p + "backend.expected-environment=test",
+                p + "backend.business-scopes[0]=catalog:read", p + "backend.business-scopes[1]=price:read", p + "backend.expected-server-name=yuheng", p + "backend.expected-server-version=1.0", p + "backend.remote-tool-name=catalog.read", p + "backend.remote-tool-document-sha256=" + "9".repeat(64),
+                p + "backend.input-schema.fields.amount=INTEGER", p + "backend.input-schema.fields.approved=BOOLEAN", p + "backend.input-schema.fields.note=STRING", p + "backend.input-schema.required[0]=amount",
+                p + "backend.output-schema.fields.value=STRING", p + "backend.output-schema.required[0]=value", p + "backend.non-billable=true", p + "backend.timeout=750ms"));
+    }
+    private static ApplicationContextRunner yamlMcp(String input, String output) throws Exception {
+        String yaml = """
+                stellar:
+                  tianji:
+                    agent:
+                      tools:
+                        governed-process:
+                          mcp-bindings:
+                            - tenant-id: 21
+                              owner-issuer-fingerprint: "%s"
+                              principal-type: USER
+                              definition-key: review
+                              definition-version: 1
+                              definition-content-sha256: "%s"
+                              tool:
+                                key: mcp.catalog
+                                version: 1
+                                content-sha256: "%s"
+                              backend:
+                                tenant-id: 21
+                                issuer: https://mcp-idp.example/21
+                                endpoint: https://mcp.example/mcp
+                                resource-uri: https://mcp.example/api
+                                registration-id: MCP_SCHEMA_PRIVATE_SENTINEL
+                                expected-client-id: mcp-client
+                                expected-app-id: mcp-app
+                                expected-source-biz: mcp-business
+                                expected-source-app: mcp-source
+                                expected-environment: test
+                                business-scopes: [catalog:read, price:read]
+                                expected-server-name: yuheng
+                                expected-server-version: "1.0"
+                                remote-tool-name: catalog.read
+                                remote-tool-document-sha256: "%s"
+                %s%s                non-billable: true
+                                timeout: 750ms
+                """.formatted("c".repeat(64), "d".repeat(64), "8".repeat(64), "9".repeat(64), yamlSchema("input-schema", input), yamlSchema("output-schema", output));
+        var sources = new YamlPropertySourceLoader().load("mcp-memory", new ByteArrayResource(yaml.getBytes(StandardCharsets.UTF_8)));
+        return runner().withPropertyValues(values(false)).withInitializer(context -> sources.forEach(source -> context.getEnvironment().getPropertySources().addFirst(source)));
+    }
+    private static String yamlSchema(String key, String variant) {
+        if (variant.equals("omitted")) return "";
+        if (variant.equals("bare")) return "                " + key + ": {}\n";
+        if (variant.equals("empty")) return "                " + key + ":\n                  fields: {}\n                  required: []\n";
+        if (variant.equals("required-only")) return "                " + key + ":\n                  required: []\n";
+        String field = key.equals("input-schema") ? "amount: INTEGER" : "value: STRING";
+        String result = "                " + key + ":\n                  fields:\n                    " + field + '\n';
+        if (!variant.equals("fields-only")) result += variant.equals("optional") ? "                  required: []\n" : "                  required: [" + (key.equals("input-schema") ? "amount" : "value") + "]\n";
+        return result;
+    }
+    private static void assertInitialMcpSchemaBindingRejected(Throwable failure) {
+        assertNotNull(failure); boolean bindingFailure = false;
+        for (var cause = failure; cause != null; cause = cause.getCause()) if (cause instanceof BindException) bindingFailure = true;
+        assertTrue(bindingFailure, "Malformed schema must fail during property binding"); assertNoMcpSchemaSentinel(failure);
+    }
+    private static void assertNoMcpSchemaSentinel(Throwable failure) {
+        assertFalse(String.valueOf(failure.getMessage()).contains(MCP_SCHEMA_SENTINEL));
+        if (failure.getCause() != null) assertNoMcpSchemaSentinel(failure.getCause());
+        for (var suppressed : failure.getSuppressed()) assertNoMcpSchemaSentinel(suppressed);
     }
 
     private static ApplicationContextRunner runner() { return new ApplicationContextRunner().withUserConfiguration(PropertiesConfiguration.class); }

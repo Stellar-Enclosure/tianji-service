@@ -57,6 +57,7 @@ stellar:
           decision-bindings: []
           start-bindings: []
           approval-bindings: []
+          mcp-bindings: []
       memory:
         enabled: false
         extraction:

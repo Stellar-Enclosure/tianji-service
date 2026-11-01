@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.core.env.Environment;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
@@ -25,6 +26,8 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvoca
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessRecorder;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolBindings;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantAuthorizer;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiToolAuthorityProperties;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiToolGrantAuthorizer;
@@ -47,7 +50,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Explicit host assembly for governed fixed Decision and approved or idempotent BPMN START tools. */
+/** Explicit host assembly for governed fixed Decision, MCP and approved or idempotent BPMN START tools. */
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.tools.governed-process", name = "enabled", havingValue = "true")
 @EnableConfigurationProperties(TianjiGovernedProcessToolProperties.class)
@@ -92,6 +95,7 @@ public class TianjiGovernedProcessToolConfiguration {
         requirePrerequisites(environment);
         try {
             if (!authority.enabled() || !properties.enabled()) throw unavailable();
+            requireMcpSlots(authority, properties, grants);
             var fixed = new TianjiFixedDecisionToolBindings(authority.descriptors(), properties.decisionBindings());
             var expected = expectedSlots(authority, grants, ToolPolicy.Risk.READ_ONLY, DecisionClient.EXECUTE_RESOURCE_KEY);
             var configured = new HashSet<List<Object>>();
@@ -156,6 +160,38 @@ public class TianjiGovernedProcessToolConfiguration {
         } catch (RuntimeException privateConfiguration) { throw unavailable(); }
     }
 
+    @Bean("tianjiGovernedProcessMcpBindings")
+    @Lazy
+    TianjiFixedReadOnlyMcpToolBindings tianjiGovernedProcessMcpBindings(TianjiToolAuthorityProperties authority,
+            TianjiGovernedProcessToolProperties properties,
+            @Qualifier("tianjiToolGrantBindings") TianjiToolGrantBindings grants, Environment environment) {
+        requirePrerequisites(environment);
+        try {
+            if (!authority.enabled() || !properties.enabled()) throw unavailable();
+            requireMcpSlots(authority, properties, grants);
+            if (properties.mcpBindings().isEmpty()) return null;
+            return new TianjiFixedReadOnlyMcpToolBindings(authority.descriptors(), properties.mcpBindings());
+        } catch (RuntimeException privateConfiguration) { throw unavailable(); }
+    }
+
+    @Bean(name = "tianjiGovernedProcessMcpTransport", destroyMethod = "close")
+    @Lazy
+    TianjiFixedReadOnlyMcpToolTransport tianjiGovernedProcessMcpTransport(TianjiGovernedProcessToolProperties properties,
+            @Qualifier("tianjiGovernedProcessMcpBindings") ObjectProvider<TianjiFixedReadOnlyMcpToolBindings> bindings,
+            @Qualifier("idpServiceOAuth2Client") ObjectProvider<IdpServiceOAuth2Client> oauth,
+            @Qualifier("tenantIssuerAuthenticationManagerComponent") ObjectProvider<TenantIssuerAuthenticationManagerComponent> authentication,
+            @Qualifier("verifiedPrincipalConverter") ObjectProvider<VerifiedPrincipalConverter> converter,
+            @Qualifier("trustedIssuerRegistry") ObjectProvider<TrustedIssuerRegistry> issuers,
+            @Qualifier("tianjiGovernedProcessHttpClient") ObjectProvider<HttpClient> http, Environment environment) {
+        requirePrerequisites(environment);
+        try {
+            if (!properties.enabled()) throw unavailable();
+            if (properties.mcpBindings().isEmpty()) return null;
+            return new TianjiFixedReadOnlyMcpToolTransport(bindings.getObject(), oauth.getObject(), authentication.getObject(),
+                    converter.getObject(), issuers.getObject(), http.getObject(), properties.concurrency());
+        } catch (RuntimeException privateConfiguration) { throw unavailable(); }
+    }
+
     @Bean(name = "tianjiGovernedProcessHttpClient", destroyMethod = "shutdownNow")
     HttpClient tianjiGovernedProcessHttpClient(Environment environment) {
         requirePrerequisites(environment);
@@ -200,6 +236,8 @@ public class TianjiGovernedProcessToolConfiguration {
             TianjiToolAuthorityProperties authority,
             @Qualifier("tianjiGovernedProcessDecisionBindings") TianjiFixedDecisionToolBindings decisions,
             @Qualifier("tianjiGovernedProcessStartBindings") TianjiFixedBpmnStartToolBindings starts,
+            @Qualifier("tianjiGovernedProcessMcpBindings") ObjectProvider<TianjiFixedReadOnlyMcpToolBindings> mcpBindings,
+            @Qualifier("tianjiGovernedProcessMcpTransport") ObjectProvider<TianjiFixedReadOnlyMcpToolTransport> mcpTransports,
             @Qualifier("tianjiToolGrantBindings") TianjiToolGrantBindings grants,
             @Qualifier("tianjiToolStartActionContextResolver") ObjectProvider<StartActionContextResolver> resolvers,
             TianjiGovernedProcessToolProperties properties,
@@ -208,8 +246,15 @@ public class TianjiGovernedProcessToolConfiguration {
             ListableBeanFactory beans,
             ObjectProvider<OpenTelemetry> telemetry, Environment environment) {
         requirePrerequisites(environment);
+        requireMcpSlots(authority, properties, grants);
         var references = new HashSet<DefinitionResourceRef>();
         decisions.bindings().forEach(binding -> references.add(binding.tool())); starts.bindings().forEach(binding -> references.add(binding.tool()));
+        TianjiFixedReadOnlyMcpToolTransport mcp = null;
+        if (!properties.mcpBindings().isEmpty()) {
+            var fixed = mcpBindings.getObject(); mcp = mcpTransports.getObject();
+            if (fixed == null || mcp == null) throw unavailable();
+            fixed.bindings().forEach(binding -> references.add(binding.tool()));
+        }
         var selected = authority.descriptors().stream().filter(descriptor -> references.contains(descriptor.reference())).toList();
         if (!authority.enabled() || selected.size() != references.size()) throw unavailable();
         var resolver = resolvers.getObject(); if (resolver == null) throw unavailable();
@@ -218,9 +263,13 @@ public class TianjiGovernedProcessToolConfiguration {
             requireApprovalReceiptSingleton(beans);
             var verifier = approvalVerifiers.getObject(); var receipt = approvalReceipts.getObject();
             if (verifier == null || receipt == null) throw unavailable();
+            if (mcp != null) return new AdkGovernedProcessToolBridge(ledger, recorder, decision, mcp, start, access, selected,
+                    material -> grants.resolve(material).stream().map(TianjiToolGrantBindings.ResolvedToolResult::binding).toList(), resolver, verifier, receipt);
             return new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, selected,
                     material -> grants.resolve(material).stream().map(TianjiToolGrantBindings.ResolvedToolResult::binding).toList(), resolver, verifier, receipt);
         }
+        if (mcp != null) return new AdkGovernedProcessToolBridge(ledger, recorder, decision, mcp, start, access, selected,
+                material -> grants.resolve(material).stream().map(TianjiToolGrantBindings.ResolvedToolResult::binding).toList(), resolver);
         return new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, selected,
                 material -> grants.resolve(material).stream().map(TianjiToolGrantBindings.ResolvedToolResult::binding).toList(), resolver);
     }
@@ -237,6 +286,8 @@ public class TianjiGovernedProcessToolConfiguration {
             @Qualifier("governedProcessToolResultAccessRecorder") ToolResultAccessRecorder accessRecorder,
             @Qualifier("tianjiGovernedProcessDecisionBindings") TianjiFixedDecisionToolBindings decisions,
             @Qualifier("tianjiGovernedProcessStartBindings") TianjiFixedBpmnStartToolBindings starts,
+            @Qualifier("tianjiGovernedProcessMcpBindings") ObjectProvider<TianjiFixedReadOnlyMcpToolBindings> mcpBindings,
+            @Qualifier("tianjiGovernedProcessMcpTransport") ObjectProvider<TianjiFixedReadOnlyMcpToolTransport> mcpTransports,
             @Qualifier("tianjiGovernedProcessHttpClient") HttpClient http,
             @Qualifier("tianjiGovernedProcessDecisionTransport") TianjiFixedDecisionToolTransport decision,
             @Qualifier("tianjiGovernedProcessStartTransport") TianjiFixedBpmnStartToolTransport start,
@@ -247,7 +298,7 @@ public class TianjiGovernedProcessToolConfiguration {
             @Qualifier("tianjiAdkGovernedProcessTools") ObjectProvider<AdkGovernedProcessToolBridge> bridges,
             @Qualifier("tianjiAdkAgentRunExecutor") ObjectProvider<AdkAgentRunExecutor> executors,
             @Qualifier("tianjiToolStartActionContextResolver") ObjectProvider<StartActionContextResolver> resolvers,
-            TianjiGovernedProcessToolProperties properties,
+            TianjiToolAuthorityProperties authority, TianjiGovernedProcessToolProperties properties,
             @Qualifier("tianjiGovernedProcessApprovalBindings") ObjectProvider<TianjiFixedToolApprovalBindings> approvalBindings,
             @Qualifier("tianjiGovernedProcessApprovalVerifier") ObjectProvider<TianjiFixedToolApprovalVerifier> approvalVerifiers,
             @Qualifier("tianjiToolApprovalReceiptResolver") ObjectProvider<ApprovalReceiptResolver> approvalReceipts,
@@ -255,6 +306,7 @@ public class TianjiGovernedProcessToolConfiguration {
             @Qualifier("tianjiExecutionGrantAuthorizer") TianjiExecutionGrantAuthorizer runAuthorization) {
         return () -> {
             requirePrerequisites(environment);
+            requireMcpSlots(authority, properties, grants);
             if (!ledger.usesDataSource(source) || !capabilities.usesDataSource(source) || !capabilities.usesLedger(ledger)
                     || !preparations.usesDataSource(source) || !preparations.usesLedger(ledger)
                     || !preparations.usesCapabilities(capabilities) || !preparations.usesAuthorization(authorization)
@@ -283,7 +335,27 @@ public class TianjiGovernedProcessToolConfiguration {
                         || !verifier.usesIssuerRegistry(issuers) || !verifier.usesHttpClient(http)
                         || !bridge.usesApprovalVerifier(verifier) || !bridge.usesApprovalReceiptResolver(receipt)) throw unavailable();
             }
+            if (!properties.mcpBindings().isEmpty()) {
+                var fixed = mcpBindings.getObject(); var mcp = mcpTransports.getObject();
+                if (fixed == null || mcp == null || !mcp.usesBindings(fixed) || !mcp.usesOAuth(oauth)
+                        || !mcp.usesAuthentication(authentication) || !mcp.usesConverter(converter)
+                        || !mcp.usesIssuerRegistry(issuers) || !mcp.usesHttpClient(http) || !bridge.usesMcpTransport(mcp)) throw unavailable();
+            }
         };
+    }
+
+    private static void requireMcpSlots(TianjiToolAuthorityProperties authority, TianjiGovernedProcessToolProperties properties,
+                                      TianjiToolGrantBindings grants) {
+        var registered = registered(authority);
+        var expected = expectedSlots(authority, grants, ToolPolicy.Risk.READ_ONLY, ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY);
+        var configured = new HashSet<List<Object>>();
+        for (var binding : properties.mcpBindings()) {
+            var descriptor = registered.get(binding.tool());
+            if (descriptor == null || descriptor.policy().risk() != ToolPolicy.Risk.READ_ONLY
+                    || !ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY.equals(descriptor.policy().executionResourceKey())
+                    || !configured.add(slot(binding))) throw unavailable();
+        }
+        if (!expected.equals(configured)) throw unavailable();
     }
 
     private static void requireApprovalSlots(TianjiToolAuthorityProperties authority, TianjiGovernedProcessToolProperties properties,
@@ -331,6 +403,9 @@ public class TianjiGovernedProcessToolConfiguration {
         return List.of(binding.tenantId(), binding.ownerIssuerFingerprint(), binding.principalType(), binding.definitionKey(), binding.definitionVersion(), binding.definitionContentSha256(), binding.tool());
     }
     private static List<Object> slot(TianjiFixedBpmnStartToolBindings.BindingVO binding) {
+        return List.of(binding.tenantId(), binding.ownerIssuerFingerprint(), binding.principalType(), binding.definitionKey(), binding.definitionVersion(), binding.definitionContentSha256(), binding.tool());
+    }
+    private static List<Object> slot(TianjiFixedReadOnlyMcpToolBindings.BindingVO binding) {
         return List.of(binding.tenantId(), binding.ownerIssuerFingerprint(), binding.principalType(), binding.definitionKey(), binding.definitionVersion(), binding.definitionContentSha256(), binding.tool());
     }
     private static List<Object> slot(TianjiFixedToolApprovalBindings.BindingVO binding) {
