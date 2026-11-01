@@ -78,7 +78,9 @@ public final class ToolResultAccessStore {
                     || !request.binding().run().runId().equals(material.run().runId())) throw unavailable();
             var policy = material.snapshot().effectivePolicy();
             if (!material.snapshot().definition().dependencies().tools().contains(request.descriptor().reference())
-                    || !policy.allowedToolVersions().contains(request.descriptor().versionKey()) || policy.maxToolCalls() < 1) throw denied();
+                    || !policy.allowedToolVersions().contains(request.descriptor().versionKey()) || policy.maxToolCalls() < 1
+                    || request.descriptor().policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
+                    && !Objects.equals(policy.approvalPolicyRef(), request.descriptor().policy().approvalPolicyRef())) throw denied();
             checkDisclosureWindow(initial);
             var first = capabilities.current(request.binding(), request.descriptor()).orElseThrow(ToolResultAccessStore::unavailable);
             if (!request.binding().equals(first.reservation().binding())) throw unavailable();
@@ -143,7 +145,7 @@ public final class ToolResultAccessStore {
                     || !binding.run().runId().equals(lease.runId()) || !binding.run().actor().equals(action.owner())
                     || !descriptor.reference().equals(binding.tool()) || !descriptor.reference().equals(action.tool())
                     || !descriptor.policy().bindingSha256().equals(binding.backendBindingSha256()) || !descriptor.policy().equals(action.policy())
-                    || descriptor.policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || !ProcessClient.START_RESOURCE_KEY.equals(descriptor.policy().executionResourceKey())
+                    || !Set.of(ToolPolicy.Risk.IDEMPOTENT_WRITE, ToolPolicy.Risk.APPROVAL_REQUIRED).contains(descriptor.policy().risk()) || !ProcessClient.START_RESOURCE_KEY.equals(descriptor.policy().executionResourceKey())
                     || !descriptor.output().fields().equals(Map.of("instanceId", ToolSchema.ValueType.STRING)) || !descriptor.output().required().equals(Set.of("instanceId"))) throw invalid();
             var rebuilt = new ToolActionRequest(binding.run().actor(), descriptor, action.businessKey(), action.businessVersion(), action.arguments());
             if (!rebuilt.intentId().equals(action.intentId()) || !rebuilt.requestSha256().equals(action.requestSha256()) || !rebuilt.arguments().equals(action.arguments())) throw invalid();

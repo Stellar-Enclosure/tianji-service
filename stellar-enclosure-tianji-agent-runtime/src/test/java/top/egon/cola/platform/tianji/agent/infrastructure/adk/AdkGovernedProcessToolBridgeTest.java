@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 import com.google.adk.tools.BaseTool;
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
@@ -503,6 +504,227 @@ class AdkGovernedProcessToolBridgeTest {
         try (var fixture = new Fixture("invoice-1", Set.of(), 0)) {
             var empty = fixture.bind(); assertTrue(empty.declaredTools().isEmpty()); assertEquals("UNKNOWN", empty.sideEffectOutcome()); empty.close();
         }
+    }
+
+    @Test void explicit_approval_capabilities_are_required_and_pointer_affinities_do_not_invoke_them() {
+        try (var legacy = new Fixture(); var fixture = new ApprovedFixture()) {
+            assertFalse(legacy.bridge.usesApprovalVerifier(fixture.verifier)); assertFalse(legacy.bridge.usesApprovalReceiptResolver(fixture.receipts));
+            assertTrue(fixture.bridge.usesApprovalVerifier(fixture.verifier)); assertTrue(fixture.bridge.usesApprovalReceiptResolver(fixture.receipts));
+            assertFalse(fixture.bridge.usesApprovalVerifier(null)); assertFalse(fixture.bridge.usesApprovalVerifier(mock(FixedToolApprovalVerifier.class)));
+            assertFalse(fixture.bridge.usesApprovalReceiptResolver(null)); assertFalse(fixture.bridge.usesApprovalReceiptResolver(request -> null));
+            assertThrows(IllegalArgumentException.class, () -> fixture.construct(null, fixture.receipts));
+            assertThrows(IllegalArgumentException.class, () -> fixture.construct(fixture.verifier, null));
+            assertTrue(fixture.receiptRequests.isEmpty()); verifyNoInteractions(fixture.verifier);
+            var scope = fixture.bind(); assertEquals(3, scope.declaredTools().size()); assertTrue(fixture.receiptRequests.isEmpty()); scope.close();
+        }
+    }
+
+    @Test void approval_selector_request_validates_full_definition_membership_policy_and_rebuilt_action_without_disclosing_it() {
+        var descriptor = approvedDescriptor(); var material = approvedMaterial(descriptor); var action = new ToolActionRequest(ACTOR, descriptor, "invoice-1", "business-v1", ARGUMENTS);
+        var value = new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(material.authorization(), material.snapshot(), descriptor, action);
+        assertEquals("AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO[redacted]", value.toString());
+        var run = material.authorization(); var changedDefinition = new AgentRunAuthorization.Request(ACTOR, RUN, run.definitionKey(), 2, run.definitionSha256(), run.requestSha256(), run.snapshotSha256(), run.policyVersionRef(), false, RUN_DEADLINE);
+        var changedPolicy = new AgentRunAuthorization.Request(ACTOR, RUN, run.definitionKey(), 1, run.definitionSha256(), run.requestSha256(), run.snapshotSha256(), "other-policy", false, RUN_DEADLINE);
+        var foreign = TrustedAgentActor.verified(22, ACTOR.subjectType(), ACTOR.subjectId(), "https://idp.example/22");
+        var otherDescriptor = new ToolDescriptor(descriptor.key(), descriptor.version(), descriptor.name(), "Changed content", descriptor.input(), descriptor.output(), descriptor.policy());
+        for (org.junit.jupiter.api.function.Executable invalid : List.<org.junit.jupiter.api.function.Executable>of(
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(null, material.snapshot(), descriptor, action),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, null, descriptor, action),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, material.snapshot(), null, action),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, material.snapshot(), descriptor, null),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(changedDefinition, material.snapshot(), descriptor, action),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(changedPolicy, material.snapshot(), descriptor, action),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, material.snapshot(), otherDescriptor, new ToolActionRequest(ACTOR, otherDescriptor, "invoice-1", "business-v1", ARGUMENTS)),
+                () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, material.snapshot(), descriptor, new ToolActionRequest(foreign, descriptor, "invoice-1", "business-v1", ARGUMENTS)))) assertThrows(IllegalArgumentException.class, invalid);
+        var snapshot = material.snapshot(); var mismatched = new AgentExecutionSnapshot(snapshot.definition(), HASH,
+                policy(Set.of(descriptor.versionKey()), 8, "other-approval"), new AgentInputDTO("private task", List.of(), Map.of()), "invoice-1");
+        assertThrows(IllegalArgumentException.class, () -> new AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO(run, mismatched, descriptor, action));
+    }
+
+    @Test void approved_wait_selects_only_host_metadata_after_unknown_and_both_fences_and_returns_no_private_body() {
+        try (var fixture = new ApprovedFixture()) {
+            fixture.receipt = "界".repeat(255); fixture.context = new AdkGovernedProcessToolBridge.StartActionContextVO("版".repeat(128), Duration.ofDays(7));
+            var scope = fixture.bind(); fixture.scope = scope;
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> {
+                assertSame(fixture.verifier, call.getArgument(0)); assertEquals(2, fixture.fences.get());
+                var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class); assertEquals("UNKNOWN", scope.sideEffectOutcome());
+                assertEquals(fixture.receipt, call.getArgument(3)); assertEquals("invoice-1", request.action().businessKey()); assertEquals("版".repeat(128), request.action().businessVersion());
+                assertEquals(NOW.plus(Duration.ofDays(7)), request.intentExpiry()); assertEquals(BigDecimal.ZERO, request.estimatedCost());
+                call.getArgument(4, ToolCommittedFactObserver.class).onCommitted(ToolExecutionOutcome.Status.AWAITING_APPROVAL);
+                return approvedResult(request.action(), "AWAITING_APPROVAL", null);
+            });
+            var result = scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", fixture.fences::incrementAndGet);
+            assertEquals(Map.of("status", "AWAITING_APPROVAL"), result); assertEquals("NONE", scope.sideEffectOutcome()); assertEquals(1, fixture.receiptRequests.size());
+            var selected = fixture.receiptRequests.getFirst(); assertEquals(fixture.material.authorization(), selected.run()); assertSame(fixture.material.snapshot(), selected.snapshot());
+            assertEquals(fixture.approved, selected.descriptor()); assertEquals(ARGUMENTS, selected.action().arguments()); assertEquals("版".repeat(128), selected.action().businessVersion());
+            var event = fixture.events.getLast(); assertEquals("AWAITING_APPROVAL", event.state()); assertEquals(0L, event.dispatchEpoch());
+            assertEquals(ToolInvocationRecorder.AccountingState.PENDING, event.accountingState()); assertNull(event.errorCode());
+            assertFalse(result.toString().contains(fixture.receipt)); verifyNoInteractions(fixture.verifier, fixture.start, fixture.access); scope.close();
+        }
+    }
+
+    @Test void wait_metadata_alone_never_proves_none_and_late_observers_cannot_change_a_frozen_scope() {
+        try (var fixture = new ApprovedFixture()) {
+            var saved = new AtomicReference<ToolCommittedFactObserver>(); var scope = fixture.bind();
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> {
+                var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class); saved.set(call.getArgument(4));
+                return approvedResult(request.action(), "AWAITING_APPROVAL", null);
+            });
+            assertEquals(Map.of("status", "AWAITING_APPROVAL"), scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", () -> { }));
+            assertEquals("UNKNOWN", scope.sideEffectOutcome()); int events = fixture.events.size(); scope.close();
+            saved.get().onCommitted(ToolExecutionOutcome.Status.SUCCEEDED); assertEquals("UNKNOWN", scope.sideEffectOutcome()); assertEquals(events, fixture.events.size());
+        }
+    }
+
+    @Test void selector_and_native_fences_fail_closed_without_model_receipt_fallback_or_recorder_io() {
+        for (String variant : List.of("before", "after", "selector", "invalid", "closed")) try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind(); fixture.scope = scope;
+            if (variant.equals("selector")) fixture.selector = ignored -> { throw new IllegalStateException("private selector"); };
+            if (variant.equals("invalid")) fixture.receipt = " private\nreceipt";
+            if (variant.equals("closed")) fixture.selector = ignored -> { scope.close(); return fixture.receipt; };
+            Runnable fence = () -> { int count = fixture.fences.incrementAndGet(); if (variant.equals("before") && count == 1 || variant.equals("after") && count == 2) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private native fence"); };
+            var rejected = assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", fence));
+            assertNull(rejected.getCause()); assertFalse(rejected.getMessage().contains("private")); assertEquals("UNKNOWN", scope.sideEffectOutcome());
+            assertEquals(variant.equals("before") ? 0 : 1, fixture.receiptRequests.size()); verifyNoInteractions(fixture.recorder, fixture.verifier, fixture.start, fixture.access); scope.close();
+        }
+        try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind();
+            assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, fixture.approved.name()), Map.of("amount", 20L, "approvalReceiptId", "model-fake"), HOST, "review_agent", () -> { }));
+            assertTrue(fixture.receiptRequests.isEmpty()); verifyNoInteractions(fixture.recorder); scope.close();
+        }
+    }
+
+    @Test void guarded_approved_transport_forwards_the_exact_bounded_deadline_and_never_calls_legacy_start() {
+        try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind(); Instant deadline = NOW.plusSeconds(4).plusNanos(123_000);
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> {
+                var wrapped = call.getArgument(1, FixedBpmnStartToolTransport.class); var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class);
+                wrapped.withVerifiedCall(new FixedBpmnStartToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), HOST, deadline),
+                        (executor, operation) -> operation.start(deadline));
+                call.getArgument(4, ToolCommittedFactObserver.class).onCommitted(ToolExecutionOutcome.Status.SUCCEEDED);
+                return approvedResult(request.action(), "DISPATCHING", successAttempt(ToolInvocationRecorder.AccountingState.SETTLED));
+            });
+            assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("instanceId", INSTANCE)), scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", fixture.fences::incrementAndGet));
+            assertEquals(3, fixture.fences.get()); assertEquals(deadline, fixture.boundedDeadline.get()); assertEquals(1, fixture.boundedStarts.get()); assertEquals(0, fixture.legacyStarts.get());
+            assertEquals("CONFIRMED", scope.sideEffectOutcome()); scope.close();
+        }
+    }
+
+    @Test void bounded_pre_send_fence_failure_preserves_its_code_after_a_committed_not_sent_fact() {
+        try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind();
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> {
+                var wrapped = call.getArgument(1, FixedBpmnStartToolTransport.class); var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class);
+                assertThrows(FixedBpmnStartToolTransport.Failure.class, () -> wrapped.withVerifiedCall(fixedRequest(request), (executor, operation) -> operation.start(NOW.plusSeconds(4))));
+                call.getArgument(4, ToolCommittedFactObserver.class).onCommitted(ToolExecutionOutcome.Status.FAILED_KNOWN);
+                return approvedResult(request.action(), "DISPATCHING", attempt(ToolExecutionOutcome.Status.FAILED_KNOWN, ToolInvocationRecorder.AccountingState.SETTLED));
+            });
+            var rejected = assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", () -> {
+                if (fixture.fences.incrementAndGet() == 3) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "private Session fence");
+            }));
+            assertEquals(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, rejected.code()); assertEquals("NONE", scope.sideEffectOutcome()); assertEquals(0, fixture.boundedStarts.get()); scope.close();
+        }
+    }
+
+    @Test void only_observed_known_approved_results_use_fresh_access_and_preserve_source_fee_semantics() {
+        for (var status : List.of(ToolExecutionOutcome.Status.SUCCEEDED, ToolExecutionOutcome.Status.REJECTED, ToolExecutionOutcome.Status.FAILED_KNOWN)) try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind(); String state = status == ToolExecutionOutcome.Status.SUCCEEDED ? "APPLIED" : status.name(); var original = source(status, new BigDecimal("2.5000"));
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> approvedResult(call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class).action(), state, null));
+            when(fixture.access.recordKnownStartResultAccess(any(), any())).thenAnswer(call -> {
+                var request = call.getArgument(0, ToolResultAccessStore.StartResultAccessRequestVO.class); assertEquals(ToolPolicy.Risk.APPROVAL_REQUIRED, request.descriptor().policy().risk());
+                call.getArgument(1, ToolCommittedFactObserver.class).onCommitted(status); return accessed(request, original, ToolInvocationRecorder.AccountingState.SETTLED);
+            });
+            var result = scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", () -> { });
+            assertEquals(status.name(), result.get("status")); assertFalse(result.toString().contains(RECEIPT)); assertFalse(result.toString().contains("2.5000"));
+            assertEquals(status == ToolExecutionOutcome.Status.SUCCEEDED ? "CONFIRMED" : "NONE", scope.sideEffectOutcome()); verify(fixture.access).recordKnownStartResultAccess(any(), any());
+            verifyNoInteractions(fixture.verifier, fixture.start); scope.close();
+        }
+    }
+
+    @Test void advanced_approved_snapshots_do_not_report_wait_or_access_results_or_resolve_none() {
+        for (String state : List.of("DISPATCHING", "UNKNOWN", "PREPARED", "EXPIRED")) try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind();
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> approvedResult(call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class).action(), state, null));
+            assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", () -> { }));
+            assertEquals("UNKNOWN", scope.sideEffectOutcome()); assertEquals("UNAVAILABLE", fixture.events.getLast().state());
+            verifyNoInteractions(fixture.access, fixture.verifier, fixture.start); scope.close();
+        }
+    }
+
+    @Test void approved_observer_truth_survives_accounting_pending_outer_failure_and_scope_freeze() {
+        for (String variant : List.of("pending", "outer", "closed")) try (var fixture = new ApprovedFixture()) {
+            var scope = fixture.bind();
+            when(fixture.recorder.executeApprovedStart(any(), any(), any(), any(), any())).thenAnswer(call -> {
+                var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class); call.getArgument(4, ToolCommittedFactObserver.class).onCommitted(ToolExecutionOutcome.Status.SUCCEEDED);
+                if (variant.equals("closed")) scope.close();
+                if (variant.equals("outer")) throw new FixedToolApprovalVerifier.Failure(FixedToolApprovalVerifier.FailureKind.APPROVAL_UNAVAILABLE);
+                return approvedResult(request.action(), "DISPATCHING", successAttempt(variant.equals("pending") ? ToolInvocationRecorder.AccountingState.PENDING : ToolInvocationRecorder.AccountingState.SETTLED));
+            });
+            assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, fixture.approved.name()), ARGUMENTS, HOST, "review_agent", () -> { }));
+            assertEquals("CONFIRMED", scope.sideEffectOutcome()); scope.close(); assertEquals("CONFIRMED", scope.sideEffectOutcome());
+        }
+    }
+
+    @Test void legacy_idempotent_observers_reject_wait_without_reporting_none_or_a_wait_event() {
+        try (var fixture = new Fixture()) {
+            var scope = fixture.bind();
+            when(fixture.recorder.executeIdempotentStart(any(), any(), any())).thenAnswer(call -> {
+                var request = call.getArgument(1, ToolInvocationStore.PreparationRequestVO.class);
+                call.getArgument(2, ToolCommittedFactObserver.class).onCommitted(ToolExecutionOutcome.Status.AWAITING_APPROVAL);
+                return fresh(request.action(), successAttempt(ToolInvocationRecorder.AccountingState.SETTLED));
+            });
+            assertThrows(AgentLedgerException.class, () -> scope.execute(tool(scope, START.name()), ARGUMENTS, HOST, "review_agent", () -> { }));
+            assertEquals("UNKNOWN", scope.sideEffectOutcome());
+            assertTrue(fixture.events.stream().noneMatch(event -> "AWAITING_APPROVAL".equals(event.state())));
+            assertEquals("UNAVAILABLE", fixture.events.getLast().state()); scope.close();
+        }
+    }
+
+    private static ToolDescriptor approvedDescriptor() { return new ToolDescriptor("process.approved", 1, "approved_start", "Approved fixed START", START.input(), START.output(),
+            new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "process.approved.action", ProcessClient.START_RESOURCE_KEY, HASH, "approval-v1")); }
+    private static AgentLedgerService.ExecutionMaterial approvedMaterial(ToolDescriptor descriptor) {
+        var tools = List.of(READ, START, descriptor); return material("invoice-1", tools, tools.stream().map(ToolDescriptor::versionKey).collect(java.util.stream.Collectors.toSet()), 8);
+    }
+    private static ToolInvocationRecorder.ApprovedStartResultVO approvedResult(ToolActionRequest action, String observed, ToolInvocationRecorder.WriteAttemptResultVO own) {
+        return new ToolInvocationRecorder.ApprovedStartResultVO(action.intentId(), observed, 3, own);
+    }
+    private static final class ApprovedFixture implements AutoCloseable {
+        final AgentLedgerService ledger = mock(AgentLedgerService.class);
+        final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
+        final ReadOnlyDecisionToolTransport decision = mock(ReadOnlyDecisionToolTransport.class);
+        final FixedBpmnStartToolTransport start = mock(FixedBpmnStartToolTransport.class);
+        final ToolResultAccessRecorder access = mock(ToolResultAccessRecorder.class);
+        final FixedToolApprovalVerifier verifier = mock(FixedToolApprovalVerifier.class);
+        final ToolDescriptor approved = approvedDescriptor();
+        final AgentLedgerService.ExecutionMaterial material = approvedMaterial(approved);
+        final List<AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO> receiptRequests = new ArrayList<>();
+        final List<AdkGovernedToolBridge.ToolEventVO> events = new ArrayList<>();
+        final AtomicInteger fences = new AtomicInteger(), boundedStarts = new AtomicInteger(), legacyStarts = new AtomicInteger();
+        final AtomicReference<Instant> boundedDeadline = new AtomicReference<>();
+        final AdkGovernedProcessToolBridge.ApprovalReceiptResolver receipts;
+        final AdkGovernedProcessToolBridge bridge;
+        Function<AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO, String> selector;
+        AdkGovernedProcessToolBridge.StartActionContextVO context = new AdkGovernedProcessToolBridge.StartActionContextVO("business-v1", Duration.ofDays(1));
+        AdkGovernedToolBridge.Scope scope;
+        String receipt = "private-host-approval-reference";
+        ApprovedFixture() {
+            receipts = request -> { receiptRequests.add(request); if (scope != null) assertEquals("UNKNOWN", scope.sideEffectOutcome()); return selector == null ? receipt : selector.apply(request); };
+            when(ledger.databaseNow()).thenReturn(NOW); when(recorder.usesLedger(ledger)).thenReturn(true); when(access.usesLedger(ledger)).thenReturn(true);
+            when(start.withVerifiedCall(any(), any())).thenAnswer(call -> call.getArgument(1, FixedBpmnStartToolTransport.Callback.class).apply(
+                    new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "process-service", "https://process-idp.example/21"), RUN_DEADLINE),
+                    new FixedBpmnStartToolTransport.OneShotStart() {
+                        @Override public FixedBpmnStartToolTransport.StartObservation start() { legacyStarts.incrementAndGet(); return new FixedBpmnStartToolTransport.StartObservation(RECEIPT, INSTANCE); }
+                        @Override public FixedBpmnStartToolTransport.StartObservation start(Instant bound) { boundedStarts.incrementAndGet(); boundedDeadline.set(bound); return new FixedBpmnStartToolTransport.StartObservation(RECEIPT, INSTANCE); }
+                    }));
+            bridge = construct(verifier, receipts); clearInvocations(recorder, start, access, verifier);
+        }
+        AdkGovernedProcessToolBridge construct(FixedToolApprovalVerifier verifier, AdkGovernedProcessToolBridge.ApprovalReceiptResolver receipts) {
+            return new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, List.of(READ, START, approved),
+                    value -> List.of(binding(value.authorization(), READ), binding(value.authorization(), START), binding(value.authorization(), approved)),
+                    ignored -> context, verifier, receipts);
+        }
+        AdkGovernedToolBridge.Scope bind() { return bridge.bindScope(material, lease(), events::add); }
+        @Override public void close() { }
     }
 
     private static AdkGovernedProcessToolBridge construct(Object[] values) {

@@ -32,6 +32,7 @@ import top.egon.cola.component.agentflow.workflow.ParallelAgentWorkflowBuilderSt
 import top.egon.cola.component.agentflow.workflow.SequentialAgentWorkflowBuilderStrategy;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ToolCommittedFactObserver;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
@@ -99,6 +100,10 @@ class AdkGovernedProcessLoopTest {
     private static final String HASH = "a".repeat(64), RECEIPT = "tianji:ps-start:v1:" + "b".repeat(64), INSTANCE = "private-process-instance";
     private static final ToolDescriptor READ = tool("fixed.decision", "fixed_decision", ToolPolicy.Risk.READ_ONLY, DecisionClient.EXECUTE_RESOURCE_KEY, "value");
     private static final ToolDescriptor START = tool("fixed.start", "fixed_start", ToolPolicy.Risk.IDEMPOTENT_WRITE, ProcessClient.START_RESOURCE_KEY, "instanceId");
+    private static final ToolDescriptor APPROVED = new ToolDescriptor("fixed.approved", 1, "fixed_approved", "Approved fixed.approved",
+            new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
+            new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
+            new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "fixed.approved.action", ProcessClient.START_RESOURCE_KEY, HASH, "approval-v1"));
 
     @Test void native_streaming_loop_uses_one_union_and_returns_only_the_authorized_instance() {
         try (var rig = new Rig("SINGLE", 2)) {
@@ -342,6 +347,91 @@ class AdkGovernedProcessLoopTest {
         }
     }
 
+    @Test void approval_wait_finished_event_requires_zero_epoch_pending_accounting_and_no_error() {
+        var id = UUID.randomUUID();
+        var value = new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                "AWAITING_APPROVAL", 0L, ToolInvocationRecorder.AccountingState.PENDING, null);
+        assertEquals("AdkGovernedToolBridge.ToolEventVO[redacted]", value.toString());
+        assertAll(
+                () -> assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                        "AWAITING_APPROVAL", null, ToolInvocationRecorder.AccountingState.PENDING, null)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                        "AWAITING_APPROVAL", 1L, ToolInvocationRecorder.AccountingState.PENDING, null)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                        "AWAITING_APPROVAL", 0L, null, null)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                        "AWAITING_APPROVAL", 0L, ToolInvocationRecorder.AccountingState.SETTLED, null)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new AdkGovernedToolBridge.ToolEventVO(AdkGovernedToolBridge.Phase.FINISHED, "writer", APPROVED.reference(), id,
+                        "AWAITING_APPROVAL", 0L, ToolInvocationRecorder.AccountingState.PENDING, "PRIVATE_ERROR")));
+    }
+
+    @Test void actual_native_approval_wait_returns_only_safe_status_and_none_effect() {
+        try (var rig = new Rig("SINGLE", 2, true)) {
+            rig.model.scripts.put("writer", List.of(APPROVED.name()));
+            assertEquals(AgentRunStatusEnum.COMPLETED, rig.executor().executeQueued(rig.actor, rig.query).status());
+            assertEquals(1, rig.writes.get()); assertEquals(1, rig.receiptSelections.get()); assertEquals(0, rig.approvalCalls.get()); assertEquals(0, rig.delegates.get());
+            assertEquals("NONE", rig.finished.get().sideEffectOutcome()); assertEquals(2, rig.model.streams.get());
+            ToolResponseMessage response = rig.model.prompts.getLast().getInstructions().stream().filter(ToolResponseMessage.class::isInstance)
+                    .map(ToolResponseMessage.class::cast).findFirst().orElseThrow();
+            String body = response.getResponses().getFirst().responseData(); assertTrue(body.contains("AWAITING_APPROVAL"));
+            for (String hidden : List.of("approval-ref", "approval-v1", "consumer", "source", "amount", "business-v1", RECEIPT)) assertFalse(body.contains(hidden));
+            var event = rig.events.stream().filter(value -> value.type().equals("TOOL_FINISHED")).findFirst().orElseThrow();
+            assertEquals("AWAITING_APPROVAL", event.payload().get("state")); assertEquals(0L, event.payload().get("dispatchEpoch"));
+            assertEquals("PENDING", event.payload().get("accountingState")); assertFalse(event.payload().containsKey("errorCode"));
+        }
+    }
+
+    @Test void approval_wait_consumes_one_plugin_entry_and_never_starts_a_second_hidden_loop() {
+        try (var rig = new Rig("SINGLE", 1, true)) {
+            rig.model.scripts.put("writer", List.of(APPROVED.name(), APPROVED.name()));
+            assertEquals(AgentRunStatusEnum.FAILED, rig.executor().executeQueued(rig.actor, rig.query).status());
+            assertEquals(AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED.name(), rig.finished.get().errorCode());
+            assertEquals(1, rig.writes.get()); assertEquals(1, rig.receiptSelections.get()); assertEquals(0, rig.delegates.get());
+            assertEquals("NONE", rig.finished.get().sideEffectOutcome()); assertEquals(2, rig.model.streams.get());
+        }
+    }
+
+    @Test void explicit_approval_scope_forwards_bounded_deadline_and_native_fence_without_legacy_fallback() {
+        try (var rig = new Rig("SINGLE", 2, true)) {
+            rig.approvedMode = ApprovedMode.SUCCESS; rig.hostApprovalReceipt = "approval-ref";
+            var scope = rig.bridge.bindScope(rig.material(), rig.lease, event -> { }); var fence = new AtomicInteger();
+            var tool = scope.declaredTools().stream().filter(value -> value.name().equals(APPROVED.name())).findFirst().orElseThrow();
+            var value = scope.execute(tool, Map.of("amount", 7), UUID.randomUUID(), "writer", fence::incrementAndGet);
+            assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("instanceId", INSTANCE)), value);
+            assertEquals(3, fence.get()); assertEquals(1, rig.boundedDelegates.get()); assertEquals(0, rig.legacyDelegates.get());
+            assertEquals(rig.deadline.truncatedTo(java.time.temporal.ChronoUnit.MICROS), rig.forwardedDeadline.get()); scope.close();
+        }
+    }
+
+    @Test void known_approval_terminal_result_uses_fresh_access_without_another_start_or_approval_call() {
+        try (var rig = new Rig("SINGLE", 2, true)) {
+            rig.approvedMode = ApprovedMode.REPLAY; rig.hostApprovalReceipt = "approval-ref";
+            var scope = rig.bridge.bindScope(rig.material(), rig.lease, event -> { });
+            var tool = scope.declaredTools().stream().filter(value -> value.name().equals(APPROVED.name())).findFirst().orElseThrow();
+            var value = scope.execute(tool, Map.of("amount", 7), UUID.randomUUID(), "writer", () -> { });
+            assertEquals(Map.of("status", "SUCCEEDED", "output", Map.of("instanceId", INSTANCE)), value);
+            assertEquals(1, rig.accesses.get()); assertEquals(0, rig.approvalCalls.get()); assertEquals(0, rig.delegates.get()); scope.close();
+        }
+    }
+
+    @Test void approval_observer_truth_survives_outer_mask_and_scope_freeze_rejects_late_rewrite() {
+        try (var rig = new Rig("SINGLE", 2, true)) {
+            rig.approvedMode = ApprovedMode.OUTER_MASK; rig.hostApprovalReceipt = "approval-ref";
+            var scope = rig.bridge.bindScope(rig.material(), rig.lease, event -> { });
+            var tool = scope.declaredTools().stream().filter(value -> value.name().equals(APPROVED.name())).findFirst().orElseThrow();
+            assertThrows(AgentLedgerException.class, () -> scope.execute(tool, Map.of("amount", 7), UUID.randomUUID(), "writer", () -> { }));
+            assertEquals("CONFIRMED", scope.sideEffectOutcome()); scope.close();
+            rig.lateObserver.get().onCommitted(ToolExecutionOutcome.Status.UNKNOWN); assertEquals("CONFIRMED", scope.sideEffectOutcome());
+        }
+        try (var rig = new Rig("SINGLE", 2, true)) {
+            var scope = rig.bridge.bindScope(rig.material(), rig.lease, event -> { });
+            var tool = scope.declaredTools().stream().filter(value -> value.name().equals(APPROVED.name())).findFirst().orElseThrow();
+            assertEquals(Map.of("status", "AWAITING_APPROVAL"), scope.execute(tool, Map.of("amount", 7), UUID.randomUUID(), "writer", () -> { }));
+            assertEquals("NONE", scope.sideEffectOutcome()); scope.close();
+            rig.lateObserver.get().onCommitted(ToolExecutionOutcome.Status.SUCCEEDED); assertEquals("NONE", scope.sideEffectOutcome());
+        }
+    }
+
     @Test void root_affinity_uses_one_lazy_selected_bridge_and_old_no_tool_execution_stays_compatible() {
         try (var rig = new Rig("SINGLE", 0)) {
             rig.tools = false; rig.model.scripts.put("writer", List.of());
@@ -362,6 +452,7 @@ class AdkGovernedProcessLoopTest {
         return new ToolExecutionGrant.BindingVO(run, descriptor.reference(), descriptor.policy().bindingSha256(), "TIANJI_TOOL_NATIVE_PROCESS", URI.create("https://process.example/resource"), descriptor.policy().executionResourceKey(), null);
     }
     private record EventWrite(long revision, String type, Map<String, Object> payload) { }
+    private enum ApprovedMode { WAIT, SUCCESS, REPLAY, OUTER_MASK }
 
     private static final class Rig implements AutoCloseable {
         final AgentLedgerService ledger = mock(AgentLedgerService.class);
@@ -370,6 +461,8 @@ class AdkGovernedProcessLoopTest {
         final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
         final ToolResultAccessRecorder access = mock(ToolResultAccessRecorder.class);
         final ReadOnlyDecisionToolTransport decision = mock(ReadOnlyDecisionToolTransport.class);
+        final FixedToolApprovalVerifier approvalVerifier = mock(FixedToolApprovalVerifier.class);
+        final AdkGovernedProcessToolBridge.ApprovalReceiptResolver approvalReceipts = mock(AdkGovernedProcessToolBridge.ApprovalReceiptResolver.class);
         final TrustedAgentActor actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/20");
         final GetAgentRunQuery query = new GetAgentRunQuery(UUID.randomUUID().toString());
         final Instant deadline = NOW.plusSeconds(60);
@@ -383,22 +476,29 @@ class AdkGovernedProcessLoopTest {
         final AtomicReference<Instant> databaseNow = new AtomicReference<>(NOW);
         final AtomicLong actualEpoch = new AtomicLong(1);
         final AtomicInteger reads = new AtomicInteger(), writes = new AtomicInteger(), delegates = new AtomicInteger(), accesses = new AtomicInteger(), resolutions = new AtomicInteger();
+        final AtomicInteger receiptSelections = new AtomicInteger(), approvalCalls = new AtomicInteger(), boundedDelegates = new AtomicInteger(), legacyDelegates = new AtomicInteger();
         final AtomicBoolean scopeClosed = new AtomicBoolean();
         final AtomicReference<AdkGovernedToolBridge.Scope> boundScope = new AtomicReference<>();
+        final AtomicReference<Instant> forwardedDeadline = new AtomicReference<>();
+        final AtomicReference<ToolCommittedFactObserver> lateObserver = new AtomicReference<>();
         final CountDownLatch writeEntered = new CountDownLatch(1), releaseWrite = new CountDownLatch(1), lateFact = new CountDownLatch(1);
         final FakeChatModel model = new FakeChatModel();
         final FixedBpmnStartToolTransport start;
         final AdkGovernedProcessToolBridge bridge;
-        final String workflow; final int maxEntries;
+        final String workflow; final int maxEntries; final boolean approved; final ToolDescriptor writeTool;
         boolean tools = true; Duration idle = Duration.ofSeconds(5);
         volatile boolean replaySecond, metadataOnly, ownMetadata, accessDenied, preflightDenied, pendingAccounting, unknown, blockWrite;
         volatile String failedEventType;
+        volatile ApprovedMode approvedMode = ApprovedMode.WAIT;
+        volatile String hostApprovalReceipt;
         Runnable beforeTransport = () -> { }, afterWrite = () -> { }; Consumer<AgentExecutionResult> onFinish = value -> { };
         AgentRunAuthorization authorizer = (request, boundary) -> AgentRunAuthorization.Decision.ALLOW;
 
-        Rig(String workflow, int maxEntries) {
-            this.workflow = workflow; this.maxEntries = maxEntries; current.set(run(AgentRunStatusEnum.QUEUED, 0, 0));
-            model.scripts.put("writer", List.of(READ.name(), START.name()));
+        Rig(String workflow, int maxEntries) { this(workflow, maxEntries, false); }
+        Rig(String workflow, int maxEntries, boolean approved) {
+            this.workflow = workflow; this.maxEntries = maxEntries; this.approved = approved; this.writeTool = approved ? APPROVED : START;
+            current.set(run(AgentRunStatusEnum.QUEUED, 0, 0));
+            model.scripts.put("writer", List.of(READ.name(), writeTool.name()));
             when(ledger.get(actor, query)).thenAnswer(call -> current.get()); when(ledger.databaseNow()).thenAnswer(call -> databaseNow.get());
             when(ledger.executionMaterial(actor, query)).thenAnswer(call -> material());
             when(ledger.claim(eq(actor), eq(query), eq(0L), anyString(), any())).thenAnswer(call -> { current.set(run(AgentRunStatusEnum.RUNNING, 1, 0)); return new ClaimedAgentRun(current.get(), lease); });
@@ -438,9 +538,15 @@ class AdkGovernedProcessLoopTest {
             start = new FixedBpmnStartToolTransport() {
                 @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
                     beforeTransport.run();
-                    return callback.apply(new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "process-service", "https://service.example/20"), deadline), () -> {
-                        delegates.incrementAndGet(); writeEntered.countDown(); if (blockWrite) awaitIgnoringInterrupt(releaseWrite);
-                        return new StartObservation(RECEIPT, INSTANCE);
+                    return callback.apply(new ReadOnlyDecisionToolTransport.VerifiedExecutor(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "process-service", "https://service.example/20"), deadline), new OneShotStart() {
+                        @Override public StartObservation start() { legacyDelegates.incrementAndGet(); return execute(); }
+                        @Override public StartObservation start(Instant callDeadlineAt) {
+                            boundedDelegates.incrementAndGet(); forwardedDeadline.set(callDeadlineAt); return execute();
+                        }
+                        private StartObservation execute() {
+                            delegates.incrementAndGet(); writeEntered.countDown(); if (blockWrite) awaitIgnoringInterrupt(releaseWrite);
+                            return new StartObservation(RECEIPT, INSTANCE);
+                        }
                     });
                 }
             };
@@ -460,6 +566,33 @@ class AdkGovernedProcessLoopTest {
                         new ToolInvocationRecorder.WriteAttemptResultVO(query.runId(), request.invocationId(), status.name(), 3, 1, NOW, NOW, outcome, true,
                                 pendingAccounting ? ToolInvocationRecorder.AccountingState.PENDING : ToolInvocationRecorder.AccountingState.SETTLED));
             });
+            when(approvalReceipts.resolve(any())).thenAnswer(call -> {
+                receiptSelections.incrementAndGet(); var request = call.getArgument(0, AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO.class);
+                assertEquals(APPROVED, request.descriptor()); assertEquals(request.run().actor(), request.action().owner()); return hostApprovalReceipt;
+            });
+            when(recorder.executeApprovedStart(any(), any(), any(), nullable(String.class), any())).thenAnswer(call -> {
+                assertSame(approvalVerifier, call.getArgument(0));
+                var transport = call.getArgument(1, FixedBpmnStartToolTransport.class);
+                var request = call.getArgument(2, ToolInvocationStore.PreparationRequestVO.class); preparations.add(request); writes.incrementAndGet();
+                var observer = call.getArgument(4, ToolCommittedFactObserver.class); lateObserver.set(observer);
+                if (approvedMode == ApprovedMode.WAIT) {
+                    observer.onCommitted(ToolExecutionOutcome.Status.AWAITING_APPROVAL);
+                    return new ToolInvocationRecorder.ApprovedStartResultVO(request.action().intentId(), "AWAITING_APPROVAL", 1, null);
+                }
+                if (approvedMode == ApprovedMode.REPLAY) {
+                    return new ToolInvocationRecorder.ApprovedStartResultVO(request.action().intentId(), "APPLIED", 3, null);
+                }
+                approvalCalls.incrementAndGet();
+                Instant bounded = deadline.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+                transport.withVerifiedCall(new FixedBpmnStartToolTransport.Request(request.binding().run(), request.lease(), request.descriptor(), request.action(), request.invocationId(), bounded),
+                        (executor, operation) -> operation.start(bounded));
+                observer.onCommitted(ToolExecutionOutcome.Status.SUCCEEDED); lateFact.countDown(); afterWrite.run();
+                if (approvedMode == ApprovedMode.OUTER_MASK) throw new FixedToolApprovalVerifier.Failure(FixedToolApprovalVerifier.FailureKind.APPROVAL_UNAVAILABLE);
+                var outcome = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("instanceId", INSTANCE), RECEIPT, null, BigDecimal.ZERO);
+                return new ToolInvocationRecorder.ApprovedStartResultVO(request.action().intentId(), "DISPATCHING", 2,
+                        new ToolInvocationRecorder.WriteAttemptResultVO(query.runId(), request.invocationId(), "SUCCEEDED", 3, 1, NOW, NOW, outcome, true,
+                                ToolInvocationRecorder.AccountingState.SETTLED));
+            });
             when(access.recordKnownStartResultAccess(any(), any())).thenAnswer(call -> {
                 accesses.incrementAndGet(); var request = call.getArgument(0, ToolResultAccessStore.StartResultAccessRequestVO.class); accessRequests.add(request);
                 if (accessDenied) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "controlled access denial");
@@ -467,8 +600,12 @@ class AdkGovernedProcessLoopTest {
                 return new ToolResultAccessRecorder.StartResultAccessVO(query.runId(), request.accessId(), request.action().intentId(), 3, HASH,
                         new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("instanceId", INSTANCE), RECEIPT, null, new BigDecimal("0.0300")), ToolInvocationRecorder.AccountingState.SETTLED);
             });
-            var actual = new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, List.of(READ, START),
-                    value -> tools ? List.of(binding(value.authorization(), READ), binding(value.authorization(), START)) : List.of(),
+            var actual = approved
+                    ? new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, List.of(READ, writeTool),
+                    value -> tools ? List.of(binding(value.authorization(), READ), binding(value.authorization(), writeTool)) : List.of(),
+                    request -> new AdkGovernedProcessToolBridge.StartActionContextVO("business-v1", Duration.ofDays(1)), approvalVerifier, approvalReceipts)
+                    : new AdkGovernedProcessToolBridge(ledger, recorder, decision, start, access, List.of(READ, writeTool),
+                    value -> tools ? List.of(binding(value.authorization(), READ), binding(value.authorization(), writeTool)) : List.of(),
                     request -> new AdkGovernedProcessToolBridge.StartActionContextVO("business-v1", Duration.ofDays(1)));
             bridge = spy(actual);
             doAnswer(call -> {
@@ -484,13 +621,13 @@ class AdkGovernedProcessLoopTest {
 
         AgentLedgerService.ExecutionMaterial material() {
             var policy = new ExecutionPolicyDTO(Duration.ofSeconds(60), idle, Duration.ofSeconds(5), 8, tools ? maxEntries : 0, 10000, 1000,
-                    BigDecimal.TEN, "USD", 2, tools ? Set.of(READ.versionKey(), START.versionKey()) : Set.of(), "retry-v1", null);
+                    BigDecimal.TEN, "USD", 2, tools ? Set.of(READ.versionKey(), writeTool.versionKey()) : Set.of(), "retry-v1", approved ? "approval-v1" : null);
             var agents = workflow.equals("SINGLE") ? List.of(Map.of("name", "writer", "instruction", "writer"))
                     : List.of(Map.of("name", "writer", "instruction", "writer"), Map.of("name", "reviewer", "instruction", "reviewer"));
             var config = Map.<String, Object>of("chatModelBeanName", "fixtureModel", "modelName", "fixture-model", "rootAgentName", workflow.equals("SINGLE") ? "writer" : "root",
                     "agents", agents, "workflows", workflow.equals("SINGLE") ? List.of() : List.of(Map.of("name", "root", "type", workflow, "subAgentNames", List.of("writer", "reviewer"))));
             var definition = new AgentDefinitionSpecDTO("assistant", 1, "CONFIG", null, "1", "1",
-                    new DefinitionDependenciesDTO(List.of(), List.of(), tools ? List.of(READ.reference(), START.reference()) : List.of(), "route-v1", "policy-v1"), policy, config);
+                    new DefinitionDependenciesDTO(List.of(), List.of(), tools ? List.of(READ.reference(), writeTool.reference()) : List.of(), "route-v1", "policy-v1"), policy, config);
             var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, new AgentInputDTO("Use the reviewed tools", null, null), "invoice-1");
             var authorization = new AgentRunAuthorization.Request(actor, query.runId(), "assistant", 1, HASH, "c".repeat(64), "d".repeat(64), "policy-v1", false, deadline);
             return new AgentLedgerService.ExecutionMaterial(run(AgentRunStatusEnum.QUEUED, 0, 0), snapshot, authorization);

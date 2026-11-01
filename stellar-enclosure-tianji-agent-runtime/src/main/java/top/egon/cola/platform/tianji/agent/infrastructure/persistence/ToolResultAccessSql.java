@@ -9,6 +9,7 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.DisclosureWindowVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.RecordedAccessVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.StartResultAccessRequestVO;
@@ -55,7 +56,9 @@ final class ToolResultAccessSql {
                 || originalAudit.expiresAt().isAfter(current.expiresAt())) throw unavailable();
         // This unlocked probe only rejects reuse of an existing host ID for another target before a possibly missing action is locked.
         var existing = read(request, deadline, false);
-        var action = intents.lockForWrite(request.action(), request.descriptor(), deadline);
+        var action = request.descriptor().policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
+                ? intents.lockForApproval(request.action(), request.descriptor(), deadline)
+                : intents.lockForWrite(request.action(), request.descriptor(), deadline);
         if (!action.action().requestSha256().equals(request.action().requestSha256()) || !action.action().intentId().equals(request.action().intentId())
                 || !action.descriptor().equals(request.descriptor())) throw conflict();
         var outcome = action.outcome();
@@ -117,7 +120,9 @@ final class ToolResultAccessSql {
         if (material == null || !run.equals(material.authorization()) || material.snapshot() == null || !run.runId().equals(material.run().runId())) throw unavailable();
         var policy = material.snapshot().effectivePolicy();
         if (!material.snapshot().definition().dependencies().tools().contains(request.descriptor().reference())
-                || !policy.allowedToolVersions().contains(request.descriptor().versionKey()) || policy.maxToolCalls() < 1) throw denied();
+                || !policy.allowedToolVersions().contains(request.descriptor().versionKey()) || policy.maxToolCalls() < 1
+                || request.descriptor().policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
+                && !Objects.equals(policy.approvalPolicyRef(), request.descriptor().policy().approvalPolicyRef())) throw denied();
         if (!policy.toolTimeout().equals(expectedTimeout)) throw unavailable();
         if (!expiries.getFirst().isAfter(now(deadline))) throw leaseLost();
     }

@@ -39,6 +39,8 @@ public interface AdkGovernedToolBridge {
                 if (!"REQUESTED".equals(state) || !Long.valueOf(0).equals(dispatchEpoch) || accountingState != null || errorCode != null) throw invalidEvent();
             } else if ("UNAVAILABLE".equals(state)) {
                 if (dispatchEpoch != null && dispatchEpoch != 0 || accountingState != null || errorCode == null) throw invalidEvent();
+            } else if ("AWAITING_APPROVAL".equals(state)) {
+                if (!Long.valueOf(0).equals(dispatchEpoch) || accountingState != ToolInvocationRecorder.AccountingState.PENDING || errorCode != null) throw invalidEvent();
             } else if (!Set.of("PREPARED", "DISPATCHING", "SUCCEEDED", "REJECTED", "FAILED_KNOWN", "UNKNOWN").contains(state)
                     || accountingState == null || dispatchEpoch == null && !Set.of("SUCCEEDED", "REJECTED", "FAILED_KNOWN").contains(state)) throw invalidEvent();
         }

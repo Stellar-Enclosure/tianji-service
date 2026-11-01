@@ -28,11 +28,13 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 
 import javax.sql.DataSource;
 import java.math.BigDecimal;
+import java.net.URI;
 import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -339,6 +341,148 @@ class ToolResultAccessStoreTest {
         }
     }
 
+    @Test void approved_fixed_start_requests_keep_the_full_profile_owner_and_binding_contract() throws Exception {
+        try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, null)) {
+            var request = assertDoesNotThrow(() -> scene.request(UUID.randomUUID()));
+            assertEquals(ToolPolicy.Risk.APPROVAL_REQUIRED, request.descriptor().policy().risk());
+            assertEquals(5, StartResultAccessRequestVO.class.getRecordComponents().length);
+            assertEquals(scene.descriptor.parametersSha256(request.action().arguments()), request.parametersSha256());
+            assertNotEquals(request.action().requestSha256(), request.parametersSha256());
+            for (var descriptor : List.of(tool(ToolPolicy.Risk.APPROVAL_REQUIRED, "other.write", true),
+                    tool(ToolPolicy.Risk.APPROVAL_REQUIRED, ProcessClient.START_RESOURCE_KEY, false))) {
+                var binding = new ToolExecutionGrant.BindingVO(request.binding().run(), descriptor.reference(), descriptor.policy().bindingSha256(),
+                        "TIANJI_TOOL_PROCESS", URI.create("https://agent.example/20"), "tool.process.execute", null);
+                var action = new ToolActionRequest(ACTOR, descriptor, "invoice-1", "v1", Map.of("amount", 20L));
+                assertThrows(IllegalArgumentException.class, () -> new StartResultAccessRequestVO(binding, request.lease(), descriptor, action, UUID.randomUUID()));
+            }
+            var foreign = new ToolActionRequest(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "other-owner", "https://idp.example/20"),
+                    scene.descriptor, "invoice-1", "v1", Map.of("amount", 20L));
+            assertThrows(IllegalArgumentException.class, () -> new StartResultAccessRequestVO(request.binding(), request.lease(), scene.descriptor, foreign, UUID.randomUUID()));
+        }
+    }
+
+    @Test void expired_consumed_approval_keeps_known_three_proof_and_fees_while_only_the_access_budget_settles_zero() throws Exception {
+        for (var status : List.of(ToolExecutionOutcome.Status.SUCCEEDED, ToolExecutionOutcome.Status.REJECTED, ToolExecutionOutcome.Status.FAILED_KNOWN)) {
+            for (BigDecimal fee : new BigDecimal[]{null, new BigDecimal("0.0310"), new BigDecimal("2.5000")}) try (var scene = approvedScene(status, fee)) {
+                var request = scene.request(UUID.randomUUID()); var original = scene.rig.base.intentRow.get();
+                var sourceRow = new HashMap<>(scene.rig.row(scene.source)); var sourceBudget = scene.rig.base.budgetRows.get(scene.source.reservationId());
+                var codec = new ToolExecutionJsonCodec(); String proof = codec.approval(original.approval().proof(), original.action());
+                scene.advancePastApproval(); assertTrue(original.approval().proof().approval().expiresAt().isBefore(scene.rig.base.wall.get()));
+                scene.store.verifyStorage(); clearInvocations(scene.rig.base.budgets, scene.actionSql);
+                var observed = new ArrayList<ToolExecutionOutcome.Status>();
+                var recorder = new ToolResultAccessRecorder(scene.store, scene.rig.base.ledger);
+                var result = recorder.recordKnownStartResultAccess(request, observed::add);
+                assertEquals(status, result.sourceOutcome().status()); assertEquals(fee, result.sourceOutcome().actualCost());
+                assertEquals(ToolInvocationRecorder.AccountingState.SETTLED, result.accessAccountingState()); assertEquals(List.of(status), observed);
+                assertSame(original, scene.rig.base.intentRow.get()); assertEquals(sourceRow, scene.rig.row(scene.source));
+                assertEquals(sourceBudget, scene.rig.base.budgetRows.get(scene.source.reservationId()));
+                assertEquals(proof, codec.approval(scene.rig.base.intentRow.get().approval().proof(), original.action()));
+                assertEquals(original.approval().proofSha256(), scene.rig.base.intentRow.get().approval().proofSha256());
+                var accessBudget = scene.rig.base.budgetRows.get(request.reservationId());
+                assertEquals(BigDecimal.ZERO, accessBudget.actualCost()); assertEquals(AgentBudgetReservation.State.SETTLED, accessBudget.state());
+                assertEquals(1, scene.accesses.size()); assertEquals(3, scene.rig.base.budgetInserts.get());
+                verify(scene.rig.base.budgets).settleBudget(eq(ACTOR), eq(request.lease()), eq(request.reservationId()), any());
+                verify(scene.rig.base.budgets, never()).settleBudget(eq(ACTOR), any(), eq(scene.source.reservationId()), any());
+                verify(scene.actionSql).lockForApproval(eq(request.action()), eq(scene.descriptor), any());
+                verify(scene.actionSql, never()).lockForWrite(any(), any(), any());
+            }
+        }
+    }
+
+    @Test void approved_exact_access_replay_keeps_one_fact_and_budget_but_rechecks_current_reconcile() throws Exception {
+        try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, new BigDecimal("0.0300"))) {
+            var request = scene.request(UUID.randomUUID()); var first = scene.read(request); var stored = new HashMap<>(scene.accesses.get(request.accessId()));
+            var source = scene.rig.base.intentRow.get(); var sourceBudget = scene.rig.base.budgetRows.get(scene.source.reservationId());
+            scene.advancePastApproval(); clearInvocations(scene.rig.base.authority, scene.rig.base.capabilities, scene.rig.base.budgets);
+            var replay = scene.read(request);
+            assertEquals(first.sourceResultSha256(), replay.sourceResultSha256()); assertEquals(first.sourceActionRevision(), replay.sourceActionRevision());
+            assertEquals(first.sourceOutcome(), replay.sourceOutcome()); assertEquals(stored, scene.accesses.get(request.accessId()));
+            assertEquals(1, scene.accesses.size()); assertEquals(3, scene.rig.base.budgetInserts.get()); assertSame(source, scene.rig.base.intentRow.get());
+            assertEquals(sourceBudget, scene.rig.base.budgetRows.get(scene.source.reservationId()));
+            verify(scene.rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.RECONCILE));
+            verify(scene.rig.base.capabilities).current(request.binding(), scene.descriptor);
+            verify(scene.rig.base.capabilities).currentInTransaction(request.binding(), scene.descriptor);
+            verify(scene.rig.base.budgets, never()).reserveBudget(any(), any(), any());
+            scene.check.set(value -> new ToolExecutionAuthorization.CheckResult(value, ToolExecutionAuthorization.Boundary.RECONCILE, ToolExecutionAuthorization.Decision.DENY, null));
+            assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () -> scene.read(request));
+            assertEquals(stored, scene.accesses.get(request.accessId())); assertEquals(3, scene.rig.base.budgetInserts.get());
+        }
+    }
+
+    @Test void approved_disclosure_rejects_current_approval_policy_drift_outside_and_inside_the_transaction() throws Exception {
+        for (boolean inTransaction : List.of(false, true)) for (String policy : java.util.Arrays.asList(null, "another-approval-policy")) {
+            try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, null)) {
+                var request = scene.request(UUID.randomUUID()); var original = scene.rig.base.intentRow.get();
+                if (inTransaction) scene.beforeRunLock.set(() -> scene.setApprovalPolicy(policy)); else scene.setApprovalPolicy(policy);
+                clearInvocations(scene.rig.base.authority);
+                assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () -> scene.read(request));
+                assertTrue(scene.accesses.isEmpty()); assertEquals(2, scene.rig.base.budgetInserts.get()); assertSame(original, scene.rig.base.intentRow.get());
+                if (inTransaction) verify(scene.rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.RECONCILE));
+                else verify(scene.rig.base.authority, never()).check(any(), eq(ToolExecutionAuthorization.Boundary.RECONCILE));
+            }
+        }
+    }
+
+    @Test void historical_approval_never_substitutes_for_current_reconcile_capability_or_live_lease() throws Exception {
+        for (String change : List.of("deny", "prepare", "epoch", "lease", "cancel")) try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, null)) {
+            var request = scene.request(UUID.randomUUID()); var original = scene.rig.base.intentRow.get();
+            if (change.equals("deny")) scene.check.set(value -> new ToolExecutionAuthorization.CheckResult(value, ToolExecutionAuthorization.Boundary.RECONCILE, ToolExecutionAuthorization.Decision.DENY, null));
+            if (change.equals("prepare")) scene.check.set(value -> scene.rig.allowed(value, ToolExecutionAuthorization.Boundary.PREPARE));
+            if (change.equals("epoch")) { var old = scene.rig.evidence(RUN); scene.rig.base.insideEvidence.set(new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(old.reservation().binding(), 4), old.grantId(), old.ciphertext(), old.expiresAt())); }
+            if (change.equals("lease")) scene.rig.base.databaseLease.set(NOW.minusSeconds(1));
+            if (change.equals("cancel")) scene.rig.base.sourceActive.set(false);
+            var rejected = assertThrows(AgentLedgerException.class, () -> scene.read(request));
+            assertTrue(Set.of(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED).contains(rejected.code()));
+            assertTrue(scene.accesses.isEmpty()); assertEquals(2, scene.rig.base.budgetInserts.get()); assertSame(original, scene.rig.base.intentRow.get());
+        }
+    }
+
+    @Test void nonterminal_approved_sources_and_strict_action_history_failures_do_not_consume_access_quota() throws Exception {
+        for (String state : List.of("AWAITING_APPROVAL", "DISPATCHING", "UNKNOWN")) {
+            try (var scene = state.equals("DISPATCHING") ? new Scene(ToolPolicy.Risk.APPROVAL_REQUIRED, ToolExecutionOutcome.Status.SUCCEEDED, null, false)
+                    : approvedScene(ToolExecutionOutcome.Status.valueOf(state), null)) {
+                var request = scene.request(UUID.randomUUID()); var original = scene.rig.base.intentRow.get(); long budgets = scene.rig.base.budgetInserts.get();
+                assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.read(request));
+                assertTrue(scene.accesses.isEmpty()); assertEquals(budgets, scene.rig.base.budgetInserts.get()); assertSame(original, scene.rig.base.intentRow.get());
+            }
+        }
+        // Strict Action parsing is covered by ActionApprovalSqlTest; access must propagate its missing/corrupt/cross-action history refusal.
+        for (String failure : List.of("missing", "corrupt-proof", "cross-action-proof")) try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, null)) {
+            var request = scene.request(UUID.randomUUID()); scene.sourceFailure.set(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "private " + failure));
+            assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.read(request)); assertTrue(scene.accesses.isEmpty()); assertEquals(2, scene.rig.base.budgetInserts.get());
+        }
+    }
+
+    @Test void approved_access_keeps_target_identity_and_source_digest_guards_on_replay() throws Exception {
+        try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, null)) {
+            var request = scene.request(UUID.randomUUID()); scene.read(request);
+            var changedAction = new ToolActionRequest(ACTOR, scene.descriptor, "different-invoice", "v1", Map.of("amount", 20L));
+            var changed = new StartResultAccessRequestVO(request.binding(), request.lease(), scene.descriptor, changedAction, request.accessId());
+            scene.missingAction.set(true); assertCode(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, () -> scene.read(changed));
+            assertEquals(1, scene.accesses.size()); assertEquals(3, scene.rig.base.budgetInserts.get());
+        }
+        for (boolean revision : List.of(false, true)) try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, new BigDecimal("0.0300"))) {
+            var request = scene.request(UUID.randomUUID()); scene.read(request); var old = scene.rig.base.intentRow.get();
+            scene.replaceSource(revision ? old.outcome() : success(new BigDecimal("0.0400")), old.revision() + (revision ? 1 : 0));
+            assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.read(request)); assertEquals(1, scene.accesses.size());
+            assertEquals(3, scene.rig.base.budgetInserts.get());
+        }
+    }
+
+    @Test void approved_access_insert_or_timeout_failures_roll_back_only_the_new_access_fact_and_budget() throws Exception {
+        for (boolean timeout : List.of(false, true)) try (var scene = approvedScene(ToolExecutionOutcome.Status.SUCCEEDED, new BigDecimal("0.0310"))) {
+            var request = scene.request(UUID.randomUUID()); var original = scene.rig.base.intentRow.get(); var budget = scene.rig.base.budgetRows.get(scene.source.reservationId());
+            if (timeout) scene.afterInsert.set(() -> { scene.rig.base.wall.set(NOW.minusSeconds(30)); scene.rig.base.nano.set(10_000_000_001L); }); else scene.failInsert.set(true);
+            assertCode(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> scene.read(request));
+            assertTrue(scene.accesses.isEmpty()); assertFalse(scene.rig.base.budgetRows.containsKey(request.reservationId())); assertEquals(2, scene.rig.base.budgetInserts.get());
+            assertSame(original, scene.rig.base.intentRow.get()); assertEquals(budget, scene.rig.base.budgetRows.get(scene.source.reservationId()));
+        }
+    }
+
+    private static Scene approvedScene(ToolExecutionOutcome.Status status, BigDecimal fee) throws Exception {
+        return new Scene(ToolPolicy.Risk.APPROVAL_REQUIRED, status, fee, true);
+    }
+
     private static ToolDescriptor tool(ToolPolicy.Risk risk, String resource, boolean output) {
         return new ToolDescriptor("process.start", 1, "process_start", "Fixed START", new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
                 new ToolSchema(output ? Map.of("instanceId", ToolSchema.ValueType.STRING) : Map.of(), output ? Set.of("instanceId") : Set.of()),
@@ -352,6 +496,7 @@ class ToolResultAccessStoreTest {
     }
 
     private static final class Scene implements AutoCloseable {
+        final ToolDescriptor descriptor;
         final ToolWriteInvocationStoreTest.Rig rig;
         final ToolInvocationStore.PreparationRequestVO source;
         final ToolResultAccessStore store;
@@ -363,39 +508,68 @@ class ToolResultAccessStoreTest {
         final AtomicReference<Runnable> beforeRunLock = new AtomicReference<>(() -> { }), afterInsert = new AtomicReference<>(() -> { });
         final AtomicReference<Function<ToolExecutionAuthorization.Request, ToolExecutionAuthorization.CheckResult>> check = new AtomicReference<>();
         final AtomicReference<ToolExecutionAuthorization.CheckResult> checked = new AtomicReference<>();
+        final AtomicReference<AgentLedgerException> sourceFailure = new AtomicReference<>();
         Map<UUID, Map<String, Object>> beforeAccesses;
         boolean ready;
 
         Scene() throws Exception { this(ToolExecutionOutcome.Status.SUCCEEDED, new BigDecimal("0.0300")); }
-        Scene(ToolExecutionOutcome.Status status, BigDecimal fee) throws Exception {
-            rig = new ToolWriteInvocationStoreTest.Rig(TOOL); source = rig.request(RUN, UUID.randomUUID());
-            var prepared = rig.prepare(source); var started = rig.begin(source, prepared.invocation(), "1".repeat(64), new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "ACTION_NOT_DISPATCHABLE", null));
-            rig.complete(source, started.attempt(), "1".repeat(64), status == ToolExecutionOutcome.Status.SUCCEEDED ? success(fee) : new ToolExecutionOutcome(status, Map.of(), null, "SOURCE_REJECTED", fee));
-            store = new ToolResultAccessStore(rig.base.source, rig.base.ledger, rig.base.capabilities, rig.base.authority, rig.base.clock(), rig.base.nano::get);
-            jdbc = rig.base.jdbc.get(); actionSql = rig.base.intents.constructed().getLast(); request = request(UUID.randomUUID());
-            check.set(this::allowed);
-            doAnswer(call -> { assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); rig.base.trace.add("reconcile-authorize");
-                ToolExecutionAuthorization.Request expected = call.getArgument(0); assertEquals(request.parametersSha256(), expected.parametersSha256());
-                assertNotEquals(request.action().requestSha256(), expected.parametersSha256());
-                var result = check.get().apply(expected); checked.set(result); return result;
-            }).when(rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.RECONCILE));
-            doAnswer(call -> {
-                assertTrue(TransactionSynchronizationManager.hasResource(rig.base.source)); rig.base.trace.add("access-action-lock");
-                if (missingAction.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Source unavailable");
-                ToolActionRequest requested = call.getArgument(0); var current = rig.base.intentRow.get();
-                if (!current.action().requestSha256().equals(requested.requestSha256())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Source changed");
-                rig.assertProjection(current); return current;
-            }).when(actionSql).lockForWrite(any(), any(), any());
-            installJdbc();
-            doAnswer(call -> { if (!call.getArgument(0, Boolean.class)) { rig.capture(); beforeAccesses = copy(accesses); } return null; }).when(rig.base.connection).setAutoCommit(anyBoolean());
-            doAnswer(call -> { rig.base.trace.add("rollback"); rig.restore(); if (beforeAccesses != null) { accesses.clear(); accesses.putAll(copy(beforeAccesses)); beforeAccesses = null; } return null; }).when(rig.base.connection).rollback();
-            doAnswer(call -> { rig.base.trace.add("commit"); rig.beforeRows = null; beforeAccesses = null; rig.base.afterCommit.get().run(); return null; }).when(rig.base.connection).commit();
+        Scene(ToolExecutionOutcome.Status status, BigDecimal fee) throws Exception { this(ToolPolicy.Risk.IDEMPOTENT_WRITE, status, fee, true); }
+        Scene(ToolPolicy.Risk risk, ToolExecutionOutcome.Status status, BigDecimal fee, boolean complete) throws Exception {
+            descriptor = risk == ToolPolicy.Risk.IDEMPOTENT_WRITE ? TOOL : tool(risk, ProcessClient.START_RESOURCE_KEY, true);
+            ToolApprovedInvocationStoreTest.Fixture approved = risk == ToolPolicy.Risk.APPROVAL_REQUIRED
+                    ? new ToolApprovedInvocationStoreTest.Fixture(descriptor, true, new BigDecimal("0.20")) : null;
+            rig = approved == null ? new ToolWriteInvocationStoreTest.Rig(descriptor) : approved.rig;
+            source = approved != null && status == ToolExecutionOutcome.Status.AWAITING_APPROVAL ? approved.waiting
+                    : approved == null ? rig.request(RUN, UUID.randomUUID()) : approved.request(RUN);
+            try {
+                if (approved == null) {
+                    var prepared = rig.prepare(source); var started = rig.begin(source, prepared.invocation(), "1".repeat(64), new ToolExecutionOutcome(ToolExecutionOutcome.Status.FAILED_KNOWN, Map.of(), null, "ACTION_NOT_DISPATCHABLE", null));
+                    rig.complete(source, started.attempt(), "1".repeat(64), status == ToolExecutionOutcome.Status.SUCCEEDED ? success(fee) : new ToolExecutionOutcome(status, Map.of(), null, "SOURCE_REJECTED", fee));
+                } else if (status != ToolExecutionOutcome.Status.AWAITING_APPROVAL) {
+                    var started = approved.begin(source);
+                    if (complete) {
+                        if (fee != null && fee.compareTo(source.estimatedCost()) > 0) rig.budgetUnknown(source, fee);
+                        approved.complete(source, started.attempt(), "1".repeat(64), status == ToolExecutionOutcome.Status.SUCCEEDED ? success(fee)
+                                : new ToolExecutionOutcome(status, Map.of(), null, "SOURCE_REJECTED", fee));
+                    }
+                }
+                store = new ToolResultAccessStore(rig.base.source, rig.base.ledger, rig.base.capabilities, rig.base.authority, rig.base.clock(), rig.base.nano::get);
+                jdbc = rig.base.jdbc.get(); actionSql = rig.base.intents.constructed().getLast();
+                // AA request construction stays in test bodies so the old production risk guard is an observed behavior failure, not a fixture leak.
+                request = approved == null ? request(UUID.randomUUID()) : null;
+                check.set(this::allowed);
+                doAnswer(call -> { assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); rig.base.trace.add("reconcile-authorize");
+                    ToolExecutionAuthorization.Request expected = call.getArgument(0); assertEquals(descriptor.parametersSha256(source.action().arguments()), expected.parametersSha256());
+                    assertNotEquals(source.action().requestSha256(), expected.parametersSha256());
+                    var result = check.get().apply(expected); checked.set(result); return result;
+                }).when(rig.base.authority).check(any(), eq(ToolExecutionAuthorization.Boundary.RECONCILE));
+                if (approved == null) {
+                    doAnswer(call -> sourceRow(call.getArgument(0))).when(actionSql).lockForWrite(any(), any(), any());
+                } else {
+                    doAnswer(call -> sourceRow(call.getArgument(0))).when(actionSql).lockForApproval(any(), any(), any());
+                    doAnswer(call -> { throw new IllegalArgumentException("An approved action cannot use the idempotent-only lock"); })
+                            .when(actionSql).lockForWrite(any(), any(), any());
+                }
+                installJdbc();
+                doAnswer(call -> { if (!call.getArgument(0, Boolean.class)) { rig.capture(); beforeAccesses = copy(accesses); } return null; }).when(rig.base.connection).setAutoCommit(anyBoolean());
+                doAnswer(call -> { rig.base.trace.add("rollback"); rig.restore(); if (beforeAccesses != null) { accesses.clear(); accesses.putAll(copy(beforeAccesses)); beforeAccesses = null; } return null; }).when(rig.base.connection).rollback();
+                doAnswer(call -> { rig.base.trace.add("commit"); rig.beforeRows = null; beforeAccesses = null; rig.base.afterCommit.get().run(); return null; }).when(rig.base.connection).commit();
+            } catch (RuntimeException | Error initializationFailure) { rig.close(); throw initializationFailure; }
         }
 
-        StartResultAccessRequestVO request(UUID id) { return new StartResultAccessRequestVO(rig.binding(RUN), source.lease(), TOOL, source.action(), id); }
+        private ToolActionIntentSql.Row sourceRow(ToolActionRequest requested) {
+            assertTrue(TransactionSynchronizationManager.hasResource(rig.base.source)); rig.base.trace.add("access-action-lock");
+            if (missingAction.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Source unavailable");
+            if (sourceFailure.get() != null) throw sourceFailure.get();
+            var current = rig.base.intentRow.get();
+            if (!current.action().requestSha256().equals(requested.requestSha256())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Source changed");
+            rig.assertProjection(current); return current;
+        }
+
+        StartResultAccessRequestVO request(UUID id) { return new StartResultAccessRequestVO(rig.binding(RUN), source.lease(), descriptor, source.action(), id); }
         ToolResultAccessStore.RecordedAccessVO read(StartResultAccessRequestVO value) { if (!ready) { store.verifyStorage(); ready = true; } return store.recordKnownStartResultAccess(value); }
         ToolExecutionAuthorization.CheckResult allowed(ToolExecutionAuthorization.Request value) { return rig.allowed(value, ToolExecutionAuthorization.Boundary.RECONCILE); }
-        AgentBudgetReservation zeroBudget(StartResultAccessRequestVO value) { return new AgentBudgetReservation(value.reservationId(), value.lease().epoch(), AgentBudgetRequest.Kind.TOOL, TOOL.versionKey(), 0, 0,
+        AgentBudgetReservation zeroBudget(StartResultAccessRequestVO value) { return new AgentBudgetReservation(value.reservationId(), value.lease().epoch(), AgentBudgetRequest.Kind.TOOL, descriptor.versionKey(), 0, 0,
                 BigDecimal.ZERO, AgentBudgetReservation.State.RESERVED, null, null, null, false); }
         void setEvidenceExpiry(Instant expires) { var old = rig.evidence(RUN); rig.evidences.put(RUN, new ToolExecutionGrant.EvidenceVO(old.reservation(), old.grantId(), old.ciphertext(), expires)); }
         void setTimeout(Duration timeout) {
@@ -405,10 +579,23 @@ class ToolResultAccessStoreTest {
             var material = rig.base.ledger.executionMaterial(ACTOR, new GetAgentRunQuery(RUN));
             doReturn(new AgentLedgerService.ExecutionMaterial(material.run(), snapshot, material.authorization())).when(rig.base.ledger).executionMaterial(eq(ACTOR), any());
         }
+        void advancePastApproval() {
+            rig.base.wall.set(NOW.plusSeconds(40)); rig.base.databaseNow.set(NOW.plusSeconds(40)); rig.base.nano.set(40_000_000_000L);
+            rig.base.databaseLease.set(NOW.plusSeconds(55)); var old = rig.evidence(RUN);
+            rig.evidences.put(RUN, new ToolExecutionGrant.EvidenceVO(new ToolExecutionGrant.ReservationVO(old.reservation().binding(), 4),
+                    "9" + "4".repeat(62), "ENC:v1:key:new:ticket", NOW.plusSeconds(60)));
+        }
+        void setApprovalPolicy(String reference) {
+            var material = rig.base.ledger.executionMaterial(ACTOR, new GetAgentRunQuery(RUN)); var snapshot = material.snapshot(); var old = snapshot.effectivePolicy();
+            var policy = new ExecutionPolicyDTO(old.totalTimeout(), old.modelIdleTimeout(), old.toolTimeout(), old.maxModelCalls(), old.maxToolCalls(), old.maxInputTokens(), old.maxOutputTokens(),
+                    old.maxEstimatedCost(), old.currency(), old.maxParallelism(), old.allowedToolVersions(), old.retryPolicyRef(), reference);
+            var changed = new AgentExecutionSnapshot(snapshot.definition(), snapshot.definitionContentSha256(), policy, snapshot.input(), snapshot.businessKey(), snapshot.processLink());
+            doReturn(new AgentLedgerService.ExecutionMaterial(material.run(), changed, material.authorization())).when(rig.base.ledger).executionMaterial(eq(ACTOR), any());
+        }
         void replaceSource(ToolExecutionOutcome outcome, long revision) {
             var old = rig.base.intentRow.get(); var row = new ToolActionIntentSql.Row(old.action(), old.descriptor(), old.originRunId(), old.originSnapshotSha256(), old.state(), revision,
                     old.createdAt(), old.updatedAt(), old.expiresAt(), old.approval(), old.dispatch(), old.sideEffectOutcome(), outcome, outcome.errorCode(), old.closedAt());
-            rig.row(source).put("outcome", new ToolExecutionJsonCodec().outcome(TOOL, outcome)); rig.row(source).put("business_receipt_id", outcome.businessReceiptId()); rig.row(source).put("error_code", outcome.errorCode()); rig.base.intentRow.set(row);
+            rig.row(source).put("outcome", new ToolExecutionJsonCodec().outcome(descriptor, outcome)); rig.row(source).put("business_receipt_id", outcome.businessReceiptId()); rig.row(source).put("error_code", outcome.errorCode()); rig.base.intentRow.set(row);
         }
         void seedState(String state) {
             var old = rig.base.intentRow.get(); boolean dispatched = Set.of("DISPATCHING", "UNKNOWN").contains(state);
