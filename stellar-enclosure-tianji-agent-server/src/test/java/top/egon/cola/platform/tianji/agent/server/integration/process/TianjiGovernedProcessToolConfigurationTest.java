@@ -6,10 +6,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.ListableBeanFactory;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.support.AbstractBeanDefinition;
 import org.springframework.beans.factory.support.AutowireCandidateQualifier;
+import org.springframework.beans.factory.support.BeanDefinitionBuilder;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.boot.LazyInitializationBeanFactoryPostProcessor;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
@@ -19,6 +22,7 @@ import org.springframework.mock.env.MockEnvironment;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.autoconfigure.TianjiAgentRuntimeAutoConfiguration;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
@@ -26,6 +30,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
@@ -33,6 +38,7 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextResolver;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.ApprovalReceiptResolver;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkToolTelemetryPrivacy;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
@@ -54,6 +60,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
@@ -76,6 +83,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -226,7 +234,7 @@ class TianjiGovernedProcessToolConfigurationTest {
             var order = inOrder(resolvers, telemetry); order.verify(resolvers).getObject(); order.verify(telemetry).getIfAvailable(); captured.set(invocation.arguments());
         })) {
             var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, decision, start, access, f.authority,
-                    f.decisions, f.starts, f.grants, resolvers, telemetry, environment());
+                    f.decisions, f.starts, f.grants, resolvers, properties(), provider(null), provider(null), null, telemetry, environment());
             assertSame(construction.constructed().getFirst(), bridge); var args = captured.get();
             assertSame(f.ledger, args.get(0)); assertSame(recorder, args.get(1)); assertSame(decision, args.get(2)); assertSame(start, args.get(3)); assertSame(access, args.get(4));
             assertEquals(Set.of(READ, START), Set.copyOf((List<?>) args.get(5))); assertSame(f.resolver, args.get(7));
@@ -245,7 +253,7 @@ class TianjiGovernedProcessToolConfigurationTest {
         AdkToolTelemetryPrivacy.requireSafe();
         try (var global = mockStatic(GlobalOpenTelemetry.class)) {
             var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, mock(TianjiFixedDecisionToolTransport.class),
-                    mock(TianjiFixedBpmnStartToolTransport.class), access, f.authority, f.decisions, f.starts, f.grants, provider(f.resolver), telemetry, environment());
+                    mock(TianjiFixedBpmnStartToolTransport.class), access, f.authority, f.decisions, f.starts, f.grants, provider(f.resolver), properties(), provider(null), provider(null), null, telemetry, environment());
             assertTrue(bridge.usesActionContextResolver(f.resolver)); verify(telemetry).getIfAvailable(); global.verifyNoInteractions();
         }
         f.noExternalCalls();
@@ -388,9 +396,9 @@ class TianjiGovernedProcessToolConfigurationTest {
         f.noExternalCalls(); verifyNoInteractions(f.source, f.issuers);
     }
 
-    @Test void eleven_distinct_named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
+    @Test void thirteen_distinct_named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
         var methods = Arrays.stream(TianjiGovernedProcessToolConfiguration.class.getDeclaredMethods()).filter(method -> method.isAnnotationPresent(Bean.class)).toList();
-        assertEquals(11, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
+        assertEquals(13, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
             var bean = method.getAnnotation(Bean.class); return bean.value().length == 0 ? method.getName() : bean.value()[0];
         }).collect(java.util.stream.Collectors.toSet()));
         var bridge = methods.stream().filter(method -> method.getName().equals("tianjiAdkGovernedProcessTools")).findFirst().orElseThrow(); assertTrue(bridge.getAnnotation(Lazy.class).value());
@@ -398,8 +406,240 @@ class TianjiGovernedProcessToolConfigurationTest {
         var host = Arrays.stream(bridge.getParameters()).filter(value -> value.getParameterizedType().getTypeName().contains("StartActionContextResolver")).findFirst().orElseThrow(); assertEquals(HOST, host.getAnnotation(Qualifier.class).value());
         var verifier = methods.stream().filter(method -> method.getName().equals("tianjiGovernedProcessToolRuntimeChainVerifier")).findFirst().orElseThrow(); assertFalse(verifier.getAnnotation(Lazy.class).value());
         for (var method : methods) if (method.getReturnType() == HttpClient.class) assertEquals("shutdownNow", method.getAnnotation(Bean.class).destroyMethod());
-        else if (method.getReturnType() == TianjiFixedDecisionToolTransport.class || method.getReturnType() == TianjiFixedBpmnStartToolTransport.class) assertEquals("close", method.getAnnotation(Bean.class).destroyMethod());
+        else if (method.getReturnType() == TianjiFixedDecisionToolTransport.class || method.getReturnType() == TianjiFixedBpmnStartToolTransport.class || method.getReturnType() == TianjiFixedToolApprovalVerifier.class) assertEquals("close", method.getAnnotation(Bean.class).destroyMethod());
         assertFalse(methods.stream().anyMatch(method -> method.getReturnType() == StartActionContextResolver.class));
+    }
+
+    @Test void empty_approval_factories_do_not_construct_a_registry_or_resolve_any_optional_collaborator() {
+        var f = new Fixture(); var fixed = provider((TianjiFixedToolApprovalBindings) null); var oauth = provider(f.oauth);
+        var authentication = provider(f.authentication); var converter = provider(f.converter); var issuers = provider(f.issuers); var http = provider(mock(HttpClient.class));
+        try (var registries = mockConstruction(TianjiFixedToolApprovalBindings.class); var verifiers = mockConstruction(TianjiFixedToolApprovalVerifier.class)) {
+            assertNull(configuration.tianjiGovernedProcessApprovalBindings(f.authority, properties(), f.grants, environment()));
+            assertNull(configuration.tianjiGovernedProcessApprovalVerifier(properties(), fixed, oauth, authentication, converter, issuers, http, environment()));
+            assertTrue(registries.constructed().isEmpty()); assertTrue(verifiers.constructed().isEmpty());
+        }
+        verifyNoInteractions(fixed, oauth, authentication, converter, issuers, http); f.noExternalCalls();
+    }
+
+    @Test void start_factory_closes_the_idempotent_and_approved_union_and_always_checks_approval_slots() {
+        var f = new ApprovedFixture();
+        assertDoesNotThrow(() -> new TianjiFixedBpmnStartToolBindings(f.descriptors, f.properties.startBindings()));
+        assertDoesNotThrow(() -> new TianjiFixedToolApprovalBindings(f.descriptors, f.properties.approvalBindings()));
+        assertEquals(2, configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, f.properties, f.aaGrants, environment()).bindings().size());
+        var missing = new TianjiGovernedProcessToolProperties(true, 2, f.properties.decisionBindings(), f.properties.startBindings(), List.of());
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, missing, f.aaGrants, environment()));
+        var old = new Fixture(); var orphan = new TianjiGovernedProcessToolProperties(true, 2, List.of(decisionProfile()), List.of(startProfile()), List.of(f.approvalProfile));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(old.authority, orphan, old.grants, environment()));
+        f.noExternalCalls(); old.noExternalCalls();
+    }
+
+    @Test void actual_approved_context_wires_the_same_worker_bridge_verifier_and_receipt_singleton_under_global_lazy() {
+        for (boolean lazy : List.of(false, true)) {
+            var f = new ApprovedFixture();
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+                f.runner(lazy, true, "stable").run(context -> {
+                    assertNull(context.getStartupFailure());
+                    var bridge = context.getBean("tianjiAdkGovernedProcessTools", AdkGovernedProcessToolBridge.class);
+                    var worker = context.getBean("tianjiAdkAgentRunExecutor", AdkAgentRunExecutor.class);
+                    var verifier = context.getBean("tianjiGovernedProcessApprovalVerifier", TianjiFixedToolApprovalVerifier.class);
+                    var bindings = context.getBean("tianjiGovernedProcessApprovalBindings", TianjiFixedToolApprovalBindings.class);
+                    var http = context.getBean("tianjiGovernedProcessHttpClient", HttpClient.class);
+                    assertTrue(worker.usesGovernedProcessTools(bridge)); assertTrue(bridge.usesApprovalVerifier(verifier)); assertTrue(bridge.usesApprovalReceiptResolver(f.receipts));
+                    assertTrue(verifier.usesBindings(bindings)); assertTrue(verifier.usesOAuth(f.oauth)); assertTrue(verifier.usesAuthentication(f.authentication));
+                    assertTrue(verifier.usesConverter(f.converter)); assertTrue(verifier.usesIssuerRegistry(f.issuers)); assertTrue(verifier.usesHttpClient(http));
+                    assertEquals(3, storage.constructed().size()); assertTrue(context.getBeanFactory().containsSingleton("tianjiAdkAgentRunExecutor"));
+                });
+            }
+            f.noExternalCalls(); verifyNoInteractions(f.receipts);
+        }
+    }
+
+    @Test void actual_empty_approval_typed_providers_and_shutdown_work_without_forcing_a_receipt_host() {
+        for (boolean lazy : List.of(false, true)) {
+            var f = new Fixture(); var receiptCreations = new AtomicInteger();
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class);
+                 var registries = mockConstruction(TianjiFixedToolApprovalBindings.class); var verifiers = mockConstruction(TianjiFixedToolApprovalVerifier.class)) {
+                f.runner(lazy, true, "stable").withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class,
+                        () -> { receiptCreations.incrementAndGet(); throw new AssertionError("IDW assembly forced the approval host"); }, definition -> definition.setLazyInit(true))
+                        .run(context -> {
+                            assertNull(context.getStartupFailure());
+                            assertNull(context.getBeanProvider(TianjiFixedToolApprovalBindings.class).getIfAvailable());
+                            assertNull(context.getBeanProvider(TianjiFixedToolApprovalVerifier.class).getIfAvailable());
+                            assertTrue(registries.constructed().isEmpty()); assertTrue(verifiers.constructed().isEmpty());
+                        });
+            }
+            assertEquals(0, receiptCreations.get()); f.noExternalCalls(); verify(f.oauth, never()).close();
+        }
+    }
+
+    @Test void a_constant_sam_prototype_is_not_a_stable_qualified_receipt_host() {
+        var f = new ApprovedFixture(); var beans = new DefaultListableBeanFactory(); ApprovalReceiptResolver shared = request -> null;
+        var definition = BeanDefinitionBuilder.genericBeanDefinition(ApprovalReceiptResolver.class, () -> shared).getBeanDefinition(); definition.setScope("prototype");
+        beans.registerBeanDefinition("tianjiToolApprovalReceiptResolver", definition);
+        assertThrows(IllegalStateException.class, () -> f.bridge(configuration, provider(shared), beans)); f.noExternalCalls();
+    }
+
+    @Test void differently_named_qualified_and_aliased_singleton_receipt_hosts_keep_spring_qualifier_semantics() {
+        for (boolean alias : List.of(false, true)) {
+            var f = new ApprovedFixture(); var beans = new DefaultListableBeanFactory();
+            var definition = BeanDefinitionBuilder.genericBeanDefinition(ApprovalReceiptResolver.class, () -> f.receipts).getBeanDefinition();
+            if (!alias) definition.addQualifier(new AutowireCandidateQualifier(Qualifier.class, "tianjiToolApprovalReceiptResolver"));
+            beans.registerBeanDefinition("operatorReceiptHost", definition);
+            if (alias) beans.registerAlias("operatorReceiptHost", "tianjiToolApprovalReceiptResolver");
+            var bridge = f.bridge(configuration, provider(f.receipts), beans);
+            assertTrue(bridge.usesApprovalReceiptResolver(f.receipts)); assertTrue(bridge.usesApprovalVerifier(f.verifier));
+            verifyNoInteractions(f.receipts); f.noExternalCalls();
+        }
+    }
+
+    @Test void every_approved_origin_and_tool_reference_component_and_policy_is_part_of_the_always_on_closure() {
+        var f = new ApprovedFixture(); var base = mapping(f.approved);
+        var changed = List.of(
+                new TianjiToolGrantBindings.BindingVO(21, ISSUER, base.principalType(), "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, "7".repeat(64), base.principalType(), "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.SERVICE, "assistant", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "other", 1, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()),
+                new TianjiToolGrantBindings.BindingVO(20, ISSUER, base.principalType(), "assistant", 2, SHA, base.tool(), base.purpose(), base.authorizationResourceKey()));
+        for (var grant : changed) {
+            var grants = new TianjiToolGrantBindings(f.descriptors, List.of(mapping(READ), mapping(START), mapping(QUERY), grant), RESOURCE,
+                    grant.principalType() == TrustedAgentActor.SubjectType.SERVICE ? mock(TianjiServiceExecutionBindings.class) : null);
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, f.properties, grants, environment()));
+        }
+        for (var ref : List.of(new DefinitionResourceRef("other.approved", 1, f.approved.reference().contentSha256()),
+                new DefinitionResourceRef(f.approved.key(), 2, f.approved.reference().contentSha256()), new DefinitionResourceRef(f.approved.key(), 1, "5".repeat(64)))) {
+            var profile = new TianjiFixedToolApprovalBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, SHA, ref, f.policy, f.backend);
+            var props = new TianjiGovernedProcessToolProperties(true, 2, f.properties.decisionBindings(), f.properties.startBindings(), List.of(profile));
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, props, f.aaGrants, environment()));
+        }
+        var changedDefinitionHash = new TianjiFixedToolApprovalBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, "6".repeat(64), f.approved.reference(), f.policy, f.backend);
+        var driftedDefinition = new TianjiGovernedProcessToolProperties(true, 2, f.properties.decisionBindings(), f.properties.startBindings(), List.of(changedDefinitionHash));
+        assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, driftedDefinition, f.aaGrants, environment()));
+        var changedPolicy = new ToolApprovalBinding(f.policy.consumer(), "different-policy", f.policy.policyBindingSha256(), f.policy.releaseVersion(), f.policy.definitionKey(), f.policy.definitionSha256(), f.policy.taskDefinitionKey());
+        var mismatched = new TianjiFixedToolApprovalBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, SHA, f.approved.reference(), changedPolicy, f.backend);
+        for (var profiles : List.of(List.of(f.approvalProfile, f.approvalProfile), List.of(mismatched))) {
+            var props = new TianjiGovernedProcessToolProperties(true, 2, f.properties.decisionBindings(), f.properties.startBindings(), profiles);
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessStartBindings(f.aaAuthority, props, f.aaGrants, environment()));
+            assertThrows(IllegalStateException.class, () -> configuration.tianjiGovernedProcessApprovalBindings(f.aaAuthority, props, f.aaGrants, environment()));
+        }
+        f.noExternalCalls();
+    }
+
+    @Test void an_unreferenced_approved_descriptor_does_not_force_approval_providers_or_receipt_metadata() {
+        var f = new ApprovedFixture(); var unused = new TianjiToolAuthorityProperties(true, Duration.ofSeconds(1), 2, f.descriptors, List.of(mapping(READ), mapping(START), mapping(QUERY)));
+        var grants = new TianjiToolGrantBindings(f.descriptors, unused.bindings(), RESOURCE, null);
+        var starts = configuration.tianjiGovernedProcessStartBindings(unused, properties(), grants, environment()); assertEquals(1, starts.bindings().size());
+        var verifiers = provider(f.verifier); var receipts = provider(f.receipts); var beans = mock(ListableBeanFactory.class);
+        var recorder = mock(ToolInvocationRecorder.class); var access = mock(ToolResultAccessRecorder.class);
+        when(recorder.usesLedger(f.ledger)).thenReturn(true); when(access.usesLedger(f.ledger)).thenReturn(true);
+        var bridge = configuration.tianjiAdkGovernedProcessTools(f.ledger, recorder, mock(TianjiFixedDecisionToolTransport.class), mock(TianjiFixedBpmnStartToolTransport.class), access,
+                unused, f.decisions, starts, grants, provider(f.resolver), properties(), verifiers, receipts, beans, provider((OpenTelemetry) null), environment());
+        assertFalse(bridge.usesApprovalVerifier(f.verifier)); assertFalse(bridge.usesApprovalReceiptResolver(f.receipts));
+        verifyNoInteractions(verifiers, receipts, beans, f.receipts); f.noExternalCalls();
+    }
+
+    @Test void each_approval_verifier_collaborator_and_bridge_approval_pointer_is_checked_on_the_healthy_actual_graph() {
+        var healthy = new ApprovedChain(); assertDoesNotThrow(healthy.proof(configuration, environment())::afterSingletonsInstantiated);
+        List<Consumer<ApprovedChain>> broken = List.of(
+                c -> when(c.approvals.usesBindings(c.approvalBindings)).thenReturn(false), c -> when(c.approvals.usesOAuth(c.oauth)).thenReturn(false),
+                c -> when(c.approvals.usesAuthentication(c.authentication)).thenReturn(false), c -> when(c.approvals.usesConverter(c.converter)).thenReturn(false),
+                c -> when(c.approvals.usesIssuerRegistry(c.issuers)).thenReturn(false), c -> when(c.approvals.usesHttpClient(c.http)).thenReturn(false),
+                c -> when(c.bridge.usesApprovalVerifier(c.approvals)).thenReturn(false), c -> when(c.bridge.usesApprovalReceiptResolver(c.receipts)).thenReturn(false));
+        for (var mutation : broken) {
+            var c = new ApprovedChain(); mutation.accept(c);
+            assertThrows(IllegalStateException.class, c.proof(configuration, environment())::afterSingletonsInstantiated); c.noExternalCalls();
+        }
+        healthy.noExternalCalls();
+    }
+
+    @Test void actual_global_lazy_rejects_missing_ambiguous_and_both_fresh_and_constant_prototype_receipt_hosts() {
+        for (String mode : List.of("missing", "ambiguous", "prototype", "constant-prototype")) {
+            var f = new ApprovedFixture(); f.receiptMode = mode;
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+                f.runner(true, true, "stable").run(context -> assertNotNull(context.getStartupFailure(), mode));
+            }
+            f.noExternalCalls();
+        }
+        for (String mode : List.of("qualified", "alias")) {
+            var f = new ApprovedFixture(); f.receiptMode = mode;
+            try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+                f.runner(true, true, "stable").run(context -> { assertNull(context.getStartupFailure(), mode);
+                    assertTrue(context.getBean("tianjiAdkGovernedProcessTools", AdkGovernedProcessToolBridge.class).usesApprovalReceiptResolver(f.receipts)); });
+            }
+            f.noExternalCalls();
+        }
+    }
+
+    @Test void actual_context_closes_the_third_private_approval_pool_and_owned_http_but_never_borrowed_iam() throws Exception {
+        var f = new ApprovedFixture(); var verifier = new AtomicReference<TianjiFixedToolApprovalVerifier>(); var http = new AtomicReference<HttpClient>();
+        try (var storage = mockConstruction(ToolExecutionStorageVerifier.class); var old = mockConstruction(AgentStorageVerifier.class)) {
+            f.runner(true, true, "stable").run(context -> { assertNull(context.getStartupFailure());
+                verifier.set(context.getBean("tianjiGovernedProcessApprovalVerifier", TianjiFixedToolApprovalVerifier.class));
+                http.set(context.getBean("tianjiGovernedProcessHttpClient", HttpClient.class)); assertTrue(verifier.get().usesHttpClient(http.get())); });
+        }
+        assertTrue(http.get().awaitTermination(Duration.ofSeconds(2)));
+        var failure = assertThrows(FixedToolApprovalVerifier.Failure.class, () -> verifier.get().withVerifiedApproval(mock(FixedToolApprovalVerifier.Request.class), ignored -> fail("closed approval verifier dispatched")));
+        assertEquals(FixedToolApprovalVerifier.FailureKind.CANCELLED, failure.kind()); verify(f.oauth, never()).close(); f.noExternalCalls(); verifyNoInteractions(f.receipts);
+    }
+
+    private static final class ApprovedFixture extends Fixture {
+        final ToolDescriptor approved = new ToolDescriptor("approved.start", 1, "approved_start", "Fixed approved START", START.input(), START.output(),
+                new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "approved.start.action", ProcessClient.START_RESOURCE_KEY, BPMN.bindingSha256(), "approval-v1"));
+        final List<ToolDescriptor> descriptors = java.util.stream.Stream.concat(DESCRIPTORS.stream(), java.util.stream.Stream.of(approved)).toList();
+        final TianjiToolAuthorityProperties aaAuthority = new TianjiToolAuthorityProperties(true, Duration.ofSeconds(1), 2, descriptors,
+                List.of(mapping(READ), mapping(START), mapping(QUERY), mapping(approved)));
+        final TianjiToolGrantBindings aaGrants = new TianjiToolGrantBindings(descriptors, aaAuthority.bindings(), RESOURCE, null);
+        final TianjiFixedBpmnStartToolBindings.BindingVO aaStart = new TianjiFixedBpmnStartToolBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, SHA, approved.reference(), BPMN);
+        final ToolApprovalBinding policy = new ToolApprovalBinding(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "approval-reader", OWNER.toASCIIString()),
+                "approval-v1", "9".repeat(64), "approval-release", "approval_flow", "8".repeat(64), "review");
+        final TianjiFixedToolApprovalBindings.BackendVO backend = new TianjiFixedToolApprovalBindings.BackendVO("process-approval", 20, OWNER, DMN.processBaseUri(), DMN.processResourceUri(),
+                "approval-client", "approval-reader", "approval-app", "platform", "agent", "test", Duration.ofSeconds(2));
+        final TianjiFixedToolApprovalBindings.BindingVO approvalProfile = new TianjiFixedToolApprovalBindings.BindingVO(20, ISSUER, TrustedAgentActor.SubjectType.USER, "assistant", 1, SHA, approved.reference(), policy, backend);
+        final TianjiGovernedProcessToolProperties properties = new TianjiGovernedProcessToolProperties(true, 2, List.of(decisionProfile()), List.of(startProfile(), aaStart), List.of(approvalProfile));
+        final TianjiFixedBpmnStartToolBindings aaStarts = new TianjiFixedBpmnStartToolBindings(descriptors, properties.startBindings());
+        final ApprovalReceiptResolver receipts = mock(ApprovalReceiptResolver.class);
+        final TianjiFixedToolApprovalVerifier verifier = mock(TianjiFixedToolApprovalVerifier.class);
+        String receiptMode = "stable";
+        ApprovedFixture() { when(authorization.usesBindings(aaGrants)).thenReturn(true); }
+        @Override ApplicationContextRunner dependencies(ApplicationContextRunner runner, boolean identity, String resolverMode) {
+            var configured = runner.withBean(DataSource.class, () -> source).withBean(AgentLedgerService.class, () -> ledger)
+                    .withBean("toolCapabilityStore", ToolCapabilityStore.class, () -> capabilities).withBean("tianjiToolGrantAuthorizer", TianjiToolGrantAuthorizer.class, () -> authorization)
+                    .withBean("tianjiExecutionGrantAuthorizer", TianjiExecutionGrantAuthorizer.class, () -> runAuthorization).withBean("tianjiToolGrantBindings", TianjiToolGrantBindings.class, () -> aaGrants)
+                    .withInitializer(context -> { context.getBeanFactory().registerSingleton("fixtureToolAuthorityProperties", aaAuthority);
+                        context.getBeanFactory().registerSingleton("idpServiceOAuth2Client", oauth); })
+                    .withBean("tenantIssuerAuthenticationManagerComponent", TenantIssuerAuthenticationManagerComponent.class, () -> authentication)
+                    .withBean("trustedIssuerRegistry", TrustedIssuerRegistry.class, () -> issuers).withBean(HOST, StartActionContextResolver.class, () -> resolver).withPropertyValues(extraValues());
+            if (receiptMode.equals("stable")) configured = configured.withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class, () -> receipts);
+            else if (receiptMode.equals("prototype")) configured = configured.withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class,
+                    () -> mock(ApprovalReceiptResolver.class), definition -> definition.setScope("prototype"));
+            else if (receiptMode.equals("constant-prototype")) configured = configured.withBean("tianjiToolApprovalReceiptResolver", ApprovalReceiptResolver.class,
+                    () -> receipts, definition -> definition.setScope("prototype"));
+            else if (receiptMode.equals("ambiguous")) for (String name : List.of("approvalHostFirst", "approvalHostSecond")) configured = configured.withBean(name, ApprovalReceiptResolver.class,
+                    () -> mock(ApprovalReceiptResolver.class), definition -> ((AbstractBeanDefinition) definition).addQualifier(new AutowireCandidateQualifier(Qualifier.class, "tianjiToolApprovalReceiptResolver")));
+            else if (receiptMode.equals("qualified")) configured = configured.withBean("operatorReceiptHost", ApprovalReceiptResolver.class, () -> receipts,
+                    definition -> ((AbstractBeanDefinition) definition).addQualifier(new AutowireCandidateQualifier(Qualifier.class, "tianjiToolApprovalReceiptResolver")));
+            else if (receiptMode.equals("alias")) configured = configured.withBean("operatorReceiptHost", ApprovalReceiptResolver.class, () -> receipts)
+                    .withInitializer(context -> context.getBeanFactory().registerAlias("operatorReceiptHost", "tianjiToolApprovalReceiptResolver"));
+            return identity ? configured.withBean("verifiedPrincipalConverter", VerifiedPrincipalConverter.class, () -> converter) : configured;
+        }
+        AdkGovernedProcessToolBridge bridge(TianjiGovernedProcessToolConfiguration cfg, ObjectProvider<ApprovalReceiptResolver> receiptProvider, ListableBeanFactory beans) {
+            var recorder = mock(ToolInvocationRecorder.class); var access = mock(ToolResultAccessRecorder.class);
+            when(recorder.usesLedger(ledger)).thenReturn(true); when(access.usesLedger(ledger)).thenReturn(true);
+            return cfg.tianjiAdkGovernedProcessTools(ledger, recorder, mock(TianjiFixedDecisionToolTransport.class), mock(TianjiFixedBpmnStartToolTransport.class), access,
+                    aaAuthority, decisions, aaStarts, aaGrants, provider(resolver), properties, provider(verifier), receiptProvider, beans, provider((OpenTelemetry) null), environment());
+        }
+        String[] extraValues() {
+            var values = new ArrayList<String>();
+            for (String value : TianjiGovernedProcessToolConfigurationTest.values()) if (value.startsWith(PREFIX + "start-bindings[0].")) values.add(value.replace("start-bindings[0]", "start-bindings[1]")
+                    .replace("tool.key=" + START.key(), "tool.key=" + approved.key()).replace("tool.content-sha256=" + START.reference().contentSha256(), "tool.content-sha256=" + approved.reference().contentSha256()));
+            String p = PREFIX + "approval-bindings[0].";
+            values.addAll(List.of(p+"tenant-id=20",p+"owner-issuer-fingerprint="+ISSUER,p+"principal-type=USER",p+"definition-key=assistant",p+"definition-version=1",p+"definition-content-sha256="+SHA,
+                    p+"tool.key="+approved.key(),p+"tool.version=1",p+"tool.content-sha256="+approved.reference().contentSha256(),
+                    p+"backend.source-id="+backend.sourceId(),p+"backend.tenant-id=20",p+"backend.process-issuer="+OWNER,p+"backend.process-base-uri="+backend.processBaseUri(),p+"backend.process-resource-uri="+backend.processResourceUri(),
+                    p+"backend.registration-id="+backend.registrationId(),p+"backend.expected-client-id="+backend.expectedClientId(),p+"backend.expected-app-id="+backend.expectedAppId(),p+"backend.expected-source-biz="+backend.expectedSourceBiz(),p+"backend.expected-source-app="+backend.expectedSourceApp(),p+"backend.expected-environment="+backend.expectedEnvironment(),p+"backend.timeout=2s",
+                    p+"approval.consumer.tenant-id=20",p+"approval.consumer.subject-type=SERVICE",p+"approval.consumer.subject-id="+policy.consumer().subjectId(),p+"approval.consumer.issuer-fingerprint="+ISSUER,
+                    p+"approval.policy-ref="+policy.policyRef(),p+"approval.policy-binding-sha256="+policy.policyBindingSha256(),p+"approval.release-version="+policy.releaseVersion(),p+"approval.definition-key="+policy.definitionKey(),p+"approval.definition-sha256="+policy.definitionSha256(),p+"approval.task-definition-key="+policy.taskDefinitionKey()));
+            return values.toArray(String[]::new);
+        }
     }
 
     private Object profileFactory(ToolDescriptor descriptor, TianjiToolAuthorityProperties authority, TianjiGovernedProcessToolProperties props, TianjiToolGrantBindings grants) {
@@ -427,8 +667,9 @@ class TianjiGovernedProcessToolConfigurationTest {
             var configured = runner.withBean(DataSource.class, () -> source).withBean(AgentLedgerService.class, () -> ledger)
                     .withBean("toolCapabilityStore", ToolCapabilityStore.class, () -> capabilities).withBean("tianjiToolGrantAuthorizer", TianjiToolGrantAuthorizer.class, () -> authorization)
                     .withBean("tianjiExecutionGrantAuthorizer", TianjiExecutionGrantAuthorizer.class, () -> runAuthorization).withBean("tianjiToolGrantBindings", TianjiToolGrantBindings.class, () -> grants)
-                    .withInitializer(context -> context.getBeanFactory().registerSingleton("fixtureToolAuthorityProperties", authority))
-                    .withBean("idpServiceOAuth2Client", IdpServiceOAuth2Client.class, () -> oauth).withBean("tenantIssuerAuthenticationManagerComponent", TenantIssuerAuthenticationManagerComponent.class, () -> authentication)
+                    .withInitializer(context -> { context.getBeanFactory().registerSingleton("fixtureToolAuthorityProperties", authority);
+                        context.getBeanFactory().registerSingleton("idpServiceOAuth2Client", oauth); })
+                    .withBean("tenantIssuerAuthenticationManagerComponent", TenantIssuerAuthenticationManagerComponent.class, () -> authentication)
                     .withBean("trustedIssuerRegistry", TrustedIssuerRegistry.class, () -> issuers);
             if (identity) configured = configured.withBean("verifiedPrincipalConverter", VerifiedPrincipalConverter.class, () -> converter);
             if (resolverMode.equals("stable")) configured = configured.withBean(HOST, StartActionContextResolver.class, () -> resolver);
@@ -447,7 +688,7 @@ class TianjiGovernedProcessToolConfigurationTest {
         void noExternalCalls() { verify(oauth, never()).authorize(any()); verify(oauth, never()).authorizeBounded(any(), anyString(), any()); verifyNoInteractions(authentication, converter); }
     }
 
-    private static final class Chain extends Fixture {
+    private static class Chain extends Fixture {
         final ToolInvocationStore prep = mock(ToolInvocationStore.class); final ToolInvocationRecorder recorder = mock(ToolInvocationRecorder.class);
         final ToolResultAccessStore accesses = mock(ToolResultAccessStore.class); final ToolResultAccessRecorder access = mock(ToolResultAccessRecorder.class);
         final HttpClient http = mock(HttpClient.class); final TianjiFixedDecisionToolTransport decision = mock(TianjiFixedDecisionToolTransport.class); final TianjiFixedBpmnStartToolTransport start = mock(TianjiFixedBpmnStartToolTransport.class);
@@ -466,7 +707,8 @@ class TianjiGovernedProcessToolConfigurationTest {
         }
         SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
             return cfg.tianjiGovernedProcessToolRuntimeChainVerifier(env, source, ledger, capabilities, authorization, grants, prep, recorder, accesses, access,
-                    decisions, starts, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers, runAuthorization);
+                    decisions, starts, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
+                    properties(), provider(null), provider(null), provider(null), null, runAuthorization);
         }
         List<Executable> operations(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
             return List.of(() -> cfg.governedProcessToolInvocationStore(source, ledger, capabilities, authorization, env),
@@ -477,8 +719,31 @@ class TianjiGovernedProcessToolConfigurationTest {
                     () -> cfg.tianjiGovernedProcessHttpClient(env).shutdownNow(),
                     () -> cfg.tianjiGovernedProcessDecisionTransport(decisions, oauth, authentication, converter, issuers, http, properties(), env).close(),
                     () -> cfg.tianjiGovernedProcessStartTransport(starts, oauth, authentication, converter, issuers, http, properties(), env).close(),
-                    () -> cfg.tianjiAdkGovernedProcessTools(ledger, recorder, decision, start, access, authority, decisions, starts, grants, resolvers, provider((OpenTelemetry) null), env),
+                    () -> cfg.tianjiAdkGovernedProcessTools(ledger, recorder, decision, start, access, authority, decisions, starts, grants, resolvers, properties(), provider(null), provider(null), null, provider((OpenTelemetry) null), env),
+                    () -> cfg.tianjiGovernedProcessApprovalBindings(authority, properties(), grants, env),
+                    () -> cfg.tianjiGovernedProcessApprovalVerifier(properties(), provider(null), provider(oauth), provider(authentication), provider(converter), provider(issuers), provider(http), env),
                     () -> proof(cfg, env).afterSingletonsInstantiated());
+        }
+    }
+
+    private static final class ApprovedChain extends Chain {
+        final ApprovedFixture profiles = new ApprovedFixture();
+        final TianjiFixedToolApprovalBindings approvalBindings = new TianjiFixedToolApprovalBindings(profiles.descriptors, profiles.properties.approvalBindings());
+        final TianjiFixedToolApprovalVerifier approvals = mock(TianjiFixedToolApprovalVerifier.class);
+        final ApprovalReceiptResolver receipts = mock(ApprovalReceiptResolver.class);
+        final DefaultListableBeanFactory beans = new DefaultListableBeanFactory();
+        ApprovedChain() {
+            when(authorization.usesBindings(profiles.aaGrants)).thenReturn(true); when(start.usesBindings(profiles.aaStarts)).thenReturn(true);
+            when(approvals.usesBindings(approvalBindings)).thenReturn(true); when(approvals.usesOAuth(oauth)).thenReturn(true);
+            when(approvals.usesAuthentication(authentication)).thenReturn(true); when(approvals.usesConverter(converter)).thenReturn(true);
+            when(approvals.usesIssuerRegistry(issuers)).thenReturn(true); when(approvals.usesHttpClient(http)).thenReturn(true);
+            when(bridge.usesApprovalVerifier(approvals)).thenReturn(true); when(bridge.usesApprovalReceiptResolver(receipts)).thenReturn(true);
+            beans.registerSingleton("tianjiToolApprovalReceiptResolver", receipts);
+        }
+        @Override SmartInitializingSingleton proof(TianjiGovernedProcessToolConfiguration cfg, MockEnvironment env) {
+            return cfg.tianjiGovernedProcessToolRuntimeChainVerifier(env, source, ledger, capabilities, authorization, profiles.aaGrants, prep, recorder, accesses, access,
+                    decisions, profiles.aaStarts, http, decision, start, oauth, authentication, converter, issuers, bridges, executors, resolvers,
+                    profiles.properties, provider(approvalBindings), provider(approvals), provider(receipts), beans, runAuthorization);
         }
     }
 
@@ -494,7 +759,7 @@ class TianjiGovernedProcessToolConfigurationTest {
     private static List<String> prerequisites() { return List.of("api", "storage", "execution-grants", "execution-authorization", "runtime", "tools.authority"); }
     private static MockEnvironment environment() { var env = new MockEnvironment(); prerequisites().forEach(feature -> env.setProperty("stellar.tianji.agent." + feature + ".enabled", "true")); env.setProperty(PREFIX + "enabled", "true"); return env; }
     @SuppressWarnings("unchecked") private static <T> ObjectProvider<T> provider(T value) { var provider = (ObjectProvider<T>) mock(ObjectProvider.class); when(provider.getObject()).thenReturn(value); when(provider.getIfAvailable()).thenReturn(value); return provider; }
-    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier"); }
+    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessApprovalBindings", "tianjiGovernedProcessApprovalVerifier", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier"); }
     private static String[] values() {
         var values = new ArrayList<String>(); prerequisites().forEach(feature -> values.add("stellar.tianji.agent." + feature + ".enabled=true"));
         values.add(PREFIX + "enabled=true"); values.add(PREFIX + "concurrency=2");

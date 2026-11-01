@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.agent.domain;
 
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
+
 import java.util.Objects;
 import java.util.List;
 import java.net.URI;
@@ -17,6 +19,7 @@ public record TrustedAgentActor(long tenantId, SubjectType subjectType, String s
         this(tenantId, subjectType, subjectId, "LEGACY");
     }
 
+    @ConstructorBinding
     public TrustedAgentActor {
         if (tenantId <= 0) {
             throw new IllegalArgumentException("tenantId must be positive");
