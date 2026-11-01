@@ -81,6 +81,22 @@ class AdkGovernedProcessToolBridgeTest {
         }
     }
 
+    @Test void action_context_resolver_affinity_is_pointer_exact_and_observation_does_not_invoke_resolvers() {
+        try (var fixture = new Fixture()) {
+            var foreignCalls = new AtomicInteger();
+            AdkGovernedProcessToolBridge.StartActionContextResolver foreign = request -> {
+                foreignCalls.incrementAndGet();
+                return fixture.context;
+            };
+            assertAll(
+                    () -> assertTrue(fixture.bridge.usesActionContextResolver(fixture.resolver)),
+                    () -> assertFalse(fixture.bridge.usesActionContextResolver(foreign)),
+                    () -> assertFalse(fixture.bridge.usesActionContextResolver(null)),
+                    () -> assertTrue(fixture.contextRequests.isEmpty()),
+                    () -> assertEquals(0, foreignCalls.get()));
+        }
+    }
+
     @Test void one_full_visibility_binding_freezes_one_host_context_and_one_database_time_for_mixed_tools() {
         try (var fixture = new Fixture()) {
             var first = fixture.bind(); var second = fixture.bind();

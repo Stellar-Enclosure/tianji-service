@@ -74,6 +74,7 @@ public final class AdkGovernedProcessToolBridge implements AdkGovernedToolBridge
     public boolean usesDecisionTransport(ReadOnlyDecisionToolTransport candidate) { return decisionTransport == candidate; }
     public boolean usesStartTransport(FixedBpmnStartToolTransport candidate) { return startTransport == candidate; }
     public boolean usesResultAccessRecorder(ToolResultAccessRecorder candidate) { return resultAccessRecorder == candidate; }
+    public boolean usesActionContextResolver(StartActionContextResolver candidate) { return actionContexts == candidate; }
 
     @Override public Scope bindScope(AgentLedgerService.ExecutionMaterial material, AgentRunLease lease, ToolEventSink sink) {
         AdkToolTelemetryPrivacy.requireSafe();

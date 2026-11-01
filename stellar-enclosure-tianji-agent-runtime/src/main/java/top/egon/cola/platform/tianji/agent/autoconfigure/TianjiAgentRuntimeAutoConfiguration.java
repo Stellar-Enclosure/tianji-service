@@ -22,6 +22,7 @@ import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkReadOnlyDecisionToolBridge;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
@@ -52,6 +53,7 @@ public class TianjiAgentRuntimeAutoConfiguration {
             @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control,
             AgentModelBudgetEstimator estimator, AgentRunAuthorization authorizer, Environment environment,
             ObjectProvider<DefaultContextAssembler> contexts,
+            @Qualifier("tianjiAdkGovernedProcessTools") ObjectProvider<AdkGovernedProcessToolBridge> governedProcessTools,
             @Qualifier("tianjiAdkReadOnlyDecisionTools") ObjectProvider<AdkReadOnlyDecisionToolBridge> tools) {
         if (!ledger.usesDataSource(dataSource)) throw new IllegalStateException("TIANJI_RUNTIME_DATA_SOURCE_MISMATCH");
         if (chatModels.isEmpty() && factories.isEmpty()) throw new IllegalStateException("TIANJI_RUNTIME_MODEL_REQUIRED");
@@ -60,15 +62,17 @@ public class TianjiAgentRuntimeAutoConfiguration {
             throw new IllegalStateException("TIANJI_RUNTIME_MODEL_CONFIGURATION_INVALID");
         }
         validateControlExecutor(control);
+        boolean readOnlyTools = environment.getProperty("stellar.tianji.agent.tools.read-only-decision.enabled", Boolean.class, false);
+        boolean governedProcessToolsEnabled = environment.getProperty("stellar.tianji.agent.tools.governed-process.enabled", Boolean.class, false);
+        if (readOnlyTools && governedProcessToolsEnabled) throw new IllegalStateException("TIANJI_TOOL_RUNTIME_MODE_CONFLICT");
         boolean snapshots = environment.getProperty("stellar.tianji.agent.context.snapshots.enabled", Boolean.class, false);
         boolean trimming = environment.getProperty("stellar.tianji.agent.context.trimming.enabled", Boolean.class, false);
         var contextOptions = new AgentContextRuntimeOptions(snapshots, trimming);
         if (!snapshots) new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
-        boolean readOnlyTools = environment.getProperty("stellar.tianji.agent.tools.read-only-decision.enabled", Boolean.class, false);
         return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
                 dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), contextOptions,
-                readOnlyTools ? tools::getObject : null);
+                governedProcessToolsEnabled ? governedProcessTools::getObject : readOnlyTools ? tools::getObject : null);
     }
 
     @Bean(destroyMethod = "close")

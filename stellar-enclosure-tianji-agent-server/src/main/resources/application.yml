@@ -51,6 +51,11 @@ stellar:
           enabled: false
           concurrency: 4
           bindings: []
+        governed-process:
+          enabled: false
+          concurrency: 4
+          decision-bindings: []
+          start-bindings: []
       memory:
         enabled: false
         extraction:

@@ -109,6 +109,36 @@ class TianjiReadOnlyDecisionToolConfigurationTest {
     }
 
     @Test
+    void both_modes_are_rejected_before_any_owned_factory_constructs_verifies_or_resolves_its_roots() {
+        var chain = new Chain(); var environment = environment(); environment.setProperty("stellar.tianji.agent.tools.governed-process.enabled", "true");
+        var telemetry = provider(mock(OpenTelemetry.class));
+        try (var stores = mockConstruction(ToolInvocationStore.class); var recorders = mockConstruction(ToolInvocationRecorder.class);
+             var transports = mockConstruction(TianjiFixedDecisionToolTransport.class); var verifiers = mockConstruction(ToolExecutionStorageVerifier.class)) {
+            assertAll(
+                    () -> assertModeConflict(() -> configuration.toolInvocationStore(chain.source, chain.ledger, chain.capabilities, chain.authorization, environment)),
+                    () -> assertModeConflict(() -> configuration.toolInvocationRecorder(chain.source, chain.ledger, chain.preparations, chain.capabilities, chain.authorization, environment)),
+                    () -> assertModeConflict(() -> configuration.tianjiFixedDecisionToolBindings(chain.authority, properties(), chain.grants, environment)),
+                    () -> assertModeConflict(() -> configuration.tianjiFixedDecisionToolHttpClient(environment).shutdownNow()),
+                    () -> assertModeConflict(() -> configuration.tianjiFixedDecisionToolTransport(chain.bindings, chain.oauth, chain.authentication, chain.converter, chain.issuers, chain.http, properties(), environment)),
+                    () -> assertModeConflict(() -> configuration.tianjiAdkReadOnlyDecisionTools(chain.recorder, chain.transport, chain.authority, chain.bindings, chain.grants, telemetry, environment)),
+                    () -> assertModeConflict(() -> configuration.tianjiReadOnlyToolRuntimeChainVerifier(environment, chain.source, chain.ledger, chain.capabilities, chain.authorization,
+                            chain.grants, chain.preparations, chain.recorder, chain.bindings, chain.http, chain.transport, chain.oauth, chain.authentication, chain.converter, chain.issuers,
+                            chain.bridges, chain.executors, chain.runAuthorization).afterSingletonsInstantiated()));
+            assertTrue(stores.constructed().isEmpty()); assertTrue(recorders.constructed().isEmpty()); assertTrue(transports.constructed().isEmpty()); assertTrue(verifiers.constructed().isEmpty());
+        }
+        verifyNoInteractions(telemetry, chain.bridges, chain.executors, chain.source); chain.noExternalCalls();
+    }
+
+    @Test
+    void runtime_mode_conflict_precedes_each_missing_prerequisite_in_the_owned_guard() {
+        for (String prerequisite : prerequisites()) {
+            var environment = environment(); environment.setProperty("stellar.tianji.agent.tools.governed-process.enabled", "true");
+            environment.setProperty("stellar.tianji.agent." + prerequisite + ".enabled", "false");
+            assertModeConflict(() -> configuration.tianjiFixedDecisionToolHttpClient(environment).shutdownNow());
+        }
+    }
+
+    @Test
     void preparation_and_recorder_each_verify_their_own_storage_once_and_keep_exact_roots() {
         var fixture = new Fixture();
         try (var verification = mockConstruction(ToolExecutionStorageVerifier.class)) {
@@ -341,6 +371,10 @@ class TianjiReadOnlyDecisionToolConfigurationTest {
         var verifier = methods.stream().filter(method -> method.getName().equals("tianjiReadOnlyToolRuntimeChainVerifier")).findFirst().orElseThrow();
         assertFalse(verifier.getAnnotation(Lazy.class).value());
         assertEquals("shutdownNow", TianjiReadOnlyDecisionToolConfiguration.class.getDeclaredMethod("tianjiFixedDecisionToolHttpClient", org.springframework.core.env.Environment.class).getAnnotation(Bean.class).destroyMethod());
+    }
+
+    private static void assertModeConflict(org.junit.jupiter.api.function.Executable operation) {
+        var failure = assertThrows(IllegalStateException.class, operation); assertEquals("TIANJI_TOOL_RUNTIME_MODE_CONFLICT", failure.getMessage()); assertNull(failure.getCause());
     }
 
     private static class Fixture {

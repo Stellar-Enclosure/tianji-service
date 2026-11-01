@@ -163,6 +163,9 @@ public class TianjiReadOnlyDecisionToolConfiguration {
         return List.of(binding.tenantId(), binding.ownerIssuerFingerprint(), binding.principalType(), binding.definitionKey(), binding.definitionVersion(), binding.definitionContentSha256(), binding.tool());
     }
     private static void requirePrerequisites(Environment environment) {
+        if (environment.getProperty("stellar.tianji.agent.tools.governed-process.enabled", Boolean.class, false)) {
+            throw new IllegalStateException("TIANJI_TOOL_RUNTIME_MODE_CONFLICT");
+        }
         for (String feature : new String[]{"api", "storage", "execution-grants", "execution-authorization", "runtime", "tools.authority"}) {
             if (!environment.getProperty("stellar.tianji.agent." + feature + ".enabled", Boolean.class, false)) {
                 throw new IllegalStateException("TIANJI_READ_ONLY_TOOL_PREREQUISITES_REQUIRED");
