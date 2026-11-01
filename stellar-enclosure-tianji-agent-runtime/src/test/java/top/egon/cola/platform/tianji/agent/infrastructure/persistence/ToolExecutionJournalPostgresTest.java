@@ -12,6 +12,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
@@ -20,6 +21,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
@@ -38,6 +40,8 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
+import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
 import java.net.URI;
 import java.math.BigDecimal;
@@ -126,6 +130,182 @@ class ToolExecutionJournalPostgresTest {
         idempotentWriteJournal(source, jdbc, ledger, capabilities);
         fixedStartRecording(source, jdbc, ledger, capabilities);
         knownStartResultAccess(source, jdbc, ledger, capabilities);
+        approvedWriteJournal(source, jdbc, ledger, capabilities);
+    }
+
+    /** Controlled source projections exercise the real journal and constraints; no live approval or START endpoint is called. */
+    private static void approvedWriteJournal(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                             ToolCapabilityStore capabilities) throws Exception {
+        var fixture = new ApprovalFixture(source, jdbc, ledger, capabilities); var waiting = fixture.waiting("approved-race-");
+        var oldWait = approvalInvocationFacts(jdbc, waiting); var oldBudget = accessBudgetFacts(jdbc, waiting.reservationId(), waiting.binding().run().runId());
+        var origin = writeActionFacts(jdbc, waiting.action()); var approval = fixture.observation(waiting.action(), "approval-" + UUID.randomUUID(), Duration.ofSeconds(25));
+        var gate = new CountDownLatch(1); var attempts = new ArrayList<ApprovedAttemptVO>();
+        try (var pool = Executors.newFixedThreadPool(8)) {
+            var futures = new ArrayList<java.util.concurrent.Future<ApprovedAttemptVO>>();
+            for (int index = 0; index < 20; index++) {
+                var request = fixture.request(index % 2, waiting.action());
+                futures.add(pool.submit(() -> { gate.await(); return fixture.begin(request, approval); }));
+            }
+            gate.countDown(); for (var future : futures) attempts.add(future.get(20, TimeUnit.SECONDS));
+        }
+        var winners = attempts.stream().filter(value -> value.result().started()).toList(); assertEquals(1, winners.size()); var winner = winners.getFirst();
+        assertEquals(2, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND intent_id=?", Integer.class, ACTOR.tenantId(), UUID.fromString(waiting.action().intentId())));
+        assertEquals(oldWait, approvalInvocationFacts(jdbc, waiting)); assertEquals(oldBudget, accessBudgetFacts(jdbc, waiting.reservationId(), waiting.binding().run().runId()));
+        int calls = 0, active = 0;
+        for (var run : fixture.runs) { var counters = invocationCounters(jdbc, run.run().runId()); calls += ((Number) counters.get("tool_calls_reserved")).intValue(); active += ((Number) counters.get("active_tool_calls")).intValue(); }
+        assertEquals(2, calls); assertEquals(1, active);
+        for (var attempt : attempts) if (!attempt.result().started()) { assertNull(attempt.result().invocation()); assertNull(attempt.result().budget()); }
+        var sourceFact = approvedActionFacts(jdbc, waiting.action()); var codec = new ToolExecutionJsonCodec(); var proof = fixture.proof(approval);
+        assertEquals(origin.get("origin_run_id"), sourceFact.get("origin_run_id")); assertEquals(origin.get("expires_at"), sourceFact.get("expires_at"));
+        assertEquals(proof, codec.approval((String) sourceFact.get("approval_proof"), (String) sourceFact.get("approval_proof_sha256"), waiting.action()));
+        assertEquals(codec.approvalSha256(proof, waiting.action()), sourceFact.get("approval_proof_sha256"));
+        assertEquals(approval.approval().expiresAt().truncatedTo(ChronoUnit.MICROS), ((Timestamp) sourceFact.get("approval_expires_at")).toInstant());
+        assertNotEquals(0, approval.approval().expiresAt().getNano() % 1_000);
+        assertEquals(approval.sourceNamespaceSha256(), sourceFact.get("approval_source_namespace_sha256"));
+        assertFalse(fixture.begin(waiting, approval).result().started()); assertEquals(oldWait, approvalInvocationFacts(jdbc, waiting));
+        approvalUniqueAndRollback(source, jdbc, fixture, waiting.action(), approval);
+        var request = winner.request(); var run = request.binding().run(); var current = ledger.get(ACTOR, new GetAgentRunQuery(run.runId()));
+        ledger.finish(ACTOR, request.lease(), current.revision(), new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED, Map.of(), null, null, null, null, "UNKNOWN"));
+        assertNull(jdbc.queryForObject("SELECT lease_expires_at FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?", Timestamp.class, ACTOR.tenantId(), run.runId()));
+        jdbc.update("UPDATE tianji_agent.agent_tool_capability SET issue_epoch=issue_epoch+1,grant_id=?,ciphertext='ENC:v1:test:approved:later',updated_at=clock_timestamp() WHERE tenant_id=? AND run_id=?", "9" + "7".repeat(62), ACTOR.tenantId(), run.runId());
+        int authorityCalls = fixture.authorityCalls.get(); var success = approvedSuccess("approved-late-receipt", new BigDecimal("0.5000"));
+        var recorded = fixture.store.completeApprovedWrite(request, winner.result().attempt(), winner.nonce(), success);
+        assertEquals(success, recorded.outcome()); assertEquals("APPLIED", writeActionFacts(jdbc, request.action()).get("state")); assertEquals(authorityCalls, fixture.authorityCalls.get());
+        assertEquals("UNKNOWN", startBudgetState(jdbc, request));
+        assertEquals(recorded.invocation(), fixture.store.completeApprovedWrite(request, winner.result().attempt(), winner.nonce(), success).invocation());
+        assertEquals(sourceFact.get("approval_proof"), approvedActionFacts(jdbc, request.action()).get("approval_proof"));
+        approvalExpiredLeaseAndProof(source, jdbc, ledger, capabilities);
+    }
+
+    private static void approvalUniqueAndRollback(DriverManagerDataSource source, JdbcTemplate jdbc, ApprovalFixture fixture,
+                                                  ToolActionRequest originalAction, ApprovedObservation originalProof) {
+        var original = approvedActionFacts(jdbc, originalAction); var duplicateWait = fixture.waiting("approved-duplicate-");
+        var duplicate = fixture.request(1, duplicateWait.action()); var before = approvedActionFacts(jdbc, duplicate.action());
+        var counters = fixture.runs.stream().map(run -> invocationCounters(jdbc, run.run().runId())).toList();
+        // The controlled projection deliberately repeats a receipt for another coherent action to prove the DB-wide source unique key.
+        var repeated = fixture.observation(duplicate.action(), originalProof.approval().approvalReceiptId(), Duration.ofSeconds(20));
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class, () -> fixture.begin(duplicate, repeated)).code());
+        assertEquals(before, approvedActionFacts(jdbc, duplicate.action())); assertEquals(original, approvedActionFacts(jdbc, originalAction));
+        assertEquals(counters, fixture.runs.stream().map(run -> invocationCounters(jdbc, run.run().runId())).toList());
+        assertNoApprovalAttempt(jdbc, duplicate);
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND approval_source_namespace_sha256=? AND approval_receipt_id=?", Integer.class,
+                ACTOR.tenantId(), repeated.sourceNamespaceSha256(), repeated.approval().approvalReceiptId()));
+        var waiting = fixture.waiting("approved-rollback-"); var request = fixture.request(1, waiting.action()); var snapshot = approvedActionFacts(jdbc, request.action());
+        var previous = fixture.runs.stream().map(run -> invocationCounters(jdbc, run.run().runId())).toList();
+        jdbc.execute("CREATE FUNCTION tianji_agent.tool_approval_begin_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'controlled approval second-write failure'; END; $$");
+        jdbc.execute("CREATE TRIGGER tool_approval_begin_fail BEFORE UPDATE ON tianji_agent.agent_tool_action_intent FOR EACH ROW WHEN (OLD.state='AWAITING_APPROVAL' AND NEW.state='DISPATCHING') EXECUTE FUNCTION tianji_agent.tool_approval_begin_fail()");
+        try {
+            var error = assertThrows(AgentLedgerException.class, () -> fixture.begin(request, fixture.observation(request.action(), "approval-" + UUID.randomUUID(), Duration.ofSeconds(20))));
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, error.code()); assertNull(error.getCause());
+            assertEquals(snapshot, approvedActionFacts(jdbc, request.action())); assertNoApprovalAttempt(jdbc, request);
+            assertEquals(previous, fixture.runs.stream().map(run -> invocationCounters(jdbc, run.run().runId())).toList());
+        } finally {
+            jdbc.execute("DROP TRIGGER tool_approval_begin_fail ON tianji_agent.agent_tool_action_intent"); jdbc.execute("DROP FUNCTION tianji_agent.tool_approval_begin_fail()");
+        }
+        new ToolExecutionStorageVerifier(source).verify();
+        var started = fixture.begin(request, fixture.observation(request.action(), "approval-" + UUID.randomUUID(), Duration.ofSeconds(20)));
+        assertTrue(started.result().started());
+        assertNull(fixture.store.completeApprovedWrite(request, started.result().attempt(), started.nonce(), approvedSuccess("approved-null-cost", null)).outcome().actualCost());
+        assertEquals("RESERVED", startBudgetState(jdbc, request));
+    }
+
+    private static void approvalExpiredLeaseAndProof(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                                     ToolCapabilityStore capabilities) throws Exception {
+        var fixture = new ApprovalFixture(source, jdbc, ledger, capabilities); var waiting = fixture.waiting("approved-expiry-"); var request = fixture.request(1, waiting.action());
+        var proof = fixture.observation(request.action(), "approval-" + UUID.randomUUID(), Duration.ofSeconds(3)); var started = fixture.begin(request, proof);
+        assertTrue(started.result().started());
+        assertEquals(1, jdbc.update("UPDATE tianji_agent.agent_run SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE tenant_id=? AND run_id=? AND status='RUNNING'", ACTOR.tenantId(), request.binding().run().runId()));
+        long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(6);
+        while (!now(jdbc).isAfter(proof.expiresAt())) { assertTrue(end - System.nanoTime() > 0, "Controlled approval expiry wait exceeded six seconds"); TimeUnit.MILLISECONDS.sleep(25); }
+        int authorityCalls = fixture.authorityCalls.get();
+        var unknown = new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OUTCOME_UNKNOWN", null);
+        assertEquals("UNKNOWN", fixture.store.completeApprovedWrite(request, started.result().attempt(), started.nonce(), unknown).invocation().state());
+        var success = approvedSuccess("approved-expired-proof-receipt", new BigDecimal("0.0750"));
+        assertEquals(success, fixture.store.completeApprovedWrite(request, started.result().attempt(), started.nonce(), success).outcome());
+        assertEquals(authorityCalls, fixture.authorityCalls.get()); assertEquals("RESERVED", startBudgetState(jdbc, request));
+        assertEquals(AgentRunStatusEnum.RUNNING, ledger.get(ACTOR, new GetAgentRunQuery(request.binding().run().runId())).status());
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> fixture.store.completeApprovedWrite(request, started.result().attempt(), "2".repeat(64), success)).code());
+    }
+
+    private static Map<String, Object> approvedActionFacts(JdbcTemplate jdbc, ToolActionRequest action) {
+        return jdbc.queryForMap("SELECT state,revision,origin_run_id,expires_at,dispatch_epoch,dispatch_nonce_sha256,dispatch_run_id,dispatch_invocation_id,executor_issuer,executor_id,approval_source_namespace_sha256,approval_receipt_id,approval_proof_sha256,approval_proof::text AS approval_proof,approval_approved,approval_consumed_at,approval_expires_at,side_effect_outcome,result::text,business_receipt_id,last_error_code,updated_at,closed_at FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND intent_id=?", action.owner().tenantId(), UUID.fromString(action.intentId()));
+    }
+    private static Map<String, Object> approvalInvocationFacts(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO request) {
+        return jdbc.queryForMap("SELECT state,revision,dispatch_epoch,outcome::text,finished_at FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?", ACTOR.tenantId(), request.binding().run().runId(), request.invocationId());
+    }
+    private static void assertNoApprovalAttempt(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO request) {
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=? AND invocation_id=?", Integer.class, ACTOR.tenantId(), request.binding().run().runId(), request.invocationId()));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_budget_reservation WHERE tenant_id=? AND run_id=? AND reservation_id=?", Integer.class, ACTOR.tenantId(), request.binding().run().runId(), request.reservationId()));
+    }
+    private static ToolExecutionOutcome approvedSuccess(String receipt, BigDecimal cost) { return new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("instanceId", "controlled-approved-instance"), receipt, null, cost); }
+    private record ApprovedAttemptVO(ToolInvocationStore.PreparationRequestVO request, ToolInvocationStore.ApprovedWriteDispatchBeginResultVO result, String nonce) {
+        @Override public String toString() { return "ControlledApprovedAttempt[redacted]"; }
+    }
+    private static final class ApprovalFixture {
+        final ToolDescriptor descriptor = new ToolDescriptor("process.approvedJournal", 1, "approved_journal", "Controlled approved journal",
+                DESCRIPTOR.input(), new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
+                new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "process.start.approved", ProcessClient.START_RESOURCE_KEY, "e".repeat(64), "approval-it-v1"));
+        final List<WriteSourceVO> runs = new ArrayList<>();
+        final AtomicInteger authorityCalls = new AtomicInteger();
+        final ToolExecutionAuthorization authority;
+        final ToolInvocationStore store;
+        final ToolCapabilityStore capabilities;
+        final JdbcTemplate jdbc;
+        final Instant expiry;
+
+        ApprovalFixture(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger, ToolCapabilityStore capabilities) {
+            this.jdbc = jdbc; this.capabilities = capabilities; expiry = now(jdbc).plusSeconds(120).truncatedTo(ChronoUnit.MICROS);
+            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(5), Duration.ofSeconds(30), Duration.ofSeconds(30), 5, 32, 10_000, 10_000,
+                    new BigDecimal("100.00"), "USD", 8, Set.of(descriptor.versionKey()), "no-retry", descriptor.policy().approvalPolicyRef());
+            ledger.publish(ACTOR, new AgentDefinitionSpecDTO("tool-approved-journal-test", 1, "CODE_FIRST", "controlled-test", "text-v1", "text-v1",
+                    new DefinitionDependenciesDTO(List.of(), List.of(), List.of(descriptor.reference()), "model-route", "tool-policy-v1"), policy, Map.of()));
+            for (int index = 0; index < 2; index++) {
+                var queued = ledger.start(ACTOR, new StartAgentRunCommand("tool-approved-journal-test", 1, null, UUID.randomUUID().toString(), null, null, new AgentInputDTO("controlled approved journal", List.of(), Map.of()), null));
+                var run = ledger.executionMaterial(ACTOR, new GetAgentRunQuery(queued.runId())).authorization();
+                var binding = new ToolExecutionGrant.BindingVO(run, descriptor.reference(), descriptor.policy().bindingSha256(), "TIANJI_TOOL_APPROVED_JOURNAL_TEST_V1", RESOURCE, "tianji.api.agent.start", null);
+                var reserved = capabilities.reserve(binding, descriptor).orElseThrow(); assertTrue(capabilities.attach(evidence(reserved, now(jdbc).plusSeconds(120).truncatedTo(ChronoUnit.MICROS)), descriptor));
+                var ticket = capabilities.current(binding, descriptor).orElseThrow();
+                var claim = ledger.claim(ACTOR, new GetAgentRunQuery(run.runId()), ledger.get(ACTOR, new GetAgentRunQuery(run.runId())).revision(), "approved-test-" + index, Duration.ofMinutes(5));
+                runs.add(new WriteSourceVO(run, binding, claim.lease(), ticket));
+            }
+            authority = new ToolExecutionAuthorization() {
+                @Override public Decision authorize(Request request, Boundary boundary) { return check(request, boundary).decision(); }
+                @Override public CheckResult check(Request request, Boundary boundary) {
+                    assertFalse(TransactionSynchronizationManager.isActualTransactionActive()); authorityCalls.incrementAndGet();
+                    var item = runs.stream().filter(value -> value.run().equals(request.run())).findFirst().orElseThrow(); var ticket = capabilities.current(item.binding(), descriptor).orElseThrow();
+                    return new CheckResult(request, boundary, Decision.ALLOW, new AuditVO(1, UUID.randomUUID(), boundary, Decision.ALLOW, ACTOR.subjectType(), ticket.grantId(), 1L, null, 1L, Instant.now(), ticket.expiresAt()));
+                }
+            };
+            store = new ToolInvocationStore(source, ledger, capabilities, authority); store.verifyStorage();
+        }
+        ToolInvocationStore.PreparationRequestVO request(int index, ToolActionRequest action) {
+            var run = runs.get(index); return new ToolInvocationStore.PreparationRequestVO(run.binding(), run.lease(), descriptor, action.arguments(), action, UUID.randomUUID(), new BigDecimal("0.20"), expiry);
+        }
+        ToolInvocationStore.PreparationRequestVO waiting(String prefix) {
+            var action = new ToolActionRequest(ACTOR, descriptor, prefix + UUID.randomUUID(), "business-v1", Map.of("amount", 20L)); var request = request(0, action);
+            assertEquals("AWAITING_APPROVAL", store.prepare(request).invocation().state()); assertEquals("SETTLED", startBudgetState(jdbc, request)); return request;
+        }
+        ApprovedObservation observation(ToolActionRequest action, String receipt, Duration lifetime) {
+            var consumer = TrustedAgentActor.verified(ACTOR.tenantId(), TrustedAgentActor.SubjectType.SERVICE, "approval-it-consumer", "https://idp.example/20");
+            var binding = new ToolApprovalBinding(consumer, descriptor.policy().approvalPolicyRef(), "c".repeat(64), "approval-release", "approval_process", "d".repeat(64), "review");
+            var query = binding.query(action, receipt); var source = query.sourceStart(); Instant verified = now(jdbc);
+            var dto = new VerifiedApprovalDTO(binding.policyRef(), binding.policyBindingSha256(), query.fingerprint(), query.approvalReceiptId(), query.requesterType(), query.requesterSubjectId(), source.commandId(),
+                    "controlled-approval-instance", "controlled-approval-task", binding.releaseVersion(), binding.definitionKey(), binding.definitionSha256(), binding.taskDefinitionKey(), OrchestrationRequestDigests.start(source), true, verified.minusSeconds(1), verified, verified.plus(lifetime).plusNanos(987));
+            return new ApprovedObservation("process-approval-primary", "https://idp.example/20", "https://process.example/api", binding, dto, consumer, verified.plusSeconds(30));
+        }
+        ToolExecutionJsonCodec.ApprovalProofVO proof(ApprovedObservation value) { return new ToolExecutionJsonCodec.ApprovalProofVO(1,
+                new ToolExecutionJsonCodec.ApprovalSourceVO(value.sourceId(), value.tenantId(), value.sourceIssuer(), value.sourceResource()), value.binding(), value.approval()); }
+        ApprovedAttemptVO begin(ToolInvocationStore.PreparationRequestVO request, ApprovedObservation approval) {
+            Instant started = Instant.now(); long nanos = System.nanoTime(); var ticket = capabilities.current(request.binding(), descriptor).orElseThrow();
+            var executor = new ReadOnlyDecisionToolTransport.VerifiedExecutor(EXECUTOR, ticket.expiresAt()); Instant call = started.plusSeconds(8);
+            for (var bound : List.of(request.binding().run().deadlineAt(), ticket.expiresAt(), executor.expiresAt(), approval.expiresAt(), expiry)) if (bound.isBefore(call)) call = bound;
+            call = call.truncatedTo(ChronoUnit.MICROS);
+            var expected = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), descriptor.reference(), descriptor.policy().bindingSha256(), request.parametersSha256(), request.action().intentId(), call);
+            var checked = authority.check(expected, ToolExecutionAuthorization.Boundary.DISPATCH); Instant technical = started.plusSeconds(10).isBefore(call) ? started.plusSeconds(10) : call;
+            var window = new ToolInvocationStore.DispatchWindowVO(started, nanos, technical, call); String nonce = UUID.randomUUID().toString().replace("-", "") + UUID.randomUUID().toString().replace("-", "");
+            return new ApprovedAttemptVO(request, store.consumeApprovalAndBeginDispatch(request, approval, ticket, checked, executor, ToolInvocationStore.dispatchNonceSha256(nonce), window), nonce);
+        }
     }
 
     private static void knownStartResultAccess(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,

@@ -1,8 +1,10 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -96,6 +98,102 @@ final class ToolActionIntentSql {
         sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
         var found = read(action.owner(), UUID.fromString(action.intentId()), false, storageDeadline);
         found.ifPresent(row -> same(row, action)); return found;
+    }
+
+    Row lockForApproval(ToolActionRequest action, ToolDescriptor descriptor, Instant deadline) {
+        now(deadline); requireApproval(action, descriptor);
+        try {
+            var locked = read(action.owner(), UUID.fromString(action.intentId()), true, deadline).orElseThrow(ToolActionIntentSql::unavailable);
+            same(locked, action); return locked;
+        } catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    void beginApprovedWrite(Row expected, ApprovedObservation approval, DispatchVO dispatch, Instant consumedAndDispatchedAt, Instant deadline) {
+        Instant checked = now(deadline); requireApproval(expected);
+        if (!"AWAITING_APPROVAL".equals(expected.state()) || expected.approval() != null || expected.dispatch() != null || approval == null
+                || dispatch == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
+        if (expected.revision() == Long.MAX_VALUE) throw unavailable();
+        writeTime(expected, consumedAndDispatchedAt, checked);
+        if (!expected.expiresAt().isAfter(consumedAndDispatchedAt) || !expected.expiresAt().isAfter(checked)) throw invalid();
+        var action = expected.action(); var owner = action.owner(); var tool = expected.descriptor();
+        approval.binding().requireApproved(action, approval.approval(), consumedAndDispatchedAt);
+        approval.binding().requireApproved(action, approval.approval(), checked);
+        if (!approval.consumerExpiresAt().isAfter(checked)) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Tool approval consumer is no longer current");
+        Instant indexedExpiry = approval.approval().expiresAt().truncatedTo(ChronoUnit.MICROS);
+        if (!indexedExpiry.isAfter(consumedAndDispatchedAt) || !indexedExpiry.isAfter(checked)) throw invalid();
+        var proof = new ToolExecutionJsonCodec.ApprovalProofVO(1,
+                new ToolExecutionJsonCodec.ApprovalSourceVO(approval.sourceId(), approval.tenantId(), approval.sourceIssuer(), approval.sourceResource()), approval.binding(), approval.approval());
+        String encoded = codec.approval(proof, action), sha = codec.approvalSha256(proof, action);
+        try {
+            if (jdbc.update("""
+                    UPDATE tianji_agent.agent_tool_action_intent
+                    SET state='DISPATCHING',revision=revision+1,approval_source_namespace_sha256=?,approval_receipt_id=?,approval_proof_sha256=?,approval_proof=CAST(? AS jsonb),
+                        approval_approved=TRUE,approval_consumed_at=?,approval_expires_at=?,dispatch_epoch=1,dispatch_nonce_sha256=?,dispatch_run_id=?,dispatch_invocation_id=?,
+                        executor_issuer=?,executor_id=?,updated_at=?,side_effect_outcome='UNKNOWN'
+                    WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
+                      AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='APPROVAL_REQUIRED' AND approval_policy_ref=?
+                      AND state='AWAITING_APPROVAL' AND revision=? AND dispatch_epoch=0
+                      AND dispatch_nonce_sha256 IS NULL AND dispatch_run_id IS NULL AND dispatch_invocation_id IS NULL AND executor_issuer IS NULL AND executor_id IS NULL
+                      AND approval_source_namespace_sha256 IS NULL AND approval_receipt_id IS NULL AND approval_proof_sha256 IS NULL AND approval_proof IS NULL
+                      AND approval_approved IS NULL AND approval_consumed_at IS NULL AND approval_expires_at IS NULL
+                      AND side_effect_outcome='NONE' AND result IS NULL AND business_receipt_id IS NULL AND last_error_code IS NULL AND closed_at IS NULL
+                      AND origin_run_id=? AND origin_snapshot_sha256=? AND created_at=? AND updated_at=? AND expires_at=? AND expires_at>clock_timestamp()
+                      AND ?>clock_timestamp() AND ?>clock_timestamp()
+                    """, approval.sourceNamespaceSha256(), approval.approval().approvalReceiptId(), sha, encoded, Timestamp.from(consumedAndDispatchedAt), Timestamp.from(indexedExpiry),
+                    dispatch.nonceSha256(), dispatch.runId(), dispatch.invocationId(), dispatch.executor().issuerFingerprint(), dispatch.executor().subjectId(), Timestamp.from(consumedAndDispatchedAt),
+                    owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), UUID.fromString(action.intentId()),
+                    action.actionKey(), action.businessKey(), action.businessVersion(), action.requestSha256(), logicalIdentity(action), tool.key(), tool.version(), tool.reference().contentSha256(), tool.policy().bindingSha256(), tool.policy().approvalPolicyRef(),
+                    expected.revision(), expected.originRunId(), expected.originSnapshotSha256(), Timestamp.from(expected.createdAt()), Timestamp.from(expected.updatedAt()), Timestamp.from(expected.expiresAt()),
+                    Timestamp.from(indexedExpiry), Timestamp.from(approval.consumerExpiresAt().truncatedTo(ChronoUnit.MICROS))) != 1) throw conflict();
+            Instant completed = now(deadline);
+            if (!indexedExpiry.isAfter(completed) || !approval.consumerExpiresAt().isAfter(completed)) throw unavailable();
+        } catch (DuplicateKeyException privateDuplicate) { throw conflict(); }
+        catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    void completeApprovedWrite(Row expected, ToolExecutionOutcome outcome, Instant finishedAt, Instant deadline) {
+        Instant checked = now(deadline); requireApproval(expected);
+        if (!Set.of("DISPATCHING", "UNKNOWN").contains(expected.state()) || expected.dispatch() == null || expected.approval() == null || outcome == null) throw invalid();
+        if (expected.revision() == Long.MAX_VALUE) throw unavailable();
+        writeTime(expected, finishedAt, checked); outcome = outcome.validated(expected.descriptor());
+        String effect = switch (outcome.status()) {
+            case SUCCEEDED -> "CONFIRMED";
+            case REJECTED, FAILED_KNOWN -> "NONE";
+            case UNKNOWN -> "UNKNOWN";
+            default -> throw invalid();
+        };
+        String state = outcome.status() == ToolExecutionOutcome.Status.SUCCEEDED ? "APPLIED" : outcome.status().name();
+        var action = expected.action(); var owner = action.owner(); var tool = expected.descriptor(); var dispatch = expected.dispatch(); var approval = expected.approval(); var proof = approval.proof();
+        if (!codec.approvalSha256(proof, action).equals(approval.proofSha256())) throw invalid();
+        try {
+            if (jdbc.update("""
+                    UPDATE tianji_agent.agent_tool_action_intent
+                    SET state=?,side_effect_outcome=?,result=CAST(? AS jsonb),business_receipt_id=?,last_error_code=?,closed_at=?,updated_at=?,revision=revision+1
+                    WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
+                      AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='APPROVAL_REQUIRED' AND approval_policy_ref=?
+                      AND state=? AND revision=? AND dispatch_epoch=? AND dispatch_nonce_sha256=? AND dispatch_run_id=? AND dispatch_invocation_id=? AND executor_issuer=? AND executor_id=?
+                      AND approval_source_namespace_sha256=? AND approval_receipt_id=? AND approval_proof_sha256=? AND approval_proof=CAST(? AS jsonb)
+                      AND approval_approved IS TRUE AND approval_consumed_at=? AND approval_expires_at=?
+                      AND origin_run_id=? AND origin_snapshot_sha256=? AND created_at=? AND updated_at=? AND expires_at=?
+                    """, state, effect, codec.outcome(tool, outcome), outcome.businessReceiptId(), outcome.errorCode(), Timestamp.from(finishedAt), Timestamp.from(finishedAt),
+                    owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), UUID.fromString(action.intentId()),
+                    action.actionKey(), action.businessKey(), action.businessVersion(), action.requestSha256(), logicalIdentity(action), tool.key(), tool.version(), tool.reference().contentSha256(), tool.policy().bindingSha256(), tool.policy().approvalPolicyRef(),
+                    expected.state(), expected.revision(), dispatch.epoch(), dispatch.nonceSha256(), dispatch.runId(), dispatch.invocationId(), dispatch.executor().issuerFingerprint(), dispatch.executor().subjectId(),
+                    proof.source().namespaceSha256(), proof.approval().approvalReceiptId(), approval.proofSha256(), codec.approval(proof, action), Timestamp.from(approval.consumedAt()), Timestamp.from(proof.approval().expiresAt().truncatedTo(ChronoUnit.MICROS)),
+                    expected.originRunId(), expected.originSnapshotSha256(), Timestamp.from(expected.createdAt()), Timestamp.from(expected.updatedAt()), Timestamp.from(expected.expiresAt())) != 1) throw conflict();
+            now(deadline);
+        } catch (DataAccessException privateStorage) { throw unavailable(); }
+    }
+
+    private static void requireApproval(Row expected) {
+        if (expected == null) throw invalid(); requireApproval(expected.action(), expected.descriptor());
+    }
+    private static void requireApproval(ToolActionRequest action, ToolDescriptor descriptor) {
+        if (action == null || descriptor == null || descriptor.policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED
+                || action.policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED || !descriptor.reference().equals(action.tool())) throw invalid();
+        sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
     }
 
     Row lockForWrite(ToolActionRequest action, ToolDescriptor descriptor, Instant deadline) {
@@ -282,7 +380,8 @@ final class ToolActionIntentSql {
         if (action.policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED || namespace == null || receipt == null || sha == null || encoded == null
                 || !Boolean.TRUE.equals(approved) || consumed == null || expires == null || created == null || consumed.isBefore(created)) throw unavailable();
         var proof = codec.approval(encoded, sha, action);
-        if (!namespace.equals(proof.source().namespaceSha256()) || !receipt.equals(proof.approval().approvalReceiptId()) || !expires.equals(proof.approval().expiresAt())) throw unavailable();
+        if (!namespace.equals(proof.source().namespaceSha256()) || !receipt.equals(proof.approval().approvalReceiptId())
+                || !expires.equals(proof.approval().expiresAt().truncatedTo(ChronoUnit.MICROS)) || !expires.isAfter(consumed)) throw unavailable();
         return new ApprovalConsumptionVO(proof, sha, consumed);
     }
 

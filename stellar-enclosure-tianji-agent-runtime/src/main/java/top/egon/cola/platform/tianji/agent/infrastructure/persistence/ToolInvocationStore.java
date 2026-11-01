@@ -5,6 +5,7 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport.VerifiedExecutor;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -124,6 +125,37 @@ public final class ToolInvocationStore {
         if (rows.invocation() == null) throw unavailable();
         return new RecorderPreparationResultVO(rows.invocation().invocation(), rows.invocation().budget());
     }
+    ApprovedWriteDispatchBeginResultVO consumeApprovalAndBeginDispatch(PreparationRequestVO request, ApprovedObservation approval,
+            ToolExecutionGrant.EvidenceVO evidence, ToolExecutionAuthorization.CheckResult checked, VerifiedExecutor executor,
+            String nonceSha256, DispatchWindowVO window) {
+        approvalWrite(request);
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Approved tool dispatch requires its own transaction");
+        if (approval == null || evidence == null || checked == null || executor == null || window == null || !hash(nonceSha256)) throw invalid();
+        checkDispatch(window);
+        Instant call = window.callDeadlineAt();
+        if (call.getNano() % 1_000 != 0 || !request.binding().equals(evidence.reservation().binding())
+                || executor.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(executor.actor().issuerFingerprint())
+                || executor.actor().tenantId() != request.binding().run().actor().tenantId() || approval.tenantId() != request.binding().run().actor().tenantId()
+                || call.isAfter(request.binding().run().deadlineAt()) || call.isAfter(evidence.expiresAt())
+                || call.isAfter(executor.expiresAt()) || call.isAfter(approval.expiresAt())) throw unavailable();
+        var expected = new ToolExecutionAuthorization.Request(request.binding().run(), request.lease(), request.descriptor().reference(),
+                request.descriptor().policy().bindingSha256(), request.parametersSha256(), request.action().intentId(), call);
+        if (!expected.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.DISPATCH) throw unavailable();
+        if (checked.decision() == ToolExecutionAuthorization.Decision.DENY) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current approved tool dispatch access was denied");
+        var audit = checked.audit();
+        if (checked.decision() != ToolExecutionAuthorization.Decision.ALLOW || audit == null || audit.boundary() != checked.boundary()
+                || audit.decision() != checked.decision() || audit.subjectType() != request.binding().run().actor().subjectType()
+                || !evidence.grantId().equals(audit.grantId()) || audit.checkedAt().isBefore(window.startedAt()) || audit.checkedAt().isAfter(clock.instant())
+                || audit.expiresAt().isBefore(call) || audit.expiresAt().isAfter(evidence.expiresAt())) throw unavailable();
+        approval.binding().requireApproved(request.action(), approval.approval(), clock.instant());
+        return transact(() -> checkDispatch(window), () -> invocations.consumeApprovalAndBeginDispatch(request, approval, evidence,
+                audit, executor, nonceSha256, call, window.deadlineAt()));
+    }
+    RecordedResultVO completeApprovedWrite(PreparationRequestVO request, DispatchAttemptVO attempt, String plainNonceHex, ToolExecutionOutcome outcome) {
+        approvalWrite(request); if (attempt == null || outcome == null) throw invalid();
+        if (!dispatchNonceSha256(plainNonceHex).equals(attempt.dispatchNonceSha256())) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Dispatch completion proof changed");
+        return writeFact(() -> { var window = factWindow(); return transact(() -> checkFact(window), () -> invocations.completeApprovedWrite(request, attempt, outcome, window.deadlineAt())); });
+    }
     WritePreparationResultVO prepareOrLoadIdempotentWrite(PreparationRequestVO request) {
         idempotentWrite(request);
         var rows = prepareInternal(request, ToolInvocationSql.Projection.IDEMPOTENT_WRITE_METADATA);
@@ -213,6 +245,11 @@ public final class ToolInvocationStore {
         if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.READ_ONLY || request.action() != null
                 || request.estimatedCost() == null || request.estimatedCost().signum() != 0) throw invalid();
     }
+    private static void approvalWrite(PreparationRequestVO request) {
+        if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED || request.action() == null || request.intentExpiry() == null) throw invalid();
+        var action = request.action(); var expected = new ToolActionRequest(request.binding().run().actor(), request.descriptor(), action.businessKey(), action.businessVersion(), request.arguments());
+        if (!expected.intentId().equals(action.intentId()) || !expected.requestSha256().equals(action.requestSha256()) || !expected.policy().equals(action.policy())) throw invalid();
+    }
     private static void idempotentWrite(PreparationRequestVO request) {
         if (request == null || request.descriptor().policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE || request.action() == null || request.intentExpiry() == null) throw invalid();
         var action = request.action(); var expected = new ToolActionRequest(request.binding().run().actor(), request.descriptor(), action.businessKey(), action.businessVersion(), request.arguments());
@@ -274,6 +311,20 @@ public final class ToolInvocationStore {
     record RecordedResultVO(RecorderPreparationVO invocation, ToolExecutionOutcome outcome, AgentBudgetReservation budget) {
         RecordedResultVO { if (invocation == null || outcome == null || budget == null || !invocation.state().equals(outcome.status().name())) throw invalid(); }
         @Override public String toString() { return "ToolInvocationStore.RecordedResultVO[redacted]"; }
+    }
+    record ApprovedWriteDispatchBeginResultVO(ToolActionIntentStore.PreparedActionResult action, RecorderPreparationVO invocation,
+                                             AgentBudgetReservation budget, DispatchAttemptVO attempt) {
+        ApprovedWriteDispatchBeginResultVO {
+            if (action == null || action.risk() != ToolPolicy.Risk.APPROVAL_REQUIRED || (invocation == null) != (budget == null)
+                    || invocation != null && (!invocation.reservationId().equals(budget.reservationId()) || budget.kind() != AgentBudgetRequest.Kind.TOOL
+                    || !(action.toolRef().key() + '@' + action.toolRef().version()).equals(budget.toolVersion()) || budget.inputTokens() != 0 || budget.outputTokens() != 0)
+                    || attempt != null && (invocation == null || !"DISPATCHING".equals(invocation.state()) || !"DISPATCHING".equals(action.state())
+                    || budget.state() != AgentBudgetReservation.State.RESERVED || !invocation.runId().equals(attempt.runId()) || !invocation.invocationId().equals(attempt.invocationId())
+                    || invocation.dispatchEpoch() != attempt.dispatchEpoch() || invocation.capabilityIssueEpoch() != attempt.capabilityIssueEpoch()
+                    || !Objects.equals(invocation.dispatchedAt(), attempt.dispatchedAt()) || attempt.callDeadlineAt().isAfter(invocation.dispatchNotAfter()))) throw invalid();
+        }
+        boolean started() { return attempt != null; }
+        @Override public String toString() { return "ToolInvocationStore.ApprovedWriteDispatchBeginResultVO[redacted]"; }
     }
     record WritePreparationResultVO(RecorderPreparationVO invocation, ToolActionIntentStore.PreparedActionResult action, AgentBudgetReservation budget) {
         WritePreparationResultVO {
