@@ -1075,6 +1075,85 @@ class ProcessServerPostgresTest {
             verifyWorkerLostAcknowledgement(app, bootstrap, runs, service, owner20, worker20);
         }
         verifyWorkerExpiry(app, bootstrap, runs, service, owner20, worker20);
+        verifyWorkerBusinessErrorRouting(app, bootstrap);
+    }
+
+    private static void verifyWorkerBusinessErrorRouting(ConfigurableApplicationContext app, JdbcTemplate bootstrap) throws Exception {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var validator = new ProcessModelValidator();
+        var registration = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "business-error-worker", "businessReject", "1",
+                Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
+                Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
+                Duration.ofMinutes(2), Duration.ofMillis(200), WorkerEffect.TRANSACTIONAL_RECEIPT);
+        var registry = new WorkerTopicRegistry(List.of(registration));
+        var releases = new ProcessReleaseService(process, dmn, validator, false, registry);
+        var runs = new ProcessExecutionService(process, dmn, validator);
+        var workers = new FlowableWorkerService(process, dmn, validator, registry);
+        var owner = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "business-error-owner", "https://idp.example/20");
+        var worker = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "business-error-worker", "https://idp.example/20");
+        byte[] fixture = new ClassPathResource("fixtures/worker-business-error.bpmn20.xml").getContentAsByteArray();
+        byte[] xml = new String(fixture, StandardCharsets.UTF_8).replace("riskCheck:1", "businessReject:1")
+                .replace("tianji:topic=\"riskCheck\"", "tianji:topic=\"businessReject\"").getBytes(StandardCharsets.UTF_8);
+        releases.publish(owner, "worker-business-error", List.of(new ProcessReleaseService.ModelResource(
+                Type.BPMN, "workerBusinessError", xml, Map.of("amount", ValueType.INTEGER))));
+        var created = new java.util.ArrayList<String>();
+        var runtime = app.getBean(RuntimeService.class);
+        try {
+            var accepted = runs.start(owner, new ProcessExecutionService.StartCommand("worker-business-error", "workerBusinessError",
+                    "business-error-accepted", "business-error-accepted", "trace-business-error-accepted", Map.of("amount", 10)));
+            created.add(accepted.instanceId());
+            var task = awaitWorker(workers, worker, new AcquireWorkerTaskCommand("businessReject", "1"));
+            assertEquals(accepted.instanceId(), task.processInstanceId());
+            var command = new FailWorkerTaskCommand(task.taskId(), task.activityOccurrenceId(), task.leaseToken(),
+                    WorkerFailureKindEnum.BUSINESS_REJECTED, "CUSTOMER_INELIGIBLE");
+            var receipt = workers.fail(worker, command);
+            assertEquals(WorkerReceiptOutcomeEnum.BUSINESS_REJECTED, receipt.outcome());
+            assertEquals(receipt, workers.fail(worker, command));
+            assertEquals("BUSINESS_REJECTED", bootstrap.queryForObject(
+                    "SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?", String.class,
+                    WorkerLeaseStore.tokenHash(task.leaseToken())));
+            assertEquals("CUSTOMER_INELIGIBLE", bootstrap.queryForObject(
+                    "SELECT failure_code FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?", String.class,
+                    WorkerLeaseStore.tokenHash(task.leaseToken())));
+            // Native propagation is a separate observation after the accepted receipt, never inferred from its outcome.
+            await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(100)).until(() ->
+                    app.getBean(TaskService.class).createTaskQuery().processInstanceId(accepted.instanceId())
+                            .taskTenantId("20").taskDefinitionKey("rejectionReview").count() == 1);
+            var rollback = runs.start(owner, new ProcessExecutionService.StartCommand("worker-business-error", "workerBusinessError",
+                    "business-error-rollback", "business-error-rollback", "trace-business-error-rollback", Map.of("amount", 10)));
+            created.add(rollback.instanceId());
+            var rollbackTask = awaitWorker(workers, worker, new AcquireWorkerTaskCommand("businessReject", "1"));
+            assertEquals(rollback.instanceId(), rollbackTask.processInstanceId());
+            bootstrap.execute("""
+                    CREATE FUNCTION tianji_process.test_business_error_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN
+                      IF NEW.failure_code='FORCE_BUSINESS_ERROR_ROLLBACK' THEN RAISE EXCEPTION 'forced business-error receipt failure'; END IF;
+                      RETURN NEW;
+                    END $$
+                    """);
+            try {
+                bootstrap.execute("CREATE TRIGGER test_business_error_receipt_failure BEFORE UPDATE ON tianji_process.tianji_worker_lease_receipt "
+                        + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_business_error_receipt_failure()");
+                assertThrows(RuntimeException.class, () -> workers.fail(worker, new FailWorkerTaskCommand(
+                        rollbackTask.taskId(), rollbackTask.activityOccurrenceId(), rollbackTask.leaseToken(),
+                        WorkerFailureKindEnum.BUSINESS_REJECTED, "FORCE_BUSINESS_ERROR_ROLLBACK")));
+                assertEquals("LEASED", bootstrap.queryForObject(
+                        "SELECT state FROM tianji_process.tianji_worker_lease_receipt WHERE token_sha256=?", String.class,
+                        WorkerLeaseStore.tokenHash(rollbackTask.leaseToken())));
+                assertEquals(1, app.getBean(ManagementService.class).createExternalWorkerJobQuery().jobId(rollbackTask.taskId()).count());
+                assertEquals(0, app.getBean(ManagementService.class).createJobQuery().jobId(rollbackTask.taskId()).count());
+            } finally {
+                bootstrap.execute("DROP TRIGGER IF EXISTS test_business_error_receipt_failure ON tianji_process.tianji_worker_lease_receipt");
+                bootstrap.execute("DROP FUNCTION tianji_process.test_business_error_receipt_failure()");
+            }
+        } finally {
+            for (String instanceId : created) {
+                if (runtime.createProcessInstanceQuery().processInstanceId(instanceId).processInstanceTenantId("20").count() != 0) {
+                    runtime.deleteProcessInstance(instanceId, "TEST_FIXTURE_CLEANUP");
+                }
+            }
+        }
     }
 
     private static void verifyWorkerLostAcknowledgement(ConfigurableApplicationContext app, JdbcTemplate processDatabase,

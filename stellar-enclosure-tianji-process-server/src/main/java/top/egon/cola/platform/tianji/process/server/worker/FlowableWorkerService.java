@@ -33,6 +33,7 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerBusinessError;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 
 import java.security.SecureRandom;
@@ -248,15 +249,47 @@ public final class FlowableWorkerService {
             if (!"LEASED".equals(current.state())) return replayFailure(actor, command, hash, resultHash, current);
             VerifiedJob verified = verifyLease(actor, current, nativeJob, registration);
             if (!current.inputSha256().equals(inputHash(nativeJob, registration, verified.inputs()))) throw conflict();
-            boolean retry = command.kind() == WorkerFailureKindEnum.RETRYABLE && nativeJob.retries() > 1;
-            WorkerReceiptOutcomeEnum outcome = retry ? WorkerReceiptOutcomeEnum.RETRY_SCHEDULED : WorkerReceiptOutcomeEnum.NEEDS_MANUAL;
-            var failure = process.getManagementService().createExternalWorkerJobFailureBuilder(nativeJob.id(), nativeJob.owner())
-                    .errorMessage(command.errorCode()).retries(retry ? nativeJob.retries() - 1 : 0);
-            if (retry) failure.retryTimeout(registration.retryDelay());
-            failure.fail();
+            WorkerReceiptOutcomeEnum outcome;
+            if (command.kind() == WorkerFailureKindEnum.BUSINESS_REJECTED && !agentDispatch
+                    && !registration.internalAgentDispatch() && verified.businessError() != null) {
+                scheduleBusinessError(actor.tenantId(), nativeJob, verified.businessError());
+                outcome = WorkerReceiptOutcomeEnum.BUSINESS_REJECTED;
+            } else {
+                boolean retry = command.kind() == WorkerFailureKindEnum.RETRYABLE && nativeJob.retries() > 1;
+                outcome = retry ? WorkerReceiptOutcomeEnum.RETRY_SCHEDULED : WorkerReceiptOutcomeEnum.NEEDS_MANUAL;
+                var failure = process.getManagementService().createExternalWorkerJobFailureBuilder(nativeJob.id(), nativeJob.owner())
+                        .errorMessage(command.errorCode()).retries(retry ? nativeJob.retries() - 1 : 0);
+                if (retry) failure.retryTimeout(registration.retryDelay());
+                failure.fail();
+            }
             var finish = new WorkerLeaseStore.Finish(outcome, resultHash, null, command.kind(), command.errorCode());
             return receipt(leases.finish(actor, command.taskId(), hash, finish));
         }));
+    }
+
+    /** The receipt accepts asynchronous native error work; it does not assert that the boundary has advanced. */
+    private void scheduleBusinessError(long tenantId, NativeJob original, WorkerBusinessError businessError) {
+        String code = businessError.errorCode();
+        if (code == null || !code.matches("[A-Z][A-Z0-9_]{0,63}")) throw businessErrorUnavailable();
+        var management = process.getManagementService();
+        management.createExternalWorkerCompletionBuilder(original.id(), original.owner()).bpmnError(code);
+        var external = management.createExternalWorkerJobQuery().jobId(original.id()).listPage(0, 2);
+        if (external == null || !external.isEmpty()) throw businessErrorUnavailable();
+        var executable = management.createJobQuery().jobId(original.id()).listPage(0, 2);
+        if (executable == null || executable.size() != 1) throw businessErrorUnavailable();
+        var scheduled = executable.getFirst();
+        if (scheduled == null || !original.id().equals(scheduled.getId())
+                || !Long.toString(tenantId).equals(scheduled.getTenantId())
+                || !original.processInstanceId().equals(scheduled.getProcessInstanceId())
+                || !original.definitionId().equals(scheduled.getProcessDefinitionId())
+                || !original.executionId().equals(scheduled.getExecutionId())
+                || !original.elementId().equals(scheduled.getElementId())
+                || !"external-worker-complete".equals(scheduled.getJobHandlerType())
+                || !("error:" + code).equals(scheduled.getJobHandlerConfiguration())) throw businessErrorUnavailable();
+    }
+
+    private static IllegalStateException businessErrorUnavailable() {
+        return new IllegalStateException("Worker business-error scheduling could not be verified");
     }
 
     private WorkerReceiptDTO replayFailure(ProcessActor actor, FailWorkerTaskCommand command, String hash, String resultHash,
@@ -314,7 +347,7 @@ public final class FlowableWorkerService {
         Map<String, Object> inputs = new HashMap<>();
         for (var mapping : worker.inputs()) inputs.put(mapping.target(), process.getRuntimeService().getVariable(job.executionId(), mapping.source()));
         return new VerifiedJob(release.releaseKey(), processBinding.modelSha256(), instance.getBusinessKey(), correlations.getFirst(),
-                ProcessValues.inputs(registration.inputs(), inputs));
+                ProcessValues.inputs(registration.inputs(), inputs), model.workerBusinessErrors().get(job.elementId()));
     }
 
     private NativeJob lockNative(long tenantId, String jobId) {
@@ -373,5 +406,5 @@ public final class FlowableWorkerService {
     private record NativeJob(String id, String owner, Instant expiresAt, String processInstanceId, String executionId,
                              String definitionId, String elementId, String topic, int retries, boolean live) { }
     private record VerifiedJob(String releaseKey, String modelSha256, String businessKey, String correlationId,
-                               Map<String, Object> inputs) { }
+                               Map<String, Object> inputs, WorkerBusinessError businessError) { }
 }

@@ -1,10 +1,13 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
 import org.flowable.bpmn.converter.BpmnXMLConverter;
+import org.flowable.bpmn.model.BoundaryEvent;
+import org.flowable.bpmn.model.ErrorEventDefinition;
 import org.flowable.bpmn.model.EventGateway;
 import org.flowable.bpmn.model.IntermediateCatchEvent;
 import org.flowable.bpmn.model.MessageEventDefinition;
 import org.flowable.bpmn.model.TimerEventDefinition;
+import org.flowable.engine.runtime.ExternalWorkerCompletionBuilder;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -19,6 +22,114 @@ import static top.egon.cola.platform.tianji.process.server.release.ValidatedProc
 
 class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
+
+    @Test
+    void worker_business_error_symbols_and_fixture_are_present() {
+        assertAll(
+                () -> assertDoesNotThrow(() -> ValidatedProcessModel.class.getDeclaredMethod("workerBusinessErrors")),
+                () -> assertDoesNotThrow(() -> Class.forName(ValidatedProcessModel.class.getName() + "$WorkerBusinessError")),
+                () -> assertNotNull(ProcessModelValidatorTest.class.getResource(
+                        "/fixtures/worker-business-error.bpmn20.xml")),
+                () -> assertDoesNotThrow(() -> ExternalWorkerCompletionBuilder.class.getMethod(
+                        "bpmnError", String.class))
+        );
+    }
+
+    @Test
+    void fixed_worker_business_error_is_graph_derived_immutable_and_converter_safe() throws Exception {
+        byte[] xml = fixture("worker-business-error.bpmn20.xml");
+        var model = assertDoesNotThrow(() -> validator.validateBpmn(xml, "workerBusinessError"));
+        assertEquals(Map.of("worker", new ValidatedProcessModel.WorkerBusinessError(
+                "businessError", "ORDER_REJECTED", "workerRejected", "rejectionReview")),
+                model.workerBusinessErrors());
+        assertThrows(UnsupportedOperationException.class, () -> model.workerBusinessErrors().clear());
+        assertTrue(validator.validateBpmn(fixture("baseline.bpmn20.xml"), "baseline")
+                .workerBusinessErrors().isEmpty());
+        assertTrue(validator.validateBpmn(fixture("worker-mapping.bpmn20.xml"), "workerMapping")
+                .workerBusinessErrors().isEmpty());
+        assertTrue(validator.validateBpmn(fixture("agent-dispatch-wait.bpmn20.xml"), "agentDispatch")
+                .workerBusinessErrors().isEmpty());
+        assertTrue(validator.validateDmn(fixture("baseline.dmn"), "baselineDecision")
+                .workerBusinessErrors().isEmpty());
+        assertTrue(new ValidatedProcessModel(ValidatedProcessModel.Type.BPMN, "legacy", new byte[] {1},
+                Map.of(), Map.of(), java.util.List.of()).workerBusinessErrors().isEmpty());
+
+        var nativeModel = new BpmnXMLConverter().convertToBpmnModel(
+                () -> new ByteArrayInputStream(xml), true, true);
+        assertEquals("ORDER_REJECTED", nativeModel.getErrors().get("businessError"));
+        var boundary = assertInstanceOf(BoundaryEvent.class,
+                nativeModel.getMainProcess().getFlowElement("workerRejected"));
+        var definition = assertInstanceOf(ErrorEventDefinition.class,
+                boundary.getEventDefinitions().getFirst());
+        // Flowable 8 normalizes an ErrorEventDefinition boundary to false internally; the validated XML still requires literal true.
+        assertFalse(boundary.isCancelActivity());
+        assertEquals("worker", boundary.getAttachedToRefId());
+        assertEquals("businessError", definition.getErrorCode());
+        assertEquals(1, boundary.getOutgoingFlows().size());
+        assertEquals("rejectionReview", boundary.getOutgoingFlows().getFirst().getTargetRef());
+    }
+
+    @Test
+    void worker_business_error_profile_rejects_dynamic_ambiguous_and_nonordinary_models() throws Exception {
+        String xml = new String(fixture("worker-business-error.bpmn20.xml"), StandardCharsets.UTF_8);
+        var invalidModels = new java.util.LinkedHashMap<String, String>();
+        invalidModels.put("missing-error-code", xml.replace(" errorCode=\"ORDER_REJECTED\"", ""));
+        invalidModels.put("missing-error-id", xml.replace("<error id=\"businessError\"", "<error"));
+        invalidModels.put("lowercase-error-code", xml.replace("ORDER_REJECTED", "order_rejected"));
+        invalidModels.put("oversized-error-code", xml.replace("ORDER_REJECTED", "A".repeat(65)));
+        invalidModels.put("dynamic-error-code", xml.replace("ORDER_REJECTED", "${route}"));
+        invalidModels.put("extra-error-attribute", xml.replace("<error id=\"businessError\"",
+                "<error name=\"unsafe\" id=\"businessError\""));
+        invalidModels.put("missing-error-ref", xml.replace("errorRef=\"businessError\"", ""));
+        invalidModels.put("unknown-error-ref", xml.replace("errorRef=\"businessError\"", "errorRef=\"missingError\""));
+        invalidModels.put("unused-error", xml.replace("    <process id=\"workerBusinessError\"",
+                "    <error id=\"unusedError\" errorCode=\"UNUSED\"/>\n    <process id=\"workerBusinessError\""));
+        invalidModels.put("multiple-error-definitions", xml.replace("<errorEventDefinition errorRef=\"businessError\"/>",
+                "<errorEventDefinition errorRef=\"businessError\"/><errorEventDefinition errorRef=\"businessError\"/>"));
+        invalidModels.put("second-boundary-on-worker", xml.replace(
+                "        <sequenceFlow id=\"toRejectionReview\"", """
+                        <boundaryEvent id="workerRejectedAgain" attachedToRef="worker" cancelActivity="true">
+                            <errorEventDefinition errorRef="businessError"/>
+                        </boundaryEvent>
+                        <sequenceFlow id="toSecondRejection" sourceRef="workerRejectedAgain" targetRef="rejectionReviewAgain"/>
+                        <userTask id="rejectionReviewAgain"/>
+                        <sequenceFlow id="toSecondRejectionEnd" sourceRef="rejectionReviewAgain" targetRef="rejectionEndAgain"/>
+                        <endEvent id="rejectionEndAgain"/>
+                        <sequenceFlow id="toRejectionReview"""));
+        invalidModels.put("noninterrupting-boundary", xml.replace("cancelActivity=\"true\"", "cancelActivity=\"false\""));
+        invalidModels.put("boundary-without-outgoing", xml.replace(
+                "        <sequenceFlow id=\"toRejectionReview\" sourceRef=\"workerRejected\" targetRef=\"rejectionReview\"/>\n", ""));
+        invalidModels.put("boundary-with-two-outgoing", xml.replace(
+                "        <sequenceFlow id=\"toRejectionReview\" sourceRef=\"workerRejected\" targetRef=\"rejectionReview\"/>",
+                "        <sequenceFlow id=\"toRejectionReview\" sourceRef=\"workerRejected\" targetRef=\"rejectionReview\"/>\n"
+                        + "        <sequenceFlow id=\"toOtherRejection\" sourceRef=\"workerRejected\" targetRef=\"end\"/>"));
+        invalidModels.put("explicit-boundary-incoming", xml.replace("        <boundaryEvent id=\"workerRejected\"",
+                "        <sequenceFlow id=\"explicitBoundaryIncoming\" sourceRef=\"start\" targetRef=\"workerRejected\"/>\n"
+                        + "        <boundaryEvent id=\"workerRejected\""));
+        invalidModels.put("cyclic-error-path", xml.replace("sourceRef=\"rejectionReview\" targetRef=\"rejectionEnd\"",
+                "sourceRef=\"rejectionReview\" targetRef=\"rejectionReview\""));
+        invalidModels.put("human-task-attachment", xml.replace("attachedToRef=\"worker\"", "attachedToRef=\"review\""));
+        invalidModels.put("compensate-definition", xml.replace("<errorEventDefinition errorRef=\"businessError\"/>",
+                "<compensateEventDefinition/>"));
+        invalidModels.put("subprocess", xml.replace("<userTask id=\"review\"/>", "<subProcess id=\"review\"/>"));
+        for (var invalid : invalidModels.entrySet()) {
+            assertNotEquals(xml, invalid.getValue(), invalid.getKey());
+            assertThrows(IllegalArgumentException.class,
+                    () -> validator.validateBpmn(bytes(invalid.getValue()), "workerBusinessError"), invalid.getKey());
+        }
+
+        String agent = new String(fixture("agent-dispatch-wait.bpmn20.xml"), StandardCharsets.UTF_8);
+        String agentWithError = addBusinessError(agent);
+        assertNotEquals(agent, agentWithError, "agent-message-worker");
+        assertThrows(IllegalArgumentException.class,
+                () -> validator.validateBpmn(bytes(agentWithError), "agentDispatch"), "agent-message-worker");
+        String linkedCase = new String(fixture("formal-case-linked.bpmn20.xml"), StandardCharsets.UTF_8);
+        String caseWithError = addBusinessError(linkedCase)
+                .replace("attachedToRef=\"worker\"", "attachedToRef=\"caseSource\"");
+        assertNotEquals(linkedCase, caseWithError, "case-source-attachment");
+        assertThrows(IllegalArgumentException.class,
+                () -> validator.validateBpmn(bytes(caseWithError), "linkedProcess"), "case-source-attachment");
+    }
 
     @Test
     void released_timer_wait_metadata_covers_every_supported_timer_without_changing_older_models() throws Exception {
@@ -332,6 +443,19 @@ class ProcessModelValidatorTest {
     }
 
     private static byte[] bytes(String value) { return value.getBytes(StandardCharsets.UTF_8); }
+
+    private static String addBusinessError(String xml) {
+        return xml.replace("    <process ", "    <error id=\"businessError\" errorCode=\"ORDER_REJECTED\"/>\n    <process ")
+                .replace("    </process>", """
+                        <boundaryEvent id="workerRejected" attachedToRef="worker" cancelActivity="true">
+                            <errorEventDefinition errorRef="businessError"/>
+                        </boundaryEvent>
+                        <sequenceFlow id="toBusinessRejection" sourceRef="workerRejected" targetRef="businessRejectionReview"/>
+                        <userTask id="businessRejectionReview"/>
+                        <sequenceFlow id="toBusinessRejectionEnd" sourceRef="businessRejectionReview" targetRef="businessRejectionEnd"/>
+                        <endEvent id="businessRejectionEnd"/>
+                    </process>""");
+    }
 
     private static byte[] branching(int levels) {
         StringBuilder nodes = new StringBuilder("<startEvent id='start'/><endEvent id='end'/>");

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn"
+             xmlns:tianji="urn:stellar-enclosure:tianji:worker:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <error id="businessError" errorCode="ORDER_REJECTED"/>
+    <process id="workerBusinessError" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toWorker" sourceRef="start" targetRef="worker"/>
+        <serviceTask id="worker" flowable:type="external-worker" flowable:topic="riskCheck:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="riskCheck"
+                     tianji:schemaVersion="1" tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="amount" target="requestedAmount"
+                                                    tianji:type="INTEGER"/>
+                <flowable:externalWorkerOutParameter source="approved" target="approved"
+                                                     tianji:type="BOOLEAN"/>
+            </extensionElements>
+        </serviceTask>
+        <sequenceFlow id="toReview" sourceRef="worker" targetRef="review"/>
+        <userTask id="review"/>
+        <sequenceFlow id="toEnd" sourceRef="review" targetRef="end"/>
+        <endEvent id="end"/>
+        <boundaryEvent id="workerRejected" attachedToRef="worker" cancelActivity="true">
+            <errorEventDefinition errorRef="businessError"/>
+        </boundaryEvent>
+        <sequenceFlow id="toRejectionReview" sourceRef="workerRejected" targetRef="rejectionReview"/>
+        <userTask id="rejectionReview"/>
+        <sequenceFlow id="toRejectionEnd" sourceRef="rejectionReview" targetRef="rejectionEnd"/>
+        <endEvent id="rejectionEnd"/>
+    </process>
+</definitions>

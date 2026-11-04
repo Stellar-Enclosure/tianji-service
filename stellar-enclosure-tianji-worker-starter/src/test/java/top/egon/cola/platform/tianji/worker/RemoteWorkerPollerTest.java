@@ -140,6 +140,32 @@ class RemoteWorkerPollerTest {
     }
 
     @Test
+    void business_rejection_accepts_the_existing_terminal_receipt_without_reexecuting_business() {
+        var client = mock(WorkerClient.class); var store = store(); var scheduler = mock(TaskScheduler.class);
+        var callback = captureScheduler(scheduler); var registration = registration(contract());
+        var task = task(20, contract());
+        when(client.acquire(any())).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task));
+        when(store.execute(eq(task), eq(registration.descriptor()), same(registration.handler())))
+                .thenThrow(new WorkerHandlerFailureException(WorkerFailureKindEnum.BUSINESS_REJECTED, "CUSTOMER_INELIGIBLE"));
+        var receipt = new WorkerReceiptDTO(task.taskId(), task.activityOccurrenceId(), WorkerReceiptOutcomeEnum.BUSINESS_REJECTED, NOW);
+        when(client.fail(any())).thenReturn(receipt);
+        var poller = poller(client, store, List.of(registration), scheduler, Runnable::run, properties(1, Duration.ZERO));
+        poller.start();
+        try {
+            callback.get().run();
+            var failure = org.mockito.ArgumentCaptor.forClass(FailWorkerTaskCommand.class);
+            verify(client, times(1)).fail(failure.capture());
+            assertEquals(WorkerFailureKindEnum.BUSINESS_REJECTED, failure.getValue().kind());
+            assertEquals("CUSTOMER_INELIGIBLE", failure.getValue().errorCode());
+            assertEquals(task.taskId(), failure.getValue().taskId());
+            assertEquals(task.activityOccurrenceId(), failure.getValue().activityOccurrenceId());
+            assertEquals(task.leaseToken(), failure.getValue().leaseToken());
+            verify(store, times(1)).execute(eq(task), eq(registration.descriptor()), same(registration.handler()));
+            verify(client, never()).complete(any());
+        } finally { poller.stop(); }
+    }
+
+    @Test
     void bounded_slots_and_shutdown_prevent_a_new_generation_from_overlapping_old_work() throws Exception {
         var client = mock(WorkerClient.class);
         var store = store();

@@ -82,6 +82,30 @@ class WorkerControllerTest {
     }
 
     @Test
+    void declared_business_rejection_uses_the_existing_noncacheable_receipt_contract() throws Exception {
+        when(access.require(TianjiProcessPermissions.WORKER_FAIL_API)).thenReturn(actor);
+        String lease = Base64.getUrlEncoder().withoutPadding().encodeToString(new byte[32]);
+        var command = new FailWorkerTaskCommand("task", "occurrence", lease,
+                WorkerFailureKindEnum.BUSINESS_REJECTED, "CUSTOMER_INELIGIBLE");
+        var decided = Instant.parse("2026-11-05T00:00:00.123456Z");
+        var receipt = new WorkerReceiptDTO("task", "occurrence", WorkerReceiptOutcomeEnum.BUSINESS_REJECTED, decided);
+        when(workers.fail(actor, command)).thenReturn(receipt);
+        var mvc = MockMvcBuilders.standaloneSetup(new WorkerController(workers, access))
+                .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
+        String body = mvc.perform(post("/api/tianji/v1/worker-tasks/fail").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(command)))
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.taskId").value("task")).andExpect(jsonPath("$.activityOccurrenceId").value("occurrence"))
+                .andExpect(jsonPath("$.outcome").value("BUSINESS_REJECTED"))
+                .andExpect(jsonPath("$.decidedAt").value(decided.toString())).andReturn().getResponse().getContentAsString();
+        assertEquals(4, mapper.readTree(body).size());
+        assertFalse(body.contains(lease)); assertFalse(body.contains(command.errorCode()));
+        var ordered = inOrder(access, workers);
+        ordered.verify(access).require(TianjiProcessPermissions.WORKER_FAIL_API);
+        ordered.verify(workers).fail(actor, command);
+    }
+
+    @Test
     void bounds_fixed_and_streamed_worker_bodies_before_deserialization() throws Exception {
         var mvc = MockMvcBuilders.standaloneSetup(new WorkerController(workers, access))
                 .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();

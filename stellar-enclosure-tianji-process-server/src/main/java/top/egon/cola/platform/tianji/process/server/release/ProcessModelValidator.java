@@ -14,6 +14,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTask;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskField;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskKind;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerBusinessError;
 
 import javax.xml.XMLConstants;
 import java.time.Duration;
@@ -37,6 +38,7 @@ public final class ProcessModelValidator {
     private static final String TIANJI_TASK = "urn:stellar-enclosure:tianji:task:1";
     private static final Pattern IDENTIFIER = Pattern.compile("[A-Za-z_][A-Za-z0-9_.-]{0,127}");
     private static final Pattern VARIABLE = Pattern.compile("[A-Za-z_][A-Za-z0-9_]{0,63}");
+    private static final Pattern ERROR_CODE = Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
     private static final Set<String> RESERVED = Set.of("true", "false", "null", "empty", "and", "or", "not", "div", "mod",
             "eq", "ne", "lt", "gt", "le", "ge", "instanceof", "execution", "task", "authenticatedUserId");
     private static final String INTEGER = "-?(?:0|[1-9][0-9]{0,14})";
@@ -44,11 +46,12 @@ public final class ProcessModelValidator {
     private static final Pattern ROUTE = Pattern.compile("\\$\\{([A-Za-z_][A-Za-z0-9_]{0,63}) == (" + STRING
             + "|" + INTEGER + "|true|false)\\}");
     private static final Map<String, Set<String>> BPMN_CHILDREN = Map.ofEntries(
-            Map.entry("definitions", Set.of("process", "message")),
+            Map.entry("definitions", Set.of("process", "message", "error")),
             Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "boundaryEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow")),
             Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition", "messageEventDefinition")),
-            Map.entry("boundaryEvent", Set.of("timerEventDefinition")),
+            Map.entry("boundaryEvent", Set.of("timerEventDefinition", "errorEventDefinition")),
             Map.entry("timerEventDefinition", Set.of("timeDuration")),
+            Map.entry("error", Set.of()), Map.entry("errorEventDefinition", Set.of()),
             Map.entry("serviceTask", Set.of("extensionElements")),
             Map.entry("userTask", Set.of("extensionElements")),
             Map.entry("extensionElements", Set.of("field", "externalWorkerInParameter", "externalWorkerOutParameter", "taskLane", "taskField")),
@@ -56,6 +59,7 @@ public final class ProcessModelValidator {
     private static final Map<String, Set<String>> BPMN_ATTRIBUTES = Map.ofEntries(
             Map.entry("definitions", Set.of("id", "name", "targetNamespace")),
             Map.entry("message", Set.of("id", "name")), Map.entry("messageEventDefinition", Set.of("id", "messageRef")),
+            Map.entry("error", Set.of("id", "errorCode")), Map.entry("errorEventDefinition", Set.of("id", "errorRef")),
             Map.entry("process", Set.of("id", "name", "isExecutable")),
             Map.entry("startEvent", Set.of("id", "name")), Map.entry("endEvent", Set.of("id", "name")),
             Map.entry("userTask", Set.of("id", "name")), Map.entry("parallelGateway", Set.of("id", "name")),
@@ -99,6 +103,13 @@ public final class ProcessModelValidator {
         Map<String, WorkerTask> workers = new LinkedHashMap<>();
         Map<String, HumanTask> humans = new LinkedHashMap<>();
         Map<String, String> caseKeys = new LinkedHashMap<>();
+        Map<String, String> errorCodes = new LinkedHashMap<>();
+        for (Element error : children(root, "error")) {
+            String id = required(error, "id");
+            String code = required(error, "errorCode");
+            if (!ERROR_CODE.matcher(code).matches() || errorCodes.size() >= 16
+                    || errorCodes.putIfAbsent(id, code) != null) throw invalid();
+        }
         Map<String, String> messages = new LinkedHashMap<>();
         Set<String> messageNames = new HashSet<>();
         for (Element message : children(root, "message")) {
@@ -111,6 +122,8 @@ public final class ProcessModelValidator {
         Map<String, String> messageStatusVariables = new LinkedHashMap<>();
         Map<String, Duration> timers = new LinkedHashMap<>();
         Map<String, ValidatedProcessModel.HumanTaskTimer> humanTimers = new LinkedHashMap<>();
+        Map<String, String> errorBoundaryRefs = new LinkedHashMap<>();
+        Map<String, String> errorBoundaryAttachments = new LinkedHashMap<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
             if ("sequenceFlow".equals(kind)) {
@@ -167,10 +180,18 @@ public final class ProcessModelValidator {
                 }
                 if ("boundaryEvent".equals(kind)) {
                     if (!"true".equals(element.getAttribute("cancelActivity")) || children(element).size() != 1) throw invalid();
-                    String attached = required(element, "attachedToRef"); var literal = only(only(element, "timerEventDefinition"), "timeDuration"); var duration = timerDuration(literal);
-                    if (duration.getNano() != 0 || !duration.toString().equals(literal.getTextContent())) throw invalid();
-                    timers.put(id, duration);
-                    humanTimers.put(id, new ValidatedProcessModel.HumanTaskTimer(attached, duration));
+                    String attached = required(element, "attachedToRef");
+                    if (!children(element, "timerEventDefinition").isEmpty()) {
+                        var literal = only(only(element, "timerEventDefinition"), "timeDuration"); var duration = timerDuration(literal);
+                        if (duration.getNano() != 0 || !duration.toString().equals(literal.getTextContent())) throw invalid();
+                        timers.put(id, duration);
+                        humanTimers.put(id, new ValidatedProcessModel.HumanTaskTimer(attached, duration));
+                    } else {
+                        String ref = required(only(element, "errorEventDefinition"), "errorRef");
+                        if (!IDENTIFIER.matcher(ref).matches() || !errorCodes.containsKey(ref)
+                                || errorBoundaryRefs.putIfAbsent(id, ref) != null
+                                || errorBoundaryAttachments.putIfAbsent(id, attached) != null) throw invalid();
+                    }
                 }
             }
         }
@@ -249,6 +270,21 @@ public final class ProcessModelValidator {
             }
         }
         if (!cases.keySet().equals(caseKeys.keySet())) throw invalid();
+        var referencedErrors = new HashSet<String>();
+        var workerErrors = new LinkedHashMap<String, WorkerBusinessError>();
+        for (var entry : errorBoundaryRefs.entrySet()) {
+            String boundaryId = entry.getKey(), errorId = entry.getValue();
+            String workerId = errorBoundaryAttachments.get(boundaryId);
+            var boundary = nodes.get(boundaryId); var worker = nodes.get(workerId);
+            if (!workers.containsKey(workerId) || waitingWorkers.contains(workerId)
+                    || !referencedErrors.add(errorId) || boundary == null || worker == null
+                    || boundary.next.size() != 1 || workerErrors.containsKey(workerId)) throw invalid();
+            String targetId = boundary.next.getFirst().element.getAttribute("id");
+            workerErrors.put(workerId, new WorkerBusinessError(errorId, errorCodes.get(errorId), boundaryId, targetId));
+            // The native interrupting boundary is an implicit alternative edge from its attached Worker.
+            worker.next.add(boundary); boundary.previous.add(worker); boundary.incoming++;
+        }
+        if (!referencedErrors.equals(errorCodes.keySet())) throw invalid();
         var timedTasks = new HashSet<String>();
         for (var entry : humanTimers.entrySet()) {
             String attached = entry.getValue().taskElementId(); if (!humans.containsKey(attached) || !timedTasks.add(attached)) throw invalid();
@@ -281,7 +317,7 @@ public final class ProcessModelValidator {
         }
         if (visited != nodes.size()) throw invalid();
         return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes,
-                workers, waits, humans, humanTimers, cases, Map.copyOf(timers));
+                workers, waits, humans, humanTimers, cases, Map.copyOf(timers), Map.copyOf(workerErrors));
     }
 
     private static Duration timerDuration(Element duration) {
