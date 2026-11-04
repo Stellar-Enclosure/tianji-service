@@ -89,7 +89,9 @@ class ProcessControlOpenApiContractTest {
         String description = root.path("info").path("description").asText().toLowerCase(java.util.Locale.ROOT);
         assertTrue(description.contains("stellar.tianji.process.cancellation.enabled=false"));
         assertTrue(description.contains("step 4"));
-        assertTrue(description.contains("not implemented") || description.contains("pending"));
+        assertTrue(description.contains("provider source is implemented"));
+        assertTrue(description.contains("runtime") && description.contains("unverified"));
+        assertFalse(description.contains("pending step 4"));
     }
 
     @Test

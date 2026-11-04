@@ -4,7 +4,7 @@
   "info": {
     "title": "Tianji Process Control Consumer Contract",
     "version": "1.0.0",
-    "description": "Contract-first consumer authority. Provider is not implemented by this artifact and remains pending Step 4; stellar.tianji.process.cancellation.enabled=false by default. Runtime PostgreSQL/Flowable/IAM acceptance is unverified. Existing caller supplies bearer credentials; illustrative identity.example OAuth URLs are documentation only. Token retrieval precedes the configured HTTP timeout. SDK follows existing Process HTTP/HTTPS and Redirect.NEVER constructor policy, sends each mutation once, requires exact200 JSON/+json and caps response bytes at2MiB. No registration, activation or role grant occurs."
+    "description": "Contract-first consumer authority. Provider source is implemented in Step 4; stellar.tianji.process.cancellation.enabled=false by default. Runtime PostgreSQL/Flowable/IAM acceptance is unverified. Existing caller supplies bearer credentials; illustrative identity.example OAuth URLs are documentation only. Token retrieval precedes the configured HTTP timeout. SDK follows existing Process HTTP/HTTPS and Redirect.NEVER constructor policy, sends each mutation once, requires exact200 JSON/+json and caps response bytes at2MiB. No registration, activation or role grant occurs."
   },
   "tags": [
     {

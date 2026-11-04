@@ -6,10 +6,10 @@
 | Template Version | `5` |
 | Status | `Draft` |
 | Created | `2026-11-05 00:25 Asia/Shanghai` |
-| Updated | `2026-11-05 01:40 Asia/Shanghai` |
+| Updated | `2026-11-05 04:23 Asia/Shanghai` |
 | Owner | `Root; only Root may run Maven/tests, stage, commit, or authorize execution` |
 | Repository | `tianji-service` |
-| Scope | `Four sequential source-only Steps: C contract, CL HTTP capability, sole final V9/storage primitives, then PS control/cancel API` |
+| Scope | `Four sequential source feature Steps plus one post-delivery artifact-status correction: C, CL, V9/storage, PS provider, then historical OAS wording` |
 | Source Requirement | `Root full-read approval of the reviewed cancellation Spec; web Step 42 committed at 43c58a1069a50fb71b955540bae2d7e8526794b0; Draft Plan still awaits Root full read and explicit GO` |
 | Baseline Revision | `main@cfffb7649af7a1cb429ac935f2bc2c1f88ac3d8d; clean; ProcessDB V8 latest; 8 Process SQL and 24 repository SQL; no V9` |
 | Implements Spec | [BPMN Process control snapshot and bounded cancellation](../spec/2026-11-04-23-22-process-control-cancellation.md) |
@@ -23,7 +23,7 @@
 
 ## 1. Summary
 
-This Draft Plan implements the reviewed cancellation Spec in exactly four semantic, sequential commits. Step 1 publishes the separate engine-neutral C capability and finite value tests plus reviewed Spec/Plan/evidence. Step 2 adds the strict CL HTTP implementation, packaged OAS3.1 and listener-free fake transport tests. Step 3 freezes the sole complete V9 and implements only storage/verifier/Agent-closure primitives—no API admission. Step 4 adds the useful control snapshot, root-fenced native cancellation, error/security/default-off wiring and runtime-free final audit.
+This Plan implements the reviewed cancellation Spec in four semantic source feature commits and one bounded artifact-status follow-up. Step 1 publishes the separate engine-neutral C capability and finite value tests plus reviewed Spec/Plan/evidence. Step 2 adds the strict CL HTTP implementation, packaged OAS3.1 and listener-free fake transport tests. Step 3 freezes the sole complete V9 and implements only storage/verifier/Agent-closure primitives—no API admission. Step 4 adds the useful control snapshot, root-fenced native cancellation, error/security/default-off wiring and runtime-free final audit.
 
 Every behavior is test-first with a true assertion RED; reflection/resource assertions are used where a missing new type/file would otherwise cause a compile-only failure. Root alone may run Maven, tests, verification, staging and commits. All Maven verification commands include `-DskipITs=true`; `HttpProcessClientTest`, PostgreSQL/environment-gated tests, listeners and application/runtime startup are never selected. Mock/source/static evidence does not prove PostgreSQL atomicity, native Flowable concurrency or production IAM.
 
@@ -42,7 +42,7 @@ Every behavior is test-first with a true assertion RED; reflection/resource asse
 | --- | --- | --- | --- | --- |
 | Primary | [Cancellation Spec](../spec/2026-11-04-23-22-process-control-cancellation.md) | Review/updated 2026-11-05 01:40 | all | authoritative contracts, schema, security, transaction, tests and rollout |
 | Normative dependency | [Formal CMMN Case server](../spec/2026-11-04-15-50-formal-cmmn-case-server.md) | Review/implemented source baseline through `cfffb764` | §5.1, §7.3, §11.4, §16 | approved technical vertical, immutable V8/provenance grants and external pre-provisioned migration model |
-| Legacy architecture/roadmap dependency | [Agent Framework Upgrade Plan](../../../../docs/plans/agent-framework-upgrade-plan.md) | current SHA `b6aebf5e5059bb94da801ba29ccdfa39ecacf095fe7af67425d844b634cb5b39`; T3-10 normative content unchanged | §10, §11.2, §14.4, §17.3 T3-10/S10/S11 | cancellation/Agent boundary and explicitly unfinished compensation/dead-letter recovery |
+| Legacy architecture/roadmap dependency | [Agent Framework Upgrade Plan](../../../../docs/plans/agent-framework-upgrade-plan.md) | current SHA `3cbb9a6a8850c074f4048f4e7093793876f9c5ea2b3df0f2af9d0a0fdd26ca59`; T3-10 normative content unchanged | §10, §11.2, §14.4, §17.3 T3-10/S10/S11 | cancellation/Agent boundary and explicitly unfinished compensation/dead-letter recovery |
 
 ### 2.3 Superseded or excluded content
 
@@ -1640,6 +1640,127 @@ state PostgreSQL/native concurrency/IAM/deployment/browser RuntimeUnverified and
 - Commit paths: `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/release/ProcessModelValidatorTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/execution/ProcessControlNativeAccessTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/execution/ProcessControlServiceTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/api/ProcessControlControllerTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/ProcessApiConfigurationTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/ProcessSecurityConfigurationTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/ProcessStorageConfigurationTest.java`, `stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/ProcessPermissionIntegrationTest.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/release/ValidatedProcessModel.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/release/ProcessModelValidator.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/execution/ProcessControlNativeAccess.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/execution/ProcessControlService.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/error/ProcessVersionConflictException.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/error/ProcessCancellationBlockedException.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/api/ProcessControlController.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/api/ProcessRequestBodyAdvice.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/api/ProcessApiErrors.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/security/TianjiProcessPermissions.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/ProcessSecurityConfiguration.java`, `stellar-enclosure-tianji-process-server/src/main/java/top/egon/cola/platform/tianji/process/server/ProcessStorageConfiguration.java`, `stellar-enclosure-tianji-process-server/src/main/resources/application.yml`, `docs/egon/evidence/2026-11-05-bounded-process-cancellation.md`.
 - Commit: `feat(process): add bounded owner process cancellation`.
 
+### Step 5 — Refresh the packaged contract status after the provider source commit
+
+- Requirements: `REQ-513`, `REQ-514`, `REQ-515`; no API behavior, schema or scope expansion.
+- Dependencies: Steps 1-4 committed as `4b1d79d`, `167e2a20`, `2a24fc1`, `257b988`; final233 regression and35 clean producer-artifact tests passed; Step4 source audit has no remaining implementation finding.
+- Baseline state: `main@257b988c6d777611d7f734ee3c5373039d137f56`, clean. The OAS info.description and its test still deliberately describe the historical Step2/provider-pending-Step4 state.
+- Observable outcome: consumers can see that the provider source now exists while cancellation stays default-off and PostgreSQL/Flowable/IAM/runtime acceptance stays unverified.
+- End state: status-only wording/test and evidence committed; all contract graph/schemas/operations/provider code/config/migrations remain unchanged.
+- Execution authorization: Root reviewed this bounded final-conformance finding and approves this exact Step under the existing user goal; no new business/API design, dependency, runtime operation or user decision is introduced. Original Steps1-4 and primary Spec authority remain unchanged.
+- Test-first gate: `Required` — change only the status assertion first and observe a true JUnit assertion failure against the historical resource before its text changes.
+- Manual Checks: `MC-ARCH-001`, `MC-REUSE-001`, `MC-DEP-001`, `MC-NAME-001`, `MC-VALID-001`, `MC-MODEL-001`, `MC-CONVERT-001`, `MC-LOG-001`, `MC-BEAN-001`, `MC-UTIL-001`, `MC-JSON-001`, `MC-TIME-001`, `MC-CONFIG-001`, `MC-PATTERN-001`, `MC-SCOPE-001`, `MC-TEST-001`, `MC-BLOCKER-001`; document/test-only applicability must be recorded separately.
+- Literal Rules: `Rule 1`, `Rule 2`, `Rule 3`, `Rule 4`, `Rule 5`, `Rule 6`, `Rule 7`, `Rule 9`, `Rule 10`, `Rule 11`; Rule11 remains applicable to unchanged existing technical/module boundaries.
+- Ordered files:
+
+#### File 1 — `MODIFY stellar-enclosure-tianji-client/src/test/java/top/egon/cola/platform/tianji/client/ProcessControlOpenApiContractTest.java`
+
+- Purpose: Require accurate post-provider source status while preserving the default-off/runtime boundary.
+- Symbols: status assertions in existing operation/metadata test; no schema assertion is weakened.
+- Repository evidence: historical description asserts pending Step4; actual provider commit/evidence exists.
+- Dependencies and consumers: existing packaged OAS and C contract checks.
+- Why now: Completed provider source makes the historical consumer-only status stale; this is the bounded final-conformance correction.
+- Literal rule enforcement: Rule 1, Rule 2, Rule 3, Rule 5, Rule 6, Rule 10, Rule 11.
+- Contract/signature changes: None; test-only wording expectation.
+- Input/output and state mapping: source description must say provider source is implemented, mention Step4/defaultfalse, preserve runtime-unverified and contain no pending-Step4 claim.
+- Error and edge behavior: resource left unchanged produces one genuine assertion RED, not compile/fixture failure.
+- Standards impact: MC-VALID-001, MC-JSON-001, MC-TIME-001, MC-TEST-001, MC-SCOPE-001.
+- Implementation pseudocode:
+
+```java
+assertTrue(description.contains("provider source is implemented"));
+assertTrue(description.contains("runtime") && description.contains("unverified"));
+assertFalse(description.contains("pending step 4"));
+// Keep exact graph, scopes, errors, model/time schemas and default-off assertions.
+```
+- Verification contribution: targeted true RED before File2.
+- After this file: source remains historical and test fails.
+
+#### File 2 — `MODIFY stellar-enclosure-tianji-client/src/main/resources/META-INF/tianji/openapi/process-control-v1.json`
+
+- Purpose: Correct only info.description after Step4 delivery.
+- Symbols: info.description; paths/components/security/enum/required/error content unchanged.
+- Repository evidence: actual provider code and source tests/producer artifact from257b988.
+- Dependencies and consumers: File1; Java consumers opening the packaged static contract.
+- Why now: Completed provider source makes the historical consumer-only status stale; this is the bounded final-conformance correction.
+- Literal rule enforcement: Rule 1, Rule 2, Rule 3, Rule 5, Rule 6, Rule 10, Rule 11.
+- Contract/signature changes: None; no wire/schema/operation/runtime/config/dependency change.
+- Input/output and state mapping: replace provider-pending sentence with implemented-source Step4/default-off/RuntimeUnverified wording.
+- Error and edge behavior: never imply migration, deployment, enablement, IAM registration/grant or production acceptance.
+- Standards impact: MC-MODEL-001, MC-JSON-001, MC-TIME-001, MC-SCOPE-001.
+- Implementation pseudocode:
+
+```text
+before = parse the committed OAS JSON from257b988
+replace exactly the historical info.description sentence with provider-source-implemented Step4 wording
+require unchanged defaultfalse and runtime-unverified limitations
+parse current JSON; remove only info.description from before and current objects
+require the remaining objects to be identical, including all paths/schemas/security/errors
+open the actual CL JAR and require packaged bytes equal current source
+```
+- Verification contribution: existing three OAS tests GREEN and actual packaged byte check.
+- After this file: description agrees with delivered source and acceptance boundary.
+
+#### File 3 — `MODIFY docs/egon/plan/2026-11-05-00-25-process-control-cancellation-implementation.md`
+
+- Purpose: Record this final-conformance Step without rewriting the four committed feature Steps or primary Spec.
+- Symbols: continuation metadata, Step5 and execution closure note.
+- Repository evidence: Step4 evidence explicitly lists historical wording follow-up.
+- Dependencies and consumers: Source requirement REQ513/514 and completed Steps1-4.
+- Why now: Completed provider source makes the historical consumer-only status stale; this is the bounded final-conformance correction.
+- Literal rule enforcement: Rule 1, Rule 2, Rule 3, Rule 5, Rule 6, Rule 10, Rule 11.
+- Contract/signature changes: None.
+- Input/output and state mapping: historical four-Step design remains; bounded fifth status-only task is explicit.
+- Error and edge behavior: cannot grant runtime execution or change accepted API/schema/DDL behavior.
+- Standards impact: MC-ARCH-001, MC-DEP-001, MC-SCOPE-001, MC-BLOCKER-001; existing profile unchanged.
+- Implementation pseudocode:
+
+```text
+retain committed Steps1-4 and the primary Spec revision
+append the exact four-file status-only Step and source/runtime distinction
+record Root review of the completed provider and historical wording finding
+strict-validate the linked Spec and amended Plan before test/resource changes
+require no new API/dependency/schema/runtime authority and preserve source scope
+```
+- Verification contribution: strict Plan metadata/file/requirement checks.
+- After this file: scope and review decision are concrete before status resource edits.
+
+#### File 4 — `CREATE docs/egon/evidence/2026-11-05-process-control-artifact-status.md`
+
+- Purpose: Record exact description-only JSON equivalence, RED/GREEN, actual CL JAR bytes, all17 MC/ten Rules and four-file scope.
+- Symbols: artifact SHA/source hash, post-provider status, unchanged default-off/runtime limits.
+- Repository evidence: Step4 source/provider/permission artifacts and this Step's actual finite commands.
+- Dependencies and consumers: Files1-3.
+- Why now: Completed provider source makes the historical consumer-only status stale; this is the bounded final-conformance correction.
+- Literal rule enforcement: Rule 1, Rule 2, Rule 3, Rule 5, Rule 6, Rule 10, Rule 11.
+- Contract/signature changes: None.
+- Input/output and state mapping: actual results only; no prefilled runtime PASS.
+- Error and edge behavior: full T3-10/T3-09/T3-12/T4 and live runtime remain required.
+- Standards impact: MC-ARCH-001, MC-DEP-001, MC-VALID-001, MC-SCOPE-001, MC-TEST-001, MC-BLOCKER-001; all Manual Checks/Literal Rules recorded with applicability.
+- Implementation pseudocode:
+
+```text
+record the actual three-test assertion RED and subsequent GREEN
+open actual CL JAR; compare packaged OAS bytes and record artifact SHA
+compare JSON outside info.description against the committed baseline
+verify all25 SQL/provider/C/POM/frontend hashes unchanged
+record each of17 Manual Checks and ten Literal Rules independently
+stage exactly four paths, inspect diff and commit this bounded Step
+```
+- Verification contribution: final root scope/manual/commit gate.
+- After this file: Step5 ready for focused commit.
+
+- Validation working directory: repository root.
+- Verification command: `STELLAR_VERIFY_GOAL=verify ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=false JAVA_HOME=/opt/homebrew/opt/openjdk@25/libexec/openjdk.jdk/Contents/Home ./scripts/verify-source-reactor.sh -gs /tmp/tianji-compat-fix/settings.xml -s /tmp/tianji-compat-fix/settings.xml -o -B -ntp -DskipITs=true -DskipTests=false -Dsurefire.failIfNoSpecifiedTests=false -Dotel.traces.exporter=none -Dotel.metrics.exporter=none -Dotel.logs.exporter=none -Dtest=ProcessControlOpenApiContractTest`.
+- Expected result: three OAS tests pass; source/actual CL JAR OAS bytes match; JSON outside info.description is identical.
+- RED command: same finite command without STELLAR_VERIFY_GOAL=verify; expected3 tests/one status assertion failure/zero errors or skips against old resource.
+- Focused GREEN command: above verification command; no HTTP listener/PG/native runtime selector.
+- Failure returns to: status assertion/resource or local artifact inspection only; never weaken contract tests or change provider/SQL.
+- Completion criteria: strict docs, four exact paths, baseline excluded SHA/25 SQL, actual CL JAR and all17 MC/ten Rules pass; runtime stays unverified.
+- Rollback: revert this description/test/docs-only Step; no migration/config/provider behavior is involved.
+- Commit paths: `stellar-enclosure-tianji-client/src/test/java/top/egon/cola/platform/tianji/client/ProcessControlOpenApiContractTest.java`, `stellar-enclosure-tianji-client/src/main/resources/META-INF/tianji/openapi/process-control-v1.json`, `docs/egon/plan/2026-11-05-00-25-process-control-cancellation-implementation.md`, `docs/egon/evidence/2026-11-05-process-control-artifact-status.md`.
+- Commit: `docs(client): refresh process control provider source status`.
+
 ## 8. Test, Validation, and Quality Gates
 
 All rows are future Root-only instructions. No command has been executed by this Plan. Every Maven/source-reactor command includes `-DskipITs=true`; no selector includes `HttpProcessClientTest`, any `*PostgresTest`, application startup or environment runtime.
@@ -1692,9 +1813,9 @@ Compatibility checks per Step: Step 1 reflection pins old Java/JSON; Step 2 old 
 | `REQ-510` | §4/§11/§16 | 3 | V9/SQL test/verifier/evidence | S3/static hash | sole immutable final V9 |
 | `REQ-511` | §4/§11.4 | 3/4 | verifier/tests/config readiness | TEST-514/515 | exact V8+V9 consumers |
 | `REQ-512` | §4/§9/§16 | 4 | permissions/controller/config/application.yml | TEST-515/PaC | default-off/no implicit grant |
-| `REQ-513` | §4/§9/§14 | 2/4 | codec/OAS/client/advice/controller | S2/S4 | strict bounded fake/MockMvc |
-| `REQ-514` | §4/§18 | 1/4 | docs/evidence/scope audit | strict/final static | no T3-10 completion claim |
-| `REQ-515` | §4/§6.3/§9-11 | 1-4 | C/codec/OAS/V9/store/service/tests | TEST-503/507/508/513 | actual independent UTC instants/no chronology |
+| `REQ-513` | §4/§9/§14 | 2/4/5 | codec/OAS/client/advice/controller/status evidence | S2/S4/S5 | strict bounded fake/MockMvc and current packaged status |
+| `REQ-514` | §4/§18 | 1/4/5 | docs/evidence/scope audit | strict/final static | no T3-10 completion claim |
+| `REQ-515` | §4/§6.3/§9-11 | 1-5 | C/codec/OAS/V9/store/service/tests/status | TEST-503/507/508/513/S5 | actual independent UTC instants/no chronology; runtime-unverified preserved |
 | `REQ-401`, `REQ-402`, `REQ-403`, `REQ-404` | Formal Case §4 | 3/4 compatibility | V8/verifiers/Case stores/release/model remain | S3/S4 selected regressions + hashes | no V8/direct/linked Case regression |
 | `REQ-405`, `REQ-406`, `REQ-407`, `REQ-408` | Formal Case §4 | 4 compatibility | Case API/read/actions/native versions unchanged | Case/model/controller selected regression/source audit | cancellation does not widen Case authority |
 | `REQ-409`, `REQ-410`, `REQ-411`, `REQ-412` | Formal Case §4 | 3/4 compatibility | HumanTask/provenance/factory/Inbox unchanged | storage/config/Case selected regressions | no privilege/lock/completion drift |
