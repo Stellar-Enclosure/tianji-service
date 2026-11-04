@@ -43,6 +43,23 @@ class ProcessSecurityConfigurationTest {
         }
     }
 
+    @Test
+    void control_and_cancel_use_the_existing_mixed_principal_wildcard_policy() {
+        var policy = new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy();
+        for (var operation : java.util.List.of("control", "cancellations")) {
+            var request = new org.springframework.mock.web.MockHttpServletRequest(
+                    operation.equals("control") ? "GET" : "POST", "/api/tianji/v1/process-instances/one/" + operation);
+            assertEquals(top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE,
+                    policy.requirement(request));
+        }
+    }
+
+    @Test
+    void cancellation_has_an_explicit_default_off_configuration_boundary() {
+        org.junit.jupiter.api.Assertions.assertDoesNotThrow(() -> java.util.Arrays.stream(ProcessSecurityConfiguration.class.getDeclaredClasses())
+                .filter(type -> type.getSimpleName().equals("CancellationConfiguration")).findFirst().orElseThrow());
+    }
+
     @RestController
     static class Probe {
         @GetMapping("/actuator/health")

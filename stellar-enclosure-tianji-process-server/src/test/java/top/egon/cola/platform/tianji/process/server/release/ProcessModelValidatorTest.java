@@ -21,6 +21,32 @@ class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
 
     @Test
+    void released_timer_wait_metadata_covers_every_supported_timer_without_changing_older_models() throws Exception {
+        var standalone = validator.validateBpmn(fixture("baseline.bpmn20.xml"), "baseline");
+        var agent = validator.validateBpmn(fixture("agent-dispatch-wait.bpmn20.xml"), "agentDispatch");
+        var linkedCase = validator.validateBpmn(fixture("formal-case-linked.bpmn20.xml"), "linkedProcess");
+        var boundary = validator.validateBpmn(fixture("governed-human-task-timer.bpmn20.xml"), "timedHumanReview");
+        var cmmn = new ValidatedProcessModel(ValidatedProcessModel.Type.CMMN, "legacyCase", new byte[] {1},
+                Map.of(), Map.of(), java.util.List.of());
+        var dmn = validator.validateDmn(fixture("baseline.dmn"), "baselineDecision");
+        var legacy = new ValidatedProcessModel(ValidatedProcessModel.Type.BPMN, "legacy", new byte[] {1},
+                Map.of(), Map.of(), java.util.List.of());
+
+        assertAll(
+                () -> assertEquals(Map.of("wait", Duration.ofSeconds(1)), standalone.timerWaits()),
+                () -> assertEquals(Map.of("waitTimeout", Duration.ofMinutes(5)), agent.timerWaits()),
+                () -> assertEquals(Map.of("waitCaseTimeout", Duration.ofMinutes(5)), linkedCase.timerWaits()),
+                () -> assertEquals(Map.of("reviewTimeout", Duration.ofMinutes(5)), boundary.timerWaits()),
+                () -> assertEquals(Map.of("reviewTimeout", new ValidatedProcessModel.HumanTaskTimer("review", Duration.ofMinutes(5))),
+                        boundary.humanTaskTimers()),
+                () -> assertThrows(UnsupportedOperationException.class, () -> standalone.timerWaits().clear()),
+                () -> assertTrue(cmmn.timerWaits().isEmpty()),
+                () -> assertTrue(dmn.timerWaits().isEmpty()),
+                () -> assertTrue(legacy.timerWaits().isEmpty())
+        );
+    }
+
+    @Test
     void literal_case_source_after_a_committed_native_wait_is_a_supported_closed_bpmn_profile() throws Exception {
         byte[] xml = fixture("formal-case-linked.bpmn20.xml");
         assertDoesNotThrow(() -> SafeModelXml.parse(xml, true));

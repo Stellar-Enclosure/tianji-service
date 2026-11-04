@@ -342,10 +342,86 @@ class ProcessApiConfigurationTest {
         }
     }
 
+    @Test
+    void cancellation_admission_exposes_its_named_control_service() {
+        var source = mock(DataSource.class); var manager = new DataSourceTransactionManager(source);
+        var process = mock(ProcessEngine.class); var configuration = mock(SpringProcessEngineConfiguration.class);
+        var dmn = mock(DmnEngine.class); var decision = mock(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        when(process.getProcessEngineConfiguration()).thenReturn(configuration); when(configuration.getDataSource()).thenReturn(source);
+        when(configuration.getTransactionManager()).thenReturn(manager); when(configuration.getDatabaseSchema()).thenReturn("tianji_process");
+        when(dmn.getDmnEngineConfiguration()).thenReturn(decision);
+        var arguments = new java.util.ArrayList<java.util.List<?>>();
+        try (var verifiers = mockConstruction(ProcessApiSchemaVerifier.class);
+             var natives = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.class,
+                     (value, ignored) -> { when(value.usesDataSource(source)).thenReturn(true); when(value.usesEngine(configuration)).thenReturn(true); });
+             var stores = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.ProcessCancellationReceiptStore.class,
+                     (value, ignored) -> when(value.usesDataSource(source)).thenReturn(true));
+             var dispatches = mockConstruction(AgentDispatchStore.class);
+             var services = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.ProcessControlService.class,
+                     (value, construction) -> arguments.add(construction.arguments()))) {
+            runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.cancellation.enabled=true")
+                    .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                    .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                    .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                    .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                    .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                    .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                    .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                    .withBean(ProcessEngine.class, () -> process).withBean(DmnEngine.class, () -> dmn)
+                    .run(context -> {
+                        assertThat(context).hasNotFailed();
+                        assertThat(context).hasBean("processControlService");
+                        assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.api.ProcessControlController.class);
+                        assertThat(context).hasBean("processControlNativeAccess");
+                        assertThat(context).hasBean("processCancellationReceiptStore");
+                        assertThat(services.constructed()).hasSize(1); assertThat(natives.constructed()).hasSize(1); assertThat(stores.constructed()).hasSize(1);
+                        assertThat(dispatches.constructed()).hasSize(1);
+                        assertThat(arguments.getFirst()).isEqualTo(java.util.List.of(configuration, decision,
+                                context.getBean(ProcessModelValidator.class), context.getBean(ProcessReleaseService.class),
+                                natives.constructed().getFirst(), stores.constructed().getFirst(), dispatches.constructed().getFirst()));
+                        verify(stores.constructed().getFirst()).verifyStorage();
+                        verify(dispatches.constructed().getFirst()).requireStorage(source, manager, "tianji_process");
+                    });
+        }
+        runner.run(context -> {
+            assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianji.process.server.api.ProcessControlController.class);
+            for (String name : java.util.List.of("processControlService", "processControlNativeAccess", "processCancellationReceiptStore"))
+                assertThat(context).doesNotHaveBean(name);
+        });
+    }
+
+    @Test
+    void cancellation_cannot_escape_the_existing_process_api_boundary() {
+        runner.withPropertyValues("stellar.tianji.process.cancellation.enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Process cancellation requires the Process API security boundary");
+        });
+    }
+
+    @Test
+    void cancellation_factory_verifies_v9_before_exposing_native_access() {
+        var source = mock(DataSource.class); var process = mock(ProcessEngine.class); var configuration = mock(SpringProcessEngineConfiguration.class);
+        when(process.getProcessEngineConfiguration()).thenReturn(configuration); when(configuration.getDataSource()).thenReturn(source);
+        when(configuration.getTransactionManager()).thenReturn(new DataSourceTransactionManager(source)); when(configuration.getDatabaseSchema()).thenReturn("tianji_process");
+        try (var verifiers = mockConstruction(ProcessApiSchemaVerifier.class);
+             var natives = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.class)) {
+            var actual = new ProcessSecurityConfiguration.CancellationConfiguration().processControlNativeAccess(process);
+            assertThat(actual).isNotNull(); assertThat(natives.constructed()).containsExactly(actual);
+            assertThat(verifiers.constructed()).hasSize(1); verify(verifiers.constructed().getFirst()).verifyCancellation();
+        }
+        try (var verifiers = mockConstruction(ProcessApiSchemaVerifier.class,
+                (value, ignored) -> org.mockito.Mockito.doThrow(new IllegalStateException("V9 unavailable")).when(value).verifyCancellation());
+             var natives = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.class)) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                    () -> new ProcessSecurityConfiguration.CancellationConfiguration().processControlNativeAccess(process));
+            assertThat(natives.constructed()).isEmpty();
+        }
+    }
+
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class, ApprovalVerificationController.class, top.egon.cola.platform.tianji.process.server.api.CaseController.class, top.egon.cola.platform.tianji.process.server.api.CaseRequestBodyAdvice.class})
+    @Import({ProcessSecurityConfiguration.class, top.egon.cola.platform.tianji.process.server.api.ProcessControlController.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class, ApprovalVerificationController.class, top.egon.cola.platform.tianji.process.server.api.CaseController.class, top.egon.cola.platform.tianji.process.server.api.CaseRequestBodyAdvice.class})
     static class TestWeb { }
     private static ApprovalConsumerRegistry.Registration approvalBinding() { return new ApprovalConsumerRegistry.Registration(ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "consumer", "https://idp.example/20"),
             "approval.v1", "release", "approval", "a".repeat(64), "review", java.util.Set.of("50"), java.time.Duration.ofMinutes(1), java.util.Set.of(ApprovalRequesterTypeEnum.USER)); }

@@ -12,6 +12,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         labelPage = "tianji.process.permissions", labelKey = "permission.process.start")
 @PermissionDefinition(code = TianjiProcessPermissions.READ, meaning = "Read an owned process instance",
         labelPage = "tianji.process.permissions", labelKey = "permission.process.read")
+@PermissionDefinition(code = TianjiProcessPermissions.CANCEL, meaning = "Cancel an owned process instance",
+        labelPage = "tianji.process.permissions", labelKey = "permission.process.cancel")
 @PermissionDefinition(code = TianjiProcessPermissions.DECISION_EXECUTE, meaning = "Execute a decision from a fixed release",
         labelPage = "tianji.process.permissions", labelKey = "permission.decision.execute")
 @PermissionDefinition(code = TianjiProcessPermissions.WORKER_ACQUIRE, meaning = "Acquire an authorized worker task",
@@ -28,6 +30,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Start process instances"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.process.read", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read owned process instances"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.process.cancel", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Cancel owned process instances"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.decision.execute", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Execute decisions"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.worker.acquire", defaultLocale = "en-US",
@@ -42,6 +46,10 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Start a process instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read a process instance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.control", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Review process control"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.cancel", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Cancel a process instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.decision.evaluate", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Evaluate a decision"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.worker.acquire", defaultLocale = "en-US",
@@ -135,6 +143,7 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_READ = "TIANJI_PROCESS_RELEASE_READ";
     public static final String START = "TIANJI_PROCESS_START";
     public static final String READ = "TIANJI_PROCESS_READ";
+    public static final String CANCEL = "TIANJI_PROCESS_CANCEL";
     public static final String DECISION_EXECUTE = "TIANJI_DECISION_EXECUTE";
     public static final String WORKER_ACQUIRE = "TIANJI_WORKER_ACQUIRE";
     public static final String WORKER_REPORT = "TIANJI_WORKER_REPORT";
@@ -143,6 +152,8 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_GET_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_RESOURCE_KEY;
     public static final String START_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_RESOURCE_KEY;
     public static final String GET_API = "tianji.api.process.instance.get";
+    public static final String CONTROL_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CONTROL_RESOURCE_KEY;
+    public static final String CANCEL_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CANCEL_RESOURCE_KEY;
     public static final String DECISION_API = top.egon.cola.platform.tianji.contract.orchestration.DecisionClient.EXECUTE_RESOURCE_KEY;
     public static final String WORKER_ACQUIRE_API = "tianji.api.process.worker.acquire";
     public static final String WORKER_COMPLETE_API = "tianji.api.process.worker.complete";
@@ -152,6 +163,7 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_READ_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_SCOPE;
     public static final String START_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_SCOPE;
     public static final String READ_SCOPE = "tianji:process:read";
+    public static final String CANCEL_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CANCEL_SCOPE;
     public static final String DECISION_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.DecisionClient.EXECUTE_SCOPE;
     public static final String WORKER_ACQUIRE_SCOPE = "tianji:worker:acquire";
     public static final String WORKER_REPORT_SCOPE = "tianji:worker:report";

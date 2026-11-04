@@ -133,6 +133,17 @@ class ProcessStorageConfigurationTest {
         }
     }
 
+    @Test
+    void cancellation_requires_the_enabled_servlet_process_api() {
+        var configuration = new ProcessStorageConfiguration();
+        var enabled = new MockEnvironment().withProperty("stellar.tianji.process.cancellation.enabled", "true");
+        assertThrows(IllegalStateException.class, () -> configuration.workerWebBoundaryGuard(enabled, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        enabled.setProperty("stellar.tianji.process.api.enabled", "true");
+        assertThrows(IllegalStateException.class, () -> configuration.workerWebBoundaryGuard(enabled, mock(ApplicationContext.class)).afterSingletonsInstantiated());
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(enabled, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(new MockEnvironment(), mock(ApplicationContext.class)).afterSingletonsInstantiated());
+    }
+
     private static void guard(MockEnvironment environment) {
         ProcessStorageConfiguration.processStoragePropertiesGuard(environment).postProcessBeanFactory(null);
     }

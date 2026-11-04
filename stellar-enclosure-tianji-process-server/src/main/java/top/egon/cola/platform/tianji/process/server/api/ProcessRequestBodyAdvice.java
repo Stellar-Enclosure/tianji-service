@@ -22,6 +22,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCom
 import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
+import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -36,6 +37,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 9 * 1_048_576;
     static final int MAX_WORKER_BYTES = 256 * 1024;
     static final int MAX_AGENT_RESULT_BYTES = 64 * 1024;
+    static final int MAX_PROCESS_CANCEL_BYTES = 4096;
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
@@ -44,22 +46,30 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
+    private static final JsonMapper STRICT_PROCESS_CANCEL_JSON = JsonMapper.builder(JsonFactory.builder()
+                    .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(2).maxStringLength(4096)
+                            .maxNameLength(64).maxNumberLength(20).maxTokenCount(32).build()).build())
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
 
     @Override
     public boolean supports(MethodParameter parameter, Type type, Class<? extends HttpMessageConverter<?>> converter) {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
-                || workerCommand(type) || type == AgentTerminalEvent.class;
+                || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class;
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
-        int maxBytes = type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
+        int maxBytes = type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
+                : type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
         if (input.getHeaders().getContentLength() > maxBytes) throw new TooLarge();
         byte[] body = input.getBody().readNBytes(maxBytes + 1);
         if (body.length > maxBytes) throw new TooLarge();
         if (workerCommand(type)) validateWorkerBody(body, type);
         if (type == AgentTerminalEvent.class) validateAgentResult(body);
+        if (type == CancelProcessCommand.class) validateProcessCancel(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -107,10 +117,25 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         } catch (RuntimeException invalid) { throw invalidAgentResult(); }
     }
 
+    private static void validateProcessCancel(byte[] body) {
+        Set<String> fields = Set.of("instanceId", "commandId", "expectedVersion", "reason");
+        try {
+            var root = STRICT_PROCESS_CANCEL_JSON.readTree(body);
+            if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(fields)) {
+                throw invalidProcessCancel();
+            }
+            strings(root, fields);
+            STRICT_PROCESS_CANCEL_JSON.readValue(body, CancelProcessCommand.class);
+        } catch (RuntimeException invalid) {
+            throw invalidProcessCancel();
+        }
+    }
+
     private static void strings(JsonNode node, Set<String> names) {
         for (String name : names) if (node.get(name) == null || !node.get(name).isString()) throw invalidAgentResult();
     }
     private static IllegalArgumentException invalidAgentResult() { return new IllegalArgumentException("Agent result event is invalid"); }
+    private static IllegalArgumentException invalidProcessCancel() { return new IllegalArgumentException("Process cancellation request is invalid"); }
 
     static final class TooLarge extends RuntimeException { }
 }

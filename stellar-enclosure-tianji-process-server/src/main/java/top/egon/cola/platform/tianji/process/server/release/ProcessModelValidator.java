@@ -169,6 +169,7 @@ public final class ProcessModelValidator {
                     if (!"true".equals(element.getAttribute("cancelActivity")) || children(element).size() != 1) throw invalid();
                     String attached = required(element, "attachedToRef"); var literal = only(only(element, "timerEventDefinition"), "timeDuration"); var duration = timerDuration(literal);
                     if (duration.getNano() != 0 || !duration.toString().equals(literal.getTextContent())) throw invalid();
+                    timers.put(id, duration);
                     humanTimers.put(id, new ValidatedProcessModel.HumanTaskTimer(attached, duration));
                 }
             }
@@ -279,7 +280,8 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits, humans, humanTimers, cases);
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes,
+                workers, waits, humans, humanTimers, cases, Map.copyOf(timers));
     }
 
     private static Duration timerDuration(Element duration) {

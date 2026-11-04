@@ -24,6 +24,9 @@ import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCancellationReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
 import top.egon.cola.platform.tianji.process.server.execution.CasePlanItemReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
@@ -87,6 +90,8 @@ public class ProcessSecurityConfiguration {
         boolean approvalVerificationEnabled = environment.getProperty("stellar.tianji.process.approval-verification.enabled", Boolean.class, false);
         boolean casesEnabled = environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false);
         boolean newCaseStartsEnabled = environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false);
+        boolean cancellationEnabled = environment.getProperty("stellar.tianji.process.cancellation.enabled", Boolean.class, false);
+        if (cancellationEnabled && !enabled) throw new IllegalStateException("Process cancellation requires the Process API security boundary");
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
@@ -413,6 +418,47 @@ public class ProcessSecurityConfiguration {
                 throw new IllegalStateException("Agent result Inbox requires shared JDBC storage");
             }
             return new AgentResultInbox(manager.getDataSource(), manager, configuration.getDatabaseSchema(), dispatches, producers, properties.pendingRetention());
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "cancellation.enabled"}, havingValue = "true")
+    static class CancellationConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(ProcessControlNativeAccess.class)
+        ProcessControlNativeAccess processControlNativeAccess(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            DataSource source = caseDataSource(configuration);
+            new ProcessApiSchemaVerifier(source, configuration.getDatabaseSchema()).verifyCancellation();
+            return new ProcessControlNativeAccess(source, configuration);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(ProcessCancellationReceiptStore.class)
+        ProcessCancellationReceiptStore processCancellationReceiptStore(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            var store = new ProcessCancellationReceiptStore(caseDataSource(configuration), configuration.getDatabaseSchema());
+            store.verifyStorage();
+            return store;
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(ProcessControlService.class)
+        ProcessControlService processControlService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator,
+                ProcessReleaseService releases, ProcessControlNativeAccess nativeAccess, ProcessCancellationReceiptStore cancellations,
+                ObjectProvider<AgentDispatchStore> dispatch) {
+            var configuration = processConfiguration(process);
+            DataSource source = caseDataSource(configuration);
+            var manager = (DataSourceTransactionManager) configuration.getTransactionManager();
+            String schema = configuration.getDatabaseSchema();
+            new ProcessApiSchemaVerifier(source, schema).verifyCancellation();
+            if (!nativeAccess.usesDataSource(source) || !nativeAccess.usesEngine(configuration) || !cancellations.usesDataSource(source)) {
+                throw new IllegalStateException("Process cancellation requires its exact owning storage participants");
+            }
+            var selected = dispatch.getIfAvailable();
+            if (selected == null) selected = new AgentDispatchStore(source, manager, schema);
+            selected.requireStorage(source, manager, schema);
+            return new ProcessControlService(configuration, decisionConfiguration(dmn), validator, releases, nativeAccess, cancellations, selected);
         }
     }
 

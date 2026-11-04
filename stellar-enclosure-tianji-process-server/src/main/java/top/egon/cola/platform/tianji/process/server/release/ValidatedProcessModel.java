@@ -25,6 +25,7 @@ public final class ValidatedProcessModel {
     private final Map<String, HumanTask> humanTasks;
     private final Map<String, HumanTaskTimer> humanTaskTimers;
     private final Map<String, CaseSource> caseSources;
+    private final Map<String, Duration> timerWaits;
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds) {
@@ -57,6 +58,16 @@ public final class ValidatedProcessModel {
                           Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
                           Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks,
                           Map<String, HumanTaskTimer> humanTaskTimers, Map<String, CaseSource> caseSources) {
+        this(type, definitionKey, xml, inputs, outputs, ruleIds, decisionTasks, routeConditions, workerTasks, messageWaits,
+                humanTasks, humanTaskTimers, caseSources, Map.of());
+    }
+
+    ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
+                          Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds,
+                          Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
+                          Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks,
+                          Map<String, HumanTaskTimer> humanTaskTimers, Map<String, CaseSource> caseSources,
+                          Map<String, Duration> timerWaits) {
         this.type = type;
         this.definitionKey = definitionKey;
         this.xml = xml.clone();
@@ -70,6 +81,7 @@ public final class ValidatedProcessModel {
         this.humanTasks = Map.copyOf(humanTasks);
         this.humanTaskTimers = Map.copyOf(humanTaskTimers);
         this.caseSources = Map.copyOf(caseSources);
+        this.timerWaits = Map.copyOf(timerWaits);
     }
 
     public Type type() { return type; }
@@ -85,6 +97,7 @@ public final class ValidatedProcessModel {
     public Map<String, HumanTask> humanTasks() { return humanTasks; }
     public Map<String, HumanTaskTimer> humanTaskTimers() { return humanTaskTimers; }
     public Map<String, CaseSource> caseSources() { return caseSources; }
+    public Map<String, Duration> timerWaits() { return timerWaits; }
 
     /** Released graph-derived metadata. Constructing it grants neither source identity nor native execution authority. */
     public record CaseSource(String caseDefinitionKey, String messageElementId, String messageName, String timerElementId, Duration timeout) { }
