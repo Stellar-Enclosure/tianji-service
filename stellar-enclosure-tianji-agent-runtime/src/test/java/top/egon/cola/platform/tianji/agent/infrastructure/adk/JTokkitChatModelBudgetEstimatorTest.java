@@ -13,14 +13,17 @@ import com.google.genai.types.Part;
 import com.knuddels.jtokkit.Encodings;
 import com.knuddels.jtokkit.api.EncodingType;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.openai.OpenAiChatOptions;
 import top.egon.cola.platform.tianji.agent.autoconfigure.ModelBudgetProperties;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -39,6 +42,128 @@ import static org.mockito.Mockito.*;
 
 class JTokkitChatModelBudgetEstimatorTest {
     private static final String MODEL = "gpt-4o-mini";
+    private static final String CODE_REF = "conditional-research-v1";
+
+    @Test
+    void native_budget_binding_contract_is_present() {
+        assertDoesNotThrow(() -> {
+            Class<?> estimator = Class.forName(AgentModelBudgetEstimator.class.getName());
+            Class<?> binding = Class.forName(AgentModelBudgetEstimator.class.getName() + "$NativeModelBinding");
+            estimator.getMethod("bindNative", AgentExecutionSnapshot.class, binding);
+        });
+    }
+
+    @Test
+    void native_binding_value_rejects_unsafe_fields_and_redacts_the_model() {
+        var model = model();
+        var binding = new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model);
+
+        assertAll(
+                () -> assertThrows(IllegalArgumentException.class,
+                        () -> new AgentModelBudgetEstimator.NativeModelBinding(null, "modelBean", MODEL, model)),
+                () -> assertThrows(IllegalArgumentException.class,
+                        () -> new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "model\nBean", MODEL, model)),
+                () -> assertThrows(IllegalArgumentException.class,
+                        () -> new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", " ", model)),
+                () -> assertThrows(IllegalArgumentException.class,
+                        () -> new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, null)));
+        assertFalse(binding.toString().contains(model.toString()));
+    }
+
+    @Test
+    void custom_estimator_native_binding_defaults_to_feature_unavailable() {
+        AgentModelBudgetEstimator custom = new AgentModelBudgetEstimator() {
+            @Override public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) { throw new AssertionError(); }
+            @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) { throw new AssertionError(); }
+        };
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var snapshot = codeFirstSnapshot(estimator.descriptors().getFirst(), CODE_REF, Map.of(), "USD");
+
+        assertLedgerFailure(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+                () -> custom.bindNative(snapshot, new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model)));
+    }
+
+    @Test
+    void exact_native_binding_reuses_all_five_config_calculations() {
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var descriptor = estimator.descriptors().getFirst();
+        var configSnapshot = snapshot(descriptor);
+        var nativeSnapshot = codeFirstSnapshot(descriptor, CODE_REF, Map.of(), "USD");
+        var bound = assertDoesNotThrow(() -> estimator.bindNative(nativeSnapshot,
+                new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model)));
+        var request = request("hello world");
+        var response = LlmResponse.builder().usageMetadata(GenerateContentResponseUsageMetadata.builder()
+                .promptTokenCount(100).candidatesTokenCount(50).totalTokenCount(150).build()).build();
+
+        assertAll(
+                () -> assertEquals(estimator.estimate(configSnapshot, request), bound.estimate(nativeSnapshot, request)),
+                () -> assertEquals(estimator.actualUsage(configSnapshot, response), bound.actualUsage(nativeSnapshot, response)),
+                () -> assertEquals(estimator.contextWindow(configSnapshot, request), bound.contextWindow(nativeSnapshot, request)),
+                () -> assertEquals(estimator.modelAdapterFingerprint(configSnapshot, request), bound.modelAdapterFingerprint(nativeSnapshot, request)),
+                () -> assertEquals(estimator.contextPolicy(configSnapshot, request), bound.contextPolicy(nativeSnapshot, request)));
+    }
+
+    @Test
+    void native_binding_rejects_metadata_profile_identity_and_current_default_drift() {
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var descriptor = estimator.descriptors().getFirst();
+        var snapshot = codeFirstSnapshot(descriptor, CODE_REF, Map.of(), "USD");
+        var exact = new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model);
+
+        assertAll(
+                () -> assertBindingUnavailable(estimator, codeFirstSnapshot(descriptor, CODE_REF, Map.of("unexpected", true), "USD"), exact),
+                () -> assertBindingUnavailable(estimator, snapshot,
+                        new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF + ".other", "modelBean", MODEL, model)),
+                () -> assertBindingUnavailable(estimator, snapshot,
+                        new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "otherBean", MODEL, model)),
+                () -> assertBindingUnavailable(estimator, snapshot,
+                        new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", "gpt-4o", model)),
+                () -> assertBindingUnavailable(estimator, snapshot,
+                        new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model())),
+                () -> assertBindingUnavailable(estimator, codeFirstSnapshot(descriptor.modelName(), "route@2#" + "b".repeat(64), descriptor.policyVersionRef(), CODE_REF, Map.of(), "USD"), exact),
+                () -> assertBindingUnavailable(estimator, codeFirstSnapshot(descriptor.modelName(), descriptor.modelRouteRef(), "policy@2#" + "b".repeat(64), CODE_REF, Map.of(), "USD"), exact),
+                () -> assertBindingUnavailable(estimator, codeFirstSnapshot(descriptor, CODE_REF, Map.of(), "CNY"), exact));
+
+        var options = new AtomicReference<ChatOptions>(ChatOptions.builder().model(MODEL).maxTokens(32).temperature(0.2).build());
+        var changingModel = mock(ChatModel.class); when(changingModel.getOptions()).thenAnswer(call -> options.get());
+        var changingEstimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", changingModel));
+        var changingDescriptor = changingEstimator.descriptors().getFirst();
+        var changingSnapshot = codeFirstSnapshot(changingDescriptor, CODE_REF, Map.of(), "USD");
+        var changingBinding = new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, changingModel);
+        var changingBound = assertDoesNotThrow(() -> changingEstimator.bindNative(changingSnapshot, changingBinding));
+        options.set(ChatOptions.builder().model(MODEL).maxTokens(32).temperature(0.8).build());
+        assertBindingUnavailable(changingEstimator, changingSnapshot, changingBinding);
+        assertAllFiveFail(changingBound, changingSnapshot, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
+    }
+
+    @Test
+    void bound_native_view_rejects_equal_copy_and_forged_config_for_all_five_methods() {
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var descriptor = estimator.descriptors().getFirst();
+        var nativeSnapshot = codeFirstSnapshot(descriptor, CODE_REF, Map.of(), "USD");
+        var bound = assertDoesNotThrow(() -> estimator.bindNative(nativeSnapshot,
+                new AgentModelBudgetEstimator.NativeModelBinding(CODE_REF, "modelBean", MODEL, model)));
+        var equalCopy = new AgentExecutionSnapshot(nativeSnapshot.definition(), nativeSnapshot.definitionContentSha256(),
+                nativeSnapshot.effectivePolicy(), nativeSnapshot.input(), nativeSnapshot.businessKey(), nativeSnapshot.processLink());
+        assertEquals(nativeSnapshot, equalCopy);
+        assertNotSame(nativeSnapshot, equalCopy);
+
+        assertAllFiveFail(bound, equalCopy, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
+        assertAllFiveFail(bound, snapshot(descriptor), AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
+    }
+
+    @Test
+    void legacy_global_estimator_keeps_plain_code_first_unsupported_for_all_five_methods() {
+        var model = model();
+        var estimator = new JTokkitChatModelBudgetEstimator(new ModelBudgetProperties(List.of(profile(MODEL, BigDecimal.ONE))), Map.of("modelBean", model));
+        var snapshot = codeFirstSnapshot(estimator.descriptors().getFirst(), CODE_REF, Map.of(), "USD");
+
+        assertAllFiveFail(estimator, snapshot, AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE);
+    }
 
     @Test
     void exact_converter_messages_use_the_selected_encoding_and_content_addressed_route_and_policy() {
@@ -148,6 +273,36 @@ class JTokkitChatModelBudgetEstimatorTest {
                 inputPrice, new BigDecimal("2"), "USD", 8, 1, true, true);
     }
     private static LlmRequest request(String text) { return LlmRequest.builder().model(MODEL).contents(List.of(Content.builder().role("user").parts(List.of(Part.fromText(text))).build())).build(); }
+    private static AgentExecutionSnapshot codeFirstSnapshot(JTokkitChatModelBudgetEstimator.Descriptor descriptor, String codeRef,
+                                                            Map<String, Object> configuration, String currency) {
+        return codeFirstSnapshot(descriptor.modelName(), descriptor.modelRouteRef(), descriptor.policyVersionRef(), codeRef, configuration, currency);
+    }
+    private static AgentExecutionSnapshot codeFirstSnapshot(String modelName, String route, String policyRef, String codeRef,
+                                                            Map<String, Object> configuration, String currency) {
+        var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, 0, 10000, 1000,
+                BigDecimal.ONE, currency, 1, Set.of(), "retry", "approval");
+        var definition = new AgentDefinitionSpecDTO("assistant", 1, "CODE_FIRST", codeRef, "1", "1",
+                new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), route, policyRef), policy, configuration);
+        return new AgentExecutionSnapshot(definition, "a".repeat(64), policy, new AgentInputDTO(modelName, null, null), null);
+    }
+    private static void assertBindingUnavailable(JTokkitChatModelBudgetEstimator estimator, AgentExecutionSnapshot snapshot,
+                                                 AgentModelBudgetEstimator.NativeModelBinding binding) {
+        assertLedgerFailure(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, () -> estimator.bindNative(snapshot, binding));
+    }
+    private static void assertAllFiveFail(AgentModelBudgetEstimator estimator, AgentExecutionSnapshot snapshot,
+                                          AgentErrorCodeEnum expectedCode) {
+        var request = request("hello");
+        var response = LlmResponse.builder().build();
+        assertAll(
+                () -> assertLedgerFailure(expectedCode, () -> estimator.estimate(snapshot, request)),
+                () -> assertLedgerFailure(expectedCode, () -> estimator.actualUsage(snapshot, response)),
+                () -> assertLedgerFailure(expectedCode, () -> estimator.contextWindow(snapshot, request)),
+                () -> assertLedgerFailure(expectedCode, () -> estimator.modelAdapterFingerprint(snapshot, request)),
+                () -> assertLedgerFailure(expectedCode, () -> estimator.contextPolicy(snapshot, request)));
+    }
+    private static void assertLedgerFailure(AgentErrorCodeEnum expectedCode, Executable executable) {
+        assertEquals(expectedCode, assertThrows(AgentLedgerException.class, executable).code());
+    }
     private static AgentExecutionSnapshot snapshot(JTokkitChatModelBudgetEstimator.Descriptor descriptor) {
         var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, 0, 10000, 1000,
                 BigDecimal.ONE, "USD", 1, Set.of(), "retry", "approval");

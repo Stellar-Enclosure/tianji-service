@@ -62,8 +62,24 @@ public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEs
 
     public List<Descriptor> descriptors() { return descriptors; }
 
+    @Override public AgentModelBudgetEstimator bindNative(AgentExecutionSnapshot snapshot, NativeModelBinding binding) {
+        if (snapshot == null || binding == null || !"CODE_FIRST".equals(snapshot.definition().executionMode())
+                || !snapshot.definition().configuration().isEmpty()
+                || !Objects.equals(snapshot.definition().codeRef(), binding.codeRef())) throw unavailable();
+        var dependencies = snapshot.definition().dependencies();
+        Bound bound = profiles.get(new Key(binding.modelName(), dependencies.modelRouteRef(), dependencies.policyVersionRef()));
+        if (bound == null || !bound.profile().modelBeanName().equals(binding.modelBeanName())
+                || bound.model() != binding.model()
+                || !bound.profile().currency().equals(snapshot.effectivePolicy().currency())) throw unavailable();
+        current(bound);
+        return new NativeBoundEstimator(snapshot, bound);
+    }
+
     @Override public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) {
         Bound bound = require(snapshot, request.model().orElse(null));
+        return estimate(bound, request);
+    }
+    private Estimate estimate(Bound bound, LlmRequest request) {
         Prompt prompt = converter.toLlmPrompt(request, bound.model().getOptions());
         current(bound);
         if (prompt.getOptions() != null && prompt.getOptions().getModel() != null && !bound.profile().modelName().equals(prompt.getOptions().getModel())) throw unsupported();
@@ -92,19 +108,30 @@ public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEs
     }
 
     @Override public ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {
-        var bound = require(snapshot, request.model().orElse(null)); var profile = bound.profile();
+        return contextWindow(require(snapshot, request.model().orElse(null)));
+    }
+    private static ContextWindow contextWindow(Bound bound) {
+        var profile = bound.profile();
         return new ContextWindow(profile.modelName(), bound.descriptor().modelRouteRef(), bound.descriptor().policyVersionRef(), profile.windowTokens(), profile.safetyMarginTokens());
     }
     @Override public String modelAdapterFingerprint(AgentExecutionSnapshot snapshot, LlmRequest request) {
-        var bound = require(snapshot, request.model().orElse(null));
+        return modelAdapterFingerprint(require(snapshot, request.model().orElse(null)));
+    }
+    private static String modelAdapterFingerprint(Bound bound) {
         return AdkSemanticJsonDigest.fingerprint(ADAPTER_VERSION, List.of(bound.descriptor().routeSha256(), bound.descriptor().policySha256()));
     }
     @Override public ContextPolicy contextPolicy(AgentExecutionSnapshot snapshot, LlmRequest request) {
-        var bound = require(snapshot, request.model().orElse(null)); var profile = bound.profile();
+        return contextPolicy(require(snapshot, request.model().orElse(null)));
+    }
+    private static ContextPolicy contextPolicy(Bound bound) {
+        var profile = bound.profile();
         return new ContextPolicy(bound.descriptor().policyVersionRef(), profile.maxTrimSteps(), profile.retainRecentUserTurns(), profile.trimEvidence(), profile.trimHistory());
     }
     @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) {
-        var bound = require(snapshot, modelName(snapshot)); var usage = response.usageMetadata().orElse(null);
+        return actualUsage(require(snapshot, modelName(snapshot)), response);
+    }
+    private static AgentBudgetSettlement actualUsage(Bound bound, LlmResponse response) {
+        var usage = response.usageMetadata().orElse(null);
         if (usage == null || usage.promptTokenCount().isEmpty() || usage.candidatesTokenCount().isEmpty()) return new AgentBudgetSettlement(null, null, null);
         long input = usage.promptTokenCount().orElseThrow(); long output = usage.candidatesTokenCount().orElseThrow();
         if (input < 0 || output < 0 || usage.totalTokenCount().isPresent() && usage.totalTokenCount().orElseThrow() != input + output) throw unavailable();
@@ -119,6 +146,42 @@ public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEs
         if (bound == null || !bound.profile().modelBeanName().equals(snapshot.definition().configuration().get("chatModelBeanName"))
                 || !bound.profile().currency().equals(snapshot.effectivePolicy().currency())) throw unavailable();
         current(bound); return bound;
+    }
+    private final class NativeBoundEstimator implements AgentModelBudgetEstimator {
+        private final AgentExecutionSnapshot boundSnapshot;
+        private final Bound bound;
+
+        private NativeBoundEstimator(AgentExecutionSnapshot snapshot, Bound bound) {
+            this.boundSnapshot = snapshot;
+            this.bound = bound;
+        }
+
+        @Override public Estimate estimate(AgentExecutionSnapshot candidate, LlmRequest request) {
+            requireSnapshot(candidate); requireModel(request.model().orElse(null)); current(bound);
+            return JTokkitChatModelBudgetEstimator.this.estimate(bound, request);
+        }
+        @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot candidate, LlmResponse response) {
+            requireSnapshot(candidate); current(bound); return JTokkitChatModelBudgetEstimator.actualUsage(bound, response);
+        }
+        @Override public ContextWindow contextWindow(AgentExecutionSnapshot candidate, LlmRequest request) {
+            requireSnapshot(candidate); requireModel(request.model().orElse(null)); current(bound);
+            return JTokkitChatModelBudgetEstimator.contextWindow(bound);
+        }
+        @Override public String modelAdapterFingerprint(AgentExecutionSnapshot candidate, LlmRequest request) {
+            requireSnapshot(candidate); requireModel(request.model().orElse(null)); current(bound);
+            return JTokkitChatModelBudgetEstimator.modelAdapterFingerprint(bound);
+        }
+        @Override public ContextPolicy contextPolicy(AgentExecutionSnapshot candidate, LlmRequest request) {
+            requireSnapshot(candidate); requireModel(request.model().orElse(null)); current(bound);
+            return JTokkitChatModelBudgetEstimator.contextPolicy(bound);
+        }
+        private void requireModel(String modelName) {
+            if (!bound.profile().modelName().equals(modelName)) throw unsupported();
+        }
+        private void requireSnapshot(AgentExecutionSnapshot candidate) {
+            // A semantically equal copy is not the execution authority bound by the executor.
+            if (candidate != boundSnapshot) throw unavailable();
+        }
     }
     private static String modelName(AgentExecutionSnapshot snapshot) {
         Object model = snapshot.definition().configuration().get("modelName"); return model instanceof String value ? value : null;
