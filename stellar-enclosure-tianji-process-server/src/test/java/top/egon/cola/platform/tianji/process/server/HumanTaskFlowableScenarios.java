@@ -51,7 +51,7 @@ import java.util.stream.IntStream;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
-/** Called only by the existing explicit fresh-loopback PostgreSQL test, after native engine provisioning and V7. */
+/** Called only by the existing explicit fresh-loopback PostgreSQL test, after native engine provisioning and verified V7/V8. */
 final class HumanTaskFlowableScenarios {
     private static final ProcessActor APPLICANT = actor("human-applicant"), REVIEWER = actor("human-reviewer"), OTHER = actor("human-other");
     private HumanTaskFlowableScenarios() { }
@@ -213,7 +213,7 @@ final class HumanTaskFlowableScenarios {
 
     private static String start(ProcessExecutionService runs, String release, String definition, String suffix) { return runs.start(APPLICANT, new ProcessExecutionService.StartCommand(release, definition, "native-human-" + suffix, "native-human-start-" + suffix, "native-human-correlation-" + suffix, Map.of())).instanceId(); }
     private static HumanTaskDTO task(FlowableHumanTaskService service, TaskService tasks, String instance, JdbcTemplate jdbc) { var task = tasks.createTaskQuery().processInstanceId(instance).singleResult(); assertNotNull(task); return service.get(context("get", REVIEWER, Set.of("50"), jdbc), new GetHumanTaskQuery(task.getId())); }
-    private static HumanTaskContext context(String operation, ProcessActor actor, Set<String> roles, JdbcTemplate jdbc) { return new HumanTaskContext(actor, "tianji.api.process.task." + operation, roles, jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant().plusSeconds(30), 2, 3); }
+    static HumanTaskContext context(String operation, ProcessActor actor, Set<String> roles, JdbcTemplate jdbc) { return new HumanTaskContext(actor, "tianji.api.process.task." + operation, roles, jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant().plusSeconds(30), 2, 3); }
     private static ProcessActor actor(String subject) { return ProcessActor.verified(20, ProcessActor.SubjectType.USER, subject, "https://idp.example/20"); }
     private static boolean hasMessage(Throwable failure, String text) { for (var current = failure; current != null; current = current.getCause()) if (current.getMessage() != null && current.getMessage().contains(text)) return true; return false; }
 }

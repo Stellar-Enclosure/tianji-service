@@ -102,6 +102,37 @@ class ProcessStorageConfigurationTest {
         assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(reads, servlet).afterSingletonsInstantiated());
     }
 
+    @Test
+    void linked_case_factory_holds_typed_lazy_providers_without_resolving_application_services_at_engine_configuration() {
+        var source = mock(DataSource.class); var manager = new DataSourceTransactionManager(source);
+        var outbox = new OutboxInfrastructure(source, "source", manager, "manager");
+        var properties = new TransactionalOutboxProperties(); properties.getStorage().getJdbc().setSchema("tianji_process");
+        @SuppressWarnings("unchecked") var services = (org.springframework.beans.factory.ObjectProvider<top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService>) mock(org.springframework.beans.factory.ObjectProvider.class);
+        @SuppressWarnings("unchecked") var registries = (org.springframework.beans.factory.ObjectProvider<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry>) mock(org.springframework.beans.factory.ObjectProvider.class);
+        var service = mock(top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService.class);
+        var registry = mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.class);
+        org.mockito.Mockito.when(services.getObject()).thenReturn(service); org.mockito.Mockito.when(registries.getObject()).thenReturn(registry);
+        for (boolean enabled : new boolean[]{false, true}) {
+            var engine = new SpringProcessEngineConfiguration(); engine.setDataSource(source); engine.setTransactionManager(manager);
+            engine.setDatabaseSchema("tianji_process"); engine.setDatabaseSchemaUpdate("false");
+            var arguments = new java.util.ArrayList<java.util.List<?>>();
+            try (var statements = org.mockito.Mockito.mockConstruction(org.springframework.jdbc.core.JdbcTemplate.class,
+                    (value, ignored) -> org.mockito.Mockito.when(value.queryForObject("SELECT current_schema()", String.class)).thenReturn("tianji_process"));
+                 var factories = org.mockito.Mockito.mockConstruction(top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory.class,
+                    (value, construction) -> arguments.add(construction.arguments()))) {
+                new ProcessStorageConfiguration().processStorageGuard(outbox, properties, new MockEnvironment().withProperty("stellar.tianji.process.cases.enabled", Boolean.toString(enabled)), services, registries).configure(engine);
+                org.mockito.Mockito.verifyNoInteractions(services, registries);
+                org.junit.jupiter.api.Assertions.assertEquals(1, arguments.size());
+                org.junit.jupiter.api.Assertions.assertEquals(enabled ? 2 : 0, arguments.getFirst().size());
+                if (enabled) {
+                    org.junit.jupiter.api.Assertions.assertSame(service, ((java.util.function.Supplier<?>) arguments.getFirst().get(0)).get());
+                    org.junit.jupiter.api.Assertions.assertSame(registry, ((java.util.function.Supplier<?>) arguments.getFirst().get(1)).get());
+                    org.mockito.Mockito.clearInvocations(services, registries);
+                }
+            }
+        }
+    }
+
     private static void guard(MockEnvironment environment) {
         ProcessStorageConfiguration.processStoragePropertiesGuard(environment).postProcessBeanFactory(null);
     }

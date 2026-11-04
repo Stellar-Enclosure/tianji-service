@@ -48,6 +48,10 @@ import java.util.Objects;
 public final class FlowableCaseService {
     private static final String PREFIX = "tianji.api.process.case.";
     private final SpringCmmnEngineConfiguration engine;
+    private final SpringProcessEngineConfiguration process;
+    private final top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry sourceRegistry;
+    private final top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox caseInbox;
+    private final java.util.function.BooleanSupplier completionReady;
     private final DataSource source;
     private final CmmnRuntimeService runtime;
     private final ProcessReleaseService releases;
@@ -67,6 +71,13 @@ public final class FlowableCaseService {
     }
     public FlowableCaseService(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn, SpringDmnEngineConfiguration dmn,
             ProcessModelValidator validator, CaseStartProvenanceStore provenance, CasePlanItemReceiptStore planReceipts, boolean newStartsEnabled) {
+        this(process,cmmn,dmn,validator,provenance,planReceipts,newStartsEnabled,null,null,()->false);
+    }
+
+    public FlowableCaseService(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn, SpringDmnEngineConfiguration dmn,
+            ProcessModelValidator validator, CaseStartProvenanceStore provenance, CasePlanItemReceiptStore planReceipts, boolean newStartsEnabled,
+            top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry registry,
+            top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox inbox, java.util.function.BooleanSupplier completionReady) {
         this.engine = Objects.requireNonNull(cmmn, "cmmn"); this.provenance = Objects.requireNonNull(provenance, "provenance"); this.planReceipts = Objects.requireNonNull(planReceipts, "planReceipts");
         Objects.requireNonNull(process, "process"); Objects.requireNonNull(dmn, "dmn"); Objects.requireNonNull(validator, "validator");
         if (!(cmmn.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw invalidConfiguration();
@@ -78,7 +89,95 @@ public final class FlowableCaseService {
         jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5); commands = new ProcessCommandReceiptStore(jdbc, schema); nativeAccess = new CaseNativeAccess(source, cmmn);
         read = new TransactionTemplate(manager); read.setReadOnly(true); read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ); read.setTimeout(10);
         write = new TransactionTemplate(manager); write.setTimeout(10); this.newStartsEnabled = newStartsEnabled;
+        this.process = process; sourceRegistry = registry; caseInbox = inbox; this.completionReady = Objects.requireNonNull(completionReady,"completionReady");
+        if ((registry == null) != (inbox == null)) throw invalidConfiguration();
+        if (inbox != null) inbox.requireStorage(source,manager,schema);
     }
+
+    /** Joins the actual current BPMN transaction; owner comes only from its durable APPLIED START. */
+    public CaseStartProvenanceStore.Entry startLinked(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration registration, NativeSourceFacts facts) {
+        if (sourceRegistry == null || caseInbox == null || registration == null || facts == null || !sourceRegistry.current(registration)) throw unavailable();
+        var execution = nativeSource(registration,facts); Instant deadline = linkedNow().plusSeconds(10);
+        String occurrence = ProcessRequestDigest.hash(List.of("TIANJI_CASE_SOURCE_OCCURRENCE_LOCK_V1",Long.toString(registration.actor().tenantId()),facts.parentProcessInstanceId(),facts.sourceOccurrenceId()),Map.of());
+        jdbc.query("SELECT pg_advisory_xact_lock(?)",rs->{},ByteBuffer.wrap(HexFormat.of().parseHex(occurrence)).getLong()); linkedCurrent(deadline);
+        var parent = parentStart(registration.actor().tenantId(),facts.parentProcessInstanceId()); var binding = registration.binding();
+        if (!binding.releaseKey().equals(parent.releaseKey()) || !binding.sourceElementId().equals(facts.sourceElementId())) throw unavailable();
+        var release = releases.get(parent.actor(),parent.releaseKey());
+        var parentDefinition = release.definitions().stream().filter(value->value.type()==Type.BPMN && value.definitionKey().equals(binding.parentDefinitionKey())).findFirst().orElseThrow(FlowableCaseService::unavailable);
+        var caseDefinition = release.definitions().stream().filter(value->value.type()==Type.CMMN && value.definitionKey().equals(binding.caseDefinitionKey())).findFirst().orElseThrow(FlowableCaseService::unavailable);
+        if (!facts.parentDefinitionId().equals(parentDefinition.engineDefinitionId()) || !binding.parentModelSha256().equals(parentDefinition.modelSha256()) || !binding.caseModelSha256().equals(caseDefinition.modelSha256())) throw unavailable();
+        var model = models.runningProcess(binding.tenantId(),parentDefinition); var policy = model.caseSources().get(facts.sourceElementId());
+        if (policy == null || !binding.caseDefinitionKey().equals(policy.caseDefinitionKey()) || models.caseModel(binding.tenantId(),caseDefinition) == null) throw unavailable();
+        var root = execution.getProcessInstance();
+        if (root == null || !facts.parentProcessInstanceId().equals(root.getId()) || !facts.parentDefinitionId().equals(root.getProcessDefinitionId()) || !Long.toString(binding.tenantId()).equals(root.getTenantId()) || !safeReference(root.getBusinessKey(),255)) throw unavailable();
+        String business = root.getBusinessKey();
+        String commandId = ProcessRequestDigest.hash(List.of("TIANJI_LINKED_CASE_START_ID_V1",Long.toString(binding.tenantId()),facts.parentProcessInstanceId(),facts.sourceOccurrenceId()),Map.of());
+        String requestHash = ProcessRequestDigest.hash(List.of("TIANJI_LINKED_CASE_START_V1",Long.toString(binding.tenantId()),facts.parentProcessInstanceId(),facts.parentDefinitionId(),facts.sourceElementId(),facts.sourceOccurrenceId(),facts.sourceExecutionId(),
+                binding.releaseKey(),binding.parentDefinitionKey(),binding.parentModelSha256(),binding.caseDefinitionKey(),binding.caseModelSha256(),caseDefinition.engineDefinitionId(),
+                parent.actor().subjectType().name(),parent.actor().issuerFingerprint(),parent.actor().subjectId(),parent.commandId(),parent.requestHash(),registration.actor().issuerFingerprint(),registration.actor().subjectId(),business,parent.correlationId()),Map.of());
+        var accepted = provenance.byLinkedOccurrence(binding.tenantId(),facts.parentProcessInstanceId(),facts.sourceOccurrenceId());
+        if (accepted.isPresent()) {
+            var existing = accepted.orElseThrow(); provenance.lockScope(binding.tenantId(),existing.seed().caseInstanceId());
+            existing = provenance.byLinkedOccurrence(binding.tenantId(),facts.parentProcessInstanceId(),facts.sourceOccurrenceId()).orElseThrow(FlowableCaseService::unavailable);
+            validateLinked(existing,registration,facts,parent,parentDefinition,caseDefinition,business,commandId,requestHash);
+            var base = commands.lockIfPresent(registration.actor(),ProcessCommandReceiptStore.Kind.CASE_START,commandId).orElseThrow(FlowableCaseService::unavailable);
+            if (!"APPLIED".equals(base.state()) || !requestHash.equals(base.requestHash()) || !existing.seed().caseInstanceId().equals(base.resourceId()) || !parent.releaseKey().equals(base.releaseKey()) || !parent.correlationId().equals(base.correlationId())) throw unavailable();
+            if (!sourceRegistry.current(registration)) throw unavailable(); linkedCurrent(deadline); return existing;
+        }
+        if (!newStartsEnabled || !completionReady.getAsBoolean() || !sourceRegistry.current(registration)) throw unavailable();
+        if (commands.lockIfPresent(registration.actor(),ProcessCommandReceiptStore.Kind.CASE_START,commandId).isPresent()
+                || !commands.insert(registration.actor(),ProcessCommandReceiptStore.Kind.CASE_START,commandId,requestHash,parent.releaseKey(),parent.correlationId())) throw unavailable();
+        linkedCurrent(deadline);
+        var created = runtime.createCaseInstanceBuilder().caseDefinitionId(caseDefinition.engineDefinitionId()).tenantId(Long.toString(binding.tenantId())).businessKey(business).start();
+        if (created == null || !safeReference(created.getId(),255) || !caseDefinition.engineDefinitionId().equals(created.getCaseDefinitionId()) || !Long.toString(binding.tenantId()).equals(created.getTenantId()) || !business.equals(created.getBusinessKey())) throw unavailable();
+        linkedCurrent(deadline); commands.apply(registration.actor(),ProcessCommandReceiptStore.Kind.CASE_START,commandId,created.getId(),null);
+        var seed = new CaseStartProvenanceStore.Seed(created.getId(),"LINKED_BPMN",business,parent.correlationId(),parent.releaseKey(),caseDefinition.definitionKey(),caseDefinition.engineDefinitionId(),caseDefinition.modelSha256(),parent.actor(),"START",parent.commandId(),parent.requestHash(),registration.actor(),commandId,requestHash,registration.sourceId(),facts.parentProcessInstanceId(),facts.sourceOccurrenceId(),facts.sourceElementId(),parentDefinition.definitionKey(),parentDefinition.engineDefinitionId(),parentDefinition.modelSha256());
+        var result = provenance.insert(seed); if (!seed.equals(result.seed())) throw unavailable(); caseInbox.prepare(result);
+        if (!sourceRegistry.current(registration) || !completionReady.getAsBoolean()) throw unavailable(); linkedCurrent(deadline); return result;
+    }
+    private org.flowable.engine.impl.persistence.entity.ExecutionEntity nativeSource(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration registration, NativeSourceFacts facts) {
+        var command = Context.getCommandContext();
+        if (command == null || org.flowable.engine.impl.util.CommandContextUtil.getProcessEngineConfiguration()!=process || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
+        top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory.requireCaseSourcesConfigured(process);
+        var execution = org.flowable.engine.impl.util.CommandContextUtil.getExecutionEntityManager(command).findById(facts.sourceExecutionId());
+        if (execution == null || !facts.sourceExecutionId().equals(execution.getId()) || !facts.parentProcessInstanceId().equals(execution.getProcessInstanceId()) || !facts.parentDefinitionId().equals(execution.getProcessDefinitionId())
+                || !facts.sourceElementId().equals(execution.getCurrentActivityId()) || !(execution.getCurrentFlowElement() instanceof org.flowable.bpmn.model.CaseServiceTask) || !Long.toString(registration.actor().tenantId()).equals(execution.getTenantId())) throw unavailable();
+        var activity = org.flowable.engine.impl.util.CommandContextUtil.getActivityInstanceEntityManager(command).findUnfinishedActivityInstance(execution);
+        if (activity == null || !facts.sourceOccurrenceId().equals(activity.getId()) || activity.getEndTime()!=null || !facts.sourceExecutionId().equals(activity.getExecutionId()) || !facts.parentProcessInstanceId().equals(activity.getProcessInstanceId())
+                || !facts.parentDefinitionId().equals(activity.getProcessDefinitionId()) || !facts.sourceElementId().equals(activity.getActivityId()) || !Long.toString(registration.actor().tenantId()).equals(activity.getTenantId())) throw unavailable();
+        return execution;
+    }
+    private ParentStart parentStart(long tenant,String instanceId) {
+        var rows = jdbc.query("SELECT tenant_id,subject_type,subject_issuer,subject_id,command_id,request_sha256,release_key,correlation_id,state,resource_id,created_at FROM "+'"'+engine.getDatabaseSchema()+"\".tianji_process_command_receipt WHERE tenant_id=? AND command_type='START' AND state='APPLIED' AND resource_id=?",(rs,row)->{
+            try {
+                var actor = new ProcessActor(rs.getLong("tenant_id"),ProcessActor.SubjectType.valueOf(rs.getString("subject_type")),rs.getString("subject_id"),rs.getString("subject_issuer"));
+                if (actor.tenantId()!=tenant || "LEGACY".equals(actor.issuerFingerprint()) || !"APPLIED".equals(rs.getString("state")) || !instanceId.equals(rs.getString("resource_id"))
+                        || !commandReference(rs.getString("command_id")) || !commandReference(rs.getString("correlation_id")) || rs.getString("request_sha256")==null || !rs.getString("request_sha256").matches("[0-9a-f]{64}") || rs.getString("release_key")==null || !rs.getString("release_key").matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")) throw unavailable();
+                return new ParentStart(actor,rs.getString("command_id"),rs.getString("request_sha256"),rs.getString("release_key"),rs.getString("correlation_id"),rs.getTimestamp("created_at").toInstant());
+            } catch (RuntimeException malformed) { throw unavailable(); }
+        },tenant,instanceId);
+        if (rows.size()!=1) throw unavailable(); return rows.getFirst();
+    }
+    private static void validateLinked(CaseStartProvenanceStore.Entry existing,top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration registration,NativeSourceFacts facts,ParentStart parent,Definition parentDefinition,Definition caseDefinition,String business,String commandId,String hash) {
+        var seed=existing.seed();
+        if (!"LINKED_BPMN".equals(seed.startKind()) || !parent.actor().equals(seed.owner()) || !registration.actor().equals(seed.executor()) || !"START".equals(seed.ownerStartCommandType()) || !parent.commandId().equals(seed.ownerStartCommandId()) || !parent.requestHash().equals(seed.ownerStartRequestSha256())
+                || !parent.releaseKey().equals(seed.releaseKey()) || !parent.correlationId().equals(seed.correlationId()) || !business.equals(seed.businessKey()) || !facts.parentProcessInstanceId().equals(seed.parentProcessInstanceId()) || !facts.sourceOccurrenceId().equals(seed.sourceOccurrenceId()) || !facts.sourceElementId().equals(seed.sourceElementId())
+                || !parentDefinition.definitionKey().equals(seed.parentDefinitionKey()) || !parentDefinition.engineDefinitionId().equals(seed.parentEngineDefinitionId()) || !parentDefinition.modelSha256().equals(seed.parentModelSha256()) || !caseDefinition.definitionKey().equals(seed.caseDefinitionKey()) || !caseDefinition.engineDefinitionId().equals(seed.caseEngineDefinitionId()) || !caseDefinition.modelSha256().equals(seed.caseModelSha256())
+                || !commandId.equals(seed.caseStartCommandId()) || !hash.equals(seed.caseStartRequestSha256())) throw unavailable();
+    }
+    private Instant linkedNow() {
+        if (Thread.currentThread().isInterrupted() || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)
+                || !Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'",Boolean.class))) throw unavailable();
+        return Objects.requireNonNull(jdbc.queryForObject("SELECT clock_timestamp()",java.sql.Timestamp.class)).toInstant();
+    }
+    private void linkedCurrent(Instant deadline) { if (!linkedNow().isBefore(deadline)) throw unavailable(); }
+    private record ParentStart(ProcessActor actor,String commandId,String requestHash,String releaseKey,String correlationId,Instant createdAt) {}
+    public record NativeSourceFacts(String parentProcessInstanceId,String parentDefinitionId,String sourceElementId,String sourceOccurrenceId,String sourceExecutionId) {
+        public NativeSourceFacts { if (!safeReference(parentProcessInstanceId,255) || !safeReference(parentDefinitionId,255) || !safeReference(sourceOccurrenceId,255) || !safeReference(sourceExecutionId,255) || sourceElementId==null || !sourceElementId.matches("[A-Za-z_][A-Za-z0-9_.-]{0,127}")) throw new IllegalArgumentException("Native Case source reference is invalid"); }
+        @Override public String toString() { return "NativeSourceFacts[redacted]"; }
+    }
+    private static boolean safeReference(String value,int maximum) { return value!=null && !value.isBlank() && value.equals(value.trim()) && value.length()<=maximum && java.nio.charset.StandardCharsets.UTF_8.newEncoder().canEncode(value) && value.chars().noneMatch(Character::isISOControl); }
+    private static boolean commandReference(String value) { return value!=null && value.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"); }
 
     public CaseInstanceDTO start(CaseContext context, StartCaseCommand command) {
         context.requireResource(PREFIX + "start"); Objects.requireNonNull(command, "command"); ownTransaction();

@@ -266,6 +266,10 @@ class ProcessApiConfigurationTest {
         try (var provenance = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
              var planReceipts = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.CasePlanItemReceiptStore.class);
              var taskReceipts = mockConstruction(HumanTaskReceiptStore.class, (value, construction) -> receiptArguments.add(construction.arguments()));
+             var inboxes = mockConstruction(top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox.class);
+             var waits = mockConstruction(top.egon.cola.platform.tianji.process.server.bridge.FlowableCaseWaitInspector.class);
+             var completions = mockConstruction(top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionCorrelationService.class);
+             var pollers = mockConstruction(top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionPoller.class);
              var cases = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService.class, (value, construction) -> caseArguments.add(construction.arguments()));
              var tasks = mockConstruction(FlowableHumanTaskService.class, (value, construction) -> taskArguments.add(construction.arguments()));
              var releases = mockConstruction(ProcessReleaseService.class, (value, construction) -> releaseArguments.add(construction.arguments()))) {
@@ -285,18 +289,32 @@ class ProcessApiConfigurationTest {
                         assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.api.CaseRequestBodyAdvice.class);
                         assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.security.TianjiCaseAccess.class);
                         assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService.class);
+                        assertThat(context).hasBean("caseSourceRegistry"); assertThat(context).hasBean("caseCompletionInbox");
+                        assertThat(context).hasBean("caseCompletionCorrelationService"); assertThat(context).hasBean("caseCompletionPoller");
+                        assertThat(inboxes.constructed()).hasSize(1); assertThat(completions.constructed()).hasSize(1); assertThat(pollers.constructed()).hasSize(1);
                         assertThat(context).hasSingleBean(HumanTaskController.class); assertThat(context).hasSingleBean(FlowableHumanTaskService.class);
                         assertThat(provenance.constructed()).hasSize(1); assertThat(planReceipts.constructed()).hasSize(1); assertThat(taskReceipts.constructed()).hasSize(1);
                         var origin = provenance.constructed().getFirst(); var plans = planReceipts.constructed().getFirst(); var human = taskReceipts.constructed().getFirst();
                         verify(origin).verifyStorage(); verify(plans).verifyStorage(); verify(human).verifyStorage();
-                        assertThat(caseArguments).hasSize(1); assertThat(caseArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
+                        assertThat(caseArguments).hasSize(1); assertThat(caseArguments.getFirst()).hasSize(10);
+                        assertThat(caseArguments.getFirst().subList(0, 7)).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
                                 context.getBean(ProcessModelValidator.class), origin, plans, false));
+                        assertThat(caseArguments.getFirst().get(7)).isSameAs(context.getBean("caseSourceRegistry"));
+                        assertThat(caseArguments.getFirst().get(8)).isSameAs(inboxes.constructed().getFirst());
+                        var ready = (java.util.function.BooleanSupplier) caseArguments.getFirst().get(9);
+                        assertThat(ready.getAsBoolean()).isFalse(); org.mockito.Mockito.when(pollers.constructed().getFirst().isRunning()).thenReturn(true); assertThat(ready.getAsBoolean()).isTrue();
                         assertThat(taskArguments).hasSize(1); assertThat(taskArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
                                 context.getBean(ProcessModelValidator.class), human, origin));
                         assertThat(receiptArguments).containsExactly(java.util.List.of(source, "tianji_process", origin));
-                        assertThat(releaseArguments).hasSize(1); assertThat(releaseArguments.getFirst()).hasSize(10);
+                        assertThat(releaseArguments).hasSize(1); assertThat(releaseArguments.getFirst()).hasSize(13);
                         assertThat(releaseArguments.getFirst().get(1)).isSameAs(caseConfiguration);
                         assertThat(releaseArguments.getFirst().get(8)).isEqualTo(false); assertThat(releaseArguments.getFirst().get(9)).isEqualTo(true);
+                        assertThat(releaseArguments.getFirst().get(10)).isSameAs(context.getBean("caseSourceRegistry"));
+                        assertThat(releaseArguments.getFirst().get(12)).isEqualTo(false);
+                        assertThat(((java.util.function.BooleanSupplier) releaseArguments.getFirst().get(11)).getAsBoolean()).isTrue();
+                        assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties.class);
+                        assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry.class);
+                        assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client.class);
                     });
         }
     }

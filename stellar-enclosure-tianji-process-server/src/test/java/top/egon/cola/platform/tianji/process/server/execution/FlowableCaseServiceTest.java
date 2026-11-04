@@ -100,7 +100,79 @@ class FlowableCaseServiceTest {
             assertThrows(IllegalStateException.class,()->f.tx.execute(s->f.service.get(context("get"),new CaseInstanceQuery("case-1"))));verify(f.provenance,never()).find(anyLong(),anyString());
         }
     }
+    @Test void linked_start_inherits_the_applied_parent_owner_and_uses_the_fixed_service_executor_in_one_transaction() throws Exception {
+        try(var f=new LinkedFixture()){
+            var before=org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
+            var result=assertDoesNotThrow(()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));
+            assertNotNull(result);assertEquals(CaseSnapshotTest.OWNER,result.seed().owner());assertEquals(f.registration.actor(),result.seed().executor());
+            assertNotEquals(result.seed().owner().issuerFingerprint(),result.seed().executor().issuerFingerprint());assertEquals("START",result.seed().ownerStartCommandType());assertEquals("parent-start",result.seed().ownerStartCommandId());
+            assertEquals("business",result.seed().businessKey());assertEquals("correlation",result.seed().correlationId());assertEquals("release",result.seed().releaseKey());assertEquals("native-occurrence",result.seed().sourceOccurrenceId());
+            assertSame(before,org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication());
+            var order=inOrder(f.base.builder,f.base.commands.get(),f.base.provenance,f.inbox);order.verify(f.base.builder).start();order.verify(f.base.commands.get()).apply(eq(f.registration.actor()),eq(ProcessCommandReceiptStore.Kind.CASE_START),anyString(),eq("case-1"),isNull());order.verify(f.base.provenance).insert(any());order.verify(f.inbox).prepare(any());
+        }
+    }
+    @Test void linked_start_requires_actual_native_context_an_applied_parent_and_running_completion_before_creating_a_case() throws Exception {
+        try(var f=new LinkedFixture()){
+            assertThrows(IllegalStateException.class,()->f.service.startLinked(f.registration,f.facts));
+            f.parent.put("state","PENDING");assertThrows(IllegalStateException.class,()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));
+            f.parent.put("state","APPLIED");f.running.set(false);assertThrows(IllegalStateException.class,()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));
+            verify(f.base.builder,never()).start();verify(f.inbox,never()).prepare(any());
+        }
+    }
+    @Test void repeated_native_occurrence_ignores_a_source_audit_rename_without_starting_another_case() throws Exception {
+        try(var f=new LinkedFixture()){
+            var first=assertDoesNotThrow(()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));assertNotNull(first);
+            when(f.base.provenance.byLinkedOccurrence(20,"parent","native-occurrence")).thenReturn(Optional.of(first));
+            when(f.base.commands.get().lockIfPresent(eq(f.registration.actor()),eq(ProcessCommandReceiptStore.Kind.CASE_START),eq(first.seed().caseStartCommandId()))).thenReturn(Optional.of(new ProcessCommandReceiptStore.Receipt(first.seed().caseStartRequestSha256(),"release","correlation","APPLIED","case-1",CaseSnapshotTest.NOW,null)));
+            var renamed=new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration(f.registration.binding(),"renamed",f.registration.actor(),f.registration.authorizationKey());
+            f.running.set(false);
+            assertEquals(first,assertDoesNotThrow(()->f.base.tx.execute(status->f.service.startLinked(renamed,f.facts))));
+            verify(f.base.builder,times(1)).start();verify(f.inbox,times(1)).prepare(any());
+        }
+    }
+    @Test void forged_native_occurrence_or_cross_release_source_binding_cannot_create_a_case() throws Exception {
+        try(var f=new LinkedFixture()){
+            when(f.activity.getId()).thenReturn("another-occurrence");assertThrows(IllegalStateException.class,()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));
+            when(f.activity.getId()).thenReturn("native-occurrence");var old=f.registration.binding();
+            var binding=new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.BindingKey(20,"other-release",old.parentDefinitionKey(),old.parentModelSha256(),old.sourceElementId(),old.caseDefinitionKey(),old.caseModelSha256());
+            var wrong=new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration(binding,"source",f.registration.actor(),f.registration.authorizationKey());
+            assertThrows(IllegalStateException.class,()->f.base.tx.execute(status->f.service.startLinked(wrong,f.facts)));verify(f.base.builder,never()).start();
+        }
+    }
+    @Test void failure_after_linked_native_start_rolls_back_the_same_parent_transaction_and_never_commits_a_partial_inbox() throws Exception {
+        try(var f=new LinkedFixture()){
+            when(f.inbox.prepare(any())).thenThrow(new IllegalStateException("inbox write failed"));
+            assertThrows(IllegalStateException.class,()->f.base.tx.execute(status->f.service.startLinked(f.registration,f.facts)));
+            verify(f.base.builder).start();verify(f.base.connection).rollback();
+        }
+    }
     private static CaseContext context(String operation){return new CaseContext(CaseSnapshotTest.OWNER,"tianji.api.process.case."+operation,Set.of("7"),CaseSnapshotTest.NOW.plusSeconds(30),2,3);}
+    private static final class LinkedFixture implements AutoCloseable {
+        final Fixture base=new Fixture(true);final top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry registry=mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.class);final top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox inbox=mock(top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox.class);
+        final java.util.concurrent.atomic.AtomicBoolean running=new java.util.concurrent.atomic.AtomicBoolean(true);final top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration registration;final FlowableCaseService.NativeSourceFacts facts=new FlowableCaseService.NativeSourceFacts("parent","parent-def","caseSource","native-occurrence","source-execution");
+        final org.flowable.common.engine.impl.interceptor.CommandContext command=mock(org.flowable.common.engine.impl.interceptor.CommandContext.class);final org.flowable.engine.impl.persistence.entity.ExecutionEntity execution=mock(org.flowable.engine.impl.persistence.entity.ExecutionEntity.class);final org.flowable.engine.impl.persistence.entity.ActivityInstanceEntity activity=mock(org.flowable.engine.impl.persistence.entity.ActivityInstanceEntity.class);
+        final org.mockito.MockedStatic<org.flowable.common.engine.impl.context.Context> contexts;final org.mockito.MockedStatic<org.flowable.engine.impl.util.CommandContextUtil> nativeContexts;final FlowableCaseService service;final java.util.Map<String,Object> parent=new java.util.HashMap<>();
+        LinkedFixture()throws Exception {
+            var actor=top.egon.cola.platform.tianji.process.server.identity.ProcessActor.verified(20,top.egon.cola.platform.tianji.process.server.identity.ProcessActor.SubjectType.SERVICE,"case-service","https://service.example/20");
+            var key=new top.egon.cola.platform.tianquan.shoubing.starter.client.ServiceAuthorizationKey("https://service.example/20","local","case-service",1,"process-app",java.net.URI.create("https://process.example/api/tianji"),top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext.TENANT,"20",Set.of("tianji:case:start"));
+            var binding=new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.BindingKey(20,"release","process","b".repeat(64),"caseSource","governedCase",CaseSnapshotTest.HASH);registration=new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration(binding,"source",actor,key);when(registry.current(any())).thenReturn(true);when(registry.require(any())).thenReturn(registration);
+            when(base.provenance.byLinkedOccurrence(anyLong(),anyString(),anyString())).thenReturn(Optional.empty());
+            service=new FlowableCaseService(base.process,base.cmmn,base.dmn,new ProcessModelValidator(),base.provenance,base.receipts,true,registry,inbox,running::get);
+            var definition=new ProcessReleaseService.Definition(ValidatedProcessModel.Type.CMMN,"governedCase","case-def","deployment",1,CaseSnapshotTest.HASH,Map.of());var parentDefinition=new ProcessReleaseService.Definition(ValidatedProcessModel.Type.BPMN,"process","parent-def","parent-deployment",1,"b".repeat(64),Map.of());
+            when(base.releases.constructed().getLast().get(any(),eq("release"))).thenReturn(new ProcessReleaseService.Release("release","a".repeat(64),CaseSnapshotTest.NOW,List.of(parentDefinition,definition)));
+            var parentModel=mock(ValidatedProcessModel.class);when(parentModel.caseSources()).thenReturn(Map.of("caseSource",new ValidatedProcessModel.CaseSource("governedCase","waitCaseResult","TianjiCaseCompletedV1","waitCaseTimeout",java.time.Duration.ofMinutes(5))));when(base.models.constructed().getLast().runningProcess(20,parentDefinition)).thenReturn(parentModel);
+            parent.putAll(Map.of("tenant_id",20L,"subject_type","USER","subject_issuer",CaseSnapshotTest.OWNER.issuerFingerprint(),"subject_id",CaseSnapshotTest.OWNER.subjectId(),"command_id","parent-start","request_sha256","d".repeat(64),"release_key","release","correlation_id","correlation","state","APPLIED","resource_id","parent"));parent.put("created_at",java.sql.Timestamp.from(CaseSnapshotTest.NOW.minusSeconds(10)));
+            var jdbc=base.statements.constructed().getLast();when(jdbc.queryForObject(startsWith("SELECT NOT pg_is_in_recovery()"),eq(Boolean.class))).thenReturn(true);when(jdbc.queryForObject(eq("SELECT clock_timestamp()"),eq(java.sql.Timestamp.class))).thenReturn(java.sql.Timestamp.from(CaseSnapshotTest.NOW));
+            when(jdbc.query(anyString(),org.mockito.ArgumentMatchers.<org.springframework.jdbc.core.RowMapper<Object>>any(),any(Object[].class))).thenAnswer(call->{var rs=mock(java.sql.ResultSet.class);when(rs.getString(anyString())).thenAnswer(read->{var value=parent.get(read.getArgument(0));return value==null?null:value.toString();});when(rs.getLong(anyString())).thenAnswer(read->((Number)parent.get(read.getArgument(0))).longValue());when(rs.getTimestamp(anyString())).thenAnswer(read->parent.get(read.getArgument(0)));org.springframework.jdbc.core.RowMapper<?> mapper=call.getArgument(1);return List.of(mapper.mapRow(rs,0));});
+            var executions=mock(org.flowable.engine.impl.persistence.entity.ExecutionEntityManager.class);when(executions.findById("source-execution")).thenReturn(execution);var activities=mock(org.flowable.engine.impl.persistence.entity.ActivityInstanceEntityManager.class);when(activities.findUnfinishedActivityInstance(execution)).thenReturn(activity);
+            var task=new org.flowable.bpmn.model.CaseServiceTask();task.setId("caseSource");when(execution.getId()).thenReturn("source-execution");when(execution.getProcessInstanceId()).thenReturn("parent");when(execution.getProcessDefinitionId()).thenReturn("parent-def");when(execution.getTenantId()).thenReturn("20");when(execution.getCurrentActivityId()).thenReturn("caseSource");when(execution.getCurrentFlowElement()).thenReturn(task);
+            var root=mock(org.flowable.engine.impl.persistence.entity.ExecutionEntity.class);when(root.getId()).thenReturn("parent");when(root.getProcessDefinitionId()).thenReturn("parent-def");when(root.getTenantId()).thenReturn("20");when(root.getBusinessKey()).thenReturn("business");when(execution.getProcessInstance()).thenReturn(root);
+            when(activity.getId()).thenReturn("native-occurrence");when(activity.getExecutionId()).thenReturn("source-execution");when(activity.getProcessInstanceId()).thenReturn("parent");when(activity.getProcessDefinitionId()).thenReturn("parent-def");when(activity.getActivityId()).thenReturn("caseSource");when(activity.getTenantId()).thenReturn("20");
+            contexts=mockStatic(org.flowable.common.engine.impl.context.Context.class);contexts.when(org.flowable.common.engine.impl.context.Context::getCommandContext).thenReturn(command);nativeContexts=mockStatic(org.flowable.engine.impl.util.CommandContextUtil.class);nativeContexts.when(org.flowable.engine.impl.util.CommandContextUtil::getProcessEngineConfiguration).thenReturn(base.process);nativeContexts.when(()->org.flowable.engine.impl.util.CommandContextUtil.getExecutionEntityManager(command)).thenReturn(executions);nativeContexts.when(()->org.flowable.engine.impl.util.CommandContextUtil.getActivityInstanceEntityManager(command)).thenReturn(activities);
+            var factory=new top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory(()->service,()->registry);var parser=mock(org.flowable.engine.impl.bpmn.parser.BpmnParser.class);when(base.process.getActivityBehaviorFactory()).thenReturn(factory);when(base.process.getBpmnParser()).thenReturn(parser);when(parser.getActivityBehaviorFactory()).thenReturn(factory);
+        }
+        @Override public void close(){nativeContexts.close();contexts.close();base.close();}
+    }
     private static final class Fixture implements AutoCloseable{
         final DataSource source=mock(DataSource.class);final Connection connection=mock(Connection.class);final SpringProcessEngineConfiguration process=mock(SpringProcessEngineConfiguration.class);final SpringCmmnEngineConfiguration cmmn=mock(SpringCmmnEngineConfiguration.class);final SpringDmnEngineConfiguration dmn=mock(SpringDmnEngineConfiguration.class);
         final CmmnRuntimeService runtime=mock(CmmnRuntimeService.class);final CaseInstanceBuilder builder=mock(CaseInstanceBuilder.class,RETURNS_SELF);final CaseStartProvenanceStore provenance=mock(CaseStartProvenanceStore.class);final CasePlanItemReceiptStore receipts=mock(CasePlanItemReceiptStore.class);

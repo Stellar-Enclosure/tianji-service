@@ -342,6 +342,67 @@ class ProcessReleaseServiceTest {
         verifyNoInteractions(source);
     }
 
+    @Test
+    void linked_source_publication_binds_both_models_and_the_source_node_in_one_release() throws Exception {
+        try (var f = new CaseFixture(); var pinned = mockStatic(PinnedDecisionActivityBehaviorFactory.class)) {
+            var registry = mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.class);
+            var registration = mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.Registration.class);
+            var key = sourceBinding(f, "release"); when(registry.require(key)).thenReturn(registration); when(registry.current(registration)).thenReturn(true);
+            configureLinkedProcess(f);
+            var service = sourcePublisher(f, registry, () -> true, true);
+            var release = assertDoesNotThrow(() -> service.publish(f.actor, "release", sourceBundle(f)));
+            assertEquals(Set.of(Type.BPMN, Type.CMMN), release.definitions().stream().map(ProcessReleaseService.Definition::type).collect(java.util.stream.Collectors.toSet()));
+            verify(registry).require(key); verify(registry).current(registration); verify(f.connection).commit();
+        }
+    }
+
+    @Test
+    void linked_source_requires_new_start_and_live_maintenance_before_database_or_native_deployment() throws Exception {
+        for (boolean starts : List.of(false, true)) {
+            try (var f = new CaseFixture(); var pinned = mockStatic(PinnedDecisionActivityBehaviorFactory.class)) {
+                var registry = mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.class);
+                var service = sourcePublisher(f, registry, () -> false, starts);
+                assertThrows(IllegalArgumentException.class, () -> service.publish(f.actor, "release", sourceBundle(f)));
+                verifyNoInteractions(f.source, f.repository, registry);
+            }
+        }
+    }
+
+    @Test
+    void linked_source_cannot_fetch_a_case_from_another_release_or_skip_the_current_source_registration() throws Exception {
+        try (var f = new CaseFixture(); var pinned = mockStatic(PinnedDecisionActivityBehaviorFactory.class)) {
+            var registry = mock(top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.class);
+            var service = sourcePublisher(f, registry, () -> true, true);
+            assertThrows(IllegalArgumentException.class, () -> service.publish(f.actor, "release", List.of(sourceBundle(f).getFirst())));
+            verifyNoInteractions(registry, f.source, f.repository);
+            var checked = new SourceChecked(); when(registry.require(sourceBinding(f, "release"))).thenThrow(checked);
+            assertSame(checked, assertThrows(SourceChecked.class, () -> service.publish(f.actor, "release", sourceBundle(f))));
+            verifyNoInteractions(f.source, f.repository);
+        }
+    }
+
+    private static final class SourceChecked extends RuntimeException { }
+    private static List<ProcessReleaseService.ModelResource> sourceBundle(CaseFixture f) throws Exception {
+        return List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "linkedProcess", fixture("formal-case-linked.bpmn20.xml"), Map.of()), f.resource(Map.of()));
+    }
+    private static top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.BindingKey sourceBinding(CaseFixture f, String release) throws Exception {
+        String parentHash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(fixture("formal-case-linked.bpmn20.xml")));
+        return new top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry.BindingKey(20, release, "linkedProcess", parentHash, "caseSource", "governedCase", f.hash);
+    }
+    private static ProcessReleaseService sourcePublisher(CaseFixture f, top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry registry,
+                                                         java.util.function.BooleanSupplier ready, boolean starts) {
+        when(f.process.getHistoryService()).thenReturn(mock(HistoryService.class)); when(f.process.isDbHistoryUsed()).thenReturn(true); when(f.process.getHistoryLevel()).thenReturn(HistoryLevel.AUDIT);
+        return new ProcessReleaseService(f.process, f.cmmn, f.dmn, new ProcessModelValidator(), false, null, false, () -> true, true, true, registry, ready, starts);
+    }
+    private static void configureLinkedProcess(CaseFixture f) {
+        var repository = f.process.getRepositoryService();
+        var builder = mock(org.flowable.engine.repository.DeploymentBuilder.class, RETURNS_SELF); var deployment = mock(org.flowable.engine.repository.Deployment.class);
+        var query = mock(org.flowable.engine.repository.ProcessDefinitionQuery.class, RETURNS_SELF); var definition = mock(org.flowable.engine.repository.ProcessDefinition.class);
+        when(repository.createDeployment()).thenReturn(builder); when(builder.deploy()).thenReturn(deployment); when(deployment.getId()).thenReturn("parent-deployment");
+        when(repository.createProcessDefinitionQuery()).thenReturn(query); when(query.list()).thenReturn(List.of(definition));
+        when(definition.getId()).thenReturn("parent-definition"); when(definition.getKey()).thenReturn("linkedProcess"); when(definition.getVersion()).thenReturn(1);
+    }
+
     private static byte[] fixture(String name) throws Exception {
         try (var input = ProcessReleaseServiceTest.class.getResourceAsStream("/fixtures/" + name)) { assertNotNull(input); return input.readAllBytes(); }
     }

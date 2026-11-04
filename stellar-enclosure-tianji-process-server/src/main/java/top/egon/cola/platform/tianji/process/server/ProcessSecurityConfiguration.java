@@ -44,6 +44,16 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseSourceProperties;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionCorrelationService;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionPoller;
+import top.egon.cola.platform.tianji.process.server.bridge.FlowableCaseWaitInspector;
+import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
+import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
@@ -169,7 +179,9 @@ public class ProcessSecurityConfiguration {
                                                  ProcessModelValidator validator, Environment environment,
                                                  ObjectProvider<WorkerTopicRegistry> registries,
                                                  ObjectProvider<ProcessAgentBridgePoller> bridges,
-                                                 ObjectProvider<CmmnEngine> caseEngines) {
+                                                 ObjectProvider<CmmnEngine> caseEngines,
+                                                 ObjectProvider<CaseSourceRegistry> sources,
+                                                 ObjectProvider<CaseCompletionPoller> completions) {
         boolean decisionTasksEnabled = environment.getProperty("stellar.tianji.process.decision-tasks.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         WorkerTopicRegistry registry = workerEnabled ? registries.getIfAvailable() : null;
@@ -184,7 +196,9 @@ public class ProcessSecurityConfiguration {
             var cmmn = caseEngines.getIfAvailable();
             if (cmmn == null) throw new IllegalStateException("Case publication requires the initialized CMMN engine");
             return new ProcessReleaseService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator,
-                    decisionTasksEnabled, registry, bridgeEnabled, maintenanceReady, humanPublicationEnabled, true);
+                    decisionTasksEnabled, registry, bridgeEnabled, maintenanceReady, humanPublicationEnabled, true, sources.getObject(),
+                    () -> { var poller = completions.getIfAvailable(); return poller != null && poller.isRunning(); },
+                    environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false));
         }
         return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry,
                 bridgeEnabled, maintenanceReady, humanPublicationEnabled);
@@ -277,6 +291,7 @@ public class ProcessSecurityConfiguration {
 
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "cases.enabled"}, havingValue = "true")
+    @EnableConfigurationProperties(CaseSourceProperties.class)
     static class CaseConfiguration {
         @Bean
         @ConditionalOnMissingBean(CaseStartProvenanceStore.class)
@@ -299,9 +314,53 @@ public class ProcessSecurityConfiguration {
         @Bean
         @ConditionalOnMissingBean(FlowableCaseService.class)
         FlowableCaseService flowableCaseService(ProcessEngine process, CmmnEngine cmmn, DmnEngine dmn, ProcessModelValidator validator,
-                CaseStartProvenanceStore provenance, CasePlanItemReceiptStore receipts, Environment environment) {
+                CaseStartProvenanceStore provenance, CasePlanItemReceiptStore receipts, Environment environment,
+                CaseSourceRegistry registry, CaseCompletionInbox inbox, ObjectProvider<CaseCompletionPoller> completions) {
             return new FlowableCaseService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator, provenance, receipts,
-                    environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false));
+                    environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false), registry, inbox,
+                    () -> { var poller = completions.getIfAvailable(); return poller != null && poller.isRunning(); });
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(CaseSourceRegistry.class)
+        CaseSourceRegistry caseSourceRegistry(CaseSourceProperties properties, ObjectProvider<IdpStarterProperties> starter,
+                ObjectProvider<TrustedIssuerRegistry> issuers, ObjectProvider<IdpServiceOAuth2Client> oauth) {
+            if (properties.sources().isEmpty()) return new CaseSourceRegistry(properties, null, null, oauth::getObject);
+            return new CaseSourceRegistry(properties, starter.getObject(), issuers.getObject(), oauth::getObject);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(CaseCompletionInbox.class)
+        CaseCompletionInbox caseCompletionInbox(ProcessEngine process) {
+            var configuration = processConfiguration(process); var source = caseDataSource(configuration);
+            return new CaseCompletionInbox(source, (DataSourceTransactionManager) configuration.getTransactionManager(), configuration.getDatabaseSchema());
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(VerifiedProcessModels.class)
+        VerifiedProcessModels verifiedCaseModels(ProcessEngine process, CmmnEngine cmmn, DmnEngine dmn, ProcessModelValidator validator) {
+            return new VerifiedProcessModels(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(FlowableCaseWaitInspector.class)
+        FlowableCaseWaitInspector flowableCaseWaitInspector(ProcessEngine process, ProcessReleaseService releases, VerifiedProcessModels models, ProcessModelValidator validator) {
+            return new FlowableCaseWaitInspector(processConfiguration(process), releases, models, validator);
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(CaseCompletionCorrelationService.class)
+        CaseCompletionCorrelationService caseCompletionCorrelationService(ProcessEngine process, CmmnEngine cmmn, ProcessReleaseService releases,
+                VerifiedProcessModels models, CaseStartProvenanceStore provenance, CaseCompletionInbox inbox, CaseSourceRegistry registry,
+                FlowableCaseWaitInspector waits, CaseSourceProperties properties) {
+            return new CaseCompletionCorrelationService(processConfiguration(process), caseConfiguration(cmmn), releases, models, provenance, inbox, registry,
+                    waits, properties.retryDelay(), properties.maxFailures());
+        }
+
+        @Bean(destroyMethod = "stop")
+        @ConditionalOnMissingBean(CaseCompletionPoller.class)
+        CaseCompletionPoller caseCompletionPoller(CaseSourceRegistry registry, CaseCompletionCorrelationService completion, CaseSourceProperties properties) {
+            return new CaseCompletionPoller(registry, completion, properties.pollInterval(), properties.batchSize());
         }
     }
 

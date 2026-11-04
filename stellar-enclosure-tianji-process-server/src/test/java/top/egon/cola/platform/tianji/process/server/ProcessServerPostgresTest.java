@@ -158,10 +158,7 @@ class ProcessServerPostgresTest {
 
     @Test
     void engines_persist_and_flowable_and_outbox_commit_or_roll_back_together() throws Exception {
-        String url = System.getProperty("tianji.process.postgres.test.url");
-        if (url == null || !url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) {
-            throw new IllegalArgumentException("integration tests require an explicit loopback tianji_it_ database");
-        }
+        String url = explicitTestUrl();
         DriverManagerDataSource bootstrap = new DriverManagerDataSource(url);
         JdbcTemplate jdbc = new JdbcTemplate(bootstrap);
         if (jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname = ?", Integer.class, SCHEMA) != 0) {
@@ -257,6 +254,11 @@ class ProcessServerPostgresTest {
                 + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
         assertEquals("LEGACY", jdbc.queryForObject("SELECT subject_issuer FROM tianji_process.tianji_process_command_receipt "
                 + "WHERE tenant_id=991 AND command_id='legacy-command'", String.class));
+        var beforeCase = jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history ORDER BY installed_rank", (rs, row) -> rs.getInt(1));
+        var caseSchema = Flyway.configure().dataSource(bootstrap).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .table("tianji_process_schema_history").baselineVersion("0").locations("classpath:db/tianji-process").target("8").cleanDisabled(true).load();
+        assertEquals(1, caseSchema.migrate().migrationsExecuted); caseSchema.validate();
+        assertEquals(beforeCase, jdbc.query("SELECT checksum FROM tianji_process.tianji_process_schema_history WHERE version<>'8' ORDER BY installed_rank", (rs, row) -> rs.getInt(1)));
         jdbc.execute("""
                 CREATE FUNCTION tianji_process.test_release_failure() RETURNS trigger LANGUAGE plpgsql AS $$
                 BEGIN
@@ -276,24 +278,13 @@ class ProcessServerPostgresTest {
                 """);
         jdbc.execute("CREATE TRIGGER test_receipt_failure BEFORE UPDATE ON tianji_process.tianji_process_command_receipt "
                 + "FOR EACH ROW EXECUTE FUNCTION tianji_process.test_receipt_failure()");
-        String runtimeUser = System.getProperty("tianji.process.postgres.test.runtime-user", "");
-        if (!runtimeUser.matches("tianji_it_runtime_[0-9a-f]{12}")) {
-            throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
-        }
-        Boolean limitedRole = jdbc.queryForObject("SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole "
-                + "FROM pg_roles WHERE rolname = ?", Boolean.class, runtimeUser);
-        assertEquals(Boolean.TRUE, limitedRole);
-        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_auth_members WHERE member = "
-                + "(SELECT oid FROM pg_roles WHERE rolname = ?)", Integer.class, runtimeUser));
-        assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_database_privilege(?, current_database(), 'CREATE')",
-                Boolean.class, runtimeUser));
-        assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_schema_privilege(?, ?, 'CREATE')",
-                Boolean.class, runtimeUser, SCHEMA));
+        String runtimeUser = explicitRuntimeRole(jdbc);
         jdbc.execute("GRANT USAGE ON SCHEMA tianji_process TO \"" + runtimeUser + "\"");
         jdbc.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA tianji_process TO \"" + runtimeUser + "\"");
         jdbc.execute("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA tianji_process TO \"" + runtimeUser + "\"");
         jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.flyway_schema_history FROM \"" + runtimeUser + "\"");
         jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.tianji_process_schema_history FROM \"" + runtimeUser + "\"");
+        restrictCaseRuntimePrivileges(jdbc, runtimeUser);
         assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_schema_privilege(?, ?, 'CREATE')",
                 Boolean.class, runtimeUser, SCHEMA));
 
@@ -2053,11 +2044,66 @@ class ProcessServerPostgresTest {
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(), URI.create(issuer)));
     }
 
-    private static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {
+    static String explicitTestUrl() {
+        String url = System.getProperty("tianji.process.postgres.test.url");
+        if (url == null || !url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) {
+            throw new IllegalArgumentException("integration tests require an explicit loopback tianji_it_ database");
+        }
+        return url;
+    }
+
+    static String explicitRuntimeRole(JdbcTemplate jdbc) {
+        String runtimeUser = System.getProperty("tianji.process.postgres.test.runtime-user", "");
+        if (!runtimeUser.matches("tianji_it_runtime_[0-9a-f]{12}")) {
+            throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
+        }
+        Boolean limitedRole = jdbc.queryForObject("SELECT rolcanlogin AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole "
+                + "FROM pg_roles WHERE rolname = ?", Boolean.class, runtimeUser);
+        assertEquals(Boolean.TRUE, limitedRole);
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_auth_members WHERE member = "
+                + "(SELECT oid FROM pg_roles WHERE rolname = ?)", Integer.class, runtimeUser));
+        assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_database_privilege(?, current_database(), 'CREATE')",
+                Boolean.class, runtimeUser));
+        assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_schema_privilege(?, ?, 'CREATE')",
+                Boolean.class, runtimeUser, SCHEMA));
+        return runtimeUser;
+    }
+
+    /** Only the separately enabled fresh-DB test calls this provisioner; normal selectors never execute it. */
+    static CaseDatabase formalCaseDatabase() {
+        String url = explicitTestUrl(); var source = new DriverManagerDataSource(url); var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
+        if (jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname=?", Integer.class, SCHEMA) != 0) throw new IllegalStateException("integration tests require a fresh database without the process schema");
+        var outbox = Flyway.configure().dataSource(source).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .locations("classpath:db/transactional-outbox/postgresql").cleanDisabled(true).load(); outbox.migrate(); outbox.validate();
+        String scoped = url + "?currentSchema=" + SCHEMA;
+        try (var nativeSchema = context(Provisioner.class, scoped, System.getProperty("user.name"), "--flowable.database-schema-update=true", "--egon.cola.component.transactional-outbox.enabled=false")) {
+            assertNotNull(nativeSchema.getBean(RepositoryService.class)); assertNotNull(nativeSchema.getBean(CmmnRepositoryService.class)); assertNotNull(nativeSchema.getBean(DmnRepositoryService.class));
+        }
+        var platform = Flyway.configure().dataSource(source).schemas(SCHEMA).defaultSchema(SCHEMA).table("tianji_process_schema_history")
+                .baselineVersion("0").locations("classpath:db/tianji-process").target("8").cleanDisabled(true).load();
+        platform.baseline(); assertEquals(8, platform.migrate().migrationsExecuted); platform.validate();
+        String runtime = explicitRuntimeRole(jdbc);
+        jdbc.execute("GRANT USAGE ON SCHEMA tianji_process TO \"" + runtime + "\"");
+        jdbc.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA tianji_process TO \"" + runtime + "\"");
+        jdbc.execute("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA tianji_process TO \"" + runtime + "\"");
+        jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.flyway_schema_history FROM \"" + runtime + "\"");
+        jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON tianji_process.tianji_process_schema_history FROM \"" + runtime + "\"");
+        restrictCaseRuntimePrivileges(jdbc, runtime);
+        return new CaseDatabase(scoped, runtime, jdbc);
+    }
+
+    private static void restrictCaseRuntimePrivileges(JdbcTemplate jdbc, String runtime) {
+        if (!runtime.matches("tianji_it_runtime_[0-9a-f]{12}")) throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
+        jdbc.execute("REVOKE UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES ON tianji_process.tianji_case_start_provenance, tianji_process.tianji_case_plan_item_receipt FROM \"" + runtime + "\"");
+        jdbc.execute("REVOKE DELETE, TRUNCATE, TRIGGER, REFERENCES ON tianji_process.tianji_case_completion_inbox FROM \"" + runtime + "\"");
+    }
+    record CaseDatabase(String scopedUrl, String runtimeUser, JdbcTemplate bootstrap) { }
+
+    static ConfigurableApplicationContext context(Class<?> source, String url, String user, String... extra) {
         return context(new Class<?>[] {source, TestDelivery.class}, url, user, extra);
     }
 
-    private static ConfigurableApplicationContext context(Class<?>[] sources, String url, String user, String... extra) {
+    static ConfigurableApplicationContext context(Class<?>[] sources, String url, String user, String... extra) {
         String[] args = new String[extra.length + 5];
         args[0] = "--spring.datasource.url=" + url;
         args[1] = "--spring.datasource.username=" + user;

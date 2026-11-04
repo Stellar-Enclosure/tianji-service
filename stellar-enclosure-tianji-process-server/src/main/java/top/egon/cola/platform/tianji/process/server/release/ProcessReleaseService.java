@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
+import top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskTimerAvailability;
@@ -57,6 +58,9 @@ public final class ProcessReleaseService {
     private final SpringDmnEngineConfiguration dmn;
     private final SpringCmmnEngineConfiguration cmmn;
     private final boolean casesEnabled;
+    private final CaseSourceRegistry caseSources;
+    private final BooleanSupplier caseCompletionReady;
+    private final boolean newCaseStartsEnabled;
     private final ProcessModelValidator validator;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate write;
@@ -110,6 +114,16 @@ public final class ProcessReleaseService {
                                  SpringDmnEngineConfiguration dmn, ProcessModelValidator validator, boolean decisionTasksEnabled,
                                  WorkerTopicRegistry workerTopics, boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady,
                                  boolean humanTasksEnabled, boolean casesEnabled) {
+        this(process, cmmn, dmn, validator, decisionTasksEnabled, workerTopics, agentMessageWaitsEnabled, agentMaintenanceReady,
+                humanTasksEnabled, casesEnabled, null, () -> false, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn,
+                                 SpringDmnEngineConfiguration dmn, ProcessModelValidator validator, boolean decisionTasksEnabled,
+                                 WorkerTopicRegistry workerTopics, boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady,
+                                 boolean humanTasksEnabled, boolean casesEnabled, CaseSourceRegistry caseSources,
+                                 BooleanSupplier caseCompletionReady, boolean newCaseStartsEnabled) {
+        this.caseSources = caseSources; this.caseCompletionReady = Objects.requireNonNull(caseCompletionReady, "caseCompletionReady"); this.newCaseStartsEnabled = newCaseStartsEnabled;
         this.cmmn = cmmn; this.casesEnabled = casesEnabled;
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
@@ -151,6 +165,7 @@ public final class ProcessReleaseService {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
         List<PreparedModel> models = prepare(resources, actor.tenantId());
+        validateCaseSources(actor.tenantId(), releaseKey, models);
         String manifestHash = manifestHash(models);
         return Objects.requireNonNull(write.execute(status -> publishInTransaction(actor, releaseKey, manifestHash, models)));
     }
@@ -325,6 +340,23 @@ public final class ProcessReleaseService {
         prepared.sort(Comparator.comparing((PreparedModel item) -> item.type().name())
                 .thenComparing(item -> item.definitionKey()));
         return List.copyOf(prepared);
+    }
+
+    private void validateCaseSources(long tenantId, String releaseKey, List<PreparedModel> models) {
+        if (models.stream().noneMatch(value -> value.type() == Type.BPMN && !value.model().caseSources().isEmpty())) return;
+        if (!casesEnabled || !newCaseStartsEnabled || caseSources == null || !caseCompletionReady.getAsBoolean()) throw invalid();
+        PinnedDecisionActivityBehaviorFactory.requireCaseSourcesConfigured(process);
+        FlowableAgentWaitInspector.requireHistory(process);
+        for (var parent : models) {
+            if (parent.type() != Type.BPMN) continue;
+            for (var source : parent.model().caseSources().entrySet()) {
+                var child = models.stream().filter(value -> value.type() == Type.CMMN && value.definitionKey().equals(source.getValue().caseDefinitionKey()))
+                        .findFirst().orElseThrow(ProcessReleaseService::invalid);
+                var binding = new CaseSourceRegistry.BindingKey(tenantId, releaseKey, parent.definitionKey(), parent.modelHash(), source.getKey(), child.definitionKey(), child.modelHash());
+                var registration = caseSources.require(binding);
+                if (registration == null || !caseSources.current(registration)) throw invalid();
+            }
+        }
     }
 
     private void requireCasePublication() {

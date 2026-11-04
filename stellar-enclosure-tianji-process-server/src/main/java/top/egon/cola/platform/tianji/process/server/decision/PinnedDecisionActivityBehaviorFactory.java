@@ -25,6 +25,25 @@ import java.util.Map;
 
 /** Binds native decision execution and governed user-task assignment to the immutable process release. */
 public final class PinnedDecisionActivityBehaviorFactory extends DefaultActivityBehaviorFactory {
+    private final java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService> sourceServices;
+    private final java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> sourceRegistries;
+
+    public PinnedDecisionActivityBehaviorFactory() { sourceServices = null; sourceRegistries = null; }
+    public PinnedDecisionActivityBehaviorFactory(java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService> services,
+            java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> registries) {
+        sourceServices = java.util.Objects.requireNonNull(services, "services"); sourceRegistries = java.util.Objects.requireNonNull(registries, "registries");
+    }
+    /** Source admission requires the installed parser factory and actual lazy collaborators, not merely this class name. */
+    public static void requireCaseSourcesConfigured(SpringProcessEngineConfiguration process) {
+        if (process == null || !(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory factory)
+                || factory.sourceServices == null || factory.sourceRegistries == null || process.getBpmnParser() == null
+                || process.getBpmnParser().getActivityBehaviorFactory() != factory) throw new IllegalStateException("Linked Case sources are not configured");
+    }
+    @Override public org.flowable.engine.impl.bpmn.behavior.CaseTaskActivityBehavior createCaseTaskBehavior(org.flowable.bpmn.model.CaseServiceTask task) {
+        return new top.egon.cola.platform.tianji.process.server.bridge.PinnedCaseSourceActivityBehavior(task,
+                sourceServices == null ? () -> null : sourceServices, sourceRegistries == null ? () -> null : sourceRegistries);
+    }
+
     @Override
     public UserTaskActivityBehavior createUserTaskActivityBehavior(UserTask task) {
         return task.getAttributeValue("urn:stellar-enclosure:tianji:task:1", "kind") == null

@@ -21,6 +21,68 @@ class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
 
     @Test
+    void literal_case_source_after_a_committed_native_wait_is_a_supported_closed_bpmn_profile() throws Exception {
+        byte[] xml = fixture("formal-case-linked.bpmn20.xml");
+        assertDoesNotThrow(() -> SafeModelXml.parse(xml, true));
+        assertDoesNotThrow(() -> validator.validateBpmn(xml, "linkedProcess"));
+    }
+
+    @Test
+    void case_source_wait_metadata_is_graph_derived_immutable_and_separate_from_agent_waits() throws Exception {
+        var model = assertDoesNotThrow(() -> validator.validateBpmn(fixture("formal-case-linked.bpmn20.xml"), "linkedProcess"));
+        assertEquals(Map.of("caseSource", new ValidatedProcessModel.CaseSource("governedCase", "waitCaseResult", "TianjiCaseCompletedV1", "waitCaseTimeout", Duration.ofMinutes(5))), model.caseSources());
+        assertTrue(model.messageWaits().isEmpty());
+        assertThrows(UnsupportedOperationException.class, () -> model.caseSources().clear());
+        byte[] copied = model.xml(); copied[0] = 0; assertNotEquals(0, model.xml()[0]);
+        assertTrue(validator.validateBpmn(fixture("agent-dispatch-wait.bpmn20.xml"), "agentDispatch").caseSources().isEmpty());
+    }
+
+    @Test
+    void case_sources_accept_a_timer_barrier_and_the_actual_agent_failure_route_without_an_immediate_human_task() throws Exception {
+        String linked = new String(fixture("formal-case-linked.bpmn20.xml"), StandardCharsets.UTF_8);
+        String human = linked.substring(linked.indexOf("        <userTask id=\"beforeCase\""), linked.indexOf("        <sequenceFlow id=\"toCaseSource\""));
+        String timer = linked.replace(human, "        <intermediateCatchEvent id=\"beforeCase\"><timerEventDefinition><timeDuration>PT1S</timeDuration></timerEventDefinition></intermediateCatchEvent>\n");
+        assertDoesNotThrow(() -> validator.validateBpmn(bytes(timer), "linkedProcess"));
+        String agent = new String(fixture("agent-dispatch-wait.bpmn20.xml"), StandardCharsets.UTF_8);
+        String caseBody = linked.substring(linked.indexOf("        <serviceTask id=\"caseSource\""), linked.indexOf("    </process>"));
+        agent = agent.replace("    <message id=\"agentFinished\"", "    <message id=\"caseFinished\" name=\"TianjiCaseCompletedV1\"/>\n    <message id=\"agentFinished\"")
+                .replace("targetRef=\"failureReview\"", "targetRef=\"caseSource\"")
+                .replace("        <userTask id=\"failureReview\"/>\n", "")
+                .replace("        <sequenceFlow id=\"toFailureEnd\" sourceRef=\"failureReview\" targetRef=\"failureEnd\"/>\n", "")
+                .replace("        <endEvent id=\"failureEnd\"/>\n", "")
+                .replace("    </process>", caseBody + "    </process>");
+        String failureRoute = agent;
+        var parsed = assertDoesNotThrow(() -> validator.validateBpmn(bytes(failureRoute), "agentDispatch"));
+        assertEquals("governedCase", parsed.caseSources().get("caseSource").caseDefinitionKey());
+        assertEquals("worker", parsed.messageWaits().get("waitResult").workerElementId());
+        assertFalse(parsed.humanTasks().containsKey("failureReview"));
+        validator.validateWorkerBindings(parsed, Map.of("amount", INTEGER), null);
+    }
+
+    @Test
+    void case_source_grammar_rejects_inline_start_bypass_callbacks_versions_and_ambiguous_waits() throws Exception {
+        String xml = new String(fixture("formal-case-linked.bpmn20.xml"), StandardCharsets.UTF_8);
+        String barrier = xml.substring(xml.indexOf("        <sequenceFlow id=\"toBeforeCase\""), xml.indexOf("        <serviceTask id=\"caseSource\""));
+        String inline = xml.replace(barrier, "        <sequenceFlow id=\"inline\" sourceRef=\"start\" targetRef=\"caseSource\"/>\n");
+        String bypass = xml.replace("<sequenceFlow id=\"toBeforeCase\" sourceRef=\"start\" targetRef=\"beforeCase\"/>",
+                "<sequenceFlow id=\"toBeforeCase\" sourceRef=\"start\" targetRef=\"barrierFork\"/><parallelGateway id=\"barrierFork\"/><sequenceFlow id=\"waitBranch\" sourceRef=\"barrierFork\" targetRef=\"beforeCase\"/><sequenceFlow id=\"bypass\" sourceRef=\"barrierFork\" targetRef=\"barrierMerge\"/>")
+                .replace("<sequenceFlow id=\"toCaseSource\" sourceRef=\"beforeCase\" targetRef=\"caseSource\"/>",
+                        "<sequenceFlow id=\"toCaseSource\" sourceRef=\"beforeCase\" targetRef=\"barrierMerge\"/><parallelGateway id=\"barrierMerge\"/><sequenceFlow id=\"afterMerge\" sourceRef=\"barrierMerge\" targetRef=\"caseSource\"/>");
+        for (String invalid : java.util.List.of(inline, bypass,
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", "flowable:caseDefinitionKey=\"${caseKey}\""),
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", ""),
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", "flowable:caseDefinitionKey=\"governedCase\" flowable:caseDefinitionVersion=\"1\""),
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", "flowable:caseDefinitionKey=\"governedCase\" flowable:callbackType=\"process\""),
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", "flowable:caseDefinitionKey=\"governedCase\" flowable:inheritVariables=\"true\""),
+                xml.replace("flowable:caseDefinitionKey=\"governedCase\"", "flowable:caseDefinitionKey=\"governedCase\" flowable:async=\"true\""),
+                xml.replace("<intermediateCatchEvent id=\"waitCaseResult\">", "<intermediateCatchEvent id=\"waitCaseResult\" xmlns:tianji=\"urn:stellar-enclosure:tianji:worker:1\" tianji:workerRef=\"caseSource\">"),
+                xml.replace("<messageEventDefinition messageRef=\"caseFinished\"/>", "<timerEventDefinition><timeDuration>PT1S</timeDuration></timerEventDefinition>"),
+                xml.replace("targetRef=\"caseSource\"", "targetRef=\"caseResultGateway\""))) {
+            assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(invalid), "linkedProcess"));
+        }
+    }
+
+    @Test
     void public_cmmn_validation_returns_the_existing_closed_immutable_metadata() throws Exception {
         var model = validator.validateCmmn(fixture("governed-case.cmmn"), "governedCase");
         assertNotNull(model);

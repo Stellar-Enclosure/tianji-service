@@ -10,6 +10,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerTask;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.MessageWait;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.CaseSource;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTask;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskField;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskKind;
@@ -97,6 +98,7 @@ public final class ProcessModelValidator {
         Map<String, String> decisions = new LinkedHashMap<>();
         Map<String, WorkerTask> workers = new LinkedHashMap<>();
         Map<String, HumanTask> humans = new LinkedHashMap<>();
+        Map<String, String> caseKeys = new LinkedHashMap<>();
         Map<String, String> messages = new LinkedHashMap<>();
         Set<String> messageNames = new HashSet<>();
         for (Element message : children(root, "message")) {
@@ -121,27 +123,36 @@ public final class ProcessModelValidator {
                         || element.hasAttributeNS(TIANJI_TASK, "laneVariable") || element.hasAttributeNS(TIANJI_TASK, "approvalVariable") || !children(element).isEmpty())) humans.put(id, humanTask(element));
                 if ("serviceTask".equals(kind)) {
                     String taskType = element.getAttributeNS(FLOWABLE, "type");
-                    Element extension = only(element, "extensionElements");
-                    if ("dmn".equals(taskType)) {
-                        if (element.hasAttributeNS(FLOWABLE, "topic") || element.hasAttributeNS(FLOWABLE, "doNotIncludeVariables")
-                                || element.hasAttributeNS(TIANJI_WORKER, "schemaVersion") || element.hasAttributeNS(TIANJI_WORKER, "topic")
-                                || element.hasAttributeNS(TIANJI_WORKER, "effectSafety")
-                                || children(extension).size() != 1) throw invalid();
-                        Element field = only(extension, "field");
-                        if (!"decisionTableReferenceKey".equals(required(field, "name"))) throw invalid();
-                        String decisionKey = only(field, "string").getTextContent();
-                        if (!IDENTIFIER.matcher(decisionKey).matches()) throw invalid();
-                        decisions.put(id, decisionKey);
-                    } else if ("external-worker".equals(taskType)) {
-                        workers.put(id, workerTask(element, extension));
-                    } else throw invalid();
+                    if ("case".equals(taskType)) {
+                        String caseKey = element.getAttributeNS(FLOWABLE, "caseDefinitionKey");
+                        if (!IDENTIFIER.matcher(caseKey).matches() || !children(element).isEmpty()
+                                || element.hasAttributeNS(FLOWABLE, "topic") || element.hasAttributeNS(FLOWABLE, "doNotIncludeVariables")
+                                || element.hasAttributeNS(TIANJI_WORKER, "topic") || element.hasAttributeNS(TIANJI_WORKER, "schemaVersion") || element.hasAttributeNS(TIANJI_WORKER, "effectSafety")) throw invalid();
+                        caseKeys.put(id, caseKey);
+                    } else {
+                        Element extension = only(element, "extensionElements");
+                        if ("dmn".equals(taskType)) {
+                            if (element.hasAttributeNS(FLOWABLE, "topic") || element.hasAttributeNS(FLOWABLE, "doNotIncludeVariables")
+                                    || element.hasAttributeNS(TIANJI_WORKER, "schemaVersion") || element.hasAttributeNS(TIANJI_WORKER, "topic")
+                                    || element.hasAttributeNS(TIANJI_WORKER, "effectSafety")
+                                    || children(extension).size() != 1) throw invalid();
+                            Element field = only(extension, "field");
+                            if (!"decisionTableReferenceKey".equals(required(field, "name"))) throw invalid();
+                            String decisionKey = only(field, "string").getTextContent();
+                            if (!IDENTIFIER.matcher(decisionKey).matches()) throw invalid();
+                            decisions.put(id, decisionKey);
+                        } else if ("external-worker".equals(taskType)) {
+                            workers.put(id, workerTask(element, extension));
+                        } else throw invalid();
+                    }
                 }
                 if ("intermediateCatchEvent".equals(kind)) {
                     if (children(element).size() != 1) throw invalid();
                     if (!children(element, "messageEventDefinition").isEmpty()) {
                         String ref = required(only(element, "messageEventDefinition"), "messageRef");
                         if (!IDENTIFIER.matcher(ref).matches() || !messages.containsKey(ref) || messageRefs.containsValue(ref)
-                                || !IDENTIFIER.matcher(element.getAttributeNS(TIANJI_WORKER, "workerRef")).matches()) throw invalid();
+                                || element.hasAttributeNS(TIANJI_WORKER, "workerRef") && !IDENTIFIER.matcher(element.getAttributeNS(TIANJI_WORKER, "workerRef")).matches()
+                                || !element.hasAttributeNS(TIANJI_WORKER, "workerRef") && element.hasAttributeNS(TIANJI_WORKER, "statusVariable")) throw invalid();
                         messageRefs.put(id, ref);
                         if (element.hasAttributeNS(TIANJI_WORKER, "statusVariable")) {
                             String variable = element.getAttributeNS(TIANJI_WORKER, "statusVariable");
@@ -172,7 +183,7 @@ public final class ProcessModelValidator {
             to.previous.add(from);
             to.incoming++;
         }
-        if (decisions.size() > 1 || workers.size() > 16 || humans.size() > 16 || humans.values().stream().anyMatch(task -> task.laneVariable() != null) && decisions.size() != 1
+        if (decisions.size() > 1 || workers.size() > 16 || caseKeys.size() > 16 || humans.size() > 16 || humans.values().stream().anyMatch(task -> task.laneVariable() != null) && decisions.size() != 1
                 || (!decisions.isEmpty() || !workers.isEmpty()) && nodes.values().stream().anyMatch(n -> "parallelGateway".equals(n.kind))
                 || decisions.isEmpty() && messageRefs.isEmpty() && humans.isEmpty() && nodes.values().stream().anyMatch(n -> "exclusiveGateway".equals(n.kind))) throw invalid();
         FlowNode start = null;
@@ -190,7 +201,7 @@ public final class ProcessModelValidator {
                 case "boundaryEvent" -> { if (node.incoming != 0 || outgoing != 1) throw invalid(); }
                 case "parallelGateway" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing < 1 || outgoing > 4) throw invalid(); }
                 case "eventBasedGateway" -> {
-                    if (node.incoming != 1 || outgoing != 2 || !workers.containsKey(node.previous.getFirst().element.getAttribute("id"))
+                    if (node.incoming != 1 || outgoing != 2 || !workers.containsKey(node.previous.getFirst().element.getAttribute("id")) && !caseKeys.containsKey(node.previous.getFirst().element.getAttribute("id"))
                             || node.next.stream().anyMatch(next -> !"intermediateCatchEvent".equals(next.kind))
                             || node.next.stream().filter(next -> messageRefs.containsKey(next.element.getAttribute("id"))).count() != 1
                             || node.next.stream().filter(next -> timers.containsKey(next.element.getAttribute("id"))).count() != 1) throw invalid();
@@ -219,16 +230,24 @@ public final class ProcessModelValidator {
         if (messages.size() != messageRefs.size()) throw invalid();
         Map<String, MessageWait> waits = new LinkedHashMap<>();
         Set<String> waitingWorkers = new HashSet<>();
+        Map<String, CaseSource> cases = new LinkedHashMap<>();
         for (var entry : messageRefs.entrySet()) {
             FlowNode message = nodes.get(entry.getKey());
             FlowNode gateway = message.previous.getFirst();
-            String worker = message.element.getAttributeNS(TIANJI_WORKER, "workerRef");
-            if (!"eventBasedGateway".equals(gateway.kind) || !worker.equals(gateway.previous.getFirst().element.getAttribute("id"))
-                    || !waitingWorkers.add(worker)) throw invalid();
+            if (!"eventBasedGateway".equals(gateway.kind)) throw invalid();
+            String sourceId = gateway.previous.getFirst().element.getAttribute("id");
             String timer = gateway.next.stream().map(next -> next.element.getAttribute("id")).filter(timers::containsKey)
                     .findFirst().orElseThrow(ProcessModelValidator::invalid);
-            waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer), messageStatusVariables.get(entry.getKey())));
+            if (caseKeys.containsKey(sourceId)) {
+                if (message.element.hasAttributeNS(TIANJI_WORKER, "workerRef") || message.element.hasAttributeNS(TIANJI_WORKER, "statusVariable")
+                        || cases.put(sourceId, new CaseSource(caseKeys.get(sourceId), entry.getKey(), messages.get(entry.getValue()), timer, timers.get(timer))) != null) throw invalid();
+            } else {
+                String worker = message.element.getAttributeNS(TIANJI_WORKER, "workerRef");
+                if (!workers.containsKey(worker) || !worker.equals(sourceId) || !waitingWorkers.add(worker)) throw invalid();
+                waits.put(entry.getKey(), new MessageWait(messages.get(entry.getValue()), worker, timer, timers.get(timer), messageStatusVariables.get(entry.getKey())));
+            }
         }
+        if (!cases.keySet().equals(caseKeys.keySet())) throw invalid();
         var timedTasks = new HashSet<String>();
         for (var entry : humanTimers.entrySet()) {
             String attached = entry.getValue().taskElementId(); if (!humans.containsKey(attached) || !timedTasks.add(attached)) throw invalid();
@@ -245,6 +264,9 @@ public final class ProcessModelValidator {
             FlowNode node = ready.remove();
             if (node.paths == 0) throw invalid();
             node.decisionBefore = decisions.containsKey(node.element.getAttribute("id")) || !node.previous.isEmpty() && node.previous.stream().allMatch(previous -> previous.decisionBefore);
+            node.waitBefore = !node.previous.isEmpty() && node.previous.stream().allMatch(previous -> previous.waitBefore
+                    || "userTask".equals(previous.kind) || "intermediateCatchEvent".equals(previous.kind) || workers.containsKey(previous.element.getAttribute("id")));
+            if (caseKeys.containsKey(node.element.getAttribute("id")) && !node.waitBefore) throw invalid();
             var human = humans.get(node.element.getAttribute("id"));
             if (human != null && human.laneVariable() != null && !node.decisionBefore) throw invalid();
             visited++;
@@ -257,7 +279,7 @@ public final class ProcessModelValidator {
             }
         }
         if (visited != nodes.size()) throw invalid();
-        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits, humans, humanTimers);
+        return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes, workers, waits, humans, humanTimers, cases);
     }
 
     private static Duration timerDuration(Element duration) {
@@ -535,6 +557,8 @@ public final class ProcessModelValidator {
             if (XMLConstants.XMLNS_ATTRIBUTE_NS_URI.equals(attribute.getNamespaceURI())) continue;
             boolean flowableType = BPMN.equals(namespace) && "serviceTask".equals(kind)
                     && FLOWABLE.equals(attribute.getNamespaceURI()) && "type".equals(attribute.getLocalName());
+            boolean caseKey = BPMN.equals(namespace) && "serviceTask".equals(kind) && "case".equals(element.getAttributeNS(FLOWABLE, "type"))
+                    && FLOWABLE.equals(attribute.getNamespaceURI()) && "caseDefinitionKey".equals(attribute.getLocalName());
             boolean flowableWorkerAttribute = BPMN.equals(namespace) && "serviceTask".equals(kind)
                     && FLOWABLE.equals(attribute.getNamespaceURI()) && Set.of("topic", "doNotIncludeVariables").contains(attribute.getLocalName());
             boolean workerVersion = BPMN.equals(namespace) && "serviceTask".equals(kind)
@@ -548,7 +572,7 @@ public final class ProcessModelValidator {
                     && "type".equals(attribute.getLocalName()) && "tFormalExpression".equals(attribute.getNodeValue());
             boolean humanTask = BPMN.equals(namespace) && "userTask".equals(kind) && TIANJI_TASK.equals(attribute.getNamespaceURI())
                     && Set.of("kind", "initialLane", "laneVariable", "approvalVariable").contains(attribute.getLocalName());
-            if (!flowableType && !flowableWorkerAttribute && !workerVersion && !workerType && !workerWait && !expressionType && !humanTask
+            if (!flowableType && !caseKey && !flowableWorkerAttribute && !workerVersion && !workerType && !workerWait && !expressionType && !humanTask
                     && (attribute.getNamespaceURI() != null || !attributes.get(kind).contains(attribute.getNodeName()))) throw invalid();
             String value = attribute.getNodeValue();
             if (value.length() > 512 || value.contains("${") || value.contains("#{")) throw invalid();
@@ -602,6 +626,7 @@ public final class ProcessModelValidator {
         private int visitedInputs;
         private int paths;
         private boolean decisionBefore;
+        private boolean waitBefore;
 
         private FlowNode(String kind, Element element) { this.kind = kind; this.element = element; }
     }

@@ -98,8 +98,6 @@ public class ProcessStorageConfiguration {
         return new ObjectMapper().findAndRegisterModules();
     }
 
-    @Bean
-    @Order(Ordered.LOWEST_PRECEDENCE)
     EngineConfigurationConfigurer<SpringProcessEngineConfiguration> processStorageGuard(
             OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
         return config -> {
@@ -108,6 +106,22 @@ public class ProcessStorageConfiguration {
                 throw new IllegalStateException("Process Server requires its pinned decision task behavior");
             }
             config.setActivityBehaviorFactory(new PinnedDecisionActivityBehaviorFactory());
+        };
+    }
+
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE)
+    EngineConfigurationConfigurer<SpringProcessEngineConfiguration> processStorageGuard(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
+            Environment environment, ObjectProvider<FlowableCaseService> services,
+            ObjectProvider<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> registries) {
+        return config -> {
+            verify(config, config, outbox, properties);
+            if (config.getActivityBehaviorFactory() != null) {
+                throw new IllegalStateException("Process Server requires its pinned decision task behavior");
+            }
+            config.setActivityBehaviorFactory(environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)
+                    ? new PinnedDecisionActivityBehaviorFactory(services::getObject, registries::getObject)
+                    : new PinnedDecisionActivityBehaviorFactory());
         };
     }
 

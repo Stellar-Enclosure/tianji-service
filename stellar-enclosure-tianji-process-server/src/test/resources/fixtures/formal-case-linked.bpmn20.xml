@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn" xmlns:task="urn:stellar-enclosure:tianji:task:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <message id="caseFinished" name="TianjiCaseCompletedV1"/>
+    <process id="linkedProcess" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toBeforeCase" sourceRef="start" targetRef="beforeCase"/>
+        <userTask id="beforeCase" name="Review before Case" task:kind="ACTION" task:initialLane="operator">
+            <extensionElements><task:taskLane key="operator" roleIds="7,8"/></extensionElements>
+        </userTask>
+        <sequenceFlow id="toCaseSource" sourceRef="beforeCase" targetRef="caseSource"/>
+        <serviceTask id="caseSource" flowable:type="case" flowable:caseDefinitionKey="governedCase"/>
+        <sequenceFlow id="toCaseGateway" sourceRef="caseSource" targetRef="caseResultGateway"/>
+        <eventBasedGateway id="caseResultGateway"/>
+        <sequenceFlow id="toCaseResult" sourceRef="caseResultGateway" targetRef="waitCaseResult"/>
+        <sequenceFlow id="toCaseTimeout" sourceRef="caseResultGateway" targetRef="waitCaseTimeout"/>
+        <intermediateCatchEvent id="waitCaseResult">
+            <messageEventDefinition messageRef="caseFinished"/>
+        </intermediateCatchEvent>
+        <intermediateCatchEvent id="waitCaseTimeout">
+            <timerEventDefinition><timeDuration>PT5M</timeDuration></timerEventDefinition>
+        </intermediateCatchEvent>
+        <sequenceFlow id="toCaseCompleted" sourceRef="waitCaseResult" targetRef="caseCompleted"/>
+        <endEvent id="caseCompleted"/>
+        <sequenceFlow id="toCaseTimedOut" sourceRef="waitCaseTimeout" targetRef="caseTimeout"/>
+        <endEvent id="caseTimeout"/>
+    </process>
+</definitions>
