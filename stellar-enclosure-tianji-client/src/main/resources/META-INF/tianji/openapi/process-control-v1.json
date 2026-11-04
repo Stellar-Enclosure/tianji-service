@@ -1,0 +1,1057 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Process Control Consumer Contract",
+    "version": "1.0.0",
+    "description": "Contract-first consumer authority. Provider is not implemented by this artifact and remains pending Step 4; stellar.tianji.process.cancellation.enabled=false by default. Runtime PostgreSQL/Flowable/IAM acceptance is unverified. Existing caller supplies bearer credentials; illustrative identity.example OAuth URLs are documentation only. Token retrieval precedes the configured HTTP timeout. SDK follows existing Process HTTP/HTTPS and Redirect.NEVER constructor policy, sends each mutation once, requires exact200 JSON/+json and caps response bytes at2MiB. No registration, activation or role grant occurs."
+  },
+  "tags": [
+    {
+      "name": "Process control",
+      "description": "Exact-owner bounded BPMN control and cancellation; no admin, Case cancellation, compensation or arbitrary node movement."
+    }
+  ],
+  "paths": {
+    "/api/tianji/v1/process-instances/{instanceId}/control": {
+      "get": {
+        "operationId": "getProcessControl",
+        "tags": [
+          "Process control"
+        ],
+        "summary": "Review current owned process control facts",
+        "description": "Current verified USER or SERVICE must be the exact APPLIED START owner and hold both READ and CANCEL. Tenant/issuer/subject come only from trusted identity. SDK sends once; caller retains the exact command after an unknown outcome. Native Case-containing models are blocked. Remote linked-Agent close runs later outside the local transaction.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:read",
+              "tianji:process:cancel"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_PROCESS_READ",
+          "TIANJI_PROCESS_CANCEL"
+        ],
+        "x-resource-key": "tianji.api.process.instance.control",
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+              "x-java-utf16-max-length": 255,
+              "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+              "not": {
+                "enum": [
+                  ".",
+                  ".."
+                ]
+              }
+            }
+          },
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion equal to verified tenant, never tenant selection.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current owner control snapshot.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessControlSnapshotDTO"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INTERNAL_ERROR"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tianji/v1/process-instances/{instanceId}/cancellations": {
+      "post": {
+        "operationId": "cancelProcessInstance",
+        "tags": [
+          "Process control"
+        ],
+        "summary": "Cancel one eligible owned BPMN process",
+        "description": "Current verified USER or SERVICE must be the exact APPLIED START owner and hold both READ and CANCEL. Tenant/issuer/subject come only from trusted identity. SDK sends once; caller retains the exact command after an unknown outcome. Native Case-containing models are blocked. Remote linked-Agent close runs later outside the local transaction.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:read",
+              "tianji:process:cancel"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_PROCESS_READ",
+          "TIANJI_PROCESS_CANCEL"
+        ],
+        "x-resource-key": "tianji.api.process.instance.cancel",
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+              "x-java-utf16-max-length": 255,
+              "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+              "not": {
+                "enum": [
+                  ".",
+                  ".."
+                ]
+              }
+            }
+          },
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion equal to verified tenant, never tenant selection.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Committed cancellation/replay/terminal no-op.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelProcessResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_PROCESS_VERSION_CONFLICT",
+                        "TIANJI_PROCESS_CANCEL_BLOCKED",
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INTERNAL_ERROR"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Safe documented failure; no automatic mutation retry.",
+            "headers": {
+              "Cache-Control": {
+                "description": "Provider returns no-store. SDK sends no-store and does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_REQUEST_TOO_LARGE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "description": "Strict four-member JSON, max4KiB; duplicate/unknown/trailing/scalar/null violations fail before mutation.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelProcessCommand"
+              },
+              "example": {
+                "instanceId": "process-1",
+                "commandId": "cancel-1",
+                "expectedVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "reason": "Invoice withdrawn"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Bearer access token from the existing configured issuer; both scopes and current backend permission checks are mandatory for USER and SERVICE. Synthetic URLs do not configure a new OAuth client.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://identity.example/oauth/authorize",
+            "tokenUrl": "https://identity.example/oauth/token",
+            "scopes": {
+              "tianji:process:read": "Read the exact owned process.",
+              "tianji:process:cancel": "Read control and cancel an eligible exact-owned process."
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/oauth/token",
+            "scopes": {
+              "tianji:process:read": "Read the exact owned process.",
+              "tianji:process:cancel": "Read control and cancel an eligible exact-owned process."
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ProcessActiveWaitKindEnum": {
+        "type": "string",
+        "enum": [
+          "HUMAN_TASK",
+          "EXTERNAL_WORKER",
+          "AGENT_RESULT_WAIT",
+          "CASE_COMPLETION_WAIT",
+          "TIMER"
+        ]
+      },
+      "ProcessControlActionEnum": {
+        "type": "string",
+        "enum": [
+          "CANCEL"
+        ]
+      },
+      "ProcessControlBlockReasonEnum": {
+        "type": "string",
+        "enum": [
+          "NONE",
+          "PROCESS_TERMINAL",
+          "MODEL_CONTAINS_CASE_SOURCE"
+        ]
+      },
+      "ProcessInstanceStatusEnum": {
+        "type": "string",
+        "enum": [
+          "ACTIVE",
+          "SUSPENDED",
+          "COMPLETED",
+          "CANCELLED"
+        ]
+      },
+      "ProcessInstanceDTO": {
+        "type": "object",
+        "description": "Existing eight-field process representation remains unchanged.",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "definitionKey",
+          "releaseVersion",
+          "businessKey",
+          "correlationId",
+          "status",
+          "submittedAt",
+          "finishedAt"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$"
+          },
+          "definitionKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Immutable released activity or definition key.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "releaseVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Immutable platform release version.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "businessKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$"
+          },
+          "correlationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Stable caller command/correlation identifier.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ProcessInstanceStatusEnum"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Actual process submission instant; provider emits UTC Z, SDK accepts explicit offsets and nanoseconds."
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Required member: null for ACTIVE/SUSPENDED, actual native finish instant for COMPLETED/CANCELLED."
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "ACTIVE",
+                  "SUSPENDED"
+                ]
+              },
+              "finishedAt": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "COMPLETED",
+                  "CANCELLED"
+                ]
+              },
+              "finishedAt": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "ProcessActiveWaitDTO": {
+        "type": "object",
+        "description": "One grouped released wait. Counts derive only from verified live Task/ExternalWorkerJob/timer Job/message EventSubscription artifacts; native IDs are not returned.",
+        "additionalProperties": false,
+        "required": [
+          "activityKey",
+          "kind",
+          "occurrences"
+        ],
+        "properties": {
+          "activityKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Immutable released activity or definition key.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ProcessActiveWaitKindEnum"
+          },
+          "occurrences": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          }
+        }
+      },
+      "ProcessControlSnapshotDTO": {
+        "type": "object",
+        "description": "Independent owner decision view: identity, released current waits, action and block. Command revalidates current authorization and state.",
+        "additionalProperties": false,
+        "required": [
+          "process",
+          "activeWaits",
+          "allowedActions",
+          "cancellationBlockReason",
+          "version",
+          "observedAt"
+        ],
+        "properties": {
+          "process": {
+            "$ref": "#/components/schemas/ProcessInstanceDTO"
+          },
+          "activeWaits": {
+            "type": "array",
+            "maxItems": 256,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ProcessActiveWaitDTO"
+            },
+            "description": "Unique kind/activity pairs in kind-name then activity-key order; summed occurrences <=256. Empty is valid for a live process. Structural/inactive gateway executions are not waits.",
+            "x-unique-by": [
+              "kind",
+              "activityKey"
+            ],
+            "x-canonical-order": [
+              "kind.name",
+              "activityKey"
+            ],
+            "x-aggregate-maximum": {
+              "field": "occurrences",
+              "maximum": 256
+            }
+          },
+          "allowedActions": {
+            "type": "array",
+            "maxItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ProcessControlActionEnum"
+            }
+          },
+          "cancellationBlockReason": {
+            "$ref": "#/components/schemas/ProcessControlBlockReasonEnum"
+          },
+          "version": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Opaque lower-case SHA-256 token; never authorization or an ordinal."
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Actual database observation instant in UTC Z; excluded from the opaque version and not a lease."
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "process": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ACTIVE",
+                      "SUSPENDED"
+                    ]
+                  }
+                }
+              },
+              "cancellationBlockReason": {
+                "const": "NONE"
+              },
+              "allowedActions": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "properties": {
+              "process": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ACTIVE",
+                      "SUSPENDED"
+                    ]
+                  }
+                }
+              },
+              "cancellationBlockReason": {
+                "const": "MODEL_CONTAINS_CASE_SOURCE"
+              },
+              "allowedActions": {
+                "maxItems": 0
+              }
+            }
+          },
+          {
+            "properties": {
+              "process": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "COMPLETED",
+                      "CANCELLED"
+                    ]
+                  }
+                }
+              },
+              "cancellationBlockReason": {
+                "const": "PROCESS_TERMINAL"
+              },
+              "allowedActions": {
+                "maxItems": 0
+              },
+              "activeWaits": {
+                "maxItems": 0
+              }
+            }
+          }
+        ]
+      },
+      "CancelProcessCommand": {
+        "type": "object",
+        "description": "Stable cancellation intent. Path/body instance IDs must match. Same actor/command/hash replays the stored result; changed fields under the same command conflict. No tenant/actor/role/release input.",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "commandId",
+          "expectedVersion",
+          "reason"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$"
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Stable caller command/correlation identifier.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "expectedVersion": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Opaque lower-case SHA-256 token; never authorization or an ordinal."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Exact nonblank audit reason, max512 Java UTF-16 units. No trimming, controls, NUL or unpaired surrogates; never logged or copied to Flowable delete reason.",
+            "x-java-utf16-max-length": 512,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$"
+          }
+        }
+      },
+      "CancelProcessResult": {
+        "type": "object",
+        "description": "Accepted, replayed or audited terminal no-op result. This stops BPMN, not external business effects or formal Cases.",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "commandId",
+          "accepted",
+          "status",
+          "resultingVersion",
+          "finishedAt",
+          "decidedAt",
+          "linkedAgentClosureScheduled"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Exact safe identifier, at most 255 Java UTF-16 units. Java blank-text and surrogate checks remain authoritative; legal NBSP/BOM are preserved.",
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$"
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "description": "Stable caller command/correlation identifier.",
+            "x-java-utf16-max-length": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "accepted": {
+            "type": "boolean",
+            "description": "True only if this command committed native cancellation."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "COMPLETED",
+              "CANCELLED"
+            ]
+          },
+          "resultingVersion": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Opaque lower-case SHA-256 token; never authorization or an ordinal."
+          },
+          "finishedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Actual Flowable native finish instant; preserve independently from the database decision clock."
+          },
+          "decidedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Actual database decision instant; either relative ordering with native finishedAt is valid."
+          },
+          "linkedAgentClosureScheduled": {
+            "type": "boolean",
+            "description": "Durable linked-Agent CLOSING scheduled, not a promise of remote close or business rollback; false for a terminal no-op."
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "accepted": {
+                "const": true
+              },
+              "status": {
+                "const": "CANCELLED"
+              }
+            }
+          },
+          {
+            "properties": {
+              "accepted": {
+                "const": false
+              },
+              "linkedAgentClosureScheduled": {
+                "const": false
+              }
+            }
+          }
+        ]
+      },
+      "OrchestrationErrorDTO": {
+        "type": "object",
+        "description": "Safe fixed-code error envelope; no reason, raw body, SQL, token or internal cause.",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80,
+            "pattern": "^[A-Z0-9_]{1,80}$"
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+            "description": "Optional safe provider correlation; SDK never exposes this field for Process control failures."
+          }
+        }
+      }
+    }
+  }
+}
