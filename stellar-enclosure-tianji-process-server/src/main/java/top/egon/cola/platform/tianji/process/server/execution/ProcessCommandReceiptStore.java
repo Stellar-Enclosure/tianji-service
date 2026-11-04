@@ -10,7 +10,7 @@ import java.util.Optional;
 
 /** Local transaction participant for scoped idempotency receipts. */
 public final class ProcessCommandReceiptStore {
-    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE }
+    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE, PROCESS_CANCEL }
 
     private final JdbcTemplate jdbc;
     private final String table;
@@ -55,6 +55,24 @@ public final class ProcessCommandReceiptStore {
                         rs.getString("resource_id"), rs.getTimestamp("created_at").toInstant(), null), actor.tenantId(),
                 actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), instanceId);
         return one(rows);
+    }
+
+    public TaskOrigin lockStartByInstance(ProcessActor actor, String instanceId) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint()) || instanceId == null || instanceId.isBlank()
+                || instanceId.length() > 255 || !instanceId.equals(instanceId.trim())) {
+            throw new IllegalArgumentException("Process start source is invalid");
+        }
+        List<TaskOrigin> rows = jdbc.query("SELECT subject_type,subject_issuer,subject_id,command_id,request_sha256,release_key,correlation_id,resource_id,created_at FROM "
+                        + table + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND command_type='START' "
+                        + "AND state='APPLIED' AND resource_id=? FOR UPDATE",
+                (rs, number) -> new TaskOrigin(new ProcessActor(actor.tenantId(), ProcessActor.SubjectType.valueOf(rs.getString("subject_type")),
+                        rs.getString("subject_id"), rs.getString("subject_issuer")), rs.getString("command_id"),
+                        rs.getString("request_sha256"), rs.getString("release_key"), rs.getString("correlation_id"),
+                        rs.getString("resource_id"), rs.getTimestamp("created_at").toInstant()), actor.tenantId(),
+                actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), instanceId);
+        if (rows.size() != 1 || !rows.getFirst().requester().equals(actor)
+                || !rows.getFirst().instanceId().equals(instanceId)) throw new ProcessResourceNotFoundException();
+        return rows.getFirst();
     }
 
     /** A task approver need not be the starter; origin remains the exact authenticated tenant/issuer namespace. */

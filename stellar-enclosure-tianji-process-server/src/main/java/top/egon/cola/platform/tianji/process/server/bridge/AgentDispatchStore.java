@@ -33,6 +33,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -161,6 +162,51 @@ public final class AgentDispatchStore {
                 observationInterval.toMillis())));
     }
 
+    public int scheduleProcessClosure(ProcessClosureScope scope) {
+        requireTransaction();
+        if (scope == null) throw invalid();
+        List<Intent> candidates = jdbc.query("SELECT * FROM " + table
+                        + " WHERE tenant_id=? AND scope_type='BPMN' AND scope_id=? AND state<>'CLOSED' "
+                        + "ORDER BY occurrence_id LIMIT 257 FOR UPDATE",
+                (rs, row) -> readForClosure(rs), scope.owner().tenantId(), scope.instanceId());
+        if (candidates.size() > 256) throw unavailable();
+
+        List<Key> keys = new ArrayList<>(candidates.size());
+        var unique = new HashSet<Key>();
+        for (Intent candidate : candidates) {
+            Seed seed = candidate.seed();
+            Key key = seed.key();
+            if (candidate.state() == State.CLOSED || key.actor().tenantId() != scope.owner().tenantId()
+                    || !seed.instanceId().equals(scope.instanceId()) || !seed.releaseKey().equals(scope.releaseKey())
+                    || !seed.processDefinitionId().equals(scope.processDefinitionId())
+                    || !seed.processModelSha256().equals(scope.processModelSha256())
+                    || !seed.businessKey().equals(scope.businessKey())
+                    || !seed.correlationId().equals(scope.correlationId()) || !unique.add(key)) throw unavailable();
+            keys.add(key);
+        }
+        keys = List.copyOf(keys);
+        if (keys.isEmpty()) return 0;
+
+        String values = String.join(",", java.util.Collections.nCopies(keys.size(), "(?,?,?,?,'BPMN',?,?)"));
+        List<Object> arguments = new ArrayList<>(keys.size() * 6);
+        for (Key key : keys) {
+            arguments.add(key.actor().tenantId());
+            arguments.add(key.actor().issuerFingerprint());
+            arguments.add(key.actor().subjectId());
+            arguments.add(key.sourceId());
+            arguments.add(key.instanceId());
+            arguments.add(key.occurrenceId());
+        }
+        int affected = jdbc.update("UPDATE " + table + " AS d SET state='CLOSING',next_check_at=clock_timestamp() "
+                        + "FROM (VALUES " + values + ") AS v(tenant_id,subject_issuer,subject_id,source_id,scope_type,scope_id,occurrence_id) "
+                        + "WHERE d.tenant_id=v.tenant_id AND d.subject_issuer=v.subject_issuer AND d.subject_id=v.subject_id "
+                        + "AND d.source_id=v.source_id AND d.scope_type=v.scope_type AND d.scope_id=v.scope_id "
+                        + "AND d.occurrence_id=v.occurrence_id AND d.state<>'CLOSED'",
+                arguments.toArray());
+        if (affected != keys.size()) throw unavailable();
+        return affected;
+    }
+
     private Intent lock(Key key) {
         List<Intent> rows = jdbc.query("SELECT * FROM " + table + " WHERE " + where() + " FOR UPDATE", (rs, row) -> read(rs), args(key));
         if (rows.size() != 1) throw new ProcessResourceNotFoundException();
@@ -181,6 +227,11 @@ public final class AgentDispatchStore {
         var closed = rs.getTimestamp("closed_at");
         return new Intent(seed, rs.getTimestamp("created_at").toInstant(), rs.getTimestamp("dispatch_not_after").toInstant(),
                 State.valueOf(rs.getString("state")), rs.getString("run_id"), closed == null ? null : closed.toInstant());
+    }
+
+    private static Intent readForClosure(ResultSet rs) throws SQLException {
+        try { return read(rs); }
+        catch (RuntimeException malformed) { throw unavailable(); }
     }
 
     private Instant now() { return jdbc.queryForObject("SELECT clock_timestamp()", (rs, row) -> rs.getTimestamp(1).toInstant()); }
@@ -211,10 +262,33 @@ public final class AgentDispatchStore {
         catch (JsonProcessingException failure) { throw conflict(); }
     }
     private static void hash(String value) { if (value == null || !value.matches("[0-9a-f]{64}")) throw invalid(); }
+    private static void text(String value, int maximum) {
+        if (value == null || value.isBlank() || value.length() > maximum || !value.equals(value.trim())) throw invalid();
+        for (int index = 0; index < value.length(); index++) {
+            char character = value.charAt(index);
+            if (character < 32 || character == 127 || Character.isLowSurrogate(character)
+                    || Character.isHighSurrogate(character)
+                    && (index + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++index)))) throw invalid();
+        }
+    }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Agent dispatch intent is invalid"); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
+    private static IllegalStateException unavailable() { return new IllegalStateException("Agent dispatch closure is unavailable"); }
 
     public enum State { PENDING, SUBMITTED, ACKNOWLEDGED, CLOSING, CLOSED }
+    public record ProcessClosureScope(ProcessActor owner, String instanceId, String releaseKey,
+                                      String processDefinitionId, String processModelSha256,
+                                      String businessKey, String correlationId) {
+        public ProcessClosureScope {
+            if (owner == null || "LEGACY".equals(owner.issuerFingerprint())
+                    || releaseKey == null || !releaseKey.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+                    || correlationId == null || !correlationId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) throw invalid();
+            text(instanceId, 255);
+            text(processDefinitionId, 255);
+            hash(processModelSha256);
+            text(businessKey, 255);
+        }
+    }
     public record Key(ProcessActor actor, String sourceId, String instanceId, String occurrenceId) {
         public Key {
             if (actor == null || actor.subjectType() != ProcessActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())) throw invalid();

@@ -82,6 +82,27 @@ class HumanTaskStorageVerifierTest {
         verifyCatalog(true, true);
     }
 
+    @Test void v9_keeps_the_v8_human_task_contract_without_case_activation_grants() throws Exception {
+        var source = mock(DataSource.class);
+        try (var templates = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(invocation -> {
+            var args = invocation.getArguments();
+            if (args.length == 0 || !(args[0] instanceof String query)) return org.mockito.Answers.RETURNS_DEFAULTS.answer(invocation);
+            if (!query.contains("schema_history")) throw new AssertionError("Unexpected history query: " + query);
+            var rows = List.of(
+                    Map.<String,Object>of("version", "8", "type", "SQL", "script", "V8__add_formal_cmmn_case_support.sql",
+                            "success", true, "checksum", HumanTaskStorageVerifier.checksum(caseSql())),
+                    Map.<String,Object>of("version", "9", "type", "SQL", "script", "V9__add_process_cancellation_receipts.sql",
+                            "success", true, "checksum", -178365142));
+            @SuppressWarnings("unchecked") var mapper = (RowMapper<Object>) args[1];
+            var mapped = new ArrayList<Object>();
+            for (var row : rows) mapped.add(mapper.mapRow(resultSet(row), mapped.size()));
+            return mapped;
+        }))) {
+            assertTrue(assertDoesNotThrow(() -> new ProcessApiSchemaVerifier(source, "tianji_process").hasCaseMigration()));
+        }
+        verifyCatalog(true, false);
+    }
+
     private static void verifyCatalog(boolean upgraded, boolean corrupt) throws Exception {
         var source = mock(DataSource.class); var connection = mock(Connection.class);
         when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);

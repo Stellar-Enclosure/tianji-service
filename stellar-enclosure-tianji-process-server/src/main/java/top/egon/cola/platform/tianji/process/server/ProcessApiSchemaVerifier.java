@@ -32,6 +32,10 @@ public final class ProcessApiSchemaVerifier {
     private static final String WORKER = "tianji_worker_lease_receipt";
     private static final String CASE_FILE = "V8__add_formal_cmmn_case_support.sql";
     private static final String CASE_SHA256 = "d2ef3198b53e681835239ed374e126d226cd40afef658819dbfbdd6372d82a44";
+    private static final String CANCEL_FILE = "V9__add_process_cancellation_receipts.sql";
+    private static final String CANCEL_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
+    private static final String CANCEL_RECEIPT = "tianji_process_cancel_receipt";
+    private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final String schema;
 
@@ -50,6 +54,45 @@ public final class ProcessApiSchemaVerifier {
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Process API schema verification failed", failure);
         }
+    }
+
+    /** Cancellation reads immutable Case provenance without enabling the Case write capability. */
+    public void verifyCancellation() {
+        jdbc.setQueryTimeout(5);
+        verifyAgentDispatch();
+        try {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
+                    || laterMigrations().size() != 2) throw invalid();
+            String migration = cancellationMigration();
+            var audit = tableContracts(migration, Map.of(CANCEL_RECEIPT, 26)).get(CANCEL_RECEIPT);
+            verifyCaseColumns(CANCEL_RECEIPT, audit.columns());
+            verifyCaseChecks(CANCEL_RECEIPT, audit.checks(), false);
+            verifyCaseKeys(CANCEL_RECEIPT, audit.keys());
+            verifyCaseIndexes(CANCEL_RECEIPT, audit.indexes());
+            verifyCaseRole(CANCEL_RECEIPT, false, true);
+            verifyCancellationProvenanceRead();
+            verifyCaseRole(DISPATCH, true, false);
+            verifyCaseIndexes(DISPATCH, Map.of("tianji_agent_dispatch_scope_open_idx",
+                    new CaseIndex(List.of("tenant_id", "scope_type", "scope_id", "occurrence_id"), false, false,
+                            signature("state <> 'CLOSED'"))), false);
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Process cancellation storage schema verification failed", failure);
+        }
+    }
+
+    private void verifyCancellationProvenanceRead() {
+        String migration = caseMigration(), table = "tianji_case_start_provenance";
+        var provenance = caseContracts(migration).get(table);
+        verifyCaseColumns(table, provenance.columns());
+        verifyCaseChecks(table, provenance.checks(), false);
+        verifyCaseKeys(table, provenance.keys());
+        verifyCaseIndexes(table, provenance.indexes());
+        verifyCaseRole(table, false, false);
+        var checks = caseChecks(migration.substring(migration.indexOf("ALTER TABLE tianji_process_release_definition"),
+                migration.indexOf("ALTER TABLE tianji_human_task_receipt")));
+        String expression = checks.remove("tianji_process_release_definition_model_type_v8");
+        if (expression == null || !checks.isEmpty()) throw invalid();
+        verifyCaseChecks(DEFINITION, Map.of("tianji_process_release_definition_model_type_check", expression), true);
     }
 
     /** Formal Case activation verifies the complete additive schema without installing or repairing it. */
@@ -79,19 +122,23 @@ public final class ProcessApiSchemaVerifier {
         }
     }
 
-    /** Case-off task readers select V7 or the exact V8 upgrade without requiring Case-table privileges. */
-    public boolean hasCaseMigration() {
+    /** Case-off task readers retain the exact V8 task authority when the additive V9 is present. */
+    public boolean hasCaseMigration() { return !laterMigrations().isEmpty(); }
+
+    private List<CaseVersion> laterMigrations() {
         var versions = jdbc.query("SELECT version,type,script,success,checksum FROM \"" + schema + "\".tianji_process_schema_history "
-                        + "WHERE version NOT IN ('1','2','3','4','5','6','7')",
+                        + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        if (versions.isEmpty()) return false;
-        if (versions.size() != 1) throw invalid(); var version = versions.getFirst();
-        if (!"8".equals(version.version()) || !"SQL".equals(version.type()) || !CASE_FILE.equals(version.script()) || !version.success()
-                || version.checksum() == null) throw invalid();
-        caseMigration();
-        if (version.checksum() != checksum(CASE_FILE)) throw invalid();
-        return true;
+        if (versions.size() > 2) throw invalid();
+        for (int index = 0; index < versions.size(); index++) {
+            var version = versions.get(index);
+            String number = index == 0 ? "8" : "9", file = index == 0 ? CASE_FILE : CANCEL_FILE;
+            if (!number.equals(version.version()) || !"SQL".equals(version.type()) || !file.equals(version.script())
+                    || !version.success() || version.checksum() == null || version.checksum() != checksum(file)) throw invalid();
+            if (index == 0) caseMigration(); else cancellationMigration();
+        }
+        return versions;
     }
 
     private void verifyCaseColumns(String table, Map<String, CaseColumn> expected) {
@@ -146,7 +193,9 @@ public final class ProcessApiSchemaVerifier {
         if (!expected.equals(actual)) throw invalid();
     }
 
-    private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected) {
+    private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected) { verifyCaseIndexes(table, expected, true); }
+
+    private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected, boolean exact) {
         var actual = new HashMap<String, CaseIndex>();
         jdbc.query("""
                 SELECT x.relname,i.indisunique,i.indisprimary,i.indisvalid,i.indisready,i.indislive,am.amname,i.indnkeyatts,i.indnatts,
@@ -169,34 +218,46 @@ public final class ProcessApiSchemaVerifier {
             if (actual.put(rs.getString("relname"), new CaseIndex(caseArray(rs.getArray("fields")), rs.getBoolean("indisunique"),
                     rs.getBoolean("indisprimary"), predicate == null ? null : signature(predicate))) != null) throw invalid();
         }, schema, table);
-        if (!expected.equals(actual)) throw invalid();
+        if (exact ? !expected.equals(actual) : !actual.entrySet().containsAll(expected.entrySet())) throw invalid();
     }
 
-    private void verifyCaseRole(String table, boolean mutable) {
+    private void verifyCaseRole(String table, boolean mutable) { verifyCaseRole(table, mutable, true, false); }
+
+    private void verifyCaseRole(String table, boolean mutable, boolean requireInsert) { verifyCaseRole(table, mutable, requireInsert, true); }
+
+    private void verifyCaseRole(String table, boolean mutable, boolean requireInsert, boolean cancellation) {
+        String columns = cancellation ? " AND NOT has_any_column_privilege(c.oid,'REFERENCES')"
+                + (mutable ? "" : " AND NOT has_any_column_privilege(c.oid,'UPDATE')") : "";
+        String insert = requireInsert ? " AND has_table_privilege(c.oid,'INSERT')" : "";
         String update = mutable ? "has_table_privilege(c.oid,'UPDATE')" : "NOT has_table_privilege(c.oid,'UPDATE')";
         Boolean valid = jdbc.queryForObject("""
                 SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relispartition AND c.relpersistence='p'
                   AND has_schema_privilege(n.oid,'USAGE')
                   AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user AND (r.rolsuper OR r.rolbypassrls))
                   AND NOT pg_has_role(c.relowner,'MEMBER')
-                  AND has_table_privilege(c.oid,'SELECT') AND has_table_privilege(c.oid,'INSERT')
+                  AND has_table_privilege(c.oid,'SELECT')
                   AND NOT has_table_privilege(c.oid,'DELETE') AND NOT has_table_privilege(c.oid,'TRUNCATE')
                   AND NOT has_table_privilege(c.oid,'TRIGGER') AND NOT has_table_privilege(c.oid,'REFERENCES')
                   AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
                     AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
-                """ + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
+                """ + columns + insert + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
                 Boolean.class, schema, table);
         if (!Boolean.TRUE.equals(valid)) throw invalid();
     }
 
     /** Descriptors are taken only from the byte-pinned packaged migration, never from caller SQL or database expressions. */
     private Map<String, CaseTable> caseContracts(String sql) {
+        return tableContracts(sql, Map.of("tianji_case_start_provenance", 31,
+                "tianji_case_plan_item_receipt", 24, "tianji_case_completion_inbox", 17));
+    }
+
+    private Map<String, CaseTable> tableContracts(String sql, Map<String, Integer> sizes) {
         var contracts = new HashMap<String, CaseTable>();
         var tables = Pattern.compile("CREATE TABLE ([a-z_]+) \\(").matcher(sql);
         while (tables.find()) {
             String table = tables.group(1); int open = tables.end() - 1; String body = sql.substring(open + 1, caseClosing(sql, open));
             var columns = new HashMap<String, CaseColumn>();
-            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
+            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
             while (fields.find()) {
                 String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(").replace("timestamptz(6)", "timestamp(6) with time zone");
                 if (columns.put(fields.group(1), new CaseColumn(type, fields.group(3).contains("NOT NULL"), fields.group(3).contains("COLLATE \"C\""), null)) != null) throw invalid();
@@ -218,7 +279,6 @@ public final class ProcessApiSchemaVerifier {
             }
             contracts.put(table, new CaseTable(Map.copyOf(columns), Map.copyOf(caseChecks(body)), Set.copyOf(keys), Map.copyOf(indexes)));
         }
-        var sizes = Map.of("tianji_case_start_provenance", 31, "tianji_case_plan_item_receipt", 24, "tianji_case_completion_inbox", 17);
         if (!contracts.keySet().equals(sizes.keySet())) throw invalid();
         for (var entry : sizes.entrySet()) if (contracts.get(entry.getKey()).columns().size() != entry.getValue()) throw invalid();
         return Map.copyOf(contracts);
@@ -235,6 +295,15 @@ public final class ProcessApiSchemaVerifier {
             String actual = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
             if (!CASE_SHA256.equals(actual)) throw invalid(); return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) { throw new IllegalStateException("Case migration resource is unavailable", failure); }
+    }
+    private static String cancellationMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + CANCEL_FILE)) {
+            if (input == null) throw invalid(); byte[] bytes = input.readAllBytes();
+            if (!CANCEL_SHA256.equals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("Process cancellation migration resource is unavailable", failure);
+        }
     }
     private static int caseClosing(String value, int open) {
         int depth = 0; boolean quoted = false;
