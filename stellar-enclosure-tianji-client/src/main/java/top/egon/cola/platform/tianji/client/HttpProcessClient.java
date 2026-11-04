@@ -36,6 +36,12 @@ import top.egon.cola.platform.tianji.contract.orchestration.UnclaimHumanTaskComm
 import top.egon.cola.platform.tianji.contract.orchestration.TransferHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.CompleteHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.CaseClient;
+import top.egon.cola.platform.tianji.contract.orchestration.StartCaseCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.CaseInstanceQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ActOnPlanItemCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.CaseInstanceDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.CaseOperationResult;
 
 import java.net.URI;
 import java.net.URLEncoder;
@@ -60,7 +66,8 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
-public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient, HumanTaskClient, ApprovalClient {
+public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient,
+        HumanTaskClient, ApprovalClient, CaseClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
     private static final java.util.Set<String> HUMAN_TASK_ERRORS = java.util.Set.of("TIANJI_UNAUTHENTICATED", "TIANJI_PERMISSION_DENIED", "TIANJI_RESOURCE_NOT_FOUND", "TIANJI_IDEMPOTENCY_CONFLICT",
@@ -71,6 +78,7 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
     private final Duration timeout;
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final HumanTaskResponseCodec tasks = new HumanTaskResponseCodec();
+    private final CaseResponseCodec cases = new CaseResponseCodec();
 
     public HttpProcessClient(URI baseUri, HttpClient http, Supplier<String> tokenSupplier, Duration timeout) {
         Objects.requireNonNull(baseUri, "baseUri");
@@ -127,6 +135,33 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         Objects.requireNonNull(query, "query");
         ProcessInstanceDTO result = call("GET", "process-instances/" + segment(query.instanceId()), null, ProcessInstanceDTO.class);
         if (!query.instanceId().equals(result.instanceId())) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public CaseInstanceDTO start(StartCaseCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", "cases/start", command, CaseInstanceDTO.class, null, cases::instance);
+        if (!command.definitionKey().equals(result.definitionKey()) || !command.releaseVersion().equals(result.releaseVersion())
+                || !command.businessKey().equals(result.businessKey()) || !command.correlationId().equals(result.correlationId())) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public CaseInstanceDTO get(CaseInstanceQuery query) {
+        Objects.requireNonNull(query, "query");
+        var result = call("POST", "cases/get", query, CaseInstanceDTO.class, null, cases::instance);
+        if (!query.caseInstanceId().equals(result.caseInstanceId())) throw invalidResponse();
+        return result;
+    }
+
+    @Override
+    public CaseOperationResult actOnPlanItem(ActOnPlanItemCommand command) {
+        Objects.requireNonNull(command, "command");
+        var result = call("POST", "cases/act-plan-item", command, CaseOperationResult.class, null, cases::operation);
+        if (!command.commandId().equals(result.commandId()) || !command.caseInstanceId().equals(result.caseInstanceId())
+                || !command.planItemInstanceId().equals(result.planItemInstanceId()) || command.action() != result.action()
+                || !command.expectedVersion().equals(result.previousVersion())) throw invalidResponse();
         return result;
     }
 
@@ -243,9 +278,15 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
     }
 
     private <T> T call(String method, String path, Object body, Class<T> type, String leaseToken, Function<byte[], T> decoder) {
-        if (path.startsWith("human-tasks/") && (!baseUri.normalize().equals(baseUri) || !"https".equalsIgnoreCase(baseUri.getScheme())
+        boolean humanTask = path.startsWith("human-tasks/");
+        boolean caseOperation = path.startsWith("cases/");
+        if (humanTask && (!baseUri.normalize().equals(baseUri) || !"https".equalsIgnoreCase(baseUri.getScheme())
                 && !("http".equalsIgnoreCase(baseUri.getScheme()) && java.util.Set.of("localhost", "127.0.0.1", "[::1]", "::1").contains(baseUri.getHost().toLowerCase(java.util.Locale.ROOT))))) {
             throw new IllegalArgumentException("Human task transport requires HTTPS or a loopback fixture");
+        }
+        if (caseOperation && (!baseUri.normalize().equals(baseUri) || !"https".equalsIgnoreCase(baseUri.getScheme())
+                && !("http".equalsIgnoreCase(baseUri.getScheme()) && java.util.Set.of("localhost", "127.0.0.1", "[::1]", "::1").contains(baseUri.getHost().toLowerCase(java.util.Locale.ROOT))))) {
+            throw new IllegalArgumentException("Case transport requires HTTPS or a loopback fixture");
         }
         byte[] bytes;
         try { bytes = body == null ? null : mapper.writeValueAsBytes(body); }
@@ -257,13 +298,22 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         if (token == null || !token.matches("[A-Za-z0-9._~+/-]+=*")) throw new IllegalArgumentException("a valid access token is required");
         HttpRequest.Builder builder = HttpRequest.newBuilder(baseUri.resolve("api/tianji/v1/" + path)).timeout(timeout)
                 .header("Authorization", "Bearer " + token).header("Accept", "application/json");
+        if (caseOperation) builder.header("Cache-Control", "no-store");
         HttpRequest request = bytes == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
-        var call = http.sendAsync(request, info -> new BoundedBodySubscriber(MAX_RESPONSE_BYTES));
+        java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> call;
+        try {
+            call = http.sendAsync(request, info -> new BoundedBodySubscriber(caseOperation ? CaseResponseCodec.MAX_BYTES : MAX_RESPONSE_BYTES));
+        } catch (RuntimeException failure) {
+            if (caseOperation) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            throw failure;
+        }
         try {
             HttpResponse<byte[]> response = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-            if (response.statusCode() < 200 || response.statusCode() >= 300) throw error(response, token, leaseToken, path.startsWith("human-tasks/"));
-            if (path.startsWith("human-tasks/") && response.statusCode() != 200) throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw caseOperation ? caseError(response) : error(response, token, leaseToken, humanTask);
+            }
+            if ((humanTask || caseOperation) && response.statusCode() != 200) throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
             String contentType = response.headers().firstValue("Content-Type").orElse("");
             String mediaType = contentType.split(";", 2)[0].trim();
             if (!mediaType.equalsIgnoreCase("application/json") && !mediaType.toLowerCase(java.util.Locale.ROOT).endsWith("+json")) {
@@ -312,6 +362,24 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
             };
         }
         return new ProcessClientException(response.statusCode(), code, correlation,
+                response.headers().firstValue("Retry-After").map(HttpProcessClient::retryAfter).orElse(null));
+    }
+
+    private ProcessClientException caseError(HttpResponse<byte[]> response) {
+        String code = cases.errorCode(response.body(), response.statusCode());
+        if (code == null) {
+            code = switch (response.statusCode()) {
+                case 400 -> "TIANJI_INVALID_COMMAND";
+                case 401 -> "TIANJI_UNAUTHENTICATED";
+                case 403 -> "TIANJI_PERMISSION_DENIED";
+                case 404 -> "TIANJI_RESOURCE_NOT_FOUND";
+                case 409 -> "TIANJI_IDEMPOTENCY_CONFLICT";
+                case 413 -> "TIANJI_REQUEST_TOO_LARGE";
+                case 429 -> "TIANJI_CAPACITY_EXCEEDED";
+                default -> "TIANJI_DEPENDENCY_UNAVAILABLE";
+            };
+        }
+        return new ProcessClientException(response.statusCode(), code, null,
                 response.headers().firstValue("Retry-After").map(HttpProcessClient::retryAfter).orElse(null));
     }
 

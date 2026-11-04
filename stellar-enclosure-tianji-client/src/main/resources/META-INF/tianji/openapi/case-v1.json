@@ -1,0 +1,1471 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Case Consumer Contract",
+    "version": "1.0.0",
+    "description": "Contract-first consumer authority; no provider route is implemented by this artifact."
+  },
+  "tags": [
+    {
+      "name": "Cases",
+      "description": "Fixed governed CMMN Case consumer operations."
+    }
+  ],
+  "paths": {
+    "/api/tianji/v1/cases/start": {
+      "post": {
+        "operationId": "startCase",
+        "tags": [
+          "Cases"
+        ],
+        "summary": "Start one release-bound Case",
+        "description": "Tenant and actor are derived by the future provider from trusted context, never from this body. The SDK sends once with no automatic retry or redirect, preserves any normalized base-URI prefix, and retrieves bearer credentials only after requiring HTTPS or an HTTP loopback fixture. The configured HTTP timeout begins after token retrieval, so it does not bound the token supplier. Success requires exact HTTP 200 and JSON or structured +json; Case response bytes are capped at 128 KiB. No provider route is implemented by this artifact.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartCaseCommand"
+              },
+              "example": {
+                "definitionKey": "formalCase",
+                "releaseVersion": "release-1",
+                "businessKey": "business-1",
+                "commandId": "start-command",
+                "correlationId": "correlation-1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Started or replayed Case snapshot.",
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseInstanceDTO"
+                },
+                "example": {
+                  "caseInstanceId": "case-1",
+                  "definitionKey": "formalCase",
+                  "releaseVersion": "release-1",
+                  "businessKey": "business-1",
+                  "correlationId": "correlation-1",
+                  "status": "ACTIVE",
+                  "submittedAt": "2026-11-01T10:00:00.123456789Z",
+                  "finishedAt": null,
+                  "planItems": [
+                    {
+                      "planItemInstanceId": "primary-1",
+                      "planItemDefinitionKey": "primaryTask",
+                      "kind": "HUMAN_TASK",
+                      "state": "ENABLED",
+                      "version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "availableActions": [
+                        "DISABLE",
+                        "START"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid command.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_INVALID_COMMAND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_UNAUTHENTICATED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_PERMISSION_DENIED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not visible or absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_RESOURCE_NOT_FOUND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency or tenant-context conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_IDEMPOTENCY_CONFLICT",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_REQUEST_TOO_LARGE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_REQUEST_TOO_LARGE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Capacity exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_CAPACITY_EXCEEDED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_CAPACITY_EXCEEDED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Dependency unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_DEPENDENCY_UNAVAILABLE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "required": true,
+            "description": "The SDK sends no-store. Authorization uses bearerAuth; Accept and Content-Type are application/json as described by the operation content. No tenant, actor or role headers are sent.",
+            "schema": {
+              "type": "string",
+              "const": "no-store"
+            }
+          }
+        ]
+      }
+    },
+    "/api/tianji/v1/cases/get": {
+      "post": {
+        "operationId": "getCase",
+        "tags": [
+          "Cases"
+        ],
+        "summary": "Get one authorized Case snapshot",
+        "description": "The future provider applies tenant and data-scope visibility before returning a snapshot. The SDK sends once with no automatic retry or redirect, preserves any normalized base-URI prefix, and retrieves bearer credentials only after requiring HTTPS or an HTTP loopback fixture. The configured HTTP timeout begins after token retrieval, so it does not bound the token supplier. Success requires exact HTTP 200 and JSON or structured +json; Case response bytes are capped at 128 KiB. No provider route is implemented by this artifact.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaseInstanceQuery"
+              },
+              "example": {
+                "caseInstanceId": "case-1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current or historical Case snapshot.",
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseInstanceDTO"
+                },
+                "example": {
+                  "caseInstanceId": "case-1",
+                  "definitionKey": "formalCase",
+                  "releaseVersion": "release-1",
+                  "businessKey": "business-1",
+                  "correlationId": "correlation-1",
+                  "status": "ACTIVE",
+                  "submittedAt": "2026-11-01T10:00:00.123456789Z",
+                  "finishedAt": null,
+                  "planItems": [
+                    {
+                      "planItemInstanceId": "primary-1",
+                      "planItemDefinitionKey": "primaryTask",
+                      "kind": "HUMAN_TASK",
+                      "state": "ENABLED",
+                      "version": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "availableActions": [
+                        "DISABLE",
+                        "START"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid query.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_INVALID_COMMAND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_UNAUTHENTICATED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_PERMISSION_DENIED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Case not visible or absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_RESOURCE_NOT_FOUND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency or tenant-context conflict.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_IDEMPOTENCY_CONFLICT",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_REQUEST_TOO_LARGE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_REQUEST_TOO_LARGE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Capacity exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_CAPACITY_EXCEEDED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_CAPACITY_EXCEEDED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Dependency unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_DEPENDENCY_UNAVAILABLE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "required": true,
+            "description": "The SDK sends no-store. Authorization uses bearerAuth; Accept and Content-Type are application/json as described by the operation content. No tenant, actor or role headers are sent.",
+            "schema": {
+              "type": "string",
+              "const": "no-store"
+            }
+          }
+        ]
+      }
+    },
+    "/api/tianji/v1/cases/act-plan-item": {
+      "post": {
+        "operationId": "actOnCasePlanItem",
+        "tags": [
+          "Cases"
+        ],
+        "summary": "Request one version-bound plan-item action",
+        "description": "The future provider revalidates authorization, fixed release policy, native state and expected version. The SDK sends once with no automatic retry or redirect, preserves any normalized base-URI prefix, and retrieves bearer credentials only after requiring HTTPS or an HTTP loopback fixture. The configured HTTP timeout begins after token retrieval, so it does not bound the token supplier. Success requires exact HTTP 200 and JSON or structured +json; Case response bytes are capped at 128 KiB. No provider route is implemented by this artifact.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActOnPlanItemCommand"
+              },
+              "example": {
+                "commandId": "action-command",
+                "caseInstanceId": "case-1",
+                "planItemInstanceId": "primary-1",
+                "expectedVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "action": "START"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied transition receipt.",
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaseOperationResult"
+                },
+                "example": {
+                  "commandId": "action-command",
+                  "caseInstanceId": "case-1",
+                  "planItemInstanceId": "primary-1",
+                  "planItemDefinitionKey": "primaryTask",
+                  "action": "START",
+                  "releaseVersion": "release-1",
+                  "definitionKey": "formalCase",
+                  "previousState": "ENABLED",
+                  "previousVersion": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "resultingState": "ACTIVE",
+                  "resultingVersion": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "occurredAt": "2026-11-01T11:00:00.987654321Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid command.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_INVALID_COMMAND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_UNAUTHENTICATED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Permission denied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_PERMISSION_DENIED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Case or plan item not visible or absent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_RESOURCE_NOT_FOUND",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Trusted idempotency or tenant-context conflict. Native version/state mapping is future provider work; no new trusted error code is introduced here.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_IDEMPOTENCY_CONFLICT",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request too large.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_REQUEST_TOO_LARGE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_REQUEST_TOO_LARGE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Capacity exceeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_CAPACITY_EXCEEDED"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_CAPACITY_EXCEEDED",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Dependency unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                },
+                "example": {
+                  "code": "TIANJI_DEPENDENCY_UNAVAILABLE",
+                  "correlationId": null
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "The future provider should return no-store; the SDK does not enforce this response header.",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              },
+              "Retry-After": {
+                "description": "Optional advisory metadata only. The SDK accepts nonnegative seconds or an RFC 1123 date, clamps to one day, maps a past date to zero and an invalid value to null, and never automatically retries.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "required": true,
+            "description": "The SDK sends no-store. Authorization uses bearerAuth; Accept and Content-Type are application/json as described by the operation content. No tenant, actor or role headers are sent.",
+            "schema": {
+              "type": "string",
+              "const": "no-store"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "SDK token supplier credential; OAuth URLs/scopes are not invented here."
+      }
+    },
+    "schemas": {
+      "CasePlanItemActionEnum": {
+        "type": "string",
+        "enum": [
+          "DISABLE",
+          "ENABLE",
+          "START",
+          "TERMINATE"
+        ]
+      },
+      "CaseInstanceStatusEnum": {
+        "type": "string",
+        "enum": [
+          "ACTIVE",
+          "COMPLETED",
+          "TERMINATED"
+        ]
+      },
+      "CasePlanItemStateEnum": {
+        "type": "string",
+        "enum": [
+          "AVAILABLE",
+          "ENABLED",
+          "DISABLED",
+          "ACTIVE",
+          "COMPLETED",
+          "TERMINATED"
+        ]
+      },
+      "CasePlanItemKindEnum": {
+        "type": "string",
+        "enum": [
+          "HUMAN_TASK",
+          "MILESTONE"
+        ]
+      },
+      "StartCaseCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "definitionKey",
+          "releaseVersion",
+          "businessKey",
+          "commandId",
+          "correlationId"
+        ],
+        "properties": {
+          "definitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "releaseVersion": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "businessKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "commandId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "correlationId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          }
+        },
+        "description": "Caller-owned release/business/command/correlation fields only. commandId is the idempotency intent; provider identity, tenant and authorization are future trusted-context concerns. The SDK does not retry uncertain writes."
+      },
+      "CaseInstanceQuery": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "caseInstanceId"
+        ],
+        "properties": {
+          "caseInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          }
+        },
+        "description": "Read-only lookup of one caller-known Case reference; no pagination, filtering or client-supplied tenant identity."
+      },
+      "ActOnPlanItemCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "commandId",
+          "caseInstanceId",
+          "planItemInstanceId",
+          "expectedVersion",
+          "action"
+        ],
+        "properties": {
+          "commandId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "caseInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "planItemInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "expectedVersion": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "action": {
+            "$ref": "#/components/schemas/CasePlanItemActionEnum"
+          }
+        },
+        "description": "One finite action with caller-owned commandId and expected opaque version. The consumer binds result commandId/case/item/action and previousVersion to this command; future provider revalidates native state and released policy."
+      },
+      "CasePlanItemDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "planItemInstanceId",
+          "planItemDefinitionKey",
+          "kind",
+          "state",
+          "version",
+          "availableActions"
+        ],
+        "description": "Java constructor requires unique state-compatible action subsets: AVAILABLE/COMPLETED/TERMINATED have none; ENABLED allows DISABLE/START; DISABLED allows ENABLE; ACTIVE allows TERMINATE. MILESTONE always has no actions. Schema enum and array bounds are necessary but Java cross-field checks remain authoritative.",
+        "properties": {
+          "planItemInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "planItemDefinitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CasePlanItemKindEnum"
+          },
+          "state": {
+            "$ref": "#/components/schemas/CasePlanItemStateEnum"
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "availableActions": {
+            "type": "array",
+            "maxItems": 4,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/CasePlanItemActionEnum"
+            }
+          }
+        }
+      },
+      "CaseInstanceDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "caseInstanceId",
+          "definitionKey",
+          "releaseVersion",
+          "businessKey",
+          "correlationId",
+          "status",
+          "submittedAt",
+          "finishedAt",
+          "planItems"
+        ],
+        "description": "All nine fields are required, including explicit nullable finishedAt. ACTIVE requires null finishedAt; terminal statuses require an Instant and no advertised item actions. Empty/sparse history is valid, including nonterminal item states in a terminal Case. Java enforces unique planItemInstanceId and planItemDefinitionKey and rejects duplicates; no chronology rule.",
+        "properties": {
+          "caseInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "definitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "releaseVersion": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "businessKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "correlationId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "status": {
+            "$ref": "#/components/schemas/CaseInstanceStatusEnum"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Required textual absolute timestamp; the consumer accepts explicit offsets or Z and normalizes to Instant. Future producer output uses UTC Z. Nanoseconds are preserved; numeric and naive local timestamps are rejected; no generated Clock, freshness or chronology rule."
+          },
+          "finishedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Required member; null exactly for ACTIVE, a textual absolute timestamp for COMPLETED/TERMINATED. Offset input normalizes to Instant; producer output uses UTC Z and preserves nanoseconds. No chronology/freshness rule."
+          },
+          "planItems": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+              "$ref": "#/components/schemas/CasePlanItemDTO"
+            }
+          }
+        }
+      },
+      "CaseOperationResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "commandId",
+          "caseInstanceId",
+          "planItemInstanceId",
+          "planItemDefinitionKey",
+          "action",
+          "releaseVersion",
+          "definitionKey",
+          "previousState",
+          "previousVersion",
+          "resultingState",
+          "resultingVersion",
+          "occurredAt"
+        ],
+        "description": "Java validates exactly DISABLE ENABLED->DISABLED, ENABLE DISABLED->ENABLED, START ENABLED->ACTIVE and TERMINATE ACTIVE->TERMINATED with unequal lowercase SHA-256 versions. JSON Schema does not claim cross-property version inequality. No chronology/freshness rule.",
+        "properties": {
+          "commandId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "caseInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "planItemInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "description": "Nonblank trimmed safe reference, at most 255 Java UTF-16 units; controls, NUL and invalid surrogate sequences are rejected by the Java contract constructor."
+          },
+          "planItemDefinitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "action": {
+            "$ref": "#/components/schemas/CasePlanItemActionEnum"
+          },
+          "releaseVersion": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "definitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+          },
+          "previousState": {
+            "$ref": "#/components/schemas/CasePlanItemStateEnum"
+          },
+          "previousVersion": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "resultingState": {
+            "$ref": "#/components/schemas/CasePlanItemStateEnum"
+          },
+          "resultingVersion": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Required textual absolute timestamp; the consumer accepts explicit offsets or Z and normalizes to Instant. Future producer output uses UTC Z. Nanoseconds are preserved; numeric and naive local timestamps are rejected; no generated Clock, freshness or chronology rule."
+          }
+        }
+      },
+      "OrchestrationErrorDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z0-9_]{1,80}$"
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+            "description": "Optional provider correlation; Case SDK never exposes it."
+          }
+        },
+        "description": "Closed two-field error. code is required; correlationId may be absent, null or a valid string. The Case SDK exposes only a trusted code/status pair or status fallback, with null correlation and no response body, credential, original cause or raw detail."
+      }
+    }
+  }
+}
