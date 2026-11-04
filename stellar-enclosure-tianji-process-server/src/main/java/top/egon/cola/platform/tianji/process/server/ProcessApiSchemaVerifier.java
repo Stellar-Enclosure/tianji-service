@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.process.server;
 
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 
 import javax.sql.DataSource;
 import java.io.BufferedReader;
@@ -9,12 +10,19 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.List;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32;
+
+import static top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier.signature;
 
 /** Read-only startup verification of the platform's migration history and critical storage constraints. */
 public final class ProcessApiSchemaVerifier {
@@ -22,6 +30,8 @@ public final class ProcessApiSchemaVerifier {
     private static final String DEFINITION = "tianji_process_release_definition";
     private static final String RECEIPT = "tianji_process_command_receipt";
     private static final String WORKER = "tianji_worker_lease_receipt";
+    private static final String CASE_FILE = "V8__add_formal_cmmn_case_support.sql";
+    private static final String CASE_SHA256 = "d2ef3198b53e681835239ed374e126d226cd40afef658819dbfbdd6372d82a44";
     private final JdbcTemplate jdbc;
     private final String schema;
 
@@ -41,6 +51,207 @@ public final class ProcessApiSchemaVerifier {
             throw new IllegalStateException("Process API schema verification failed", failure);
         }
     }
+
+    /** Formal Case activation verifies the complete additive schema without installing or repairing it. */
+    public void verifyCase() {
+        jdbc.setQueryTimeout(5);
+        verify();
+        try {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
+                    || !hasCaseMigration()) throw invalid();
+            String migration = caseMigration();
+            var contracts = caseContracts(migration);
+            for (var entry : contracts.entrySet()) {
+                String table = entry.getKey(); var contract = entry.getValue();
+                verifyCaseColumns(table, contract.columns());
+                verifyCaseChecks(table, contract.checks(), false);
+                verifyCaseKeys(table, contract.keys());
+                verifyCaseIndexes(table, contract.indexes());
+                verifyCaseRole(table, "tianji_case_completion_inbox".equals(table));
+            }
+            var releaseChecks = caseChecks(migration.substring(migration.indexOf("ALTER TABLE tianji_process_release_definition"), migration.indexOf("ALTER TABLE tianji_human_task_receipt")));
+            String releaseExpression = releaseChecks.remove("tianji_process_release_definition_model_type_v8");
+            if (releaseExpression == null || !releaseChecks.isEmpty()) throw invalid();
+            verifyCaseChecks(DEFINITION, Map.of("tianji_process_release_definition_model_type_check", releaseExpression), true);
+            verifyCaseChecks("tianji_human_task_receipt", HumanTaskStorageVerifier.caseChecks(migration), true);
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Case storage schema verification failed", failure);
+        }
+    }
+
+    /** Case-off task readers select V7 or the exact V8 upgrade without requiring Case-table privileges. */
+    public boolean hasCaseMigration() {
+        var versions = jdbc.query("SELECT version,type,script,success,checksum FROM \"" + schema + "\".tianji_process_schema_history "
+                        + "WHERE version NOT IN ('1','2','3','4','5','6','7')",
+                (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
+                        rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
+        if (versions.isEmpty()) return false;
+        if (versions.size() != 1) throw invalid(); var version = versions.getFirst();
+        if (!"8".equals(version.version()) || !"SQL".equals(version.type()) || !CASE_FILE.equals(version.script()) || !version.success()
+                || version.checksum() == null) throw invalid();
+        caseMigration();
+        if (version.checksum() != checksum(CASE_FILE)) throw invalid();
+        return true;
+    }
+
+    private void verifyCaseColumns(String table, Map<String, CaseColumn> expected) {
+        var actual = new HashMap<String, CaseColumn>();
+        jdbc.query("""
+                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,a.attidentity,a.attgenerated,
+                       co.collname,pg_get_expr(d.adbin,d.adrelid) AS default_value
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+                WHERE n.nspname=? AND t.relname=? AND t.relkind='r'
+                """, rs -> {
+            if (!rs.getString("attidentity").isEmpty() || !rs.getString("attgenerated").isEmpty()
+                    || actual.put(rs.getString("attname"), new CaseColumn(rs.getString("type"), rs.getBoolean("attnotnull"),
+                    "C".equals(rs.getString("collname")), rs.getString("default_value"))) != null) throw invalid();
+        }, schema, table);
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyCaseChecks(String table, Map<String, String> expected, boolean modelAuthorityOnly) {
+        var actual = new HashMap<String, String>();
+        String authority = modelAuthorityOnly ? " AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=t.oid AND a.attnum=ANY(c.conkey) AND a.attname IN ('model_type','start_command_type'))" : "";
+        jdbc.query("SELECT c.conname,c.convalidated,pg_get_expr(c.conbin,c.conrelid) AS expression FROM pg_constraint c "
+                        + "JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace "
+                        + "WHERE n.nspname=? AND t.relname=? AND c.contype='c'" + authority, rs -> {
+            if (!rs.getBoolean("convalidated") || actual.put(rs.getString("conname"), signature(rs.getString("expression"))) != null) throw invalid();
+        }, schema, table);
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyCaseKeys(String table, Set<CaseKey> expected) {
+        var actual = new HashSet<CaseKey>();
+        jdbc.query("""
+                SELECT c.conname,c.contype,c.convalidated,c.condeferrable,c.condeferred,c.confupdtype,c.confmatchtype,
+                       CASE WHEN c.contype='f' THEN c.confdeltype::text ELSE '' END AS deletion,
+                       tn.nspname AS target_schema,tt.relname AS target,
+                       ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(num,ord)
+                             JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.num ORDER BY k.ord) AS fields,
+                       ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(num,ord)
+                             JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.num ORDER BY k.ord) AS target_fields
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                LEFT JOIN pg_class tt ON tt.oid=c.confrelid LEFT JOIN pg_namespace tn ON tn.oid=tt.relnamespace
+                WHERE n.nspname=? AND t.relname=? AND c.contype IN ('p','u','f')
+                """, rs -> {
+            boolean foreign = "f".equals(rs.getString("contype"));
+            if (!rs.getBoolean("convalidated") || rs.getBoolean("condeferrable") || rs.getBoolean("condeferred")
+                    || foreign && (!"a".equals(rs.getString("confupdtype")) || !"a".equals(rs.getString("deletion")) || !"s".equals(rs.getString("confmatchtype")))) throw invalid();
+            if (!actual.add(new CaseKey(rs.getString("conname"), rs.getString("contype"), caseArray(rs.getArray("fields")),
+                    rs.getString("target_schema"), rs.getString("target"), caseArray(rs.getArray("target_fields"))))) throw invalid();
+        }, schema, table);
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected) {
+        var actual = new HashMap<String, CaseIndex>();
+        jdbc.query("""
+                SELECT x.relname,i.indisunique,i.indisprimary,i.indisvalid,i.indisready,i.indislive,am.amname,i.indnkeyatts,i.indnatts,
+                       pg_get_expr(i.indpred,i.indrelid) AS predicate,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indclass::oid[]) k(oid) JOIN pg_opclass o ON o.oid=k.oid WHERE NOT o.opcdefault) AS default_classes,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY co(oid,ord)
+                         JOIN unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ord) USING(ord)
+                         JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num WHERE co.oid<>a.attcollation) AS column_collations,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indoption::smallint[]) o(options) WHERE options<>0) AS ascending,
+                       ARRAY(SELECT a.attname FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ord)
+                             LEFT JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num ORDER BY k.ord) AS fields
+                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam
+                WHERE n.nspname=? AND t.relname=?
+                """, rs -> {
+            if (!rs.getBoolean("indisvalid") || !rs.getBoolean("indisready") || !rs.getBoolean("indislive") || !rs.getBoolean("default_classes")
+                    || !rs.getBoolean("column_collations") || !rs.getBoolean("ascending") || !"btree".equals(rs.getString("amname"))
+                    || rs.getInt("indnkeyatts") != rs.getInt("indnatts")) throw invalid();
+            String predicate = rs.getString("predicate");
+            if (actual.put(rs.getString("relname"), new CaseIndex(caseArray(rs.getArray("fields")), rs.getBoolean("indisunique"),
+                    rs.getBoolean("indisprimary"), predicate == null ? null : signature(predicate))) != null) throw invalid();
+        }, schema, table);
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyCaseRole(String table, boolean mutable) {
+        String update = mutable ? "has_table_privilege(c.oid,'UPDATE')" : "NOT has_table_privilege(c.oid,'UPDATE')";
+        Boolean valid = jdbc.queryForObject("""
+                SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relispartition AND c.relpersistence='p'
+                  AND has_schema_privilege(n.oid,'USAGE')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user AND (r.rolsuper OR r.rolbypassrls))
+                  AND NOT pg_has_role(c.relowner,'MEMBER')
+                  AND has_table_privilege(c.oid,'SELECT') AND has_table_privilege(c.oid,'INSERT')
+                  AND NOT has_table_privilege(c.oid,'DELETE') AND NOT has_table_privilege(c.oid,'TRUNCATE')
+                  AND NOT has_table_privilege(c.oid,'TRIGGER') AND NOT has_table_privilege(c.oid,'REFERENCES')
+                  AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
+                    AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
+                """ + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
+                Boolean.class, schema, table);
+        if (!Boolean.TRUE.equals(valid)) throw invalid();
+    }
+
+    /** Descriptors are taken only from the byte-pinned packaged migration, never from caller SQL or database expressions. */
+    private Map<String, CaseTable> caseContracts(String sql) {
+        var contracts = new HashMap<String, CaseTable>();
+        var tables = Pattern.compile("CREATE TABLE ([a-z_]+) \\(").matcher(sql);
+        while (tables.find()) {
+            String table = tables.group(1); int open = tables.end() - 1; String body = sql.substring(open + 1, caseClosing(sql, open));
+            var columns = new HashMap<String, CaseColumn>();
+            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
+            while (fields.find()) {
+                String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(").replace("timestamptz(6)", "timestamp(6) with time zone");
+                if (columns.put(fields.group(1), new CaseColumn(type, fields.group(3).contains("NOT NULL"), fields.group(3).contains("COLLATE \"C\""), null)) != null) throw invalid();
+            }
+            var keys = new HashSet<CaseKey>(); var indexes = new HashMap<String, CaseIndex>();
+            var keyMatcher = Pattern.compile("CONSTRAINT ([a-z_]+)\\s+(PRIMARY KEY|FOREIGN KEY)\\s*\\(([^)]+)\\)").matcher(body);
+            while (keyMatcher.find()) {
+                String name = keyMatcher.group(1); var names = caseFields(keyMatcher.group(3)); boolean foreign = "FOREIGN KEY".equals(keyMatcher.group(2));
+                if (foreign) {
+                    var reference = Pattern.compile("\\s*REFERENCES ([a-z_]+)\\s*\\(([^)]+)\\)").matcher(body.substring(keyMatcher.end()));
+                    if (!reference.lookingAt()) throw invalid(); keys.add(new CaseKey(name, "f", names, schema, reference.group(1), caseFields(reference.group(2))));
+                } else { keys.add(new CaseKey(name, "p", names, null, null, List.of())); indexes.put(name, new CaseIndex(names, true, true, null)); }
+            }
+            var indexMatcher = Pattern.compile("CREATE (UNIQUE )?INDEX ([a-z_]+)\\s+ON ([a-z_]+)\\s*\\(([^)]+)\\)(?:\\s+WHERE ([^;]+))?;").matcher(sql);
+            while (indexMatcher.find()) if (table.equals(indexMatcher.group(3))) {
+                String predicate = indexMatcher.group(5);
+                if (indexes.put(indexMatcher.group(2), new CaseIndex(caseFields(indexMatcher.group(4)), indexMatcher.group(1) != null, false,
+                        predicate == null ? null : signature(predicate))) != null) throw invalid();
+            }
+            contracts.put(table, new CaseTable(Map.copyOf(columns), Map.copyOf(caseChecks(body)), Set.copyOf(keys), Map.copyOf(indexes)));
+        }
+        var sizes = Map.of("tianji_case_start_provenance", 31, "tianji_case_plan_item_receipt", 24, "tianji_case_completion_inbox", 17);
+        if (!contracts.keySet().equals(sizes.keySet())) throw invalid();
+        for (var entry : sizes.entrySet()) if (contracts.get(entry.getKey()).columns().size() != entry.getValue()) throw invalid();
+        return Map.copyOf(contracts);
+    }
+
+    private static HashMap<String, String> caseChecks(String sql) {
+        var checks = new HashMap<String, String>(); var matcher = Pattern.compile("CONSTRAINT ([a-z_0-9]+)\\s+CHECK\\s*\\(").matcher(sql);
+        while (matcher.find()) { int open = matcher.end() - 1; if (checks.put(matcher.group(1), signature(sql.substring(open + 1, caseClosing(sql, open)))) != null) throw invalid(); }
+        return checks;
+    }
+    private static String caseMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + CASE_FILE)) {
+            if (input == null) throw invalid(); byte[] bytes = input.readAllBytes();
+            String actual = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+            if (!CASE_SHA256.equals(actual)) throw invalid(); return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) { throw new IllegalStateException("Case migration resource is unavailable", failure); }
+    }
+    private static int caseClosing(String value, int open) {
+        int depth = 0; boolean quoted = false;
+        for (int i = open; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '\'') { if (quoted && i + 1 < value.length() && value.charAt(i + 1) == '\'') i++; else quoted = !quoted; }
+            else if (!quoted) { if (c == '(') depth++; else if (c == ')' && --depth == 0) return i; }
+        }
+        throw invalid();
+    }
+    private static List<String> caseFields(String value) { return Arrays.stream(value.split(",")).map(String::trim).toList(); }
+    private static List<String> caseArray(java.sql.Array value) throws java.sql.SQLException { return value == null ? List.of() : List.copyOf(Arrays.asList((String[]) value.getArray())); }
+    private record CaseVersion(String version, String type, String script, boolean success, Integer checksum) { }
+    private record CaseColumn(String type, boolean required, boolean cCollation, String defaultValue) { }
+    private record CaseKey(String name, String type, List<String> fields, String targetSchema, String target, List<String> targetFields) { }
+    private record CaseIndex(List<String> fields, boolean unique, boolean primary, String predicate) { }
+    private record CaseTable(Map<String, CaseColumn> columns, Map<String, String> checks, Set<CaseKey> keys, Map<String, CaseIndex> indexes) { }
 
     /** Worker activation also requires the separately deployed V4 lease schema. */
     public void verifyWorker() {

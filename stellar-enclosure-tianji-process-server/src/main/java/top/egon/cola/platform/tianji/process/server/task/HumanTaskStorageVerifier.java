@@ -41,11 +41,11 @@ public final class HumanTaskStorageVerifier {
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setReadOnly(true); transaction.setTimeout(15);
         transaction.executeWithoutResult(status -> {
             if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))) throw invalid();
-            new ProcessApiSchemaVerifier(source, schema).verify();
+            var schemaVerifier = new ProcessApiSchemaVerifier(source, schema); schemaVerifier.verify();
             var history = jdbc.query("SELECT success,checksum,script FROM \"" + schema + "\".tianji_process_schema_history WHERE version='7' AND type='SQL'",
                     (rs, number) -> rs.getBoolean("success") && rs.getObject("checksum") != null && rs.getInt("checksum") == checksum(sql) && FILE.equals(rs.getString("script")));
             if (history.size() != 1 || !history.getFirst()) throw invalid();
-            var contract = contract(sql); verifyColumns(contract); verifyChecks(contract); verifyKeys(); verifyIndexes(); verifyRole();
+            var contract = schemaVerifier.hasCaseMigration() ? contractV8(sql, caseMigration()) : contract(sql); verifyColumns(contract); verifyChecks(contract); verifyKeys(); verifyIndexes(); verifyRole();
         });
     }
 
@@ -130,8 +130,30 @@ public final class HumanTaskStorageVerifier {
         while (constraints.find()) { int open = constraints.end() - 1; checks.put(constraints.group(1), signature(sql.substring(open + 1, closing(sql, open)))); }
         if (columns.size() < 30 || checks.size() < 15) throw invalid(); return new Contract(Map.copyOf(columns), Map.copyOf(checks));
     }
+    static Contract contractV8(String sql, String caseSql) {
+        var original = contract(sql); var checks = new HashMap<>(original.checks()); checks.putAll(caseChecks(caseSql));
+        return new Contract(original.columns(), Map.copyOf(checks));
+    }
+    /** Only the V8 task authority checks change; the V7 columns, defaults and all other checks remain immutable. */
+    public static Map<String, String> caseChecks(String caseSql) {
+        var checks = new HashMap<String, String>();
+        var matcher = Pattern.compile("CONSTRAINT\\s+(human_task_[a-z0-9_]+)\\s+CHECK\\s*\\(").matcher(caseSql);
+        while (matcher.find()) {
+            String name = matcher.group(1); if (name.endsWith("_v8")) name = name.substring(0, name.length() - 3);
+            int open = matcher.end() - 1;
+            if (checks.put(name, signature(caseSql.substring(open + 1, closing(caseSql, open)))) != null) throw invalid();
+        }
+        if (!checks.keySet().equals(Set.of("human_task_model_type", "human_task_start_command_type", "human_task_case_kind"))) throw invalid();
+        return Map.copyOf(checks);
+    }
+    private static String caseMigration() {
+        try (var input = HumanTaskStorageVerifier.class.getResourceAsStream("/db/tianji-process/V8__add_formal_cmmn_case_support.sql")) {
+            if (input == null) throw invalid(); return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (java.io.IOException failure) { throw invalid(); }
+    }
+
     /** AND/OR grouping is retained; whitespace/implicit text casts and redundant atom parentheses are not authority. */
-    static String signature(String expression) {
+    public static String signature(String expression) {
         String value = expression.trim(); if (value.length() > 32_768) throw invalid(); while (value.startsWith("(") && closing(value, 0) == value.length() - 1) value = value.substring(1, value.length() - 1).trim();
         for (var operator : List.of("OR", "AND")) { var parts = split(value, operator); if (parts.size() > 1) return operator + parts.stream().map(HumanTaskStorageVerifier::signature).toList(); }
         if (keyword(value, 0, "NOT")) return "NOT[" + signature(value.substring(3)) + ']'; return "ATOM[" + atom(value).replace("][]", "]") + ']';
