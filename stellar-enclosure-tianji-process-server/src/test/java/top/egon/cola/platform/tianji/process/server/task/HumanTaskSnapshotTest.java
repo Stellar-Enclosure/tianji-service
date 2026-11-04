@@ -81,6 +81,56 @@ class HumanTaskSnapshotTest {
         assertThrows(IllegalStateException.class, () -> new HumanTaskSnapshot(mock(Task.class), links, origin, definition, model));
     }
 
+    @Test void case_snapshot_uses_the_case_scope_and_owner_realm_with_empty_action_form() throws Exception {
+        var fixture = new CaseFixture();
+        var snapshot = assertDoesNotThrow(fixture::snapshot);
+        var context = caseContext("get", Set.of("7")); var value = snapshot.projection(context);
+        assertEquals(top.egon.cola.platform.tianji.contract.orchestration.HumanTaskScopeTypeEnum.CASE, value.scopeType());
+        assertEquals("case-1", value.scopeId()); assertEquals("governedCase", value.definitionKey());
+        assertEquals("primaryTask", value.taskDefinitionKey()); assertEquals(Map.of(), value.formSchema()); assertNull(value.approvalField());
+        assertEquals(fixture.provenance, snapshot.caseProvenance()); assertEquals("case-1", snapshot.origin().instanceId());
+        assertEquals("parent-1", snapshot.caseProvenance().seed().parentProcessInstanceId());
+        assertNotEquals(snapshot.origin().requester().issuerFingerprint(), snapshot.caseProvenance().seed().executor().issuerFingerprint());
+        assertEquals(value.version(), snapshot.projection(caseContext("get", Set.of("8"))).version());
+        verify(fixture.task, never()).getProcessVariables(); verify(fixture.task, never()).getTaskLocalVariables();
+    }
+
+    @Test void case_snapshot_binds_native_scope_definition_and_plan_item_and_revision() throws Exception {
+        var f = new CaseFixture(); var first = assertDoesNotThrow(f::snapshot).version();
+        f.revision.incrementAndGet(); assertNotEquals(first, f.snapshot().version());
+        when(f.task.getScopeId()).thenReturn("foreign-case"); assertThrows(IllegalStateException.class, f::snapshot); when(f.task.getScopeId()).thenReturn("case-1");
+        when(f.task.getScopeDefinitionId()).thenReturn("foreign-def"); assertThrows(IllegalStateException.class, f::snapshot); when(f.task.getScopeDefinitionId()).thenReturn("case-definition");
+        when(f.task.getSubScopeId()).thenReturn(null); assertThrows(IllegalStateException.class, f::snapshot); when(f.task.getSubScopeId()).thenReturn("plan-1");
+        when(f.task.getProcessInstanceId()).thenReturn("parent-1"); assertThrows(IllegalStateException.class, f::snapshot);
+    }
+
+    static HumanTaskContext caseContext(String operation, Set<String> roles) { return new HumanTaskContext(REVIEWER, "tianji.api.process.task." + operation, roles, NOW.plusSeconds(30), 2, 3); }
+    static final class CaseFixture {
+        final TaskEntity task = mock(TaskEntity.class);
+        final java.util.concurrent.atomic.AtomicInteger revision = new java.util.concurrent.atomic.AtomicInteger(1);
+        final java.util.concurrent.atomic.AtomicReference<String> assignee = new java.util.concurrent.atomic.AtomicReference<>();
+        final top.egon.cola.platform.tianji.process.server.release.ValidatedCaseModel model;
+        final Definition definition;
+        final top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.Entry provenance;
+        CaseFixture() throws Exception {
+            byte[] bytes; try (var input = HumanTaskSnapshotTest.class.getResourceAsStream("/fixtures/governed-case.cmmn")) { assertNotNull(input); bytes = input.readAllBytes(); }
+            model = new ProcessModelValidator().validateCmmn(bytes, "governedCase");
+            String hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+            definition = new Definition(Type.valueOf("CMMN"), "governedCase", "case-definition", "case-deployment", 1, hash, Map.of());
+            var executor = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "case-service", "https://service.example/20");
+            var seed = new top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.Seed("case-1", "LINKED_BPMN", "business", "correlation", "release", "governedCase", "case-definition", hash,
+                    REQUESTER, "START", "parent-start", "a".repeat(64), executor, "case-start", "b".repeat(64), "source", "parent-1", "occurrence", "caseSource", "linkedProcess", "parent-definition", "c".repeat(64));
+            provenance = new top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.Entry(seed, NOW);
+            when(task.getId()).thenReturn("case-task"); when(task.getTaskDefinitionKey()).thenReturn("primaryTask"); when(task.getName()).thenReturn("Primary Task");
+            when(task.getScopeType()).thenReturn("cmmn"); when(task.getScopeId()).thenReturn("case-1"); when(task.getScopeDefinitionId()).thenReturn("case-definition"); when(task.getSubScopeId()).thenReturn("plan-1");
+            when(task.getTenantId()).thenReturn("20"); when(task.getCreateTime()).thenReturn(Date.from(NOW)); when(task.getState()).thenReturn("CREATED");
+            when(task.getRevision()).thenAnswer(i -> revision.get()); when(task.getAssignee()).thenAnswer(i -> assignee.get());
+        }
+        List<IdentityLink> links() { return List.of(caseGroup("7"), caseGroup("8")); }
+        private IdentityLink caseGroup(String role) { var link=mock(IdentityLink.class); when(link.getTaskId()).thenReturn("case-task"); when(link.getType()).thenReturn("candidate"); when(link.getGroupId()).thenReturn("role:"+role); return link; }
+        HumanTaskSnapshot snapshot() { return new HumanTaskSnapshot(task, links(), provenance, definition, model); }
+    }
+
     private HumanTaskSnapshot snapshot() { return new HumanTaskSnapshot(task, links, origin, definition, model); }
     private static IdentityLink group(String id) { var link = mock(IdentityLink.class); when(link.getTaskId()).thenReturn("task"); when(link.getType()).thenReturn("candidate"); when(link.getGroupId()).thenReturn("role:" + id); return link; }
 }

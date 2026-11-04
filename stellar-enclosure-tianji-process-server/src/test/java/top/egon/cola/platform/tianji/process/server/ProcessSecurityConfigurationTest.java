@@ -10,6 +10,8 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @WebMvcTest(value = ProcessSecurityConfigurationTest.Probe.class, properties = "spring.main.web-application-type=servlet",
@@ -23,6 +25,22 @@ class ProcessSecurityConfigurationTest {
     void allows_health_but_denies_other_paths() throws Exception {
         mvc.perform(get("/actuator/health")).andExpect(status().isOk());
         mvc.perform(get("/process-api")).andExpect(status().isForbidden());
+    }
+
+    @Test
+    void default_off_security_denies_all_three_case_posts() throws Exception {
+        for (String operation : java.util.List.of("start", "get", "act-plan-item"))
+            mvc.perform(post("/api/tianji/v1/cases/" + operation).contentType("application/json").content("{}"))
+                    .andExpect(status().isForbidden());
+    }
+
+    @Test
+    void case_start_and_get_are_explicit_mixed_principal_endpoints() {
+        var policy = new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy();
+        for (String operation : java.util.List.of("start", "get")) {
+            var request = new org.springframework.mock.web.MockHttpServletRequest("POST", "/api/tianji/v1/cases/" + operation);
+            assertEquals(top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE, policy.requirement(request));
+        }
     }
 
     @RestController

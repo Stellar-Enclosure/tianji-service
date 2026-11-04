@@ -157,6 +157,33 @@ class ProcessControllerTest {
         verifyNoInteractions(releases, processes, decisions);
     }
 
+    @Test
+    void cmmn_release_publish_and_read_keep_empty_inputs_and_hide_native_binding_ids() throws Exception {
+        var published = new ProcessReleaseService.Release("case-release", "a".repeat(64), now, List.of(
+                new ProcessReleaseService.Definition(ValidatedProcessModel.Type.CMMN, "governedCase", "private-case-definition", "private-case-deployment", 3, "b".repeat(64), Map.of())));
+        when(releases.publish(eq(ACTOR), eq("case-release"), anyList())).thenReturn(published);
+        when(releases.get(ACTOR, "case-release")).thenReturn(published);
+        var command = new PublishProcessReleaseCommand("case-release", List.of(new ProcessModelResource(ProcessModelTypeEnum.CMMN, "governedCase", "<synthetic-cmmn/>", Map.of())));
+        var write = mvc.perform(post("/api/tianji/v1/process-releases").contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(command)))
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.models[0].type").value("CMMN")).andExpect(jsonPath("$.models[0].inputs").isEmpty()).andReturn().getResponse().getContentAsString();
+        var read = mvc.perform(get("/api/tianji/v1/process-releases/case-release")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.models[0].definitionKey").value("governedCase")).andExpect(jsonPath("$.models[0].inputs").isEmpty()).andReturn().getResponse().getContentAsString();
+        assertEquals(mapper.readTree(write), mapper.readTree(read));
+        assertFalse(write.contains("private-case-definition")); assertFalse(write.contains("private-case-deployment"));
+        verify(releases).publish(eq(ACTOR), eq("case-release"), argThat(models -> models.size() == 1 && models.getFirst().type() == ValidatedProcessModel.Type.CMMN
+                && models.getFirst().definitionKey().equals("governedCase") && models.getFirst().inputs().isEmpty()));
+    }
+
+    @Test
+    void unexpected_runtime_failures_on_legacy_process_routes_keep_the_existing_internal_error_contract() throws Exception {
+        when(processes.get(ACTOR, "unexpected")).thenThrow(new RuntimeException("private legacy runtime detail"));
+        var body = mvc.perform(get("/api/tianji/v1/process-instances/unexpected")).andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.code").value("TIANJI_INTERNAL_ERROR")).andExpect(header().string("Cache-Control", "no-store"))
+                .andReturn().getResponse().getContentAsString();
+        assertFalse(body.contains("private legacy runtime detail"));
+    }
+
     private ProcessReleaseService.Release release() {
         return new ProcessReleaseService.Release("v1", "a".repeat(64), now, List.of(
                 new ProcessReleaseService.Definition(ValidatedProcessModel.Type.BPMN, "invoice", "engine-definition", "engine-deployment",

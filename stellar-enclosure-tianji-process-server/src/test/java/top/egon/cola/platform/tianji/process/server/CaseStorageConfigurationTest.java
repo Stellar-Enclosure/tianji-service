@@ -112,6 +112,60 @@ class CaseStorageConfigurationTest {
         assertTrue(catalog.queries.stream().anyMatch(sql -> sql.contains("rolsuper") && sql.contains("relowner") && sql.contains("relrowsecurity")));
     }
 
+    @Test void case_factory_is_installed_only_after_native_initialization_and_updates_both_pointers() throws Exception {
+        var fixture = new FactoryFixture();
+        var off = new org.springframework.mock.env.MockEnvironment(); fixture.configure(off);
+        assertNull(fixture.installer.get()); verifyNoInteractions(fixture.provider);
+        fixture.configure(off.withProperty("stellar.tianji.process.cases.enabled", "true"));
+        var installer = fixture.installer.get(); assertNotNull(installer); assertEquals(Integer.MAX_VALUE, installer.getPriority());
+        var original = fixture.factory.get(); installer.beforeInit(fixture.engine); assertSame(original, fixture.factory.get());
+        installer.configure(fixture.engine);
+        assertInstanceOf(top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory.class, fixture.factory.get());
+        assertSame(fixture.factory.get(), fixture.parserFactory.get());
+        assertDoesNotThrow(() -> top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory.requireConfigured(fixture.engine));
+        verifyNoInteractions(fixture.provider);
+    }
+
+    @Test void case_factory_installation_refuses_an_unknown_factory_or_a_different_parser_pointer() throws Exception {
+        for (boolean custom : List.of(false, true)) {
+            var fixture = new FactoryFixture();
+            if (custom) fixture.factory.set(new org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory() {});
+            else fixture.parserFactory.set(new org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory());
+            fixture.configure(new org.springframework.mock.env.MockEnvironment().withProperty("stellar.tianji.process.cases.enabled", "true"));
+            var installer = fixture.installer.get(); assertNotNull(installer);
+            assertThrows(IllegalStateException.class, () -> installer.configure(fixture.engine));
+        }
+    }
+
+    private static final class FactoryFixture {
+        final DataSource source = mock(DataSource.class);
+        final org.springframework.jdbc.datasource.DataSourceTransactionManager manager = new org.springframework.jdbc.datasource.DataSourceTransactionManager(source);
+        final org.flowable.cmmn.spring.SpringCmmnEngineConfiguration engine = mock(org.flowable.cmmn.spring.SpringCmmnEngineConfiguration.class);
+        final org.flowable.cmmn.engine.impl.parser.CmmnParserImpl parser = mock(org.flowable.cmmn.engine.impl.parser.CmmnParserImpl.class);
+        final java.util.concurrent.atomic.AtomicReference<org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory> factory = new java.util.concurrent.atomic.AtomicReference<>(new org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory());
+        final java.util.concurrent.atomic.AtomicReference<org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory> parserFactory = new java.util.concurrent.atomic.AtomicReference<>(factory.get());
+        final java.util.concurrent.atomic.AtomicReference<org.flowable.common.engine.impl.EngineConfigurator> installer = new java.util.concurrent.atomic.AtomicReference<>();
+        final org.springframework.beans.factory.ObjectProvider<top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService> provider = mock(org.springframework.beans.factory.ObjectProvider.class);
+        FactoryFixture() {
+            when(engine.getDataSource()).thenReturn(source); when(engine.getTransactionManager()).thenReturn(manager); when(engine.getDatabaseSchema()).thenReturn("tianji_process"); when(engine.getDatabaseSchemaUpdate()).thenReturn("false"); when(engine.getBeans()).thenReturn(Map.of());
+            when(engine.getExpressionManager()).thenReturn(mock(org.flowable.common.engine.impl.el.ExpressionManager.class));
+            when(engine.getClassDelegateFactory()).thenReturn(mock(org.flowable.cmmn.engine.impl.delegate.CmmnClassDelegateFactory.class));
+            when(engine.getCmmnRuntimeService()).thenReturn(mock(org.flowable.cmmn.api.CmmnRuntimeService.class)); when(engine.getCmmnHistoryService()).thenReturn(mock(org.flowable.cmmn.api.CmmnHistoryService.class)); when(engine.getCmmnTaskService()).thenReturn(mock(org.flowable.cmmn.api.CmmnTaskService.class));
+            when(engine.getHistoryLevel()).thenReturn(org.flowable.common.engine.impl.history.HistoryLevel.AUDIT);
+            when(engine.getCmmnParser()).thenReturn(parser); when(engine.getActivityBehaviorFactory()).thenAnswer(i -> factory.get()); when(parser.getActivityBehaviorFactory()).thenAnswer(i -> parserFactory.get());
+            doAnswer(i -> { factory.set(i.getArgument(0)); return engine; }).when(engine).setActivityBehaviorFactory(any());
+            doAnswer(i -> { parserFactory.set(i.getArgument(0)); return null; }).when(parser).setActivityBehaviorFactory(any());
+            doAnswer(i -> { installer.set(i.getArgument(0)); return engine; }).when(engine).addConfigurator(any(org.flowable.common.engine.impl.EngineConfigurator.class));
+        }
+        void configure(org.springframework.core.env.Environment environment) throws Exception {
+            var outbox = new top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure(source, "source", manager, "manager");
+            var properties = new top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties(); properties.getStorage().getJdbc().setSchema("tianji_process");
+            try (var construction = mockConstruction(JdbcTemplate.class, (jdbc, ignored) -> when(jdbc.queryForObject("SELECT current_schema()", String.class)).thenReturn("tianji_process"))) {
+                new ProcessStorageConfiguration().caseStorageGuard(outbox, properties, environment, provider).configure(engine);
+            }
+        }
+    }
+
     private static void rejects(Consumer<Catalog> mutate) throws Exception {
         var catalog = new Catalog(); mutate.accept(catalog); check(catalog, true);
     }

@@ -22,6 +22,7 @@ import java.sql.Connection;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -77,6 +78,65 @@ class HumanTaskNativeAccessTest {
             when(jdbc.get().queryForObject(eq("SELECT clock_timestamp()"), eq(Timestamp.class))).thenReturn(Timestamp.from(NOW), Timestamp.from(NOW.plusSeconds(31)));
             assertThrows(IllegalStateException.class, () -> transaction.execute(status -> access.find(context("complete", Set.of("50")), "task", true)));
             verify(engine.getTaskService(), never()).createTaskQuery();
+        }
+    }
+
+    @Test void case_scans_and_unlocked_write_discovery_bind_owner_realm_and_cmmn_scope() throws Exception {
+        var source=source(); var engine=engine(source); var cmmn=mock(org.flowable.cmmn.spring.SpringCmmnEngineConfiguration.class);
+        var tasks=mock(org.flowable.cmmn.api.CmmnTaskService.class); var manager=engine.getTransactionManager(); when(cmmn.getDataSource()).thenReturn(source); when(cmmn.getTransactionManager()).thenReturn(manager);
+        when(cmmn.getDatabaseSchema()).thenReturn("tianji_process"); when(cmmn.getCmmnTaskService()).thenReturn(tasks);
+        var jdbc=new AtomicReference<JdbcTemplate>(); var named=new AtomicReference<NamedParameterJdbcTemplate>();
+        try(var statements=statements(jdbc);var parameters=parameters(named)) {
+            var access=new HumanTaskNativeAccess(source,engine,cmmn); var tx=new TransactionTemplate((DataSourceTransactionManager)engine.getTransactionManager());
+            var query=new ListHumanTasksQuery(HumanTaskScopeTypeEnum.CASE,HumanTaskSelectionEnum.CANDIDATE,"release","case-1","primaryTask","before",5);
+            assertEquals(List.of("task"),assertDoesNotThrow(()->tx.execute(s->access.candidates(context("query",Set.of("7")),query,5))));
+            verify(named.get()).query(argThat(sql->sql.contains("scope_type_='cmmn'") && sql.contains("p.owner_issuer=:issuer") && sql.contains("t.scope_id_=:scope") && sql.contains("COLLATE \"C\"") && !sql.contains("FOR UPDATE")),any(MapSqlParameterSource.class),org.mockito.ArgumentMatchers.<RowMapper<String>>any());
+            var nativeQuery=mock(TaskQuery.class,RETURNS_SELF); var task=mock(Task.class);
+            when(task.getId()).thenReturn("task");when(task.getTenantId()).thenReturn("20");when(task.getScopeType()).thenReturn("cmmn");when(task.getScopeId()).thenReturn("case-1");when(task.getScopeDefinitionId()).thenReturn("case-definition");when(task.getSubScopeId()).thenReturn("plan-1");when(task.getTaskDefinitionKey()).thenReturn("primaryTask");
+            when(tasks.createTaskQuery()).thenReturn(nativeQuery);when(nativeQuery.singleResult()).thenReturn(task);
+            assertEquals(Optional.of(task),tx.execute(s->access.findCase(context("claim",Set.of("7")),"task",false)));
+            verify(named.get(),never()).query(contains("FOR UPDATE"),any(MapSqlParameterSource.class),org.mockito.ArgumentMatchers.<RowMapper<String>>any());
+            assertEquals(Optional.of(task),tx.execute(s->access.findCase(context("claim",Set.of("7")),"task",true)));
+            verify(named.get()).query(contains("FOR UPDATE OF t"),any(MapSqlParameterSource.class),org.mockito.ArgumentMatchers.<RowMapper<String>>any());
+            verifyNoInteractions(engine.getTaskService());
+        }
+    }
+
+    @Test void case_reference_queries_bind_the_exact_active_human_plan_item_before_the_task_fence() throws Exception {
+        var source = source(); var engine = engine(source); var manager = engine.getTransactionManager();
+        var cmmn = mock(org.flowable.cmmn.spring.SpringCmmnEngineConfiguration.class); var tasks = mock(org.flowable.cmmn.api.CmmnTaskService.class);
+        when(cmmn.getDataSource()).thenReturn(source); when(cmmn.getTransactionManager()).thenReturn(manager); when(cmmn.getDatabaseSchema()).thenReturn("tianji_process"); when(cmmn.getCmmnTaskService()).thenReturn(tasks);
+        var jdbc = new AtomicReference<JdbcTemplate>(); var named = new AtomicReference<NamedParameterJdbcTemplate>();
+        try (var statements = statements(jdbc); var parameters = parameters(named)) {
+            var access = new HumanTaskNativeAccess(source, engine, cmmn); var tx = new TransactionTemplate((DataSourceTransactionManager) manager);
+            var sqls = new java.util.ArrayList<String>(); var bindings = new java.util.ArrayList<MapSqlParameterSource>();
+            when(named.get().query(anyString(), any(MapSqlParameterSource.class), org.mockito.ArgumentMatchers.<RowMapper<String>>any())).thenAnswer(call -> {
+                sqls.add(call.getArgument(0)); bindings.add(call.getArgument(1)); return List.of("task");
+            });
+            var query = new ListHumanTasksQuery(HumanTaskScopeTypeEnum.CASE, HumanTaskSelectionEnum.CANDIDATE, null, null, null, null, 5);
+            tx.executeWithoutResult(status -> access.candidates(context("query", Set.of("7")), query, 5));
+            var taskQuery = mock(TaskQuery.class, RETURNS_SELF); var task = mock(Task.class);
+            when(task.getId()).thenReturn("task"); when(task.getTenantId()).thenReturn("20"); when(task.getScopeType()).thenReturn("cmmn"); when(task.getScopeId()).thenReturn("case-1");
+            when(task.getScopeDefinitionId()).thenReturn("case-definition"); when(task.getSubScopeId()).thenReturn("plan-1"); when(task.getTaskDefinitionKey()).thenReturn("primaryTask");
+            when(tasks.createTaskQuery()).thenReturn(taskQuery); when(taskQuery.singleResult()).thenReturn(task);
+            tx.executeWithoutResult(status -> access.findCase(context("claim", Set.of("7")), "task", true));
+            assertEquals(2, sqls.size());
+            for (int index = 0; index < sqls.size(); index++) {
+                String sql = sqls.get(index); var values = bindings.get(index).getValues();
+                assertAll("CASE affinity SQL contract, not a PostgreSQL execution claim",
+                        () -> assertTrue(sql.contains("JOIN \"tianji_process\".act_cmmn_ru_plan_item_inst i")),
+                        () -> assertTrue(sql.contains("i.id_=t.sub_scope_id_")),
+                        () -> assertTrue(sql.contains("i.case_inst_id_=t.scope_id_")),
+                        () -> assertTrue(sql.contains("i.case_def_id_=t.scope_definition_id_")),
+                        () -> assertTrue(sql.contains("i.tenant_id_=t.tenant_id_")),
+                        () -> assertTrue(sql.contains("i.item_definition_id_=t.task_def_key_")),
+                        () -> assertTrue(sql.contains("i.item_definition_type_=:humanTaskKind")),
+                        () -> assertTrue(sql.contains("i.state_=:activeState")),
+                        () -> assertTrue(sql.contains("i.ended_time_ IS NULL")),
+                        () -> assertEquals("humantask", values.get("humanTaskKind")),
+                        () -> assertEquals(org.flowable.cmmn.api.runtime.PlanItemDefinitionType.HUMAN_TASK, values.get("humanTaskKind")),
+                        () -> assertEquals(org.flowable.cmmn.api.runtime.PlanItemInstanceState.ACTIVE, values.get("activeState")));
+            }
         }
     }
 

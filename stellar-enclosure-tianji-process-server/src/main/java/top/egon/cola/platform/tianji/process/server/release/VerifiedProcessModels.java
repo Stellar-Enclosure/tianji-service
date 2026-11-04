@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
 import org.flowable.common.engine.api.FlowableObjectNotFoundException;
+import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -19,13 +20,41 @@ public final class VerifiedProcessModels {
     private static final int MAX_XML_BYTES = 512 * 1024;
     private final SpringProcessEngineConfiguration process;
     private final SpringDmnEngineConfiguration dmn;
+    private final SpringCmmnEngineConfiguration cmmn;
     private final ProcessModelValidator validator;
 
     public VerifiedProcessModels(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator) {
+        this(process, null, dmn, validator);
+    }
+
+    public VerifiedProcessModels(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn,
+                                 SpringDmnEngineConfiguration dmn, ProcessModelValidator validator) {
+        this.cmmn = cmmn;
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
+    }
+
+    public ValidatedCaseModel caseModel(long tenantId, Definition binding) {
+        if (tenantId <= 0 || cmmn == null || binding == null || binding.type() != Type.CMMN || !binding.inputs().isEmpty()) throw unavailable();
+        var repository = cmmn.getCmmnRepositoryService();
+        if (repository == null) throw unavailable();
+        var definition = repository.createCaseDefinitionQuery().caseDefinitionId(binding.engineDefinitionId())
+                .deploymentId(binding.engineDeploymentId()).caseDefinitionTenantId(Long.toString(tenantId))
+                .caseDefinitionKey(binding.definitionKey()).caseDefinitionVersion(binding.engineVersion()).singleResult();
+        if (definition == null || !binding.engineDefinitionId().equals(definition.getId()) || !binding.engineDeploymentId().equals(definition.getDeploymentId())
+                || !binding.definitionKey().equals(definition.getKey()) || !Long.toString(tenantId).equals(definition.getTenantId())
+                || definition.getVersion() != binding.engineVersion() || !(binding.definitionKey() + ".cmmn").equals(definition.getResourceName())) throw unavailable();
+        try (InputStream source = repository.getResourceAsStream(binding.engineDeploymentId(), definition.getResourceName())) {
+            byte[] xml = checkedBytes(source, binding);
+            try { return validator.validateCmmn(xml, binding.definitionKey()); }
+            catch (IllegalArgumentException invalid) { throw new IllegalStateException("Stored case model is invalid"); }
+        } catch (FlowableObjectNotFoundException missing) {
+            throw unavailable();
+        } catch (IOException failure) {
+            throw new IllegalStateException("Case model could not be read safely");
+        }
     }
 
     public ValidatedProcessModel process(long tenantId, Definition binding) {

@@ -35,6 +35,7 @@ import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
 import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
+import top.egon.cola.platform.tianji.process.server.security.TianjiCaseAccess;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
 import top.egon.cola.platform.tianji.process.server.security.TianjiApprovalVerificationAccess;
@@ -476,6 +477,60 @@ class ProcessPermissionIntegrationTest {
         assertTrue(manager.check(() -> SecurityContextHolder.getContext().getAuthentication(), invocation).isGranted());
     }
 
+    @Test
+    void case_user_resources_require_current_permission_and_scope_for_each_operation() {
+        var request = new MockHttpServletRequest();
+        request.setAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer", "https://idp.example/tenants/20");
+        VerifiedUserTokenCarrier.set(request, "verified-test-token"); RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        var permissions = Set.of(TianjiProcessPermissions.CASE_START, TianjiProcessPermissions.CASE_READ, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT);
+        var scopeCodes = Set.of(TianjiProcessPermissions.CASE_START_SCOPE, TianjiProcessPermissions.CASE_READ_SCOPE, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_SCOPE);
+        var operations = Map.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_START,
+                TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_READ,
+                TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT);
+        var operationScopes = Map.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_START_SCOPE,
+                TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_READ_SCOPE,
+                TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_SCOPE);
+        var access = new TianjiCaseAccess(new TianjiProcessAccess(guard(), CLOCK), CLOCK);
+        for (var operation : operations.entrySet()) {
+            granted.set(permissions);
+            var authorities = scopeCodes.stream().map(scope -> new SimpleGrantedAuthority("SCOPE_" + scope)).toList();
+            SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(permissions)), authorities));
+            var allowed = access.require(operation.getKey());
+            assertEquals(ProcessActor.SubjectType.USER, allowed.actor().subjectType()); assertEquals(Set.of("50"), allowed.roleIds());
+            assertEquals(operation.getKey(), allowed.resourceKey()); assertEquals(2, allowed.authVersion()); assertEquals(3, allowed.policyVersion());
+            granted.set(permissions.stream().filter(permission -> !permission.equals(operation.getValue())).collect(java.util.stream.Collectors.toUnmodifiableSet()));
+            assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access.require(operation.getKey()));
+            granted.set(permissions);
+            var reducedScopes = scopeCodes.stream().filter(scope -> !scope.equals(operationScopes.get(operation.getKey())))
+                    .map(scope -> new SimpleGrantedAuthority("SCOPE_" + scope)).toList();
+            SecurityContextHolder.getContext().setAuthentication(new Rbac3AuthenticationToken(new Rbac3UserDetails(USER, snapshot(permissions)), reducedScopes));
+            assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access.require(operation.getKey()));
+        }
+    }
+
+    @Test
+    void case_service_start_and_get_require_current_resource_and_scope_and_never_gain_operator_authority() {
+        var request = new MockHttpServletRequest(); request.setAttribute(VerifiedProcessIssuerFilter.class.getName() + ".issuer", "https://idp.example/tenants/20");
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        var scopes = Set.of(TianjiProcessPermissions.CASE_START_SCOPE, TianjiProcessPermissions.CASE_READ_SCOPE, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_SCOPE);
+        var service = new ServiceIdentityPrincipal("case-consumer", "20", "case-consumer", "case-token", URI.create("https://api.example/tianji"), 1, scopes,
+                "xingyuan", "tianji", "test", "credential", NOW.minusSeconds(1), NOW.plusSeconds(60));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(service, List.of(), URI.create("https://idp.example/tenants/20")));
+        var access = new TianjiCaseAccess(new TianjiProcessAccess(guard(), CLOCK), CLOCK);
+        for (var resource : List.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_GET_API)) {
+            var context = access.require(resource); assertEquals(ProcessActor.SubjectType.SERVICE, context.actor().subjectType());
+            assertTrue(context.roleIds().isEmpty()); assertEquals("case-consumer", context.actor().subjectId());
+        }
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access.require(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API));
+        var reduced = new java.util.HashSet<>(resources()); reduced.remove(TianjiProcessPermissions.CASE_GET_API); serviceGranted.set(Set.copyOf(reduced));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access.require(TianjiProcessPermissions.CASE_GET_API));
+        serviceGranted.set(resources());
+        var wrongScope = new ServiceIdentityPrincipal("case-consumer", "20", "case-consumer", "case-other-token", URI.create("https://api.example/tianji"), 1,
+                Set.of(TianjiProcessPermissions.CASE_START_SCOPE), "xingyuan", "tianji", "test", "credential", NOW.minusSeconds(1), NOW.plusSeconds(60));
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(wrongScope, List.of(), URI.create("https://idp.example/tenants/20")));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class, () -> access.require(TianjiProcessPermissions.CASE_GET_API));
+    }
+
     private PermissionExecutionGuard guard() {
         var registry = new PermissionPolicyRegistry(manifest, DIGEST, CLOCK, List.of(SCOPE));
         var scopes = new Rbac3StarterProperties.UserScopePolicyProperties().setEnabled(true)
@@ -489,12 +544,24 @@ class ProcessPermissionIntegrationTest {
         var taskScopes = new java.util.HashMap<>(scopes.getPermissionScopes());
         taskScopes.put(TianjiProcessPermissions.TASK_READ, Set.of(HumanTaskClient.READ_SCOPE)); taskScopes.put(TianjiProcessPermissions.TASK_TRANSFER, Set.of(HumanTaskClient.TRANSFER_SCOPE));
         taskScopes.put(TianjiProcessPermissions.TASK_CLAIM, Set.of(HumanTaskClient.CLAIM_SCOPE)); taskScopes.put(TianjiProcessPermissions.TASK_COMPLETE, Set.of(HumanTaskClient.COMPLETE_SCOPE)); scopes.setPermissionScopes(taskScopes);
+        taskScopes.put(TianjiProcessPermissions.CASE_START, Set.of(TianjiProcessPermissions.CASE_START_SCOPE));
+        taskScopes.put(TianjiProcessPermissions.CASE_READ, Set.of(TianjiProcessPermissions.CASE_READ_SCOPE));
+        taskScopes.put(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT, Set.of(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_SCOPE)); scopes.setPermissionScopes(taskScopes);
         return new PermissionExecutionGuard(registry, new CurrentRbac3User(), new AuthorizationSnapshotLoader(client, "tianji", CLOCK),
                 new PermissionServicePolicyGuard(registry, client, "tianji", CLOCK), scopes);
     }
 
     private PermissionManifest manifest() {
         var resources = List.of(
+                resource(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_START, TianjiProcessPermissions.CASE_START_SCOPE,
+                        "POST", "/api/tianji/v1/cases/start", "api.case.start"),
+                resource(TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_READ, TianjiProcessPermissions.CASE_READ_SCOPE,
+                        "POST", "/api/tianji/v1/cases/get", "api.case.get"),
+                new PermissionManifest.ResourceDefinition(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API, ResourceType.API,
+                        Map.of("methods", List.of("POST"), "paths", List.of("/api/tianji/v1/cases/act-plan-item")), ResourceAccess.PROTECTED,
+                        new PermissionRequirement(PermissionMode.ALL, List.of(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT)), null,
+                        List.of(PermissionManifest.PrincipalType.USER), List.of(TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_SCOPE),
+                        new PermissionManifest.I18nReference("tianji.process.permissions", "api.case.actPlanItem"), DefinitionLifecycle.ACTIVE),
                 resource(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
                         "GET", "/api/tianji/v1/process-instances/{instanceId}", "api.process.get"),
                 resource(TianjiProcessPermissions.START_API, TianjiProcessPermissions.START, TianjiProcessPermissions.START_SCOPE,
@@ -526,7 +593,7 @@ class ProcessPermissionIntegrationTest {
                         PermissionManifest.SnapshotMode.FULL, List.of("tianji.api.process."), List.of("process-server"),
                         List.of("process-server"), false),
                 new PermissionManifest.Artifact("tianji-service", "a".repeat(40), "build-1", "1"),
-                List.of(), List.of(TianjiProcessPermissions.READ, TianjiProcessPermissions.START, TianjiProcessPermissions.RELEASE_READ,
+                List.of(), List.of(TianjiProcessPermissions.CASE_START, TianjiProcessPermissions.CASE_READ, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT, TianjiProcessPermissions.READ, TianjiProcessPermissions.START, TianjiProcessPermissions.RELEASE_READ,
                 TianjiProcessPermissions.RELEASE_PUBLISH, TianjiProcessPermissions.DECISION_EXECUTE,
                 TianjiProcessPermissions.WORKER_ACQUIRE, TianjiProcessPermissions.WORKER_REPORT, TianjiProcessPermissions.AGENT_RESULT_RECEIVE,
                 TianjiProcessPermissions.TASK_READ, TianjiProcessPermissions.TASK_CLAIM, TianjiProcessPermissions.TASK_COMPLETE, TianjiProcessPermissions.TASK_TRANSFER, TianjiProcessPermissions.APPROVAL_VERIFY), resources, List.of(), List.of());
@@ -555,7 +622,7 @@ class ProcessPermissionIntegrationTest {
     }
 
     private static Set<String> resources() {
-        return Set.of(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
+        return Set.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API, TianjiProcessPermissions.GET_API, TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
                 TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API,
                 TianjiProcessPermissions.WORKER_ACQUIRE_API, TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_FAIL_API,
                 TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API, TianjiProcessPermissions.TASK_GET_API, TianjiProcessPermissions.TASK_QUERY_API, TianjiProcessPermissions.TASK_ADMIN_QUERY_API,

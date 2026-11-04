@@ -21,6 +21,16 @@ class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
 
     @Test
+    void public_cmmn_validation_returns_the_existing_closed_immutable_metadata() throws Exception {
+        var model = validator.validateCmmn(fixture("governed-case.cmmn"), "governedCase");
+        assertNotNull(model);
+        assertEquals("governedCase", model.definitionKey());
+        assertEquals(java.util.Set.of("primary", "supplemental", "milestone"), model.planItems().keySet());
+        assertEquals(java.util.Set.of("7", "8", "9"), model.operatorRoleIds());
+        assertThrows(IllegalArgumentException.class, () -> validator.validateCmmn(fixture("formal-case.cmmn"), "formalCase"));
+    }
+
+    @Test
     void previously_persisted_wait_models_without_status_projection_remain_readable() throws Exception {
         var previous = validator.validateBpmn(fixture("agent-dispatch-wait-v1.bpmn20.xml"), "agentDispatch");
         assertNull(previous.messageWaits().get("waitResult").statusVariable());

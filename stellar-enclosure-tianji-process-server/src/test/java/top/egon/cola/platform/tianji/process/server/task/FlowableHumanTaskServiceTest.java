@@ -6,6 +6,7 @@ import org.flowable.engine.TaskService;
 import org.flowable.identitylink.api.IdentityLink;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flowable.task.service.impl.persistence.entity.TaskEntity;
+import org.flowable.task.api.TaskQuery;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -162,6 +163,108 @@ class FlowableHumanTaskServiceTest {
             assertThrows(IllegalStateException.class, () -> fixture.service.complete(context("complete", Set.of("50")), new CompleteHumanTaskCommand("cmd", "task", fixture.version(), Map.of("approved", true, "comment", "text"))));
             verify(fixture.receipts, never()).apply(any(), any()); verify(fixture.connection).rollback();
         }
+    }
+
+    @Test void case_queries_and_claim_completion_use_the_case_facade_after_shared_scope_lock() throws Exception {
+        try(var f=new CaseFixture()) {
+            var query=new ListHumanTasksQuery(HumanTaskScopeTypeEnum.CASE,HumanTaskSelectionEnum.CANDIDATE,null,null,null,null,5);
+            var page=assertDoesNotThrow(()->f.service.query(HumanTaskSnapshotTest.caseContext("query",Set.of("7")),query));
+            assertEquals(1,page.items().size()); assertEquals(HumanTaskScopeTypeEnum.CASE,page.items().getFirst().scopeType());
+            var claim=HumanTaskSnapshotTest.caseContext("claim",Set.of("7"));
+            var result=assertDoesNotThrow(()->f.service.claim(claim,new ClaimHumanTaskCommand("claim","case-task",f.facts.snapshot().version())));
+            assertEquals(HumanTaskScopeTypeEnum.CASE,result.scopeType()); assertEquals(claim.userKey(),f.facts.assignee.get());
+            var order=inOrder(f.provenance,f.access.get(),f.tasks);
+            order.verify(f.provenance).lockScope(20,"case-1"); order.verify(f.access.get()).findCase(claim,"case-task",true); order.verify(f.tasks).claim("case-task",claim.userKey());
+            var complete=HumanTaskSnapshotTest.caseContext("complete",Set.of("8"));
+            var completed=f.service.complete(complete,new CompleteHumanTaskCommand("complete","case-task",f.facts.snapshot().version(),Map.of()));
+            assertEquals(HumanTaskScopeTypeEnum.CASE,completed.scopeType()); assertNull(completed.approvalReceiptId());
+            verify(f.tasks).complete("case-task",complete.userKey(),Map.of()); verifyNoInteractions(f.processTasks);
+            assertEquals(f.facts.provenance,f.last.get().caseProvenance());
+        }
+    }
+
+    @Test void case_replay_requires_fresh_any_lane_role_and_never_uses_deleted_native_task() throws Exception {
+        try(var f=new CaseFixture()) {
+            var context=HumanTaskSnapshotTest.caseContext("complete",Set.of("7")); f.facts.assignee.set(context.userKey());
+            var command=new CompleteHumanTaskCommand("complete","case-task",assertDoesNotThrow(f.facts::snapshot).version(),Map.of());
+            var result=assertDoesNotThrow(()->f.service.complete(context,command)); var stored=f.last.get();
+            when(f.receipts.lockCommand(any(),eq(HumanTaskActionEnum.COMPLETE),eq("complete"),anyString())).thenReturn(Optional.of(stored));
+            clearInvocations(f.access.get(),f.tasks,f.provenance);
+            assertEquals(result,f.service.complete(HumanTaskSnapshotTest.caseContext("complete",Set.of("8")),command));
+            verify(f.provenance).lockScope(20,"case-1"); verify(f.provenance,atLeastOnce()).find(20,"case-1"); verifyNoInteractions(f.access.get(),f.tasks);
+            assertThrows(ProcessResourceNotFoundException.class,()->f.service.complete(HumanTaskSnapshotTest.caseContext("complete",Set.of()),command));
+            var invalidHistoricalRole=new Entry(stored.actor(),stored.requestHash(),stored.receipt(),stored.origin(),stored.modelSha256(),stored.engineDefinitionId(),"99",stored.authVersion(),stored.policyVersion(),stored.previousAssignee(),stored.resultingAssignee(),stored.caseProvenance());
+            when(f.receipts.lockCommand(any(),eq(HumanTaskActionEnum.COMPLETE),eq("complete"),anyString())).thenReturn(Optional.of(invalidHistoricalRole));
+            assertThrows(IllegalStateException.class,()->f.service.complete(HumanTaskSnapshotTest.caseContext("complete",Set.of("8")),command));
+        }
+    }
+
+    @Test void case_transfer_and_unclaim_keep_existing_self_and_dedicated_resource_rules() throws Exception {
+        try(var f=new CaseFixture()) {
+            var self=HumanTaskSnapshotTest.caseContext("unclaim",Set.of()); f.facts.assignee.set(self.userKey());
+            assertDoesNotThrow(()->f.service.unclaim(self,new UnclaimHumanTaskCommand("unclaim","case-task",f.facts.snapshot().version())));
+            assertNull(f.facts.assignee.get());
+            var transfer=HumanTaskSnapshotTest.caseContext("transfer",Set.of());
+            var result=f.service.transfer(transfer,new TransferHumanTaskCommand("transfer","case-task",f.facts.snapshot().version(),"operator"));
+            assertEquals("operator",result.lane()); verify(f.tasks).deleteGroupIdentityLink("case-task","role:7","candidate"); verify(f.tasks).addGroupIdentityLink("case-task","role:8","candidate");
+            verify(f.facts.task).forceUpdate(); verify(f.tasks).saveTask(f.facts.task);
+            assertThrows(IllegalArgumentException.class,()->f.service.transfer(transfer,new TransferHumanTaskCommand("other","case-task",f.facts.snapshot().version(),"unreleased")));
+        }
+    }
+
+    @Test void case_form_or_other_assignee_and_source_realm_fail_without_native_effects() throws Exception {
+        try(var f=new CaseFixture()) {
+            var context=HumanTaskSnapshotTest.caseContext("complete",Set.of("7")); f.facts.assignee.set(context.userKey());
+            assertThrows(IllegalArgumentException.class,()->f.service.complete(context,new CompleteHumanTaskCommand("form","case-task",f.facts.snapshot().version(),Map.of("approved",true))));
+            f.facts.assignee.set("user-"+"f".repeat(64));
+            assertThrows(ProcessResourceNotFoundException.class,()->f.service.complete(context,new CompleteHumanTaskCommand("other","case-task",f.facts.snapshot().version(),Map.of())));
+            verify(f.receipts,never()).reserve(any(),any(),anyString(),anyString(),any());verify(f.tasks,never()).complete(anyString(),anyString(),anyMap());
+        }
+    }
+
+    @Test void case_completion_rejects_a_physical_task_hidden_by_the_active_affinity_filter() throws Exception {
+        try (var f = new CaseFixture()) {
+            var context = HumanTaskSnapshotTest.caseContext("complete", Set.of("7")); f.facts.assignee.set(context.userKey());
+            var command = new CompleteHumanTaskCommand("complete", "case-task", f.facts.snapshot().version(), Map.of());
+            // The native operation clears the active-affinity view but leaves its actual Task row behind.
+            when(f.taskQuery.singleResult()).thenReturn(f.facts.task);
+            assertThrows(IllegalStateException.class, () -> f.service.complete(context, command));
+            assertFalse(f.alive.get()); verify(f.tasks).complete("case-task", context.userKey(), Map.of());
+            verify(f.connection).rollback(); verify(f.receipts, never()).apply(any(), any());
+        }
+    }
+
+    private static final class CaseFixture implements AutoCloseable {
+        final HumanTaskSnapshotTest.CaseFixture facts=new HumanTaskSnapshotTest.CaseFixture();
+        final DataSource source=mock(DataSource.class); final Connection connection=mock(Connection.class);
+        final SpringProcessEngineConfiguration engine=mock(SpringProcessEngineConfiguration.class);final SpringDmnEngineConfiguration dmn=mock(SpringDmnEngineConfiguration.class);
+        final org.flowable.cmmn.spring.SpringCmmnEngineConfiguration cmmn=mock(org.flowable.cmmn.spring.SpringCmmnEngineConfiguration.class);
+        final org.flowable.cmmn.api.CmmnTaskService tasks=mock(org.flowable.cmmn.api.CmmnTaskService.class);final TaskService processTasks=mock(TaskService.class);
+        final TaskQuery taskQuery=mock(TaskQuery.class,RETURNS_SELF);
+        final top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore provenance=mock(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
+        final HumanTaskReceiptStore receipts=mock(HumanTaskReceiptStore.class); final AtomicReference<Entry> last=new AtomicReference<>();final AtomicBoolean alive=new AtomicBoolean(true);
+        final AtomicReference<HumanTaskNativeAccess> access=new AtomicReference<>();final FlowableHumanTaskService service;
+        final org.mockito.MockedConstruction<ProcessReleaseService> releases;final org.mockito.MockedConstruction<VerifiedProcessModels> models;final org.mockito.MockedConstruction<ProcessCommandReceiptStore> commands;final org.mockito.MockedConstruction<HumanTaskNativeAccess> natives;
+        CaseFixture() throws Exception {
+            when(source.getConnection()).thenReturn(connection);when(connection.getAutoCommit()).thenReturn(true);var manager=new DataSourceTransactionManager(source);
+            when(engine.getDataSource()).thenReturn(source);when(engine.getTransactionManager()).thenReturn(manager);when(engine.getDatabaseSchema()).thenReturn("tianji_process");when(engine.getTaskService()).thenReturn(processTasks);
+            when(cmmn.getDataSource()).thenReturn(source);when(cmmn.getTransactionManager()).thenReturn(manager);when(cmmn.getDatabaseSchema()).thenReturn("tianji_process");when(cmmn.getCmmnTaskService()).thenReturn(tasks);
+            when(provenance.usesDataSource(source)).thenReturn(true);when(provenance.find(20,"case-1")).thenReturn(Optional.of(facts.provenance));
+            when(receipts.usesDataSource(source)).thenReturn(true);when(receipts.usesCaseProvenance(provenance)).thenReturn(true);when(receipts.current(any())).thenReturn(NOW);
+            doAnswer(i->{last.set(i.getArgument(1));return null;}).when(receipts).apply(any(),any());
+            when(tasks.createTaskQuery()).thenReturn(taskQuery); when(taskQuery.singleResult()).thenReturn(null);
+            when(tasks.getIdentityLinksForTask("case-task")).thenAnswer(i->facts.links());
+            doAnswer(i->{facts.assignee.set(i.getArgument(1));facts.revision.incrementAndGet();return null;}).when(tasks).claim(eq("case-task"),anyString());
+            doAnswer(i->{facts.assignee.set(null);facts.revision.incrementAndGet();return null;}).when(tasks).unclaim("case-task");
+            doAnswer(i->{facts.revision.incrementAndGet();return null;}).when(tasks).saveTask(facts.task);
+            doAnswer(i->{alive.set(false);return null;}).when(tasks).complete(eq("case-task"),anyString(),anyMap());
+            releases=mockConstruction(ProcessReleaseService.class,(value,ignored)->when(value.get(any(),eq("release"))).thenReturn(new Release("release",HASH,NOW,List.of(facts.definition))));
+            models=mockConstruction(VerifiedProcessModels.class,(value,ignored)->when(value.caseModel(20,facts.definition)).thenReturn(facts.model));
+            commands=mockConstruction(ProcessCommandReceiptStore.class);
+            natives=mockConstruction(HumanTaskNativeAccess.class,(value,ignored)->{access.set(value);when(value.candidates(any(),any(),anyInt())).thenReturn(List.of("case-task"));when(value.findCase(any(),eq("case-task"),anyBoolean())).thenAnswer(i->alive.get()?Optional.of(facts.task):Optional.empty());});
+            service=new FlowableHumanTaskService(engine,cmmn,dmn,new ProcessModelValidator(),receipts,provenance);
+        }
+        @Override public void close(){natives.close();commands.close();models.close();releases.close();}
     }
 
     private static HumanTaskContext context(String operation, Set<String> roles) { return new HumanTaskContext(ACTOR, "tianji.api.process.task." + operation, roles, NOW.plusSeconds(30), 2, 3); }

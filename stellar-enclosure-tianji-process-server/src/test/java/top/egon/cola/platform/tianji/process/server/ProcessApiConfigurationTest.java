@@ -239,10 +239,95 @@ class ProcessApiConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.SERVICE);
     }
 
+    @Test
+    void case_api_and_new_starts_cannot_escape_the_existing_security_boundary() {
+        runner.withPropertyValues("stellar.tianji.process.cases.enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("Case API requires the Process API security boundary");
+        });
+        runner.withPropertyValues("stellar.tianji.process.cases.new-starts-enabled=true").run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasRootCauseMessage("New Case starts require the Case and human task APIs");
+        });
+        runner.run(context -> assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianji.process.server.api.CaseController.class));
+    }
+
+    @Test
+    void enabled_case_assembly_keeps_reads_and_tasks_when_new_starts_are_off_and_shares_provenance() {
+        var source = mock(DataSource.class); var manager = new DataSourceTransactionManager(source);
+        var process = mock(ProcessEngine.class); var processConfiguration = mock(SpringProcessEngineConfiguration.class);
+        var cmmn = mock(org.flowable.cmmn.engine.CmmnEngine.class); var caseConfiguration = mock(org.flowable.cmmn.spring.SpringCmmnEngineConfiguration.class);
+        var dmn = mock(DmnEngine.class); var decisionConfiguration = mock(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        when(process.getProcessEngineConfiguration()).thenReturn(processConfiguration); when(cmmn.getCmmnEngineConfiguration()).thenReturn(caseConfiguration); when(dmn.getDmnEngineConfiguration()).thenReturn(decisionConfiguration);
+        when(processConfiguration.getTransactionManager()).thenReturn(manager); when(processConfiguration.getDataSource()).thenReturn(new org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy(source));
+        when(processConfiguration.getDatabaseSchema()).thenReturn("tianji_process");
+        var caseArguments = new java.util.ArrayList<java.util.List<?>>(); var taskArguments = new java.util.ArrayList<java.util.List<?>>(); var receiptArguments = new java.util.ArrayList<java.util.List<?>>();
+        var releaseArguments = new java.util.ArrayList<java.util.List<?>>();
+        try (var provenance = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
+             var planReceipts = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.CasePlanItemReceiptStore.class);
+             var taskReceipts = mockConstruction(HumanTaskReceiptStore.class, (value, construction) -> receiptArguments.add(construction.arguments()));
+             var cases = mockConstruction(top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService.class, (value, construction) -> caseArguments.add(construction.arguments()));
+             var tasks = mockConstruction(FlowableHumanTaskService.class, (value, construction) -> taskArguments.add(construction.arguments()));
+             var releases = mockConstruction(ProcessReleaseService.class, (value, construction) -> releaseArguments.add(construction.arguments()))) {
+            runner.withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.cases.enabled=true", "stellar.tianji.process.cases.new-starts-enabled=false",
+                            "stellar.tianji.process.human-tasks.enabled=true", "stellar.tianji.process.approval-verification.enabled=true")
+                    .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                    .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                    .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                    .withBean(ProcessEngine.class, () -> process).withBean(org.flowable.cmmn.engine.CmmnEngine.class, () -> cmmn).withBean(DmnEngine.class, () -> dmn)
+                    .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class)).withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                    .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                    .withBean(ApprovalConsumerRegistry.class, () -> new ApprovalConsumerRegistry(java.util.List.of(approvalBinding())))
+                    .withBean(ApprovalVerificationService.class, () -> mock(ApprovalVerificationService.class))
+                    .run(context -> {
+                        assertThat(context).hasNotFailed();
+                        assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.api.CaseController.class);
+                        assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.api.CaseRequestBodyAdvice.class);
+                        assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.security.TianjiCaseAccess.class);
+                        assertThat(context).hasSingleBean(top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService.class);
+                        assertThat(context).hasSingleBean(HumanTaskController.class); assertThat(context).hasSingleBean(FlowableHumanTaskService.class);
+                        assertThat(provenance.constructed()).hasSize(1); assertThat(planReceipts.constructed()).hasSize(1); assertThat(taskReceipts.constructed()).hasSize(1);
+                        var origin = provenance.constructed().getFirst(); var plans = planReceipts.constructed().getFirst(); var human = taskReceipts.constructed().getFirst();
+                        verify(origin).verifyStorage(); verify(plans).verifyStorage(); verify(human).verifyStorage();
+                        assertThat(caseArguments).hasSize(1); assertThat(caseArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
+                                context.getBean(ProcessModelValidator.class), origin, plans, false));
+                        assertThat(taskArguments).hasSize(1); assertThat(taskArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
+                                context.getBean(ProcessModelValidator.class), human, origin));
+                        assertThat(receiptArguments).containsExactly(java.util.List.of(source, "tianji_process", origin));
+                        assertThat(releaseArguments).hasSize(1); assertThat(releaseArguments.getFirst()).hasSize(10);
+                        assertThat(releaseArguments.getFirst().get(1)).isSameAs(caseConfiguration);
+                        assertThat(releaseArguments.getFirst().get(8)).isEqualTo(false); assertThat(releaseArguments.getFirst().get(9)).isEqualTo(true);
+                    });
+        }
+    }
+
+    @Test
+    void case_off_publication_does_not_require_or_resolve_a_cmmn_engine() {
+        var process = mock(ProcessEngine.class); var configuration = mock(SpringProcessEngineConfiguration.class); var dmn = mock(DmnEngine.class);
+        var decision = mock(org.flowable.dmn.spring.SpringDmnEngineConfiguration.class);
+        when(process.getProcessEngineConfiguration()).thenReturn(configuration); when(dmn.getDmnEngineConfiguration()).thenReturn(decision);
+        var arguments = new java.util.ArrayList<java.util.List<?>>();
+        try (var releases = mockConstruction(ProcessReleaseService.class, (value, construction) -> arguments.add(construction.arguments()))) {
+            runner.withPropertyValues("stellar.tianji.process.api.enabled=true")
+                    .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                    .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                    .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                    .withBean(ProcessEngine.class, () -> process).withBean(DmnEngine.class, () -> dmn)
+                    .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class)).withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                    .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                    .run(context -> {
+                        assertThat(context).hasNotFailed(); assertThat(context).doesNotHaveBean(org.flowable.cmmn.engine.CmmnEngine.class);
+                        assertThat(context).doesNotHaveBean(top.egon.cola.platform.tianji.process.server.api.CaseController.class);
+                        assertThat(arguments).hasSize(1); assertThat(arguments.getFirst()).hasSize(8);
+                        assertThat(arguments.getFirst().getFirst()).isSameAs(configuration); assertThat(arguments.getFirst().get(1)).isSameAs(decision);
+                    });
+        }
+    }
+
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class, ApprovalVerificationController.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, HumanTaskController.class, HumanTaskRequestBodyAdvice.class, ApprovalVerificationController.class, top.egon.cola.platform.tianji.process.server.api.CaseController.class, top.egon.cola.platform.tianji.process.server.api.CaseRequestBodyAdvice.class})
     static class TestWeb { }
     private static ApprovalConsumerRegistry.Registration approvalBinding() { return new ApprovalConsumerRegistry.Registration(ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "consumer", "https://idp.example/20"),
             "approval.v1", "release", "approval", "a".repeat(64), "review", java.util.Set.of("50"), java.time.Duration.ofMinutes(1), java.util.Set.of(ApprovalRequesterTypeEnum.USER)); }

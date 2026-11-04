@@ -123,6 +123,62 @@ class HumanTaskReceiptStoreTest {
         }
     }
 
+    @Test void case_receipt_writer_preserves_owner_start_kind_and_scope_instead_of_service_executor() throws Exception {
+        try (var f = new Fixture()) {
+            var task = new HumanTaskSnapshotTest.CaseFixture(); var provenance = mock(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
+            when(provenance.usesDataSource(f.source)).thenReturn(true); when(provenance.find(20,"case-1")).thenReturn(Optional.of(task.provenance));
+            var store = new HumanTaskReceiptStore(f.source,"tianji_process",provenance); store.verifyStorage();
+            var context = HumanTaskSnapshotTest.caseContext("complete",Set.of("7")); var result = caseEntry(task,context);
+            when(f.commands.get().lock(ACTOR,Kind.TASK_COMPLETE,"case-complete")).thenReturn(new Receipt(HASH,"release","correlation","PENDING",null,NOW,null));
+            when(f.jdbc.get().update(anyString(),any(Object[].class))).thenReturn(1);
+            assertDoesNotThrow(()->f.transaction.executeWithoutResult(status->store.apply(context,result)));
+            var values = org.mockito.ArgumentCaptor.forClass(Object[].class); verify(f.jdbc.get()).update(startsWith("INSERT INTO"),values.capture());
+            assertEquals("CMMN",values.getValue()[10]); assertEquals("case-1",values.getValue()[8]);
+            assertEquals(task.provenance.seed().owner().subjectId(),values.getValue()[23]); assertEquals("START",values.getValue()[24]); assertEquals("parent-start",values.getValue()[25]);
+            assertNotEquals(task.provenance.seed().executor().subjectId(),values.getValue()[23]);
+        }
+    }
+
+    @Test void case_replay_revalidates_persisted_owner_executor_provenance_after_base_receipt_discovery() throws Exception {
+        try (var f = new Fixture()) {
+            var task = new HumanTaskSnapshotTest.CaseFixture(); var provenance = mock(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
+            when(provenance.usesDataSource(f.source)).thenReturn(true); when(provenance.find(20,"case-1")).thenReturn(Optional.of(task.provenance));
+            var store = new HumanTaskReceiptStore(f.source,"tianji_process",provenance); store.verifyStorage();
+            var context = HumanTaskSnapshotTest.caseContext("complete",Set.of("8")); var result = caseEntry(task,HumanTaskSnapshotTest.caseContext("complete",Set.of("7")));
+            when(f.commands.get().lockIfPresent(ACTOR,Kind.TASK_COMPLETE,"case-complete")).thenReturn(Optional.of(new Receipt(HASH,"release","correlation","APPLIED","case-task",NOW,null)));
+            when(f.jdbc.get().query(anyString(),org.mockito.ArgumentMatchers.<RowMapper<Entry>>any(),any(Object[].class))).thenReturn(List.of(result));
+            assertEquals(result,f.transaction.execute(s->store.lockCommand(context,HumanTaskActionEnum.COMPLETE,"case-complete",HASH).orElseThrow()));
+            verify(provenance,atLeastOnce()).find(20,"case-1");
+            when(provenance.find(20,"case-1")).thenReturn(Optional.empty());
+            assertThrows(IllegalStateException.class,()->f.transaction.execute(s->store.lockCommand(context,HumanTaskActionEnum.COMPLETE,"case-complete",HASH)));
+        }
+    }
+
+    @Test void actual_case_receipt_mapper_uses_cmmn_scope_and_the_independent_parent_start() throws Exception {
+        try (var f = new Fixture()) {
+            var task = new HumanTaskSnapshotTest.CaseFixture(); var provenance = mock(top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore.class);
+            when(provenance.usesDataSource(f.source)).thenReturn(true); when(provenance.find(20,"case-1")).thenReturn(Optional.of(task.provenance));
+            var store = new HumanTaskReceiptStore(f.source,"tianji_process",provenance); store.verifyStorage(); var context=HumanTaskSnapshotTest.caseContext("complete",Set.of("7"));
+            var expected=caseEntry(task,context); var row = new java.util.HashMap<String,Object>();
+            row.put("tenant_id",20L);row.put("subject_id",ACTOR.subjectId());row.put("subject_issuer",ACTOR.issuerFingerprint());row.put("requester_type","USER");row.put("requester_id",task.provenance.seed().owner().subjectId());row.put("requester_issuer",task.provenance.seed().owner().issuerFingerprint());
+            row.put("command_type","TASK_COMPLETE");row.put("command_id","case-complete");row.put("task_id","case-task");row.put("process_instance_id","case-1");row.put("release_key","release");row.put("definition_key","governedCase");row.put("task_definition_key","primaryTask");row.put("task_kind","ACTION");row.put("lane_key","operator");
+            row.put("previous_version",HASH);row.put("resulting_version",null);row.put("approval_receipt_id",null);row.put("approved",null);row.put("occurred_at",Timestamp.from(NOW));row.put("start_command_id","parent-start");row.put("start_command_type","START");row.put("start_request_sha256",task.provenance.seed().ownerStartRequestSha256());row.put("correlation_id","correlation");row.put("source_created_at",Timestamp.from(NOW));
+            row.put("model_type","CMMN");row.put("definition_sha256",task.definition.modelSha256());row.put("engine_definition_id","case-definition");row.put("authorized_role_id",7L);row.put("auth_version",2L);row.put("policy_version",3L);row.put("previous_assignee",context.userKey());row.put("resulting_assignee",null);row.put("request_sha256",HASH);
+            when(f.commands.get().lockIfPresent(ACTOR,Kind.TASK_COMPLETE,"case-complete")).thenReturn(Optional.of(new Receipt(HASH,"release","correlation","APPLIED","case-task",NOW,null)));
+            when(f.jdbc.get().query(anyString(),org.mockito.ArgumentMatchers.<RowMapper<Entry>>any(),any(Object[].class))).thenAnswer(i->{
+                var rs=mock(java.sql.ResultSet.class);when(rs.getString(anyString())).thenAnswer(c->{var value=row.get(c.getArgument(0));return value==null?null:value.toString();});when(rs.getLong(anyString())).thenAnswer(c->((Number)row.get(c.getArgument(0))).longValue());when(rs.getObject(anyString())).thenAnswer(c->row.get(c.getArgument(0)));when(rs.getTimestamp(anyString())).thenAnswer(c->row.get(c.getArgument(0)));RowMapper<Entry> mapper=i.getArgument(1);return List.of(mapper.mapRow(rs,0));
+            });
+            assertEquals(expected,assertDoesNotThrow(()->f.transaction.execute(s->store.lockCommand(context,HumanTaskActionEnum.COMPLETE,"case-complete",HASH).orElseThrow())));
+            row.put("start_command_type","CASE_START");assertThrows(IllegalStateException.class,()->f.transaction.execute(s->store.lockCommand(context,HumanTaskActionEnum.COMPLETE,"case-complete",HASH)));
+        }
+    }
+
+    private static Entry caseEntry(HumanTaskSnapshotTest.CaseFixture f,HumanTaskContext context) {
+        var receipt=new HumanTaskActionReceiptDTO("case-complete","case-task",HumanTaskActionEnum.COMPLETE,HumanTaskScopeTypeEnum.CASE,"case-1","release","governedCase","primaryTask",HumanTaskKindEnum.ACTION,"operator",HASH,null,null,null,NOW);
+        var seed=f.provenance.seed(); var source=new TaskOrigin(seed.owner(),seed.ownerStartCommandId(),seed.ownerStartRequestSha256(),seed.releaseKey(),seed.correlationId(),seed.caseInstanceId(),f.provenance.createdAt());
+        return new Entry(context.actor(),HASH,receipt,source,f.definition.modelSha256(),"case-definition","7",2,3,context.userKey(),null,f.provenance);
+    }
+
     private static HumanTaskContext context(String operation) { return new HumanTaskContext(ACTOR, "tianji.api.process.task." + operation, Set.of("50"), NOW.plusSeconds(30), 2, 3); }
     private static Receipt base(String state, String hash) { return new Receipt(hash, "release", "correlation", state, "APPLIED".equals(state) ? "task" : null, NOW, null); }
     private static Entry result(HumanTaskContext context) {

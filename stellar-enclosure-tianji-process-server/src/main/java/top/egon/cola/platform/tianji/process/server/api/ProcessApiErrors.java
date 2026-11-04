@@ -1,6 +1,10 @@
 package top.egon.cola.platform.tianji.process.server.api;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.servlet.HandlerMapping;
+import java.util.concurrent.RejectedExecutionException;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
@@ -42,7 +46,7 @@ public final class ProcessApiErrors {
     @ExceptionHandler({IllegalArgumentException.class, HttpMessageNotReadableException.class})
     ResponseEntity<OrchestrationErrorDTO> invalid() { return error(HttpStatus.BAD_REQUEST, "TIANJI_INVALID_COMMAND"); }
 
-    @ExceptionHandler(ProcessRequestBodyAdvice.TooLarge.class)
+    @ExceptionHandler({ProcessRequestBodyAdvice.TooLarge.class, CaseRequestBodyAdvice.TooLarge.class})
     ResponseEntity<OrchestrationErrorDTO> tooLarge() { return error(HttpStatus.PAYLOAD_TOO_LARGE, "TIANJI_REQUEST_TOO_LARGE"); }
 
     @ExceptionHandler(AuthenticationException.class)
@@ -59,7 +63,13 @@ public final class ProcessApiErrors {
     }
 
     @ExceptionHandler(RuntimeException.class)
-    ResponseEntity<OrchestrationErrorDTO> unexpected(RuntimeException failure) {
+    ResponseEntity<OrchestrationErrorDTO> unexpected(RuntimeException failure, HttpServletRequest request) {
+        if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler
+                && CaseController.class.isAssignableFrom(handler.getBeanType())) {
+            if (failure instanceof RejectedExecutionException) return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
+            log.error("Case API request failed: type={}", failure.getClass().getName());
+            return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");
+        }
         log.error("Process API request failed: type={}", failure.getClass().getName());
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "TIANJI_INTERNAL_ERROR");
     }

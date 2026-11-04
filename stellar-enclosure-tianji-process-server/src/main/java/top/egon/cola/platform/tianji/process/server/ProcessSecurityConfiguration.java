@@ -16,15 +16,21 @@ import org.springframework.security.web.authentication.AnonymousAuthenticationFi
 import org.springframework.web.filter.RequestContextFilter;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.flowable.cmmn.engine.CmmnEngine;
+import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
+import top.egon.cola.platform.tianji.process.server.execution.CasePlanItemReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
+import top.egon.cola.platform.tianji.process.server.security.TianjiCaseAccess;
 import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
@@ -48,7 +54,9 @@ import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuth
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
 
+import javax.sql.DataSource;
 import java.time.Clock;
+import java.util.function.BooleanSupplier;
 import java.util.List;
 
 /** The process API is opt-in and requires both identity and authorization filters. */
@@ -67,11 +75,15 @@ public class ProcessSecurityConfiguration {
         boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
         boolean taskPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
         boolean approvalVerificationEnabled = environment.getProperty("stellar.tianji.process.approval-verification.enabled", Boolean.class, false);
+        boolean casesEnabled = environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false);
+        boolean newCaseStartsEnabled = environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false);
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
         if (taskPublicationEnabled && !tasksEnabled) throw new IllegalStateException("Governed task publication requires the human task API");
         if (approvalVerificationEnabled && !enabled) throw new IllegalStateException("Approval verification requires the Process API security boundary");
+        if (casesEnabled && !enabled) throw new IllegalStateException("Case API requires the Process API security boundary");
+        if (newCaseStartsEnabled && (!casesEnabled || !tasksEnabled)) throw new IllegalStateException("New Case starts require the Case and human task APIs");
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -84,6 +96,7 @@ public class ProcessSecurityConfiguration {
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
                     if (approvalVerificationEnabled) authorize.requestMatchers(ApprovalClient.PATH).authenticated();
+                    if (casesEnabled) authorize.requestMatchers("/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get", "/api/tianji/v1/cases/act-plan-item").authenticated();
                     authorize.anyRequest().denyAll();
                 });
         if (enabled) {
@@ -123,7 +136,7 @@ public class ProcessSecurityConfiguration {
                 List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
-                        "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**"), true);
+                        "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get"), true);
     }
 
     @Bean
@@ -155,7 +168,8 @@ public class ProcessSecurityConfiguration {
     ProcessReleaseService processReleaseService(ProcessEngine process, DmnEngine dmn,
                                                  ProcessModelValidator validator, Environment environment,
                                                  ObjectProvider<WorkerTopicRegistry> registries,
-                                                 ObjectProvider<ProcessAgentBridgePoller> bridges) {
+                                                 ObjectProvider<ProcessAgentBridgePoller> bridges,
+                                                 ObjectProvider<CmmnEngine> caseEngines) {
         boolean decisionTasksEnabled = environment.getProperty("stellar.tianji.process.decision-tasks.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         WorkerTopicRegistry registry = workerEnabled ? registries.getIfAvailable() : null;
@@ -163,11 +177,17 @@ public class ProcessSecurityConfiguration {
         boolean bridgeEnabled = environment.getProperty("stellar.tianji.process.agent-bridge.enabled", Boolean.class, false);
         boolean humanPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
         if (humanPublicationEnabled && !environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false)) throw new IllegalStateException("Governed task publication requires the human task API");
+        BooleanSupplier maintenanceReady = () -> {
+            var bridge = bridges.getIfAvailable(); return bridge != null && bridge.isRunning();
+        };
+        if (environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) {
+            var cmmn = caseEngines.getIfAvailable();
+            if (cmmn == null) throw new IllegalStateException("Case publication requires the initialized CMMN engine");
+            return new ProcessReleaseService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator,
+                    decisionTasksEnabled, registry, bridgeEnabled, maintenanceReady, humanPublicationEnabled, true);
+        }
         return new ProcessReleaseService(processConfiguration(process), decisionConfiguration(dmn), validator, decisionTasksEnabled, registry,
-                bridgeEnabled, () -> {
-                    var bridge = bridges.getIfAvailable();
-                    return bridge != null && bridge.isRunning();
-                }, humanPublicationEnabled);
+                bridgeEnabled, maintenanceReady, humanPublicationEnabled);
     }
 
     @Bean
@@ -198,10 +218,14 @@ public class ProcessSecurityConfiguration {
         }
         @Bean
         @ConditionalOnMissingBean(HumanTaskReceiptStore.class)
-        HumanTaskReceiptStore approvalReceiptStore(ProcessEngine process) {
+        HumanTaskReceiptStore approvalReceiptStore(ProcessEngine process, Environment environment,
+                ObjectProvider<CaseStartProvenanceStore> provenance) {
             var configuration = processConfiguration(process);
             if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw new IllegalStateException("Approval verification requires the owning Process JDBC manager");
-            var store = new HumanTaskReceiptStore(manager.getDataSource(), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
+            var store = environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)
+                    ? new HumanTaskReceiptStore(caseDataSource(configuration), configuration.getDatabaseSchema(), provenance.getObject())
+                    : new HumanTaskReceiptStore(manager.getDataSource(), configuration.getDatabaseSchema());
+            store.verifyStorage(); return store;
         }
         @Bean
         @ConditionalOnMissingBean(ApprovalVerificationService.class)
@@ -218,8 +242,16 @@ public class ProcessSecurityConfiguration {
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "human-tasks.enabled"}, havingValue = "true")
     static class HumanTaskConfiguration {
-        @Bean
+        @Bean("humanTaskReceiptStore")
         @ConditionalOnMissingBean(HumanTaskReceiptStore.class)
+        HumanTaskReceiptStore caseAwareHumanTaskReceiptStore(ProcessEngine process, Environment environment,
+                ObjectProvider<CaseStartProvenanceStore> provenance) {
+            if (!environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) return humanTaskReceiptStore(process);
+            var configuration = processConfiguration(process);
+            var store = new HumanTaskReceiptStore(caseDataSource(configuration), configuration.getDatabaseSchema(), provenance.getObject());
+            store.verifyStorage(); return store;
+        }
+
         HumanTaskReceiptStore humanTaskReceiptStore(ProcessEngine process) {
             var configuration = processConfiguration(process);
             if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw new IllegalStateException("Human task API requires the owning Process JDBC manager");
@@ -228,13 +260,49 @@ public class ProcessSecurityConfiguration {
 
         @Bean
         @ConditionalOnMissingBean(FlowableHumanTaskService.class)
-        FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts) {
+        FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts,
+                Environment environment, ObjectProvider<CmmnEngine> caseEngines, ObjectProvider<CaseStartProvenanceStore> provenance) {
+            if (environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) {
+                var cmmn = caseEngines.getIfAvailable();
+                if (cmmn == null) throw new IllegalStateException("Case tasks require the initialized CMMN engine");
+                return new FlowableHumanTaskService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator, receipts, provenance.getObject());
+            }
             return new FlowableHumanTaskService(processConfiguration(process), decisionConfiguration(dmn), validator, receipts);
         }
 
         @Bean
         @ConditionalOnMissingBean(TianjiHumanTaskAccess.class)
         TianjiHumanTaskAccess tianjiHumanTaskAccess(TianjiProcessAccess access) { return new TianjiHumanTaskAccess(access, Clock.systemUTC()); }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "cases.enabled"}, havingValue = "true")
+    static class CaseConfiguration {
+        @Bean
+        @ConditionalOnMissingBean(CaseStartProvenanceStore.class)
+        CaseStartProvenanceStore caseStartProvenanceStore(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            var store = new CaseStartProvenanceStore(caseDataSource(configuration), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(CasePlanItemReceiptStore.class)
+        CasePlanItemReceiptStore casePlanItemReceiptStore(ProcessEngine process) {
+            var configuration = processConfiguration(process);
+            var store = new CasePlanItemReceiptStore(caseDataSource(configuration), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
+        }
+
+        @Bean
+        @ConditionalOnMissingBean(TianjiCaseAccess.class)
+        TianjiCaseAccess tianjiCaseAccess(TianjiProcessAccess access) { return new TianjiCaseAccess(access, Clock.systemUTC()); }
+
+        @Bean
+        @ConditionalOnMissingBean(FlowableCaseService.class)
+        FlowableCaseService flowableCaseService(ProcessEngine process, CmmnEngine cmmn, DmnEngine dmn, ProcessModelValidator validator,
+                CaseStartProvenanceStore provenance, CasePlanItemReceiptStore receipts, Environment environment) {
+            return new FlowableCaseService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator, provenance, receipts,
+                    environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false));
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -287,6 +355,21 @@ public class ProcessSecurityConfiguration {
             }
             return new AgentResultInbox(manager.getDataSource(), manager, configuration.getDatabaseSchema(), dispatches, producers, properties.pendingRetention());
         }
+    }
+
+    private static SpringCmmnEngineConfiguration caseConfiguration(CmmnEngine engine) {
+        if (!(engine.getCmmnEngineConfiguration() instanceof SpringCmmnEngineConfiguration configuration)) {
+            throw new IllegalStateException("Case API requires the Spring Flowable CMMN engine");
+        }
+        return configuration;
+    }
+
+    private static DataSource caseDataSource(SpringProcessEngineConfiguration configuration) {
+        if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw new IllegalStateException("Case storage requires its owning Process JDBC manager");
+        var source = configuration.getDataSource();
+        if (source instanceof TransactionAwareDataSourceProxy proxy) source = proxy.getTargetDataSource();
+        if (source != manager.getDataSource()) throw new IllegalStateException("Case storage requires the exact owning Process DataSource");
+        return source;
     }
 
     private static SpringProcessEngineConfiguration processConfiguration(ProcessEngine engine) {

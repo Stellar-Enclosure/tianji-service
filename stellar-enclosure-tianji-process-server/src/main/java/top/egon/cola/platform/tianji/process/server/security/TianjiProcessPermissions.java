@@ -90,7 +90,34 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Verify approval provenance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.task.approval.verify", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Verify an approval reference"))
+@PermissionDefinition(code = TianjiProcessPermissions.CASE_START, meaning = "Start a Case from a fixed release",
+        labelPage = "tianji.process.permissions", labelKey = "permission.case.start")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.case.start", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Start a Case from a fixed release"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.case.start", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Start a Case from a fixed release"))
+@PermissionDefinition(code = TianjiProcessPermissions.CASE_READ, meaning = "Read an authorized Case",
+        labelPage = "tianji.process.permissions", labelKey = "permission.case.read")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.case.read", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an authorized Case"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.case.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an authorized Case"))
+@PermissionDefinition(code = TianjiProcessPermissions.CASE_PLAN_ITEM_ACT, meaning = "Act on a governed Case plan item",
+        labelPage = "tianji.process.permissions", labelKey = "permission.case.act")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.case.act", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Act on a governed Case plan item"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.case.actPlanItem", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Act on a governed Case plan item"))
 public final class TianjiProcessPermissions {
+    public static final String CASE_START = "TIANJI_CASE_START";
+    public static final String CASE_READ = "TIANJI_CASE_READ";
+    public static final String CASE_PLAN_ITEM_ACT = "TIANJI_CASE_PLAN_ITEM_ACT";
+    public static final String CASE_START_API = "tianji.api.process.case.start";
+    public static final String CASE_GET_API = "tianji.api.process.case.get";
+    public static final String CASE_PLAN_ITEM_ACT_API = "tianji.api.process.case.actPlanItem";
+    public static final String CASE_START_SCOPE = "tianji:case:start";
+    public static final String CASE_READ_SCOPE = "tianji:case:read";
+    public static final String CASE_PLAN_ITEM_ACT_SCOPE = "tianji:case:act";
     public static final String APPROVAL_VERIFY = "TIANJI_TASK_APPROVAL_VERIFY";
     public static final String APPROVAL_VERIFY_API = "tianji.api.process.task.approval.verify";
     public static final String TASK_READ = "TIANJI_TASK_READ";

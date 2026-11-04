@@ -8,7 +8,6 @@ import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQu
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
-import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
@@ -106,9 +105,12 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         for (var requested : command.models()) {
             var published = result.models().stream().filter(model -> model.type() == requested.type()
                     && model.definitionKey().equals(requested.definitionKey())).findFirst().orElseThrow(HttpProcessClient::invalidResponse);
-            if (!published.contentSha256().equals(hash(requested.xml().getBytes(StandardCharsets.UTF_8)))
-                    || (requested.type() == ProcessModelTypeEnum.BPMN || !requested.inputs().isEmpty())
-                    && !published.inputs().equals(requested.inputs())) throw invalidResponse();
+            boolean inputsMatch = switch (requested.type()) {
+                case BPMN -> published.inputs().equals(requested.inputs());
+                case CMMN -> requested.inputs().isEmpty() && published.inputs().isEmpty();
+                case DMN -> requested.inputs().isEmpty() || published.inputs().equals(requested.inputs());
+            };
+            if (!published.contentSha256().equals(hash(requested.xml().getBytes(StandardCharsets.UTF_8))) || !inputsMatch) throw invalidResponse();
         }
         return result;
     }

@@ -3,6 +3,12 @@ package top.egon.cola.platform.tianji.client;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.ActOnPlanItemCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelResource;
+import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.CaseInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.CaseInstanceQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.CaseInstanceStatusEnum;
@@ -65,6 +71,26 @@ class HttpCaseClientTest {
     private static final String VERSION_A = "a".repeat(64);
     private static final String VERSION_B = "b".repeat(64);
     private final JsonMapper mapper = JsonMapper.builder().build();
+
+    @Test
+    void cmmn_release_correlation_requires_both_input_schemas_to_be_empty() throws Exception {
+        String xml = "<synthetic-cmmn/>";
+        String hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(bytes(xml)));
+        var type = ProcessModelTypeEnum.valueOf("CMMN");
+        Map<String, ProcessValueTypeEnum> empty = Map.of();
+        var inputs = Map.of("amount", ProcessValueTypeEnum.INTEGER);
+        for (var schemas : List.of(List.of(empty, empty), List.of(empty, inputs), List.of(inputs, inputs))) {
+            var requested = new PublishProcessReleaseCommand("release-1", List.of(
+                    new ProcessModelResource(type, "governedCase", xml, schemas.get(0))));
+            var returned = new ProcessReleaseDTO("release-1", VERSION_A, SUBMITTED, List.of(
+                    new ProcessModelDTO(type, "governedCase", hash, schemas.get(1))));
+            var transport = new FakeHttpClient(); transport.reply(200, "application/json", json(returned));
+            var client = client(URI.create("https://process.example/"), transport, () -> TOKEN, Duration.ofSeconds(1));
+            if (schemas.get(0).isEmpty() && schemas.get(1).isEmpty()) assertEquals(returned, assertDoesNotThrow(() -> client.publish(requested)));
+            else assertEquals("TIANJI_INVALID_RESPONSE", assertThrows(ProcessClientException.class, () -> client.publish(requested)).code());
+            assertEquals(1, transport.requests.size());
+        }
+    }
 
     @Test
     void case_calls_use_private_post_routes_preserve_prefix_headers_and_exact_command_bodies() {

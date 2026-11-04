@@ -3,11 +3,15 @@ package top.egon.cola.platform.tianji.process.server;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.common.engine.impl.AbstractEngineConfiguration;
+import org.flowable.common.engine.impl.EngineConfigurator;
+import org.flowable.cmmn.engine.impl.parser.CmmnParserImpl;
+import org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory;
 import org.flowable.common.spring.SpringEngineConfiguration;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flowable.spring.boot.EngineConfigurationConfigurer;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
@@ -23,6 +27,8 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
+import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
 
 import javax.sql.DataSource;
 import java.util.Collections;
@@ -52,6 +58,14 @@ public class ProcessStorageConfiguration {
     @Bean
     SmartInitializingSingleton workerWebBoundaryGuard(Environment environment, ApplicationContext context) {
         return () -> {
+            boolean cases = environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false);
+            if (cases && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false) || !(context instanceof WebApplicationContext))) {
+                throw new IllegalStateException("Case API requires an enabled servlet Process API");
+            }
+            if (environment.getProperty("stellar.tianji.process.cases.new-starts-enabled", Boolean.class, false)
+                    && (!cases || !environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false))) {
+                throw new IllegalStateException("New Case starts require the Case and human task APIs");
+            }
             if (environment.getProperty("stellar.tianji.process.approval-verification.enabled", Boolean.class, false)
                     && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false) || !(context instanceof WebApplicationContext))) {
                 throw new IllegalStateException("Approval verification requires an enabled servlet Process API");
@@ -97,11 +111,39 @@ public class ProcessStorageConfiguration {
         };
     }
 
-    @Bean
-    @Order(Ordered.LOWEST_PRECEDENCE)
     EngineConfigurationConfigurer<SpringCmmnEngineConfiguration> caseStorageGuard(
             OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
         return config -> verify(config, config, outbox, properties);
+    }
+
+    @Bean
+    @Order(Ordered.LOWEST_PRECEDENCE)
+    EngineConfigurationConfigurer<SpringCmmnEngineConfiguration> caseStorageGuard(
+            OutboxInfrastructure outbox, TransactionalOutboxProperties properties, Environment environment,
+            ObjectProvider<FlowableCaseService> services) {
+        return config -> {
+            verify(config, config, outbox, properties);
+            if (!environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) return;
+            config.addConfigurator(new EngineConfigurator() {
+                @Override public void beforeInit(AbstractEngineConfiguration engine) { }
+                @Override public int getPriority() { return Integer.MAX_VALUE; }
+                @Override public void configure(AbstractEngineConfiguration engine) {
+                    if (engine != config || config.getExpressionManager() == null || config.getClassDelegateFactory() == null
+                            || config.getActivityBehaviorFactory() == null || config.getActivityBehaviorFactory().getClass() != DefaultCmmnActivityBehaviorFactory.class
+                            || !(config.getCmmnParser() instanceof CmmnParserImpl parser) || parser.getClass() != CmmnParserImpl.class
+                            || parser.getActivityBehaviorFactory() != config.getActivityBehaviorFactory()) {
+                        throw new IllegalStateException("Formal Case requires its initialized native parser and default behavior factory");
+                    }
+                    var factory = new PinnedCaseActivityBehaviorFactory(services::getObject);
+                    factory.setExpressionManager(config.getExpressionManager()); factory.setClassDelegateFactory(config.getClassDelegateFactory());
+                    config.setActivityBehaviorFactory(factory); parser.setActivityBehaviorFactory(factory);
+                    if (config.getActivityBehaviorFactory() != factory || parser.getActivityBehaviorFactory() != factory) {
+                        throw new IllegalStateException("Formal Case behavior factory installation did not bind both native pointers");
+                    }
+                    PinnedCaseActivityBehaviorFactory.requireConfigured(config);
+                }
+            });
+        };
     }
 
     @Bean

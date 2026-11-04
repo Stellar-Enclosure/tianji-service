@@ -60,10 +60,16 @@ egon:
               TIANJI_TASK_CLAIM: ["tianji:task:claim"]
               TIANJI_TASK_COMPLETE: ["tianji:task:complete"]
               TIANJI_TASK_TRANSFER: ["tianji:task:transfer"]
+              TIANJI_CASE_START: ["tianji:case:start"]
+              TIANJI_CASE_READ: ["tianji:case:read"]
+              TIANJI_CASE_PLAN_ITEM_ACT: ["tianji:case:act"]
 
 stellar:
   tianji:
     process:
+      cases:
+        enabled: false
+        new-starts-enabled: false
       approval-verification:
         enabled: false
       human-tasks:

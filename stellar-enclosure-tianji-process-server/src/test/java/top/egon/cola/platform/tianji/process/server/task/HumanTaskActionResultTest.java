@@ -68,6 +68,28 @@ class HumanTaskActionResultTest {
                 snapshot(HASH, "finance", applicant.userKey(), policy(HumanTaskKind.APPROVAL)), null, null, Map.of("approved", true, "comment", "form"), NOW));
     }
 
+    @Test void case_results_retain_the_independent_owner_start_proof_without_minting_approval() throws Exception {
+        var f = new HumanTaskSnapshotTest.CaseFixture(); var provenance = f.provenance;
+        var caseOrigin = new TaskOrigin(provenance.seed().owner(), "parent-start", "a".repeat(64), "release", "correlation", "case-1", NOW);
+        var receipt = new top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionReceiptDTO("cmd", "case-task", HumanTaskActionEnum.COMPLETE,
+                top.egon.cola.platform.tianji.contract.orchestration.HumanTaskScopeTypeEnum.CASE, "case-1", "release", "governedCase", "primaryTask",
+                top.egon.cola.platform.tianji.contract.orchestration.HumanTaskKindEnum.ACTION, "operator", HASH, null, null, null, NOW);
+        var context = HumanTaskSnapshotTest.caseContext("complete", Set.of("7"));
+        var entry = assertDoesNotThrow(() -> new HumanTaskActionResult.Entry(context.actor(), HASH, receipt, caseOrigin, f.definition.modelSha256(), "case-definition", "7", 2, 3, context.userKey(), null, provenance));
+        assertEquals(provenance, entry.caseProvenance()); assertEquals("START", entry.caseProvenance().seed().ownerStartCommandType());
+        assertEquals("parent-1", entry.caseProvenance().seed().parentProcessInstanceId()); assertNull(entry.receipt().approvalReceiptId());
+        assertThrows(IllegalArgumentException.class, () -> new HumanTaskActionResult.Entry(context.actor(), HASH, receipt, caseOrigin, f.definition.modelSha256(), "case-definition", "7", 2, 3, context.userKey(), null));
+    }
+
+    @Test void case_completion_accepts_only_the_empty_released_action_form() throws Exception {
+        var f = new HumanTaskSnapshotTest.CaseFixture(); var context = HumanTaskSnapshotTest.caseContext("complete", Set.of("7")); f.assignee.set(context.userKey());
+        var before = assertDoesNotThrow(f::snapshot);
+        var result = HumanTaskActionResult.applied(context, HumanTaskActionEnum.COMPLETE, "cmd", HASH, before, null, null, Map.of(), NOW);
+        assertEquals(top.egon.cola.platform.tianji.contract.orchestration.HumanTaskScopeTypeEnum.CASE, result.receipt().scopeType());
+        assertEquals(f.provenance, result.caseProvenance()); assertNull(result.receipt().approved());
+        assertThrows(IllegalArgumentException.class, () -> HumanTaskActionResult.applied(context, HumanTaskActionEnum.COMPLETE, "other", HASH, before, null, null, Map.of("approved", true), NOW));
+    }
+
     private static HumanTaskContext context(String operation, Set<String> roles) { return new HumanTaskContext(REVIEWER, "tianji.api.process.task." + operation, roles, NOW.plusSeconds(30), 2, 3); }
     private static HumanTask policy(HumanTaskKind kind) { return new HumanTask(kind, Map.of("finance", Set.of("50"), "manager", Set.of("60")), "finance", null, kind == HumanTaskKind.APPROVAL ? "reviewApproved" : null,
             List.of(new HumanTaskField("approved", "reviewApproved", ValueType.BOOLEAN), new HumanTaskField("comment", "reviewComment", ValueType.STRING))); }

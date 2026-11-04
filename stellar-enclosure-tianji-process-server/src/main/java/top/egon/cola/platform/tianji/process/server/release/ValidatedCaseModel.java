@@ -6,14 +6,14 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Immutable validator output; construction neither authenticates a caller nor authorizes publication or execution. */
-final class ValidatedCaseModel {
+public final class ValidatedCaseModel {
     private final String definitionKey;
     private final byte[] xml;
     private final Map<String, ValidatedProcessModel.HumanTask> humanTasks;
     private final Map<String, PlanItemPolicy> planItems;
     private final Set<String> operatorRoleIds;
 
-    ValidatedCaseModel(String definitionKey, byte[] xml,
+    public ValidatedCaseModel(String definitionKey, byte[] xml,
                        Map<String, ValidatedProcessModel.HumanTask> humanTasks,
                        Map<String, PlanItemPolicy> planItems) {
         this.definitionKey = Objects.requireNonNull(definitionKey, "definitionKey");
@@ -25,16 +25,16 @@ final class ValidatedCaseModel {
         this.operatorRoleIds = Set.copyOf(roles);
     }
 
-    String definitionKey() { return definitionKey; }
-    byte[] xml() { return xml.clone(); }
-    Map<String, ValidatedProcessModel.HumanTask> humanTasks() { return humanTasks; }
-    Map<String, PlanItemPolicy> planItems() { return planItems; }
-    Set<String> operatorRoleIds() { return operatorRoleIds; }
+    public String definitionKey() { return definitionKey; }
+    public byte[] xml() { return xml.clone(); }
+    public Map<String, ValidatedProcessModel.HumanTask> humanTasks() { return humanTasks; }
+    public Map<String, PlanItemPolicy> planItems() { return planItems; }
+    public Set<String> operatorRoleIds() { return operatorRoleIds; }
 
-    enum Action { DISABLE, ENABLE, START, TERMINATE }
+    public enum Action { DISABLE, ENABLE, START, TERMINATE }
 
-    record PlanItemPolicy(String definitionId, Set<Action> actions, Set<String> roleIds) {
-        PlanItemPolicy {
+    public record PlanItemPolicy(String definitionId, Set<Action> actions, Set<String> roleIds) {
+        public PlanItemPolicy {
             definitionId = Objects.requireNonNull(definitionId, "definitionId");
             actions = Set.copyOf(Objects.requireNonNull(actions, "actions"));
             roleIds = Set.copyOf(Objects.requireNonNull(roleIds, "roleIds"));

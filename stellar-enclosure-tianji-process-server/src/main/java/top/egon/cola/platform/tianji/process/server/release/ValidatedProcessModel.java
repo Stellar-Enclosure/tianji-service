@@ -7,7 +7,7 @@ import java.time.Duration;
 
 /** Immutable result: deployment must use these validated bytes rather than a caller's mutable buffer. */
 public final class ValidatedProcessModel {
-    public enum Type { BPMN, DMN }
+    public enum Type { BPMN, CMMN, DMN }
     public enum ValueType { STRING, INTEGER, BOOLEAN }
     public enum WorkerEffect { READ_ONLY, TRANSACTIONAL_RECEIPT, EXTERNAL_IDEMPOTENT }
     public enum HumanTaskKind { ACTION, APPROVAL }

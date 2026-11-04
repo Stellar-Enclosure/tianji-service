@@ -10,7 +10,7 @@ import java.util.Optional;
 
 /** Local transaction participant for scoped idempotency receipts. */
 public final class ProcessCommandReceiptStore {
-    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE }
+    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE }
 
     private final JdbcTemplate jdbc;
     private final String table;

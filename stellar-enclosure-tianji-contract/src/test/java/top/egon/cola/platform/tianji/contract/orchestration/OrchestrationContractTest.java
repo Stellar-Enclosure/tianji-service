@@ -15,6 +15,14 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrchestrationContractTest {
     @Test
+    void formal_case_models_have_their_own_named_release_type() {
+        var cmmn = assertDoesNotThrow(() -> Enum.valueOf(ProcessModelTypeEnum.class, "CMMN"));
+        assertEquals("CMMN", cmmn.name());
+        assertEquals(ProcessModelTypeEnum.BPMN, Enum.valueOf(ProcessModelTypeEnum.class, "BPMN"));
+        assertEquals(ProcessModelTypeEnum.DMN, Enum.valueOf(ProcessModelTypeEnum.class, "DMN"));
+    }
+
+    @Test
     void canonical_start_values_preserve_the_existing_wire_fields() {
         assertEquals("tianji:process:start", ProcessClient.START_SCOPE);
         assertEquals("tianji.api.process.instance.start", ProcessClient.START_RESOURCE_KEY);

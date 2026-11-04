@@ -85,6 +85,23 @@ class ProcessStorageConfigurationTest {
         assertThrows(IllegalStateException.class, () -> config.workerWebBoundaryGuard(approvals, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
     }
 
+    @Test
+    void case_readiness_and_new_starts_have_independent_fail_closed_feature_boundaries() {
+        var configuration = new ProcessStorageConfiguration();
+        var servlet = mock(WebApplicationContext.class);
+        for (var environment : java.util.List.of(
+                new MockEnvironment().withProperty("stellar.tianji.process.cases.enabled", "true"),
+                new MockEnvironment().withProperty("stellar.tianji.process.cases.new-starts-enabled", "true").withProperty("stellar.tianji.process.api.enabled", "true").withProperty("stellar.tianji.process.human-tasks.enabled", "true"),
+                new MockEnvironment().withProperty("stellar.tianji.process.cases.enabled", "true").withProperty("stellar.tianji.process.cases.new-starts-enabled", "true").withProperty("stellar.tianji.process.api.enabled", "true"))) {
+            assertThrows(IllegalStateException.class, () -> configuration.workerWebBoundaryGuard(environment, servlet).afterSingletonsInstantiated());
+        }
+        var reads = new MockEnvironment().withProperty("stellar.tianji.process.cases.enabled", "true").withProperty("stellar.tianji.process.api.enabled", "true");
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(reads, servlet).afterSingletonsInstantiated());
+        assertThrows(IllegalStateException.class, () -> configuration.workerWebBoundaryGuard(reads, mock(ApplicationContext.class)).afterSingletonsInstantiated());
+        reads.setProperty("stellar.tianji.process.cases.new-starts-enabled", "true"); reads.setProperty("stellar.tianji.process.human-tasks.enabled", "true");
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(reads, servlet).afterSingletonsInstantiated());
+    }
+
     private static void guard(MockEnvironment environment) {
         ProcessStorageConfiguration.processStoragePropertiesGuard(environment).postProcessBeanFactory(null);
     }

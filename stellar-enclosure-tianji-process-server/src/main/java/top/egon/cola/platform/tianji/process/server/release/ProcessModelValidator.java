@@ -27,6 +27,8 @@ import java.util.regex.Pattern;
 
 /** Validates bounded, non-scriptable process models; publication applies additional feature gates. */
 public final class ProcessModelValidator {
+    public ValidatedCaseModel validateCmmn(byte[] xml, String expectedKey) { return new CmmnModelValidator().validate(xml, expectedKey); }
+
     private static final String BPMN = "http://www.omg.org/spec/BPMN/20100524/MODEL";
     private static final String DMN = "http://www.omg.org/spec/DMN/20151101";
     private static final String FLOWABLE = "http://flowable.org/bpmn";

@@ -5,6 +5,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskActionRecei
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskKindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskScopeTypeEnum;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
+import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.HumanTaskContext;
@@ -43,7 +44,7 @@ public final class HumanTaskActionResult {
         if (suppliedForm == null || action != HumanTaskActionEnum.COMPLETE && !suppliedForm.isEmpty()) throw invalid();
         if (action == HumanTaskActionEnum.COMPLETE) { if (after != null) throw invalid(); }
         else if (after == null || !before.taskId().equals(after.taskId()) || !before.origin().equals(after.origin()) || !before.definition().equals(after.definition())
-                || !policy.equals(after.policy()) || before.version().equals(after.version()) || !Objects.equals(after.facts().assignee(), action == HumanTaskActionEnum.CLAIM ? context.userKey() : null)
+                || !policy.equals(after.policy()) || !Objects.equals(before.caseProvenance(), after.caseProvenance()) || before.version().equals(after.version()) || !Objects.equals(after.facts().assignee(), action == HumanTaskActionEnum.CLAIM ? context.userKey() : null)
                 || !after.lane().equals(action == HumanTaskActionEnum.TRANSFER ? targetLane : before.lane())) throw invalid();
         boolean approval = action == HumanTaskActionEnum.COMPLETE && policy.kind() == HumanTaskKind.APPROVAL;
         Boolean approved = null; String reference = null;
@@ -54,11 +55,11 @@ public final class HumanTaskActionResult {
                     commandId, before.taskId(), before.version(), before.origin().requestHash()), Map.of());
         }
         String lane = after == null ? before.lane() : after.lane();
-        var receipt = new HumanTaskActionReceiptDTO(commandId, before.taskId(), action, HumanTaskScopeTypeEnum.PROCESS, before.origin().instanceId(), before.origin().releaseKey(),
+        var receipt = new HumanTaskActionReceiptDTO(commandId, before.taskId(), action, before.caseProvenance() == null ? HumanTaskScopeTypeEnum.PROCESS : HumanTaskScopeTypeEnum.CASE, before.origin().instanceId(), before.origin().releaseKey(),
                 before.definition().definitionKey(), before.taskDefinitionKey(), HumanTaskKindEnum.valueOf(policy.kind().name()), lane, before.version(), after == null ? null : after.version(), reference, approved, occurredAt);
         String role = action == HumanTaskActionEnum.CLAIM || action == HumanTaskActionEnum.COMPLETE ? policy.lanes().get(before.lane()).stream().filter(context.roleIds()::contains).sorted().findFirst().orElseThrow(HumanTaskActionResult::invalid) : null;
         return new Entry(context.actor(), requestHash, receipt, before.origin(), before.definition().modelSha256(), before.definition().engineDefinitionId(), role,
-                context.authVersion(), context.policyVersion(), facts.assignee(), after == null ? null : after.facts().assignee());
+                context.authVersion(), context.policyVersion(), facts.assignee(), after == null ? null : after.facts().assignee(), before.caseProvenance());
     }
 
     private static Map<String, Object> form(HumanTask policy, Map<String, Object> supplied) {
@@ -66,14 +67,26 @@ public final class HumanTaskActionResult {
         return ProcessValues.inputs(schema, supplied);
     }
     public record Entry(ProcessActor actor, String requestHash, HumanTaskActionReceiptDTO receipt, TaskOrigin origin, String modelSha256, String engineDefinitionId,
-                        String authorizedRoleId, long authVersion, long policyVersion, String previousAssignee, String resultingAssignee) {
+                        String authorizedRoleId, long authVersion, long policyVersion, String previousAssignee, String resultingAssignee,
+                        CaseStartProvenanceStore.Entry caseProvenance) {
+        public Entry(ProcessActor actor, String requestHash, HumanTaskActionReceiptDTO receipt, TaskOrigin origin, String modelSha256, String engineDefinitionId,
+                String authorizedRoleId, long authVersion, long policyVersion, String previousAssignee, String resultingAssignee) {
+            this(actor,requestHash,receipt,origin,modelSha256,engineDefinitionId,authorizedRoleId,authVersion,policyVersion,previousAssignee,resultingAssignee,null);
+        }
         public Entry {
             Objects.requireNonNull(actor, "actor"); Objects.requireNonNull(receipt, "receipt"); Objects.requireNonNull(origin, "origin");
             if (actor.subjectType() != ProcessActor.SubjectType.USER || "LEGACY".equals(actor.issuerFingerprint()) || actor.tenantId() != origin.requester().tenantId() || !actor.issuerFingerprint().equals(origin.requester().issuerFingerprint())
                     || requestHash == null || !requestHash.matches("[0-9a-f]{64}") || modelSha256 == null || !modelSha256.matches("[0-9a-f]{64}") || engineDefinitionId == null || engineDefinitionId.isBlank()
                     || !origin.instanceId().equals(receipt.scopeId()) || !origin.releaseKey().equals(receipt.releaseVersion()) || authVersion < 0 || policyVersion < 0) throw invalid();
             boolean memberAction = receipt.action() == HumanTaskActionEnum.CLAIM || receipt.action() == HumanTaskActionEnum.COMPLETE;
-            if (receipt.scopeType() != HumanTaskScopeTypeEnum.PROCESS || memberAction != (authorizedRoleId != null)
+            if (receipt.scopeType() == HumanTaskScopeTypeEnum.CASE) {
+                if (caseProvenance == null || receipt.kind() != HumanTaskKindEnum.ACTION || receipt.approvalReceiptId() != null || receipt.approved() != null) throw invalid();
+                var seed = caseProvenance.seed();
+                if (!seed.owner().equals(origin.requester()) || !seed.caseInstanceId().equals(origin.instanceId()) || !seed.releaseKey().equals(origin.releaseKey()) || !seed.correlationId().equals(origin.correlationId())
+                        || !seed.ownerStartCommandId().equals(origin.commandId()) || !seed.ownerStartRequestSha256().equals(origin.requestHash()) || !caseProvenance.createdAt().equals(origin.createdAt())
+                        || !seed.caseDefinitionKey().equals(receipt.definitionKey()) || !seed.caseModelSha256().equals(modelSha256) || !seed.caseEngineDefinitionId().equals(engineDefinitionId)) throw invalid();
+            } else if (receipt.scopeType() != HumanTaskScopeTypeEnum.PROCESS || caseProvenance != null) throw invalid();
+            if (memberAction != (authorizedRoleId != null)
                     || authorizedRoleId != null && (!authorizedRoleId.matches("[1-9][0-9]{0,18}") || Long.parseLong(authorizedRoleId) < 1)
                     || previousAssignee != null && !previousAssignee.matches("user-[0-9a-f]{64}") || resultingAssignee != null && !resultingAssignee.matches("user-[0-9a-f]{64}")
                     || receipt.action() == HumanTaskActionEnum.CLAIM && (previousAssignee != null || resultingAssignee == null)

@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.process.server.release;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.api.DmnDecision;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.repository.ProcessDefinition;
@@ -19,6 +20,7 @@ import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
+import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskTimerAvailability;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -53,6 +55,8 @@ public final class ProcessReleaseService {
     private static final TypeReference<Map<String, String>> SCHEMA = new TypeReference<>() { };
     private final SpringProcessEngineConfiguration process;
     private final SpringDmnEngineConfiguration dmn;
+    private final SpringCmmnEngineConfiguration cmmn;
+    private final boolean casesEnabled;
     private final ProcessModelValidator validator;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate write;
@@ -94,6 +98,19 @@ public final class ProcessReleaseService {
     public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, boolean decisionTasksEnabled, WorkerTopicRegistry workerTopics,
                                  boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady, boolean humanTasksEnabled) {
+        this(process, null, dmn, validator, decisionTasksEnabled, workerTopics, agentMessageWaitsEnabled, agentMaintenanceReady, humanTasksEnabled, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn,
+                                 SpringDmnEngineConfiguration dmn, ProcessModelValidator validator) {
+        this(process, cmmn, dmn, validator, false, null, false, () -> true, false, false);
+    }
+
+    public ProcessReleaseService(SpringProcessEngineConfiguration process, SpringCmmnEngineConfiguration cmmn,
+                                 SpringDmnEngineConfiguration dmn, ProcessModelValidator validator, boolean decisionTasksEnabled,
+                                 WorkerTopicRegistry workerTopics, boolean agentMessageWaitsEnabled, BooleanSupplier agentMaintenanceReady,
+                                 boolean humanTasksEnabled, boolean casesEnabled) {
+        this.cmmn = cmmn; this.casesEnabled = casesEnabled;
         this.process = Objects.requireNonNull(process, "process");
         this.dmn = Objects.requireNonNull(dmn, "dmn");
         this.validator = Objects.requireNonNull(validator, "validator");
@@ -108,6 +125,10 @@ public final class ProcessReleaseService {
                 || humanTasksEnabled && !(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || decisionTasksEnabled && (!(process.getActivityBehaviorFactory() instanceof PinnedDecisionActivityBehaviorFactory)
                 || !dmn.isHistoryEnabled() || dmn.getDmnHistoryService() == null)) throw invalidConfiguration();
+        if (casesEnabled && cmmn == null || cmmn != null && (cmmn.getTransactionManager() != manager
+                || unwrap(cmmn.getDataSource()) != manager.getDataSource() || !process.getDatabaseSchema().equals(cmmn.getDatabaseSchema())
+                || cmmn.getBeans() == null || !cmmn.getBeans().isEmpty() || cmmn.getCmmnRepositoryService() == null)) throw invalidConfiguration();
+        if (casesEnabled) PinnedCaseActivityBehaviorFactory.requireConfigured(cmmn);
         this.decisionTasksEnabled = decisionTasksEnabled;
         this.workerTopics = workerTopics;
         this.agentMessageWaitsEnabled = agentMessageWaitsEnabled;
@@ -118,6 +139,7 @@ public final class ProcessReleaseService {
         if (agentMessageWaitsEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyAgentDispatch();
         if (agentMessageWaitsEnabled) FlowableAgentWaitInspector.requireHistory(process);
         if (humanTasksEnabled) new HumanTaskStorageVerifier(manager.getDataSource(), schema).verify();
+        if (casesEnabled) new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyCase();
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);
@@ -165,7 +187,7 @@ public final class ProcessReleaseService {
         }
         for (PreparedModel model : models) {
             jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { },
-                    "tianji:release:" + schema + ":" + actor.tenantId() + ":" + model.model().type() + ":" + model.model().definitionKey());
+                    "tianji:release:" + schema + ":" + actor.tenantId() + ":" + model.type() + ":" + model.definitionKey());
         }
         for (PreparedModel model : models) {
             Definition definition = deploy(actor.tenantId(), releaseKey, model);
@@ -183,27 +205,42 @@ public final class ProcessReleaseService {
     }
 
     private Definition deploy(long tenantId, String releaseKey, PreparedModel prepared) {
-        ValidatedProcessModel model = prepared.model();
-        String tenant = Long.toString(tenantId);
-        String resource = model.definitionKey();
-        if (model.type() == Type.BPMN) {
-            var deployment = process.getRepositoryService().createDeployment().tenantId(tenant).name("tianji:" + releaseKey)
-                    .addBytes(resource + ".bpmn20.xml", model.xml()).deploy();
-            List<ProcessDefinition> definitions = process.getRepositoryService().createProcessDefinitionQuery()
-                    .deploymentId(deployment.getId()).processDefinitionTenantId(tenant).list();
-            if (definitions.size() != 1 || !resource.equals(definitions.getFirst().getKey())) throw invalidDeployment();
-            ProcessDefinition definition = definitions.getFirst();
-            return new Definition(Type.BPMN, resource, definition.getId(), deployment.getId(), definition.getVersion(),
-                    prepared.modelHash(), prepared.inputs());
-        }
-        var deployment = dmn.getDmnRepositoryService().createDeployment().tenantId(tenant).name("tianji:" + releaseKey)
-                .addDmnBytes(resource + ".dmn", model.xml()).deploy();
-        List<DmnDecision> definitions = dmn.getDmnRepositoryService().createDecisionQuery()
-                .deploymentId(deployment.getId()).decisionTenantId(tenant).list();
-        if (definitions.size() != 1 || !resource.equals(definitions.getFirst().getKey())) throw invalidDeployment();
-        DmnDecision definition = definitions.getFirst();
-        return new Definition(Type.DMN, resource, definition.getId(), deployment.getId(), definition.getVersion(),
-                prepared.modelHash(), prepared.inputs());
+        String tenant = Long.toString(tenantId), resource = prepared.definitionKey();
+        return switch (prepared.type()) {
+            case BPMN -> {
+                var deployment = process.getRepositoryService().createDeployment().tenantId(tenant).name("tianji:" + releaseKey)
+                        .addBytes(resource + ".bpmn20.xml", prepared.xml()).deploy();
+                List<ProcessDefinition> definitions = process.getRepositoryService().createProcessDefinitionQuery()
+                        .deploymentId(deployment.getId()).processDefinitionTenantId(tenant).list();
+                if (definitions.size() != 1 || !resource.equals(definitions.getFirst().getKey())) throw invalidDeployment();
+                ProcessDefinition definition = definitions.getFirst();
+                yield new Definition(Type.BPMN, resource, definition.getId(), deployment.getId(), definition.getVersion(), prepared.modelHash(), prepared.inputs());
+            }
+            case CMMN -> {
+                requireCasePublication();
+                var repository = cmmn.getCmmnRepositoryService();
+                var deployment = repository.createDeployment().tenantId(tenant).name("tianji:" + releaseKey).addBytes(resource + ".cmmn", prepared.xml()).deploy();
+                if (deployment == null || !nativeId(deployment.getId())) throw invalidDeployment();
+                var definitions = repository.createCaseDefinitionQuery().deploymentId(deployment.getId()).caseDefinitionTenantId(tenant).listPage(0, 2);
+                if (definitions.size() != 1) throw invalidDeployment();
+                var definition = definitions.getFirst();
+                if (!resource.equals(definition.getKey()) || !tenant.equals(definition.getTenantId()) || !deployment.getId().equals(definition.getDeploymentId())
+                        || !nativeId(definition.getId()) || definition.getVersion() < 1 || !(resource + ".cmmn").equals(definition.getResourceName())) throw invalidDeployment();
+                var binding = new Definition(Type.CMMN, resource, definition.getId(), deployment.getId(), definition.getVersion(), prepared.modelHash(), prepared.inputs());
+                try { new VerifiedProcessModels(process, cmmn, dmn, validator).caseModel(tenantId, binding); }
+                catch (ProcessResourceNotFoundException inconsistent) { throw invalidDeployment(); }
+                yield binding;
+            }
+            case DMN -> {
+                var deployment = dmn.getDmnRepositoryService().createDeployment().tenantId(tenant).name("tianji:" + releaseKey)
+                        .addDmnBytes(resource + ".dmn", prepared.xml()).deploy();
+                List<DmnDecision> definitions = dmn.getDmnRepositoryService().createDecisionQuery()
+                        .deploymentId(deployment.getId()).decisionTenantId(tenant).list();
+                if (definitions.size() != 1 || !resource.equals(definitions.getFirst().getKey())) throw invalidDeployment();
+                DmnDecision definition = definitions.getFirst();
+                yield new Definition(Type.DMN, resource, definition.getId(), deployment.getId(), definition.getVersion(), prepared.modelHash(), prepared.inputs());
+            }
+        };
     }
 
     private Release load(long tenantId, String releaseKey, boolean lock) {
@@ -234,25 +271,34 @@ public final class ProcessReleaseService {
             byte[] xml = resource.xml();
             size += xml.length;
             if (size > MAX_BUNDLE_BYTES || !keys.add(resource.type().name() + ":" + resource.definitionKey())) throw invalid();
-            ValidatedProcessModel model = resource.type() == Type.BPMN
-                    ? validator.validateBpmn(xml, resource.definitionKey()) : validator.validateDmn(xml, resource.definitionKey());
             Map<String, ValueType> inputs = checkedSchema(resource.inputs());
-            if (model.type() == Type.DMN) {
-                if (!inputs.isEmpty() && !inputs.equals(model.inputs())) throw invalid();
-                inputs = model.inputs();
+            ValidatedProcessModel model = null; ValidatedCaseModel caseModel = null;
+            switch (resource.type()) {
+                case BPMN -> model = validator.validateBpmn(xml, resource.definitionKey());
+                case CMMN -> {
+                    requireCasePublication();
+                    if (!inputs.isEmpty()) throw invalid();
+                    caseModel = validator.validateCmmn(xml, resource.definitionKey());
+                }
+                case DMN -> {
+                    model = validator.validateDmn(xml, resource.definitionKey());
+                    if (!inputs.isEmpty() && !inputs.equals(model.inputs())) throw invalid();
+                    inputs = model.inputs();
+                }
             }
-            prepared.add(new PreparedModel(model, hash(model.xml()), inputs));
+            byte[] validated = caseModel == null ? model.xml() : caseModel.xml();
+            prepared.add(new PreparedModel(resource.type(), resource.definitionKey(), validated, hash(validated), inputs, model, caseModel));
         }
         for (PreparedModel processModel : prepared) {
-            if (processModel.model().type() != Type.BPMN) continue;
+            if (processModel.type() != Type.BPMN) continue;
             if (!processModel.model().humanTasks().isEmpty() && !humanTasksEnabled) throw invalid();
             if (!processModel.model().humanTaskTimers().isEmpty()) HumanTaskTimerAvailability.require(process);
             PreparedModel decision = null;
             if (!processModel.model().decisionTasks().isEmpty()) {
                 if (!decisionTasksEnabled) throw invalid();
                 String decisionKey = processModel.model().decisionTasks().values().iterator().next();
-                decision = prepared.stream().filter(item -> item.model().type() == Type.DMN
-                        && item.model().definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
+                decision = prepared.stream().filter(item -> item.type() == Type.DMN
+                        && item.definitionKey().equals(decisionKey)).findFirst().orElseThrow(ProcessReleaseService::invalid);
                 validator.validateDecisionBinding(processModel.model(), processModel.inputs(), decision.model());
             }
             validator.validateHumanTaskBindings(processModel.model(), processModel.inputs(), decision == null ? null : decision.model());
@@ -276,9 +322,14 @@ public final class ProcessReleaseService {
                         && (!agentMessageWaitsEnabled || waits.values().stream().noneMatch(wait -> wait.workerElementId().equals(entry.getKey())))) throw invalid();
             }
         }
-        prepared.sort(Comparator.comparing((PreparedModel item) -> item.model().type().name())
-                .thenComparing(item -> item.model().definitionKey()));
+        prepared.sort(Comparator.comparing((PreparedModel item) -> item.type().name())
+                .thenComparing(item -> item.definitionKey()));
         return List.copyOf(prepared);
+    }
+
+    private void requireCasePublication() {
+        if (!casesEnabled || !humanTasksEnabled || cmmn == null) throw invalid();
+        PinnedCaseActivityBehaviorFactory.requireConfigured(cmmn);
     }
 
     private static String manifestHash(List<PreparedModel> models) {
@@ -286,9 +337,9 @@ public final class ProcessReleaseService {
         try (DataOutputStream output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
             output.writeInt(models.size());
             for (PreparedModel item : models) {
-                writeField(output, item.model().type().name().getBytes(StandardCharsets.UTF_8));
-                writeField(output, item.model().definitionKey().getBytes(StandardCharsets.UTF_8));
-                writeField(output, item.model().xml());
+                writeField(output, item.type().name().getBytes(StandardCharsets.UTF_8));
+                writeField(output, item.definitionKey().getBytes(StandardCharsets.UTF_8));
+                writeField(output, item.xml());
                 Map<String, ValueType> sorted = new TreeMap<>(item.inputs());
                 output.writeInt(sorted.size());
                 for (var entry : sorted.entrySet()) {
@@ -348,6 +399,15 @@ public final class ProcessReleaseService {
     private static void requireReleaseKey(String value) {
         if (value == null || !value.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")) throw invalid();
     }
+    private static boolean nativeId(String value) {
+        if (value == null || value.isBlank() || value.length() > 255 || !value.equals(value.trim())) return false;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c < 32 || c == 127 || Character.isLowSurrogate(c) || Character.isHighSurrogate(c)
+                    && (i + 1 >= value.length() || !Character.isLowSurrogate(value.charAt(++i)))) return false;
+        }
+        return true;
+    }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Process release request is invalid"); }
     private static ProcessResourceNotFoundException unavailable() { return new ProcessResourceNotFoundException(); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
@@ -375,6 +435,13 @@ public final class ProcessReleaseService {
         public Release { definitions = List.copyOf(definitions); }
     }
 
-    private record PreparedModel(ValidatedProcessModel model, String modelHash, Map<String, ValueType> inputs) { }
+    private record PreparedModel(Type type, String definitionKey, byte[] xml, String modelHash, Map<String, ValueType> inputs,
+                                 ValidatedProcessModel model, ValidatedCaseModel caseModel) {
+        private PreparedModel {
+            xml = xml.clone(); inputs = Map.copyOf(inputs);
+            if (type == Type.CMMN ? caseModel == null || model != null : model == null || caseModel != null) throw invalid();
+        }
+        @Override public byte[] xml() { return xml.clone(); }
+    }
     private record ReleaseRow(String hash, String state, Instant createdAt) { }
 }

@@ -20,6 +20,33 @@ import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 
+import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
+import org.flowable.cmmn.api.CmmnRepositoryService;
+import org.flowable.cmmn.api.CmmnRuntimeService;
+import org.flowable.cmmn.api.CmmnTaskService;
+import org.flowable.cmmn.api.CmmnHistoryService;
+import org.flowable.cmmn.api.repository.CmmnDeploymentBuilder;
+import org.flowable.cmmn.api.repository.CmmnDeployment;
+import org.flowable.cmmn.api.repository.CaseDefinitionQuery;
+import org.flowable.cmmn.api.repository.CaseDefinition;
+import org.flowable.cmmn.engine.impl.parser.CmmnParserImpl;
+import org.flowable.cmmn.engine.impl.parser.DefaultCmmnActivityBehaviorFactory;
+import org.flowable.cmmn.engine.impl.delegate.CmmnClassDelegateFactory;
+import org.flowable.common.engine.impl.el.ExpressionManager;
+import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
+import org.mockito.MockedConstruction;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.io.ByteArrayInputStream;
+import java.util.ArrayList;
+import java.util.HexFormat;
+import java.security.MessageDigest;
+
 import javax.sql.DataSource;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +56,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
+import static org.mockito.AdditionalMatchers.aryEq;
 
 class ProcessReleaseServiceTest {
     @Test
@@ -215,6 +243,174 @@ class ProcessReleaseServiceTest {
             verify(source).getConnection();
             verifyNoInteractions(process.getRepositoryService());
         }
+    }
+
+    @Test
+    void cmmn_publication_deploys_the_closed_bytes_and_returns_the_exact_case_binding() throws Exception {
+        try (var f = new CaseFixture()) {
+            var release = assertDoesNotThrow(() -> f.publisher(true, true).publish(f.actor, "release", List.of(f.resource(Map.of()))));
+            assertEquals(1, release.definitions().size()); var binding = release.definitions().getFirst();
+            assertEquals(Type.CMMN, binding.type()); assertEquals("governedCase", binding.definitionKey());
+            assertEquals("case-definition", binding.engineDefinitionId()); assertEquals("case-deployment", binding.engineDeploymentId());
+            assertEquals(3, binding.engineVersion()); assertEquals(f.hash, binding.modelSha256()); assertTrue(binding.inputs().isEmpty());
+            verify(f.builder).addBytes(eq("governedCase.cmmn"), aryEq(f.xml));
+            verify(f.builder).tenantId("20"); verify(f.caseQuery, atLeastOnce()).deploymentId("case-deployment");
+            verify(f.caseQuery).listPage(0, 2);
+            verify(f.caseQuery, atLeastOnce()).caseDefinitionTenantId("20");
+            verify(f.connection).commit(); verifyNoInteractions(f.process.getRepositoryService(), f.dmn.getDmnRepositoryService());
+        }
+    }
+
+    @Test
+    void cmmn_requires_case_and_human_publication_flags_and_real_isolated_native_readiness() throws Exception {
+        try (var f = new CaseFixture()) {
+            assertThrows(IllegalArgumentException.class, () -> f.publisher(false, false).publish(f.actor, "release", List.of(f.resource(Map.of()))));
+            assertThrows(IllegalArgumentException.class, () -> f.publisher(true, false).publish(f.actor, "release", List.of(f.resource(Map.of()))));
+            when(f.cmmn.getDataSource()).thenReturn(mock(DataSource.class));
+            assertThrows(IllegalArgumentException.class, () -> f.publisher(true, true));
+            when(f.cmmn.getDataSource()).thenReturn(f.source);
+            when(f.cmmn.getBeans()).thenReturn(Map.of("unsafe", new Object()));
+            assertThrows(IllegalArgumentException.class, () -> f.publisher(true, true));
+            when(f.cmmn.getBeans()).thenReturn(Map.of());
+            when(f.cmmn.getActivityBehaviorFactory()).thenReturn(new DefaultCmmnActivityBehaviorFactory());
+            assertThrows(IllegalStateException.class, () -> f.publisher(true, true));
+            verifyNoInteractions(f.source, f.repository);
+        }
+    }
+
+    @Test
+    void cmmn_input_schema_and_ungoverned_models_are_rejected_before_any_publication_transaction() throws Exception {
+        try (var f = new CaseFixture()) {
+            var service = f.publisher(true, true);
+            assertThrows(IllegalArgumentException.class, () -> service.publish(f.actor, "release", List.of(f.resource(Map.of("amount", ValueType.INTEGER)))));
+            assertThrows(IllegalArgumentException.class, () -> service.publish(f.actor, "release", List.of(new ProcessReleaseService.ModelResource(Type.CMMN, "formalCase", fixture("formal-case.cmmn"), Map.of()))));
+            assertThrows(IllegalArgumentException.class, () -> service.publish(f.actor, "release", List.of(new ProcessReleaseService.ModelResource(Type.CMMN, "wrongKey", f.xml, Map.of()))));
+            verifyNoInteractions(f.source, f.repository);
+        }
+    }
+
+    @Test
+    void cmmn_deployment_mismatch_rolls_back_and_never_becomes_an_applied_release() throws Exception {
+        for (String corruption : List.of("key", "tenant", "deployment", "version", "resource", "hash")) {
+            try (var f = new CaseFixture()) {
+                switch (corruption) {
+                    case "key" -> when(f.definition.getKey()).thenReturn("otherCase");
+                    case "tenant" -> when(f.definition.getTenantId()).thenReturn("21");
+                    case "deployment" -> when(f.definition.getDeploymentId()).thenReturn("other-deployment");
+                    case "version" -> when(f.definition.getVersion()).thenReturn(0);
+                    case "resource" -> when(f.definition.getResourceName()).thenReturn("other.cmmn");
+                    case "hash" -> when(f.repository.getResourceAsStream(anyString(), anyString())).thenReturn(new ByteArrayInputStream(new byte[]{1}));
+                    default -> throw new AssertionError(corruption);
+                }
+                assertThrows(IllegalStateException.class, () -> f.publisher(true, true).publish(f.actor, "release", List.of(f.resource(Map.of()))), corruption);
+                verify(f.connection).rollback();
+            }
+        }
+    }
+
+    @Test
+    void verified_case_models_recheck_every_native_binding_and_the_immutable_bytes() throws Exception {
+        try (var f = new CaseFixture()) {
+            var models = new VerifiedProcessModels(f.process, f.cmmn, f.dmn, new ProcessModelValidator());
+            var binding = new ProcessReleaseService.Definition(Type.CMMN, "governedCase", "case-definition", "case-deployment", 3, f.hash, Map.of());
+            var model = models.caseModel(20, binding); assertNotNull(model); assertEquals("governedCase", model.definitionKey());
+            verify(f.caseQuery).caseDefinitionId("case-definition"); verify(f.caseQuery).deploymentId("case-deployment");
+            verify(f.caseQuery).caseDefinitionTenantId("20"); verify(f.caseQuery).caseDefinitionKey("governedCase"); verify(f.caseQuery).caseDefinitionVersion(3);
+            when(f.definition.getTenantId()).thenReturn("21");
+            assertThrows(ProcessResourceNotFoundException.class, () -> models.caseModel(20, binding));
+            when(f.definition.getTenantId()).thenReturn("20");
+            when(f.repository.getResourceAsStream(anyString(), anyString())).thenReturn(new ByteArrayInputStream(new byte[]{1}));
+            assertThrows(ProcessResourceNotFoundException.class, () -> models.caseModel(20, binding));
+        }
+    }
+
+    @Test
+    void legacy_constructor_overloads_and_two_type_manifest_bytes_remain_compatible() throws Exception {
+        var source = mock(DataSource.class); var process = process(source); var dmn = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        var validator = new ProcessModelValidator();
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator));
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false));
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null));
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false));
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true));
+        var service = assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true, false));
+        var prepare = ProcessReleaseService.class.getDeclaredMethod("prepare", List.class, long.class); prepare.setAccessible(true);
+        var models = prepare.invoke(service, List.of(new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", fixture("baseline.dmn"), Map.of()),
+                new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", fixture("baseline.bpmn20.xml"), Map.of())), 20L);
+        var digest = ProcessReleaseService.class.getDeclaredMethod("manifestHash", List.class); digest.setAccessible(true);
+        assertEquals("2633baa271f32928b180858f00c49923f813011e00a00aa4fc3df162cfcc1049", digest.invoke(null, models));
+        verifyNoInteractions(source);
+    }
+
+    private static byte[] fixture(String name) throws Exception {
+        try (var input = ProcessReleaseServiceTest.class.getResourceAsStream("/fixtures/" + name)) { assertNotNull(input); return input.readAllBytes(); }
+    }
+    private static final class CaseFixture implements AutoCloseable {
+        final DataSource source = mock(DataSource.class); final Connection connection = mock(Connection.class);
+        final SpringProcessEngineConfiguration process = process(source);
+        final SpringDmnEngineConfiguration dmn = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
+        final SpringCmmnEngineConfiguration cmmn = mock(SpringCmmnEngineConfiguration.class);
+        final CmmnRepositoryService repository = mock(CmmnRepositoryService.class);
+        final CmmnDeploymentBuilder builder = mock(CmmnDeploymentBuilder.class, RETURNS_SELF);
+        final CmmnDeployment deployment = mock(CmmnDeployment.class);
+        final CaseDefinitionQuery caseQuery = mock(CaseDefinitionQuery.class, RETURNS_SELF);
+        final CaseDefinition definition = mock(CaseDefinition.class);
+        final ProcessActor actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "publisher", "https://idp.example/20");
+        final byte[] xml = fixture("governed-case.cmmn"); final String hash;
+        final MockedConstruction<ProcessApiSchemaVerifier> schema;
+        final MockedConstruction<HumanTaskStorageVerifier> humanSchema;
+        final MockedConstruction<JdbcTemplate> jdbc;
+        String manifest; final List<Map<String,Object>> definitions = new ArrayList<>();
+        CaseFixture() throws Exception {
+            hash = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(xml));
+            when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true);
+            when(process.getActivityBehaviorFactory()).thenReturn(new PinnedDecisionActivityBehaviorFactory());
+            var manager = process.getTransactionManager();
+            when(cmmn.getDataSource()).thenReturn(source); when(cmmn.getTransactionManager()).thenReturn(manager);
+            when(cmmn.getDatabaseSchema()).thenReturn("tianji_process"); when(cmmn.getBeans()).thenReturn(Map.of()); when(cmmn.getDatabaseSchemaUpdate()).thenReturn("false");
+            when(cmmn.getCmmnRepositoryService()).thenReturn(repository);
+            when(cmmn.getCmmnRuntimeService()).thenReturn(mock(CmmnRuntimeService.class));
+            when(cmmn.getCmmnTaskService()).thenReturn(mock(CmmnTaskService.class));
+            when(cmmn.getCmmnHistoryService()).thenReturn(mock(CmmnHistoryService.class)); when(cmmn.getHistoryLevel()).thenReturn(HistoryLevel.AUDIT);
+            var expressions = mock(ExpressionManager.class);
+            var delegates = mock(CmmnClassDelegateFactory.class);
+            var factory = new PinnedCaseActivityBehaviorFactory(() -> null);
+            factory.setExpressionManager(expressions); factory.setClassDelegateFactory(delegates);
+            var parser = new CmmnParserImpl(); parser.setActivityBehaviorFactory(factory);
+            when(cmmn.getActivityBehaviorFactory()).thenReturn(factory); when(cmmn.getCmmnParser()).thenReturn(parser);
+            when(cmmn.getExpressionManager()).thenReturn(expressions); when(cmmn.getClassDelegateFactory()).thenReturn(delegates);
+            when(repository.createDeployment()).thenReturn(builder); when(builder.deploy()).thenReturn(deployment); when(deployment.getId()).thenReturn("case-deployment");
+            when(repository.createCaseDefinitionQuery()).thenReturn(caseQuery); when(caseQuery.list()).thenReturn(List.of(definition)); when(caseQuery.listPage(0, 2)).thenReturn(List.of(definition)); when(caseQuery.singleResult()).thenReturn(definition);
+            when(definition.getId()).thenReturn("case-definition"); when(definition.getKey()).thenReturn("governedCase"); when(definition.getTenantId()).thenReturn("20");
+            when(definition.getDeploymentId()).thenReturn("case-deployment"); when(definition.getVersion()).thenReturn(3); when(definition.getResourceName()).thenReturn("governedCase.cmmn");
+            when(repository.getResourceAsStream(anyString(), anyString())).thenAnswer(i -> new ByteArrayInputStream(xml));
+            schema = mockConstruction(ProcessApiSchemaVerifier.class); humanSchema = mockConstruction(HumanTaskStorageVerifier.class);
+            jdbc = mockConstruction(JdbcTemplate.class, (mock, context) -> {
+                when(mock.update(anyString(), any(Object[].class))).thenAnswer(i -> {
+                    String sql = i.getArgument(0); Object[] args = (Object[]) i.getRawArguments()[1];
+                    if (sql.contains("INSERT INTO") && sql.contains("tianji_process_release_definition")) {
+                        definitions.add(Map.of("model_type", args[2], "definition_key", args[3], "engine_definition_id", args[4], "engine_deployment_id", args[5],
+                                "engine_version", args[6], "model_sha256", args[7], "input_schema", args[8]));
+                    } else if (sql.contains("INSERT INTO") && sql.contains("tianji_process_release")) manifest = (String) args[2];
+                    return 1;
+                });
+                when(mock.query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class))).thenAnswer(i -> {
+                    String sql = i.getArgument(0); RowMapper<?> mapper = i.getArgument(1);
+                    var rows = sql.contains("SELECT model_type") ? definitions : List.of(Map.<String,Object>of("manifest_sha256", manifest, "state", "ACTIVE", "created_at", Timestamp.from(Instant.parse("2026-11-04T08:00:00Z"))));
+                    var result = new ArrayList<>(); for (var row : rows) result.add(mapper.mapRow(resultSet(row), result.size())); return result;
+                });
+            });
+            clearInvocations(source, repository, process.getRepositoryService(), dmn.getDmnRepositoryService());
+        }
+        ProcessReleaseService publisher(boolean cases, boolean human) { return new ProcessReleaseService(process, cmmn, dmn, new ProcessModelValidator(), false, null, false, () -> true, human, cases); }
+        ProcessReleaseService.ModelResource resource(Map<String,ValueType> inputs) { return new ProcessReleaseService.ModelResource(Type.CMMN, "governedCase", xml, inputs); }
+        private static ResultSet resultSet(Map<String,Object> row) throws Exception {
+            var rs = mock(ResultSet.class);
+            when(rs.getString(anyString())).thenAnswer(i -> { var value = row.get(i.getArgument(0)); return value == null ? null : value.toString(); });
+            when(rs.getInt(anyString())).thenAnswer(i -> ((Number) row.get(i.getArgument(0))).intValue());
+            when(rs.getTimestamp(anyString())).thenAnswer(i -> row.get(i.getArgument(0))); return rs;
+        }
+        @Override public void close() { jdbc.close(); humanSchema.close(); schema.close(); }
     }
 
     private static SpringProcessEngineConfiguration process(DataSource source) {
