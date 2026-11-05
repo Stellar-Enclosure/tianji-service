@@ -59,11 +59,13 @@ public final class AgentStorageVerifier {
     private static final List<String> CHECKPOINT_KEY = List.of("tenant_id", "run_id", "attempt", "checkpoint_no");
     private static final List<String> CHECKPOINT_SESSION_KEY = append(SESSION_OWNER, "session_event_sequence");
     private static final List<String> MODEL_USAGE_KEY = List.of("tenant_id", "run_id", "reservation_id");
+    private final DataSource dataSource;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
 
     public AgentStorageVerifier(DataSource source) {
         if (source == null) throw new IllegalArgumentException("Agent DataSource is required");
+        dataSource = source;
         jdbc = new JdbcTemplate(source);
         transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
@@ -201,28 +203,123 @@ public final class AgentStorageVerifier {
         verify();
         try {
             transaction.executeWithoutResult(status -> {
-                if (!Boolean.TRUE.equals(jdbc.queryForObject("""
-                        SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'
-                          AND current_setting('server_encoding')='UTF8'
-                          AND current_setting('session_replication_role')='origin'
-                          AND current_setting('standard_conforming_strings')='on'
-                        """, Boolean.class))) throw invalid();
-                int expectedChecksum = checksum(CHECKPOINT_FILE);
-                var history = jdbc.query("""
-                        SELECT type,script,success,checksum FROM tianji_agent.flyway_schema_history
-                        WHERE version='16'
-                        """, (rs, row) -> "SQL".equals(rs.getString("type"))
-                        && CHECKPOINT_FILE.equals(rs.getString("script")) && rs.getBoolean("success")
-                        && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
-                if (history.size() != 1 || !history.getFirst()) throw invalid();
-                verifyCheckpointColumns();
-                verifyCheckpointKeysAndIndexes();
-                verifyOptionalChecks(CHECKPOINT_TABLE, migration, 9, AgentStorageVerifier::normalizedCheck);
-                verifyCheckpointRole();
+                verifyCheckpointPrimary("off");
+                verifyCheckpointCatalog(migration, false);
             });
         } catch (DataAccessException failure) {
             throw invalid();
         }
+    }
+
+    /** Verifies V16 for an independently provisioned SELECT-only checkpoint reader. */
+    public void verifyCheckpointObservation() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(dataSource)) throw invalid();
+        String migration = pinnedMigration(CHECKPOINT_FILE, CHECKPOINT_SHA256);
+        var observation = new TransactionTemplate(transaction.getTransactionManager());
+        observation.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        observation.setTimeout(2);
+        try {
+            observation.executeWithoutResult(status -> {
+                jdbc.execute("SET TRANSACTION READ ONLY");
+                jdbc.execute("SET LOCAL statement_timeout = '2s'");
+                jdbc.execute("SET LOCAL search_path = pg_catalog, tianji_agent");
+                verifyCheckpointPrimary("on");
+                if (!checkpointObservationCoreTables()) throw invalid();
+                verifyCheckpointCatalog(migration, true);
+            });
+        } catch (DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw invalid();
+        }
+    }
+
+    /** Rechecks the effective V16 reader role on the caller's exact primary transaction. */
+    public boolean checkpointObservationRoleReadable() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) return false;
+        try {
+            verifyCheckpointPrimary("on");
+            verifyCheckpointRole(true);
+            return checkpointObservationCoreTables();
+        } catch (DataAccessException | AgentLedgerException failure) {
+            return false;
+        }
+    }
+
+    private boolean checkpointObservationCoreTables() {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=9 FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent'
+                  AND c.relname IN ('agent_run','agent_definition_version','agent_event','agent_session',
+                      'agent_session_lease','agent_session_event','agent_session_scope_state',
+                      'agent_budget_reservation','flyway_schema_history')
+                  AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
+                  AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits
+                                  WHERE inhrelid=c.oid OR inhparent=c.oid)
+                """, Boolean.class));
+    }
+
+    /** Confirms the V13 evidence relations in the caller's already-bound physical primary read transaction. */
+    public boolean checkpointToolEvidenceReadable() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) return false;
+        try {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                    SELECT NOT pg_catalog.pg_is_in_recovery()
+                      AND pg_catalog.current_setting('transaction_read_only')='on'
+                      AND (SELECT count(*)=2 FROM pg_catalog.pg_class c
+                        JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                        WHERE n.nspname='tianji_agent' AND c.relname IN ('agent_tool_invocation','agent_tool_action_intent')
+                          AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition
+                          AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                          AND pg_catalog.has_schema_privilege(n.oid,'USAGE')
+                          AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits
+                                          WHERE inhrelid=c.oid OR inhparent=c.oid)
+                          AND (SELECT count(*)=2 AND bool_and(pg_catalog.has_column_privilege(c.oid,a.attnum,'SELECT'))
+                               FROM pg_catalog.pg_attribute a
+                               WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                                 AND a.attname IN ('tenant_id',CASE c.relname WHEN 'agent_tool_invocation'
+                                                       THEN 'run_id' ELSE 'origin_run_id' END)))
+                    """, Boolean.class))) return false;
+            String script = ToolExecutionStorageVerifier.FILE;
+            int expected = checksum(script);
+            var history = jdbc.query("""
+                    SELECT type,script,success,checksum FROM ONLY tianji_agent.flyway_schema_history
+                    WHERE version='13' LIMIT 2
+                    """, (rs, row) -> "SQL".equals(rs.getString("type"))
+                    && script.equals(rs.getString("script")) && rs.getBoolean("success")
+                    && rs.getObject("checksum") != null && rs.getInt("checksum") == expected);
+            return history.size() == 1 && history.getFirst();
+        } catch (DataAccessException failure) {
+            return false;
+        }
+    }
+
+    private void verifyCheckpointPrimary(String readOnly) {
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only')=?
+                  AND current_setting('server_encoding')='UTF8'
+                  AND current_setting('session_replication_role')='origin'
+                  AND current_setting('standard_conforming_strings')='on'
+                """, Boolean.class, readOnly))) throw invalid();
+    }
+
+    private void verifyCheckpointCatalog(String migration, boolean observation) {
+        int expectedChecksum = checksum(CHECKPOINT_FILE);
+        var history = jdbc.query("""
+                SELECT type,script,success,checksum FROM ONLY tianji_agent.flyway_schema_history
+                WHERE version='16' LIMIT 2
+                """, (rs, row) -> "SQL".equals(rs.getString("type"))
+                && CHECKPOINT_FILE.equals(rs.getString("script")) && rs.getBoolean("success")
+                && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+        if (history.size() != 1 || !history.getFirst()) throw invalid();
+        verifyCheckpointColumns();
+        verifyCheckpointKeysAndIndexes();
+        verifyOptionalChecks(CHECKPOINT_TABLE, migration, 9, AgentStorageVerifier::normalizedCheck);
+        verifyCheckpointRole(observation);
     }
 
     private void verifyCheckpointColumns() {
@@ -287,14 +384,18 @@ public final class AgentStorageVerifier {
                 """, Boolean.class))) throw invalid();
     }
 
-    private void verifyCheckpointRole() {
+    private void verifyCheckpointRole(boolean observation) {
         Boolean permitted = jdbc.queryForObject("""
                 SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
                   AND has_schema_privilege(n.oid,'USAGE') AND NOT has_schema_privilege(n.oid,'CREATE')
                   AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user AND (r.rolsuper OR r.rolbypassrls))
                   AND NOT pg_has_role(c.relowner,'MEMBER') AND NOT pg_has_role(n.nspowner,'MEMBER')
-                  AND has_table_privilege(c.oid,'INSERT') AND NOT has_table_privilege(c.oid,'DELETE,TRUNCATE,TRIGGER')
-                  AND NOT has_any_column_privilege(c.oid,'SELECT,UPDATE,REFERENCES,INSERT WITH GRANT OPTION')
+                  AND NOT has_table_privilege(c.oid,'DELETE,TRUNCATE,TRIGGER')
+                  AND CASE WHEN ? THEN
+                        has_table_privilege(c.oid,'SELECT')
+                        AND NOT has_any_column_privilege(c.oid,'INSERT,UPDATE,REFERENCES,SELECT WITH GRANT OPTION')
+                      ELSE has_table_privilege(c.oid,'INSERT')
+                        AND NOT has_any_column_privilege(c.oid,'SELECT,UPDATE,REFERENCES,INSERT WITH GRANT OPTION') END
                   AND CASE WHEN current_setting('server_version_num')::integer >= 170000
                         THEN NOT has_table_privilege(c.oid,'MAINTAIN') ELSE true END
                   AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhrelid=c.oid OR h.inhparent=c.oid)
@@ -307,7 +408,7 @@ public final class AgentStorageVerifier {
                   AND NOT EXISTS (SELECT 1 FROM pg_rewrite rule WHERE rule.ev_class=c.oid)
                 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                 WHERE n.nspname='tianji_agent' AND c.relname='agent_checkpoint' AND c.relkind='r'
-                """, Boolean.class);
+                """, Boolean.class, observation);
         if (!Boolean.TRUE.equals(permitted)) throw invalid();
     }
 

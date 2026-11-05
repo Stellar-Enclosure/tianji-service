@@ -5,7 +5,9 @@ import org.mockito.invocation.InvocationOnMock;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowCallbackHandler;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
@@ -115,6 +117,68 @@ class AgentCheckpointStorageVerifierTest {
         }
     }
 
+    @Test
+    void checkpoint_observation_uses_physical_read_only_and_the_separate_select_only_profile() throws Exception {
+        var catalog = new Catalog();
+        var source = source();
+        try (var templates = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = new AgentStorageVerifier(source);
+            assertDoesNotThrow(verifier::verifyCheckpointObservation);
+            assertEquals(List.of("SET TRANSACTION READ ONLY", "SET LOCAL statement_timeout = '2s'",
+                    "SET LOCAL search_path = pg_catalog, tianji_agent"), catalog.sessionSql);
+            assertEquals("on", catalog.observedReadOnly);
+            assertTrue(catalog.observedReaderRole);
+            assertTrue(catalog.observedRoleSql.contains("has_table_privilege(c.oid,'SELECT')"));
+            assertTrue(catalog.observedRoleSql.contains("INSERT,UPDATE,REFERENCES,SELECT WITH GRANT OPTION"));
+            assertFalse(verifier.checkpointObservationRoleReadable());
+            var read = new TransactionTemplate(new DataSourceTransactionManager(source));
+            read.setReadOnly(true);
+            assertTrue(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointObservationRoleReadable())));
+
+            catalog.readerPermitted = false;
+            assertFalse(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointObservationRoleReadable())));
+            assertThrows(AgentLedgerException.class, verifier::verifyCheckpointObservation);
+            catalog.readerPermitted = true;
+            catalog.readerCore = false;
+            assertFalse(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointObservationRoleReadable())));
+            assertThrows(AgentLedgerException.class, verifier::verifyCheckpointObservation);
+            assertTrue(catalog.readerCoreSql.contains("NOT c.relrowsecurity"));
+            assertTrue(catalog.readerCoreSql.contains("'agent_budget_reservation','flyway_schema_history'"));
+            catalog.readerCore = true;
+            catalog.primary = false;
+            assertThrows(AgentLedgerException.class, verifier::verifyCheckpointObservation);
+        }
+    }
+
+    @Test
+    void tool_evidence_requires_the_exact_read_snapshot_and_v13_history() throws Exception {
+        var catalog = new Catalog();
+        var source = source();
+        try (var templates = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = new AgentStorageVerifier(source);
+            assertFalse(verifier.checkpointToolEvidenceReadable());
+            var read = new TransactionTemplate(new DataSourceTransactionManager(source));
+            read.setReadOnly(true);
+            assertTrue(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointToolEvidenceReadable())));
+            assertTrue(catalog.toolCatalogSql.contains("'agent_tool_invocation','agent_tool_action_intent'"));
+            assertTrue(catalog.toolCatalogSql.contains("'run_id' ELSE 'origin_run_id'"));
+            assertTrue(catalog.toolCatalogSql.contains("NOT c.relrowsecurity"));
+            catalog.toolHistory.getFirst().put("checksum", 0);
+            assertFalse(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointToolEvidenceReadable())));
+            catalog.toolHistory.getFirst().put("checksum", AgentStorageVerifier.checksum(ToolExecutionStorageVerifier.FILE));
+            catalog.toolCatalog = false;
+            assertFalse(Boolean.TRUE.equals(read.execute(status -> verifier.checkpointToolEvidenceReadable())));
+        }
+    }
+
+    private static DataSource source() throws Exception {
+        var source = mock(DataSource.class);
+        var connection = mock(Connection.class);
+        when(source.getConnection()).thenReturn(connection);
+        when(connection.getAutoCommit()).thenReturn(true);
+        return source;
+    }
+
     private static void rejects(Consumer<Catalog> mutation) throws Exception {
         var catalog = new Catalog();
         mutation.accept(catalog);
@@ -159,6 +223,17 @@ class AgentCheckpointStorageVerifierTest {
                 row("relname", "agent_checkpoint", "contype", "f", "convalidated", true,
                         "ref_schema", "tianji_agent", "ref_table", "agent_session_event", "confdeltype", "c",
                         "columns", SESSION_EVENT, "ref_columns", SESSION)));
+        private final List<Map<String, Object>> toolHistory = new ArrayList<>(List.of(
+                row("type", "SQL", "script", ToolExecutionStorageVerifier.FILE, "success", true,
+                        "checksum", AgentStorageVerifier.checksum(ToolExecutionStorageVerifier.FILE))));
+        private final List<String> sessionSql = new ArrayList<>();
+        private boolean readerPermitted = true;
+        private boolean readerCore = true;
+        private String readerCoreSql;
+        private boolean toolCatalog = true;
+        private boolean observedReaderRole;
+        private String observedReadOnly;
+        private String toolCatalogSql;
         private final List<Map<String, Object>> columns = new ArrayList<>();
         private final List<Map<String, Object>> checks = new ArrayList<>();
         private boolean primary = true;
@@ -196,11 +271,28 @@ class AgentCheckpointStorageVerifierTest {
         Object answer(InvocationOnMock call) throws Exception {
             Object[] args = call.getArguments();
             if (!(args[0] instanceof String sql)) throw new AssertionError("Unexpected catalog operation");
-            if (sql.contains("pg_is_in_recovery()")) return primary;
-            if (sql.contains("WHERE version='16'")) {
+            if (sql.startsWith("SET ")) {
+                sessionSql.add(sql);
+                return null;
+            }
+            if (sql.contains("SELECT count(*)=9") && sql.contains("agent_session_scope_state")) {
+                readerCoreSql = sql;
+                return readerCore;
+            }
+            if (sql.contains("agent_tool_action_intent") && sql.contains("pg_is_in_recovery()")) {
+                toolCatalogSql = sql;
+                return toolCatalog;
+            }
+            if (sql.contains("pg_is_in_recovery()")) {
+                observedReadOnly = args.length > 2 ? (String) args[2] : null;
+                return primary;
+            }
+            if (sql.contains("WHERE version='16'") || sql.contains("WHERE version='13'")) {
                 var mapper = (RowMapper<?>) args[1];
                 var found = new ArrayList<>();
-                for (var row : history) found.add(mapper.mapRow(resultSet(row), found.size()));
+                for (var row : sql.contains("WHERE version='16'") ? history : toolHistory) {
+                    found.add(mapper.mapRow(resultSet(row), found.size()));
+                }
                 return found;
             }
             if (sql.contains("count(*)=3")) return constraintShape;
@@ -210,7 +302,8 @@ class AgentCheckpointStorageVerifierTest {
             }
             if (sql.contains("has_any_column_privilege")) {
                 observedRoleSql = sql;
-                return permitted;
+                observedReaderRole = args.length > 2 && Boolean.TRUE.equals(args[2]);
+                return observedReaderRole ? readerPermitted : permitted;
             }
             var callback = (RowCallbackHandler) args[1];
             List<Map<String, Object>> rows;
