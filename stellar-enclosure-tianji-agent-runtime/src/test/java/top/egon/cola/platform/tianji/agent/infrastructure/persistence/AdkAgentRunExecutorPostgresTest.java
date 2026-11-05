@@ -347,6 +347,61 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void parallel_cancellation_preserves_the_first_branch_output_and_disposes_the_sibling() throws Exception {
+        var writerStarted = new CountDownLatch(1);
+        var writerCancelled = new CountDownLatch(1);
+        var model = new FixtureModel();
+        model.script = prompt -> {
+            boolean planner = prompt.getInstructions().stream().filter(SystemMessage.class::isInstance)
+                    .map(message -> message.getText() == null ? "" : message.getText())
+                    .anyMatch(text -> text.contains("plan"));
+            if (planner) return FixtureModel.textStream("PLAN done");
+            return Flux.defer(() -> {
+                writerStarted.countDown();
+                return Flux.<ChatResponse>never().doOnCancel(writerCancelled::countDown);
+            });
+        };
+        var actor = actor();
+        ledger.publish(actor, configSpec("PARALLEL", policy(Duration.ofSeconds(25), Duration.ofSeconds(15)),
+                "parallel-owner-cancel"));
+        var query = start(actor, "parallel-owner-cancel", "key");
+        var events = new AgentEventsQuery(query.runId(), 0, 32);
+        var worker = executor(model, Map.of());
+        try (var pool = Executors.newSingleThreadExecutor()) {
+            var running = pool.submit(() -> worker.executeQueued(actor, query));
+            try {
+                assertTrue(writerStarted.await(5, TimeUnit.SECONDS));
+                await().atMost(Duration.ofSeconds(4)).untilAsserted(() -> assertTrue(ledger.events(actor, events).stream()
+                        .anyMatch(event -> "AGENT_OUTPUT".equals(event.type()) && "planner".equals(event.author())
+                                && "PLAN done".equals(event.payload().get("text")))));
+                var active = ledger.get(actor, query);
+                assertEquals(RUNNING, active.status());
+                assertTrue(ledger.getResult(actor, query).isEmpty());
+                assertFalse(running.isDone());
+                assertTrue(ledger.cancel(actor, new CancelAgentRunCommand(query.runId(), "cancel-after-first-output",
+                        active.revision(), "stop remaining branch")).accepted());
+                assertEquals(CANCELLED, running.get(8, TimeUnit.SECONDS).status());
+            } finally {
+                running.cancel(true);
+            }
+        }
+        assertTrue(writerCancelled.await(2, TimeUnit.SECONDS));
+        assertEquals(2, model.streams.get());
+        var result = ledger.getResult(actor, query).orElseThrow();
+        assertEquals(CANCELLED, result.status());
+        assertTrue(result.output().isEmpty());
+        var persisted = ledger.events(actor, events);
+        assertEquals(List.of("planner"), persisted.stream().filter(event -> "AGENT_OUTPUT".equals(event.type()))
+                .map(event -> event.author()).toList());
+        assertEquals("RUN_STATUS_CHANGED", persisted.getLast().type());
+        assertEquals("CANCELLED", persisted.getLast().payload().get("status"));
+        assertEquals(List.of("SETTLED", "UNKNOWN"), new JdbcTemplate(PostgresTestDatabase.dataSource()).queryForList("""
+                SELECT state FROM tianji_agent.agent_budget_reservation
+                WHERE tenant_id=? AND run_id=? AND kind='MODEL' ORDER BY state
+                """, String.class, actor.tenantId(), query.runId()));
+    }
+
+    @Test
     void parallel_branches_wait_for_budget_capacity_instead_of_exceeding_it() throws Exception {
         FixtureModel model = new FixtureModel();
         CountDownLatch started = new CountDownLatch(2);
