@@ -167,6 +167,7 @@ class BusinessProcessAgentAcceptanceIT {
             String property = switch (suite) {
                 case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
+                case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
                 case S12_METRICS -> logs == null
                         ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
@@ -190,7 +191,7 @@ class BusinessProcessAgentAcceptanceIT {
                     var listener = ssl(manifest.tls().trustStore(), manifest.tls().relayKeyStore(), password);
                     var http = HttpClient.newBuilder().sslContext(trust).connectTimeout(NETWORK)
                             .followRedirects(HttpClient.Redirect.NEVER).build();
-                    driver = new Driver(manifest, harness, stores, tenantSettings, http, renderRelease(manifest), logs);
+                    driver = new Driver(manifest, harness, stores, tenantSettings, http, suite == Suite.S07_GOVERNED_START ? null : renderRelease(manifest), logs);
                     driver.boot(listener, trust, password);
                     return driver;
                 } finally {
@@ -227,6 +228,10 @@ class BusinessProcessAgentAcceptanceIT {
             StoreBindingDTO businessStore = binding(StoreOwner.BUSINESS);
             var access = stores.get(StoreOwner.BUSINESS);
             ExpenseBusinessWorkerFixture.prepareDisposableFixtureTables(access.setup(), businessStore.runtimeRole(), businessStore.observerRole());
+            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+                bootGovernedStart(password);
+                return;
+            }
             relay = ExpenseAcceptanceFaultRelay.open(manifest, listener, trust, this);
             configs.put(ChildRole.AGENT, childConfig(ChildRole.AGENT, password));
             configs.put(ChildRole.PROCESS, childConfig(ChildRole.PROCESS, password));
@@ -252,6 +257,154 @@ class BusinessProcessAgentAcceptanceIT {
                 manifestHash = published.manifestSha256();
             }
         }
+
+        private void bootGovernedStart(char[] password) {
+            configs.put(ChildRole.PROCESS, childConfig(ChildRole.PROCESS, password));
+            startChild(ChildRole.PROCESS);
+            var agent = new TreeMap<>(childConfig(ChildRole.AGENT, password));
+            var businessStore = binding(StoreOwner.BUSINESS);
+            String fixture = "stellar.tianji.agent.s07-fixture.";
+            put(agent, fixture + "process-base", manifest.endpoints().process());
+            put(agent, fixture + "observer-url", businessStore.jdbcUrl());
+            put(agent, fixture + "observer-role", businessStore.observerRole());
+            put(agent, fixture + "observer-password", value(privateProperties(businessStore.credentialFile()), "observer.password"));
+            put(agent, fixture + "bpmn-sha256", S07GovernedStartFixture.BPMN_SHA);
+            put(agent, fixture + "dmn-sha256", S07GovernedStartFixture.DMN_SHA);
+            for (int index = 0; index < tenants().size(); index++) {
+                var tenant = tenants().get(index);
+                var publisher = clients(tenant).owner();
+                var published = publisher.publish(S07GovernedStartFixture.release());
+                S07GovernedStartFixture.verifyRelease(published);
+                assertEquals(published, publisher.get(new GetProcessReleaseQuery(S07GovernedStartFixture.RELEASE)));
+                var businessKey = S07GovernedStartFixture.businessKey(tenant.tenantId());
+                ExpenseBusinessWorkerFixture.seedDisposableObject(stores.get(StoreOwner.BUSINESS).setup(),
+                        tenantSourceId(tenant), tenant.tenantId(), businessKey, S07GovernedStartFixture.BUSINESS_VERSION, 0);
+                String prefix = fixture + "tenant-" + (index + 1) + ".";
+                put(agent, prefix + "source-id", tenantSourceId(tenant));
+                put(agent, prefix + "business-key", businessKey);
+                put(agent, prefix + "process-resource", tenant.processResource());
+                put(agent, prefix + "manifest-sha256", published.manifestSha256());
+                for (String name : List.of("service-subject", "service-app", "service-biz", "service-source-app",
+                        "service-environment", "start-registration", "decision-registration", "start-authority-resource",
+                        "decision-authority-resource")) {
+                    put(agent, prefix + name, setting(tenant, "s07." + name));
+                }
+            }
+            configs.put(ChildRole.AGENT, Map.copyOf(agent));
+            startChild(ChildRole.AGENT);
+        }
+
+        void verifyGovernedStart() {
+            require(manifest.suite() == Suite.S07_GOVERNED_START, "Exact S07 suite");
+            for (var tenant : tenants()) {
+                long id = tenant.tenantId();
+                String ownerIssuer = issuerSha(tenant);
+                String businessKey = S07GovernedStartFixture.businessKey(id);
+                var client = new HttpAgentClient(URI.create(manifest.endpoints().agent()), http,
+                        token(tenant, "token.agent-owner"), NETWORK, 0, Duration.ZERO);
+                var first = startGovernedRun(client, businessKey, "s07-first");
+                assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, first.status());
+                var firstResult = client.getResult(new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(first.runId()));
+                String instance = governedInstance(firstResult);
+                var action = governedAction(tenant, businessKey, first.runId(), instance);
+                var replay = startGovernedRun(client, businessKey, "s07-replay");
+                assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, replay.status());
+                assertNotEquals(first.runId(), replay.runId());
+                var replayResult = client.getResult(new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(replay.runId()));
+                assertEquals(instance, governedInstance(replayResult));
+                assertEquals(1L, count(db(StoreOwner.AGENT), """
+                        SELECT count(*) FROM tianji_agent.agent_tool_result_access a
+                        JOIN tianji_agent.agent_budget_reservation b
+                          ON (b.tenant_id,b.run_id,b.reservation_id)=(a.tenant_id,a.run_id,a.reservation_id)
+                        WHERE a.tenant_id=? AND a.run_id=? AND a.intent_id=? AND a.owner_type='USER'
+                          AND a.owner_issuer=? AND a.owner_id=? AND a.source_action_revision=?
+                          AND a.authorization_audit->>'boundary'='RECONCILE' AND a.authorization_audit->>'decision'='ALLOW'
+                          AND b.state='SETTLED'
+                        """, id, replay.runId(), action.intentId(), ownerIssuer, tenant.ownerSubject(), action.revision()));
+                assertEquals(0L, count(db(StoreOwner.AGENT), """
+                        SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=?
+                        """, id, replay.runId()));
+                var foreign = tenants().stream().filter(other -> other.tenantId() != id).findFirst().orElseThrow();
+                var blocked = startGovernedRun(client, S07GovernedStartFixture.businessKey(foreign.tenantId()), "s07-foreign-object");
+                assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.FAILED, blocked.status());
+                assertEquals(0L, count(db(StoreOwner.AGENT), """
+                        SELECT count(*) FROM tianji_agent.agent_tool_invocation WHERE tenant_id=? AND run_id=?
+                        """, id, blocked.runId()));
+                assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                        SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                        WHERE tenant_id=? AND command_type='START' AND release_key=?
+                        """, id, S07GovernedStartFixture.RELEASE));
+                assertEquals(action, governedAction(tenant, businessKey, first.runId(), instance));
+            }
+            assertEquals((long) tenants().size(), count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                    WHERE command_type='START' AND release_key=?
+                    """, S07GovernedStartFixture.RELEASE));
+            assertEquals((long) tenants().size(), count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.act_ru_task WHERE task_def_key_='review'
+                    """));
+        }
+
+        private top.egon.cola.platform.tianji.contract.agent.AgentRunDTO startGovernedRun(HttpAgentClient client,
+                String businessKey, String commandId) {
+            var input = new top.egon.cola.platform.tianji.contract.agent.AgentInputDTO(null, List.of(),
+                    Map.of("requestedAmount", S07GovernedStartFixture.AMOUNT));
+            var started = client.start(new top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand(
+                    S07GovernedStartFixture.AGENT, 1, null, commandId, businessKey, commandId, input, null));
+            var query = new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(started.runId());
+            return harness.await(Phase.STANDARD_PATH, () -> {
+                var current = client.get(query);
+                return switch (current.status()) {
+                    case COMPLETED, FAILED, CANCELLED, TIMED_OUT, SUSPENDED -> Optional.of(current);
+                    default -> Optional.empty();
+                };
+            });
+        }
+
+        private static String governedInstance(top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult result) {
+            assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, result.status());
+            String output = assertInstanceOf(String.class, result.output().get("text"));
+            require(output.startsWith("s07-started:"), "S07 exact terminal fixture marker");
+            return new GetProcessInstanceQuery(output.substring("s07-started:".length())).instanceId();
+        }
+
+        private GovernedActionVO governedAction(TenantBindingDTO tenant, String businessKey, String runId, String instance) {
+            long id = tenant.tenantId();
+            String issuer = issuerSha(tenant);
+            String executor = setting(tenant, "s07.service-subject");
+            var action = one(db(StoreOwner.AGENT), """
+                    SELECT a.intent_id,a.revision FROM tianji_agent.agent_tool_action_intent a
+                    JOIN tianji_agent.agent_tool_invocation i
+                      ON (a.tenant_id,a.dispatch_run_id,a.dispatch_invocation_id)=(i.tenant_id,i.run_id,i.invocation_id)
+                    JOIN tianji_agent.agent_budget_reservation b
+                      ON (i.tenant_id,i.run_id,i.reservation_id)=(b.tenant_id,b.run_id,b.reservation_id)
+                    WHERE a.tenant_id=? AND a.owner_type='USER' AND a.owner_issuer=? AND a.owner_id=?
+                      AND a.business_key=? AND a.business_version=? AND a.origin_run_id=? AND a.dispatch_run_id=?
+                      AND a.executor_issuer=? AND a.executor_id=? AND a.dispatch_epoch=1 AND a.state='APPLIED'
+                      AND i.state='SUCCEEDED' AND i.business_receipt_id=a.business_receipt_id AND i.intent_id=a.intent_id
+                      AND i.authorization_audit->>'boundary'='DISPATCH' AND i.authorization_audit->>'decision'='ALLOW'
+                      AND b.state='SETTLED'
+                    """, (rs, row) -> new GovernedActionVO(rs.getObject("intent_id", UUID.class), rs.getLong("revision")),
+                    id, issuer, tenant.ownerSubject(), businessKey, Long.toString(S07GovernedStartFixture.BUSINESS_VERSION),
+                    runId, runId, issuer, executor).orElseThrow();
+            String commandId = action.intentId().toString();
+            var command = new StartProcessCommand(S07GovernedStartFixture.BPMN, S07GovernedStartFixture.RELEASE, businessKey,
+                    commandId, commandId, Map.of("amount", S07GovernedStartFixture.AMOUNT));
+            assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                    WHERE tenant_id=? AND subject_type='SERVICE' AND subject_issuer=? AND subject_id=?
+                      AND command_type='START' AND command_id=? AND request_sha256=? AND release_key=?
+                      AND correlation_id=? AND state='APPLIED' AND resource_id=?
+                    """, id, issuer, executor, commandId, OrchestrationRequestDigests.start(command),
+                    S07GovernedStartFixture.RELEASE, commandId, instance));
+            assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.act_ru_task
+                    WHERE tenant_id_=? AND proc_inst_id_=? AND task_def_key_='review'
+                    """, Long.toString(id), instance));
+            return action;
+        }
+
+        private record GovernedActionVO(UUID intentId, long revision) { }
 
         List<TenantBindingDTO> tenants() { return manifest.tenants(); }
         ExpenseAcceptanceHarness harness() { return harness; }
@@ -920,7 +1073,7 @@ class BusinessProcessAgentAcceptanceIT {
                     ? S12ChildLogPrivacy.Credential.AGENT_DB : S12ChildLogPrivacy.Credential.PROCESS_DB, runtimePassword);
             put(config, "spring.datasource.password", runtimePassword);
             put(config, "spring.datasource.hikari.schema", store.schema());
-            if (manifest.suite() != Suite.S12_METRICS) {
+            if (manifest.suite() != Suite.S12_METRICS && manifest.suite() != Suite.S07_GOVERNED_START) {
                 put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
                 put(config, "management.tracing.sampling.probability", "1.0");
             }
@@ -949,6 +1102,13 @@ class BusinessProcessAgentAcceptanceIT {
 
         private void agentConfig(Map<String, String> config) {
             String prefix = "stellar.tianji.agent.";
+            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+                for (String flag : List.of("storage", "api", "runtime", "dispatch", "reconciliation", "execution-grants",
+                        "execution-authorization")) put(config, prefix + flag + ".enabled", "true");
+                put(config, "egon.cola.component.agent-flow.enabled", "true");
+                put(config, "egon.cola.component.agent-flow-registry.enabled", "false");
+                return;
+            }
             for (String flag : List.of("storage", "api", "runtime", "dispatch", "reconciliation", "execution-grants",
                     "execution-authorization", "linked", "service-execution", "terminal-events", "result-delivery")) {
                 put(config, prefix + flag + ".enabled", "true");
@@ -995,6 +1155,14 @@ class BusinessProcessAgentAcceptanceIT {
 
         private void processConfig(Map<String, String> config) {
             String prefix = "stellar.tianji.process.";
+            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+                put(config, prefix + "api.enabled", "true");
+                put(config, prefix + "decision-tasks.enabled", "true");
+                put(config, "flowable.database-schema-update", "false");
+                put(config, "flowable.database-schema", "tianji_process");
+                put(config, "flowable.async-executor-activate", "false");
+                return;
+            }
             for (String flag : List.of("api", "decision-tasks", "worker", "human-tasks", "agent-bridge", "agent-results", "cases")) {
                 put(config, prefix + flag + ".enabled", "true");
             }

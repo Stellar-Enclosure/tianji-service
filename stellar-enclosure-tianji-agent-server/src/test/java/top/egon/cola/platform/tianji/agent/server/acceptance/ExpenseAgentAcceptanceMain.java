@@ -84,14 +84,30 @@ public final class ExpenseAgentAcceptanceMain {
     public static void main(String[] args) {
         try {
             Properties settings = privateChildSettings(args, "AGENT");
-            for (String feature : List.of("storage", "api", "runtime", "reconciliation", "dispatch", "linked",
-                    "service-execution", "terminal-events", "result-delivery")) {
+            boolean s07 = "true".equals(settings.getProperty(FIXTURE + "s07-governed-start"));
+            var required = s07 ? List.of("storage", "api", "runtime", "reconciliation", "dispatch", "execution-grants", "execution-authorization")
+                    : List.of("storage", "api", "runtime", "reconciliation", "dispatch", "linked",
+                    "service-execution", "terminal-events", "result-delivery");
+            for (String feature : required) {
                 if (!"true".equals(settings.getProperty("stellar.tianji.agent." + feature + ".enabled"))) throw unavailable();
             }
             if ("true".equals(settings.getProperty("stellar.tianji.agent.model-budgets.enabled"))
                     || "true".equals(System.getenv(LOG_PRIVACY_ENV))
                     && !"true".equals(settings.getProperty(FIXTURE + "s12-metrics"))) throw unavailable();
             installTrust(settings);
+            if (s07) {
+                if (settings.containsKey(FIXTURE + "s12-receive-link") || settings.containsKey(FIXTURE + "s12-metrics")
+                        || System.getenv(LOG_PRIVACY_ENV) != null) throw unavailable();
+                var plan = S07GovernedStartAgentFixtureConfiguration.prepare(settings);
+                new SpringApplicationBuilder(TianjiAgentServerApplication.class, S07GovernedStartAgentFixtureConfiguration.class)
+                        .web(WebApplicationType.SERVLET).initializers(context -> {
+                            context.getEnvironment().getPropertySources().addFirst(new org.springframework.core.env.MapPropertySource(
+                                    "s07BoundToolFixture", plan.properties()));
+                            ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
+                                    "s07FixturePlan", S07GovernedStartAgentFixtureConfiguration.FixturePlan.class, () -> plan);
+                        }).run(args);
+                return;
+            }
             var app = new SpringApplicationBuilder(TianjiAgentServerApplication.class, FixtureConfiguration.class)
                     .web(WebApplicationType.SERVLET);
             if ("true".equals(settings.getProperty(FIXTURE + "s12-receive-link"))) {

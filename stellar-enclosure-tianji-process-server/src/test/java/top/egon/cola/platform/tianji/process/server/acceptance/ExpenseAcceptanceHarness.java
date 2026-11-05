@@ -454,6 +454,8 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
         } else if (manifest.suite() == Suite.S12_METRICS) {
             values.setProperty(prefix + "s12-metrics", "true");
             values.setProperty(prefix + "s12-metrics-endpoint", manifest.endpoints().collector());
+        } else if (manifest.suite() == Suite.S07_GOVERNED_START) {
+            values.setProperty(prefix + "s07-governed-start", "true");
         }
         values.setProperty(prefix + "role", role.name());
         values.setProperty(prefix + "trust-store", manifest.tls().trustStore());
@@ -629,7 +631,8 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
-        if (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS) throw invalid();
+        if (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS
+                || manifest.suite() == Suite.S07_GOVERNED_START) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
         Path destination = output.resolve("expense-" + manifest.runId() + ".json");
@@ -804,7 +807,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
     enum Suite {
-        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS;
+        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S07_GOVERNED_START;
 
         boolean observesReceiveLinks() {
             return this == RECEIVE_LINK || this == RECEIVE_LINK_REPLAY;

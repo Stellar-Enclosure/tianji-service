@@ -29,10 +29,16 @@ public final class ExpenseProcessAcceptanceMain {
     public static void main(String[] args) {
         try {
             Properties settings = privateChildSettings(args, "PROCESS");
+            boolean s07 = "true".equals(settings.getProperty(FIXTURE + "s07-governed-start"));
             if (!"false".equals(settings.getProperty("flowable.database-schema-update"))
-                    || !"true".equals(settings.getProperty("flowable.async-executor-activate"))
-                    || !"tianji_process".equals(settings.getProperty("flowable.database-schema"))) throw unavailable();
-            for (String feature : List.of("api", "worker", "human-tasks", "agent-bridge", "agent-results", "cases")) {
+                    || !Boolean.toString(!s07).equals(settings.getProperty("flowable.async-executor-activate"))
+                    || !"tianji_process".equals(settings.getProperty("flowable.database-schema"))
+                    || s07 && (settings.containsKey(FIXTURE + "s12-receive-link") || settings.containsKey(FIXTURE + "s12-metrics"))) {
+                throw unavailable();
+            }
+            var required = s07 ? List.of("api", "decision-tasks")
+                    : List.of("api", "worker", "human-tasks", "agent-bridge", "agent-results", "cases");
+            for (String feature : required) {
                 if (!"true".equals(settings.getProperty("stellar.tianji.process." + feature + ".enabled"))) throw unavailable();
             }
             installTrust(settings);
