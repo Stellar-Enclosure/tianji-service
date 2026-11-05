@@ -17,8 +17,11 @@ import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.FunctionTool;
 import com.google.adk.tools.ToolContext;
 import com.google.genai.types.Content;
+import com.google.genai.types.ExecutableCode;
 import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
+import com.google.genai.types.PartialArg;
 import io.reactivex.rxjava3.core.Flowable;
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -30,6 +33,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -393,6 +397,220 @@ class NativeAgentGateTest {
         assertFalse(unknown.getMessage().contains("private-unknown"));
     }
 
+    @Test
+    void bounded_plan_route_and_repeated_role() throws Exception {
+        var audits = new ArrayList<Audit>();
+        var fixture = boundedFixture((author, payload) -> audits.add(new Audit(author, Map.copyOf(payload))));
+        String plan = boundedPlan("""
+                {"taskId":"task-1","agent":"bounded_researcher","question":"first question"},
+                {"taskId":"task-2","agent":"bounded_researcher","question":"second question"}
+                """);
+        ToolContext firstOutbound = captureBoundedTransfer(fixture.gate(), fixture.rootContext(),
+                boundedPlanResponse(plan, "bounded_researcher", "out-1"), "bounded_researcher", "out-1");
+        confirmBoundedTransfer(fixture.gate(), fixture.rootContext(), firstOutbound, "bounded_researcher", Map.of());
+        InvocationContext firstChild = fixture.rootContext().toBuilder().agent(fixture.researcher()).build();
+        LlmRequest.Builder firstRequest = requestBuilder();
+        assertDoesNotThrow(() -> fixture.gate().prepareModelRequest(callback(firstChild, "before-child-1"), firstRequest));
+        assertEquals(1, countQuestionMarkers(firstRequest));
+        assertTrue(requestText(firstRequest).contains("first question"));
+        assertDoesNotThrow(() -> fixture.gate().prepareModelRequest(callback(firstChild, "before-child-1-retry"), firstRequest));
+        assertEquals(1, countQuestionMarkers(firstRequest));
+        ToolContext firstReturn = captureBoundedTransfer(fixture.gate(), firstChild,
+                transferResponse("bounded_supervisor", "back-1", "first summary"), "bounded_supervisor", "back-1");
+        confirmBoundedTransfer(fixture.gate(), firstChild, firstReturn, "bounded_supervisor", Map.of());
+        InvocationContext routeRoot = firstChild.toBuilder().agent(fixture.root()).build();
+        ToolContext secondOutbound = captureBoundedTransfer(fixture.gate(), routeRoot,
+                transferResponse("bounded_researcher", "out-2", null), "bounded_researcher", "out-2");
+        confirmBoundedTransfer(fixture.gate(), routeRoot, secondOutbound, "bounded_researcher", Map.of());
+        InvocationContext secondChild = routeRoot.toBuilder().agent(fixture.researcher()).build();
+        assertNotSame(firstChild, secondChild);
+        LlmRequest.Builder secondRequest = requestBuilder();
+        assertDoesNotThrow(() -> fixture.gate().prepareModelRequest(callback(secondChild, "before-child-2"), secondRequest));
+        assertTrue(requestText(secondRequest).contains("second question"));
+        assertFalse(requestText(secondRequest).contains("first question"));
+        ToolContext secondReturn = captureBoundedTransfer(fixture.gate(), secondChild,
+                transferResponse("bounded_supervisor", "back-2", "second summary"), "bounded_supervisor", "back-2");
+        confirmBoundedTransfer(fixture.gate(), secondChild, secondReturn, "bounded_supervisor", Map.of());
+        InvocationContext finalRoot = secondChild.toBuilder().agent(fixture.root()).build();
+        completeBoundedRoot(fixture.gate(), finalRoot, "final answer");
+        assertEquals(List.of(
+                new NativeAgentGate.TaskResultVO("task-1", "bounded_researcher", "first summary"),
+                new NativeAgentGate.TaskResultVO("task-2", "bounded_researcher", "second summary")),
+                fixture.gate().requireCompletedTasks());
+        assertEquals(Map.of("bounded_supervisor", "final answer", "bounded_researcher", "second summary"),
+                fixture.gate().requireCompletedOutputs());
+        assertEquals(4, audits.size());
+        for (int index = 0; index < audits.size(); index++) {
+            assertEquals(Set.of("to", "ordinal", "topologyHash", "planHash", "taskOrdinal", "state"),
+                    audits.get(index).payload().keySet());
+            assertEquals(index + 1, ((Number) audits.get(index).payload().get("ordinal")).intValue());
+            assertEquals(index / 2 + 1, ((Number) audits.get(index).payload().get("taskOrdinal")).intValue());
+            assertFalse(audits.get(index).payload().containsValue("task-1"));
+            assertFalse(audits.get(index).payload().containsValue("first question"));
+        }
+    }
+
+    @Test
+    void bounded_context_window_and_stored_confirmation() throws Exception {
+        var fixture = boundedFixture((author, payload) -> { });
+        String plan = boundedPlan("""
+                {"taskId":"task-1","agent":"bounded_researcher","question":"first"},
+                {"taskId":"task-2","agent":"bounded_researcher","question":"second"}
+                """);
+        ToolContext firstOutbound = captureBoundedTransfer(fixture.gate(), fixture.rootContext(),
+                boundedPlanResponse(plan, "bounded_researcher", "out-1"), "bounded_researcher", "out-1");
+        confirmBoundedTransfer(fixture.gate(), fixture.rootContext(), firstOutbound,
+                "bounded_researcher", Map.of("receipt", "one"));
+        assertDoesNotThrow(() -> fixture.gate().afterTool(transferTool(),
+                Map.of("agent_name", "bounded_researcher"), firstOutbound, Map.of("receipt", "one")));
+        InvocationContext firstChild = fixture.rootContext().toBuilder().agent(fixture.researcher()).build();
+        LlmRequest.Builder firstBuilder = requestBuilder();
+        assertDoesNotThrow(() -> fixture.gate().prepareModelRequest(callback(firstChild, "child-1"), firstBuilder));
+        ToolContext firstReturn = captureBoundedTransfer(fixture.gate(), firstChild,
+                transferResponse("bounded_supervisor", "back-1", "first summary"), "bounded_supervisor", "back-1");
+        confirmBoundedTransfer(fixture.gate(), firstChild, firstReturn, "bounded_supervisor", Map.of());
+        InvocationContext routeRoot = firstChild.toBuilder().agent(fixture.root()).build();
+        ToolContext secondOutbound = captureBoundedTransfer(fixture.gate(), routeRoot,
+                transferResponse("bounded_researcher", "out-2", null), "bounded_researcher", "out-2");
+        confirmBoundedTransfer(fixture.gate(), routeRoot, secondOutbound, "bounded_researcher", Map.of());
+        assertDoesNotThrow(() -> fixture.gate().afterTool(transferTool(),
+                Map.of("agent_name", "bounded_researcher"), firstOutbound, Map.of("receipt", "one")));
+        InvocationContext secondChild = routeRoot.toBuilder().agent(fixture.researcher()).build();
+        assertThrows(AgentLedgerException.class, () -> fixture.gate().prepareModelRequest(callback(secondChild, "child-2"), firstBuilder));
+
+        var staleContext = boundedFixture((author, payload) -> { });
+        ToolContext staleFirstOutbound = captureBoundedTransfer(staleContext.gate(), staleContext.rootContext(),
+                boundedPlanResponse(plan, "bounded_researcher", "stale-out-1"), "bounded_researcher", "stale-out-1");
+        confirmBoundedTransfer(staleContext.gate(), staleContext.rootContext(), staleFirstOutbound,
+                "bounded_researcher", Map.of());
+        InvocationContext staleFirstChild = staleContext.rootContext().toBuilder().agent(staleContext.researcher()).build();
+        assertDoesNotThrow(() -> staleContext.gate().prepareModelRequest(
+                callback(staleFirstChild, "stale-child-1"), requestBuilder()));
+        ToolContext staleFirstReturn = captureBoundedTransfer(staleContext.gate(), staleFirstChild,
+                transferResponse("bounded_supervisor", "stale-back-1", "first summary"), "bounded_supervisor", "stale-back-1");
+        confirmBoundedTransfer(staleContext.gate(), staleFirstChild, staleFirstReturn, "bounded_supervisor", Map.of());
+        InvocationContext staleRouteRoot = staleFirstChild.toBuilder().agent(staleContext.root()).build();
+        ToolContext staleSecondOutbound = captureBoundedTransfer(staleContext.gate(), staleRouteRoot,
+                transferResponse("bounded_researcher", "stale-out-2", null), "bounded_researcher", "stale-out-2");
+        confirmBoundedTransfer(staleContext.gate(), staleRouteRoot, staleSecondOutbound, "bounded_researcher", Map.of());
+        assertThrows(AgentLedgerException.class, () -> staleContext.gate().prepareModelRequest(
+                callback(staleFirstChild, "stale-child-reused"), requestBuilder()));
+
+        var changedReplay = boundedFixture((author, payload) -> { });
+        ToolContext changed = captureBoundedTransfer(changedReplay.gate(), changedReplay.rootContext(),
+                boundedPlanResponse(boundedPlan("""
+                        {"taskId":"only","agent":"bounded_researcher","question":"question"}
+                        """), "bounded_researcher", "out"), "bounded_researcher", "out");
+        confirmBoundedTransfer(changedReplay.gate(), changedReplay.rootContext(), changed,
+                "bounded_researcher", Map.of("receipt", "original"));
+        assertThrows(AgentLedgerException.class, () -> changedReplay.gate().afterTool(transferTool(),
+                Map.of("agent_name", "bounded_researcher"), changed, Map.of("receipt", "changed")));
+    }
+
+    @Test
+    void bounded_partial_semantic_allowlist() {
+        List<Part> forbidden = List.of(
+                Part.builder().functionResponse(FunctionResponse.builder().name("other").response(Map.of()).build()).build(),
+                Part.builder().executableCode(ExecutableCode.builder().language("PYTHON").code("print('x')").build()).build(),
+                Part.builder().inlineData(com.google.genai.types.Blob.builder()
+                        .mimeType("text/plain").data(new byte[]{1}).build()).build());
+        for (Part part : forbidden) {
+            var fixture = boundedFixture((author, payload) -> { });
+            LlmResponse partial = LlmResponse.builder().content(Content.fromParts(part))
+                    .partial(true).turnComplete(false).build();
+            assertThrows(AgentLedgerException.class, () -> fixture.gate().validateResponseEnvelope(
+                    callback(fixture.rootContext(), "partial"), partial));
+        }
+        var allowed = boundedFixture((author, payload) -> { });
+        String plan = boundedPlan("""
+                {"taskId":"one","agent":"bounded_researcher","question":"question"}
+                """);
+        FunctionCall normal = FunctionCall.builder().id("call").name("transfer_to_agent")
+                .args(Map.of("agent_name", "bounded_researcher")).build();
+        LlmResponse withMetadata = LlmResponse.builder().content(Content.builder().role("model").parts(
+                        Part.builder().text(plan).partMetadata(Map.of("provider", "normal")).build(),
+                        Part.builder().functionCall(normal).thoughtSignature(new byte[]{1, 2}).build()).build())
+                .partial(false).turnComplete(false).build();
+        assertDoesNotThrow(() -> allowed.gate().observeResponse(callback(allowed.rootContext(), "complete"), withMetadata));
+        var partialArgs = boundedFixture((author, payload) -> { });
+        FunctionCall incomplete = FunctionCall.builder().id("call").name("transfer_to_agent")
+                .args(Map.of("agent_name", "bounded_researcher"))
+                .partialArgs(PartialArg.builder().jsonPath("$.agent_name").stringValue("bounded_researcher").build()).build();
+        assertThrows(AgentLedgerException.class, () -> partialArgs.gate().validateResponseEnvelope(
+                callback(partialArgs.rootContext(), "complete"), response(List.of(incomplete))));
+        var continuing = boundedFixture((author, payload) -> { });
+        FunctionCall unfinished = FunctionCall.builder().id("call").name("transfer_to_agent")
+                .args(Map.of("agent_name", "bounded_researcher")).willContinue(true).build();
+        assertThrows(AgentLedgerException.class, () -> continuing.gate().validateResponseEnvelope(
+                callback(continuing.rootContext(), "complete"), response(List.of(unfinished))));
+    }
+
+    @Test
+    void bounded_final_candidate_is_one_shot() throws Exception {
+        var wrongText = readyForBoundedFinal();
+        assertDoesNotThrow(() -> wrongText.fixture().gate().observeResponse(
+                callback(wrongText.finalRoot(), "candidate"), finalResponse("expected")));
+        Event wrong = finalEvent(wrongText.fixture().root(), wrongText.finalRoot().invocationId(), "wrong");
+        assertThrows(AgentLedgerException.class, () -> wrongText.fixture().gate().observeEvent(wrong,
+                Optional.of(outputProjection(wrongText.fixture().root(), "wrong"))));
+        var secondCandidate = readyForBoundedFinal();
+        assertDoesNotThrow(() -> secondCandidate.fixture().gate().observeResponse(
+                callback(secondCandidate.finalRoot(), "candidate-1"), finalResponse("expected")));
+        assertThrows(AgentLedgerException.class, () -> secondCandidate.fixture().gate().observeResponse(
+                callback(secondCandidate.finalRoot(), "candidate-2"), finalResponse("expected")));
+        var oldRoot = readyForBoundedFinal();
+        assertThrows(AgentLedgerException.class, () -> oldRoot.fixture().gate().observeResponse(
+                callback(oldRoot.fixture().rootContext(), "old-root"), finalResponse("expected")));
+        var consumed = readyForBoundedFinal();
+        assertDoesNotThrow(() -> consumed.fixture().gate().observeResponse(
+                callback(consumed.finalRoot(), "candidate"), finalResponse("expected")));
+        Event exact = finalEvent(consumed.fixture().root(), consumed.finalRoot().invocationId(), "expected");
+        assertDoesNotThrow(() -> consumed.fixture().gate().observeEvent(
+                exact, Optional.of(outputProjection(consumed.fixture().root(), "expected"))));
+        assertEquals(1, consumed.fixture().gate().requireCompletedTasks().size());
+        assertThrows(AgentLedgerException.class, () -> consumed.fixture().gate().observeEvent(
+                exact, Optional.of(outputProjection(consumed.fixture().root(), "expected"))));
+    }
+
+    @Test
+    void bounded_audit_and_failed_cas() throws Exception {
+        var audits = new ArrayList<Audit>();
+        var successful = boundedFixture((author, payload) -> audits.add(new Audit(author, Map.copyOf(payload))));
+        String plan = boundedPlan("""
+                {"taskId":"private-task-id","agent":"bounded_researcher","question":"private question"}
+                """);
+        ToolContext outbound = captureBoundedTransfer(successful.gate(), successful.rootContext(),
+                boundedPlanResponse(plan, "bounded_researcher", "out"), "bounded_researcher", "out");
+        assertEquals(1, audits.size());
+        assertEquals(Set.of("to", "ordinal", "topologyHash", "planHash", "taskOrdinal", "state"),
+                audits.getFirst().payload().keySet());
+        assertFalse(audits.getFirst().payload().containsValue("private-task-id"));
+        assertFalse(audits.getFirst().payload().containsValue("private question"));
+        confirmBoundedTransfer(successful.gate(), successful.rootContext(), outbound, "bounded_researcher", Map.of());
+        var attempts = new AtomicInteger();
+        var failed = boundedFixture((author, payload) -> {
+            attempts.incrementAndGet();
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "private conflict");
+        });
+        assertDoesNotThrow(() -> failed.gate().observeResponse(callback(failed.rootContext(), "plan"),
+                boundedPlanResponse(plan, "bounded_researcher", "out")));
+        AgentLedgerException conflict = assertThrows(AgentLedgerException.class, () -> failed.gate().beforeTool(
+                transferTool(), Map.of("agent_name", "bounded_researcher"), tool(failed.rootContext(), "out")));
+        assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, conflict.code());
+        assertFalse(conflict.getMessage().contains("private conflict"));
+        assertEquals(1, attempts.get());
+        assertThrows(AgentLedgerException.class, failed.gate()::requireCompletedTasks);
+        var unknown = boundedFixture((author, payload) -> { throw new IllegalStateException("private sentinel"); });
+        assertDoesNotThrow(() -> unknown.gate().observeResponse(callback(unknown.rootContext(), "plan"),
+                boundedPlanResponse(plan, "bounded_researcher", "out")));
+        AgentLedgerException safe = assertInstanceOf(AgentLedgerException.class,
+                assertThrows(RuntimeException.class, () -> unknown.gate().beforeTool(transferTool(),
+                        Map.of("agent_name", "bounded_researcher"), tool(unknown.rootContext(), "out"))));
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, safe.code());
+        assertNull(safe.getCause());
+        assertFalse(safe.getMessage().contains("private sentinel"));
+    }
+
     private static Fixture fixture(NativeAgentGate.AuthorizationAppender appender) {
         var model = new ScriptedLlm("gpt-5");
         var tree = tree(model, model, model);
@@ -419,6 +637,26 @@ class NativeAgentGateTest {
         InvocationContext context = InvocationContext.builder().sessionService(sessions).agent(root)
                 .session(session).invocationId("invocation-1").build();
         return new SupervisorFixture(gate, root, researcher, critic, context);
+    }
+
+    private static BoundedFixture boundedFixture(NativeAgentGate.AuthorizationAppender appender) {
+        var model = new ScriptedLlm("gpt-5");
+        var researcher = LlmAgent.builder().name("bounded_researcher").model(model)
+                .outputKey("bounded_researcher_output")
+                .disallowTransferToParent(false).disallowTransferToPeers(true).build();
+        var critic = LlmAgent.builder().name("bounded_critic").model(model)
+                .outputKey("bounded_critic_output")
+                .disallowTransferToParent(false).disallowTransferToPeers(true).build();
+        var root = LlmAgent.builder().name("bounded_supervisor").model(model)
+                .outputKey("bounded_supervisor_output").subAgents(researcher, critic)
+                .disallowTransferToParent(true).disallowTransferToPeers(true).build();
+        NativeAgentCompilerStrategy.TemplateSpec spec = boundedSpec();
+        NativeAgentGate gate = NativeAgentGate.bind(spec, root, spec.topologyHash(POLICY), appender);
+        BaseSessionService sessions = mock(BaseSessionService.class);
+        Session session = Session.builder("session-1").appName("app").userId("user").state(Map.of()).build();
+        InvocationContext context = InvocationContext.builder().sessionService(sessions).agent(root)
+                .session(session).invocationId("invocation-1").build();
+        return new BoundedFixture(gate, root, researcher, critic, context);
     }
 
     private static NativeAgentGate bind(Tree tree, NativeAgentGate.AuthorizationAppender appender) {
@@ -466,6 +704,20 @@ class NativeAgentGateTest {
                 2, 4, List.of("researcher", "critic"));
     }
 
+    private static NativeAgentCompilerStrategy.TemplateSpec boundedSpec() {
+        return new NativeAgentCompilerStrategy.TemplateSpec("bounded-research-v1",
+                NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1,
+                "researchModel", "gpt-5", ROUTE, "1", "2", "bounded_supervisor",
+                List.of(
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "bounded_supervisor", null, "bounded_supervisor_output", true, true),
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "bounded_researcher", "bounded_supervisor", "bounded_researcher_output", false, true),
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "bounded_critic", "bounded_supervisor", "bounded_critic_output", false, true)),
+                2, 16, List.of("bounded_researcher", "bounded_critic"));
+    }
+
     private static CallbackContext callback(InvocationContext context, String eventId) {
         return new CallbackContext(context, EventActions.builder().build(), eventId);
     }
@@ -493,10 +745,87 @@ class NativeAgentGateTest {
                 .partial(false).turnComplete(false).build();
     }
 
+    private static String boundedPlan(String taskRows) {
+        return "{\"schemaVersion\":\"1\",\"tasks\":[" + taskRows.strip() + "]}";
+    }
+
+    private static LlmResponse boundedPlanResponse(String plan, String target, String callId) {
+        FunctionCall call = FunctionCall.builder().id(callId).name("transfer_to_agent")
+                .args(Map.of("agent_name", target)).build();
+        return LlmResponse.builder().content(Content.builder().role("model")
+                        .parts(Part.fromText(plan), Part.builder().functionCall(call).build()).build())
+                .partial(false).turnComplete(false).build();
+    }
+
+    private static LlmResponse finalResponse(String text) {
+        return LlmResponse.builder().content(Content.builder().role("model")
+                        .parts(Part.fromText(text)).build())
+                .partial(false).turnComplete(true).build();
+    }
+
+    private static LlmRequest.Builder requestBuilder() {
+        return LlmRequest.builder().model("gpt-5").contents(List.of(
+                Content.builder().role("user").parts(Part.fromText("existing input")).build()));
+    }
+
+    private static String requestText(LlmRequest.Builder request) {
+        return request.build().contents().stream()
+                .flatMap(content -> content.parts().orElse(List.of()).stream())
+                .map(part -> part.text().orElse(""))
+                .reduce("", String::concat);
+    }
+
+    private static long countQuestionMarkers(LlmRequest.Builder request) {
+        return request.build().contents().stream()
+                .flatMap(content -> content.parts().orElse(List.of()).stream())
+                .map(part -> part.text().orElse(""))
+                .filter(text -> text.contains("TIANJI_UNTRUSTED_TASK_QUESTION_V1"))
+                .count();
+    }
+
     private static LlmResponse response(List<FunctionCall> calls) {
         return LlmResponse.builder().content(Content.builder().role("model")
                         .parts(calls.stream().map(call -> Part.builder().functionCall(call).build()).toList()).build())
                 .partial(false).turnComplete(false).build();
+    }
+
+    private static ToolContext captureBoundedTransfer(NativeAgentGate gate, InvocationContext source,
+                                                      LlmResponse response, String target,
+                                                      String callId) throws Exception {
+        assertDoesNotThrow(() -> gate.observeResponse(callback(source, "model-" + callId), response));
+        ToolContext tool = tool(source, callId);
+        assertDoesNotThrow(() -> gate.beforeTool(transferTool(), Map.of("agent_name", target), tool));
+        return tool;
+    }
+
+    private static void confirmBoundedTransfer(NativeAgentGate gate, InvocationContext source,
+                                               ToolContext context, String target,
+                                               Map<String, Object> result) throws Exception {
+        assertSame(source, context.invocationContext());
+        AgentTransfer.transferToAgent(target, context);
+        assertDoesNotThrow(() -> gate.afterTool(
+                transferTool(), Map.of("agent_name", target), context, result));
+    }
+
+    private static void completeBoundedRoot(NativeAgentGate gate, InvocationContext context, String text) {
+        assertDoesNotThrow(() -> gate.observeResponse(callback(context, "final-model"), finalResponse(text)));
+        Event event = finalEvent(context.agent(), context.invocationId(), text);
+        assertDoesNotThrow(() -> gate.observeEvent(event, Optional.of(outputProjection(context.agent(), text))));
+    }
+
+    private static FinalReady readyForBoundedFinal() throws Exception {
+        BoundedFixture fixture = boundedFixture((author, payload) -> { });
+        String plan = boundedPlan("""
+                {"taskId":"only","agent":"bounded_researcher","question":"question"}
+                """);
+        ToolContext outbound = captureBoundedTransfer(fixture.gate(), fixture.rootContext(),
+                boundedPlanResponse(plan, "bounded_researcher", "out"), "bounded_researcher", "out");
+        confirmBoundedTransfer(fixture.gate(), fixture.rootContext(), outbound, "bounded_researcher", Map.of());
+        InvocationContext child = fixture.rootContext().toBuilder().agent(fixture.researcher()).build();
+        ToolContext returned = captureBoundedTransfer(fixture.gate(), child,
+                transferResponse("bounded_supervisor", "back", "summary"), "bounded_supervisor", "back");
+        confirmBoundedTransfer(fixture.gate(), child, returned, "bounded_supervisor", Map.of());
+        return new FinalReady(fixture, child.toBuilder().agent(fixture.root()).build());
     }
 
     private static void assertRejectedRootResponse(LlmResponse response) {
@@ -556,6 +885,13 @@ class NativeAgentGateTest {
 
     private record SupervisorFixture(NativeAgentGate gate, LlmAgent root, LlmAgent researcher,
                                      LlmAgent critic, InvocationContext rootContext) {
+    }
+
+    private record BoundedFixture(NativeAgentGate gate, LlmAgent root, LlmAgent researcher,
+                                  LlmAgent critic, InvocationContext rootContext) {
+    }
+
+    private record FinalReady(BoundedFixture fixture, InvocationContext finalRoot) {
     }
 
     private record Audit(String author, Map<String, Object> payload) {

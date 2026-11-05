@@ -18,7 +18,8 @@ public interface NativeAgentCompilerStrategy extends Function<Scheduler, BaseAge
 
     enum TransferTopologyEnum {
         CONDITIONAL_RESEARCH_V1,
-        SUPERVISOR_RESEARCH_V1
+        SUPERVISOR_RESEARCH_V1,
+        BOUNDED_RESEARCH_V1
     }
 
     record AgentSpec(String name, String parentName, String outputKey,
@@ -45,7 +46,10 @@ public interface NativeAgentCompilerStrategy extends Function<Scheduler, BaseAge
             modelBeanName = requireSafe(modelBeanName, "Model bean name", 256);
             modelName = requireSafe(modelName, "Model name", 512);
             modelRouteRef = requireVersionedRef(modelRouteRef, "Model route reference");
-            if (!"1".equals(inputSchemaVersion) || !"1".equals(outputSchemaVersion)) throw invalid();
+            if (!"1".equals(inputSchemaVersion)
+                    || !(topology == TransferTopologyEnum.BOUNDED_RESEARCH_V1 ? "2" : "1").equals(outputSchemaVersion)) {
+                throw invalid();
+            }
             rootAgentName = requireSafe(rootAgentName, "Root Agent name", 128);
             if (agents == null || requiredChildOrder == null) throw invalid();
             try {
@@ -117,6 +121,16 @@ public interface NativeAgentCompilerStrategy extends Function<Scheduler, BaseAge
                 requireAgent(agents, "supervisor", null, "supervisor_root_output", true, true);
                 requireAgent(agents, "researcher", "supervisor", "researcher_output", false, true);
                 requireAgent(agents, "critic", "supervisor", "critic_output", false, true);
+            }
+            case BOUNDED_RESEARCH_V1 -> {
+                if (!"bounded-research-v1".equals(codeRef)
+                        || !"bounded_supervisor".equals(rootAgentName) || maxTransfers != 16
+                        || !requiredChildOrder.equals(List.of("bounded_researcher", "bounded_critic"))) {
+                    throw invalid();
+                }
+                requireAgent(agents, "bounded_supervisor", null, "bounded_supervisor_output", true, true);
+                requireAgent(agents, "bounded_researcher", "bounded_supervisor", "bounded_researcher_output", false, true);
+                requireAgent(agents, "bounded_critic", "bounded_supervisor", "bounded_critic_output", false, true);
             }
         }
     }

@@ -98,6 +98,64 @@ class AdkNativeAgentCompletionTest {
         }
     }
 
+    @Test void bounded_result_has_ordered_tasks_and_the_last_summary_for_a_repeated_role() {
+        try (var rig = new Rig(false, "bounded")) {
+            rig.nativeMode = true;
+            assertEquals(AgentRunStatusEnum.COMPLETED, assertDoesNotThrow(rig::execute).status());
+            var result = rig.finished.get();
+            assertNotNull(result);
+            assertEquals("2", result.outputSchemaVersion());
+            assertEquals("root final", result.output().get("text"));
+            assertEquals(Map.of("bounded_supervisor", "root final", "bounded_researcher", "summary-2",
+                    "bounded_critic", "summary-3"), result.output().get("agents"));
+            var tasks = assertInstanceOf(List.class, result.output().get("tasks"));
+            assertEquals(List.of(
+                    Map.of("taskId", "first", "agent", "bounded_researcher", "summary", "summary-1"),
+                    Map.of("taskId", "second", "agent", "bounded_researcher", "summary", "summary-2"),
+                    Map.of("taskId", "third", "agent", "bounded_critic", "summary", "summary-3")), tasks);
+            for (Object task : tasks) assertEquals(Set.of("taskId", "agent", "summary"),
+                    assertInstanceOf(Map.class, task).keySet());
+            assertThrows(UnsupportedOperationException.class, tasks::clear);
+            assertEquals(7, rig.model.calls.get());
+            verify(rig.bound, times(7)).estimate(same(rig.snapshot), any());
+        }
+    }
+
+    @Test void bounded_event_type_and_payload_do_not_expose_task_questions_or_identifiers() {
+        try (var rig = new Rig(false, "bounded")) {
+            rig.nativeMode = true;
+            assertEquals(AgentRunStatusEnum.COMPLETED, assertDoesNotThrow(rig::execute).status());
+            var authorizations = rig.events.stream().filter(row ->
+                    row.get("type").equals("NATIVE_TASK_TRANSFER_AUTHORIZED")).toList();
+            assertEquals(6, authorizations.size());
+            assertEquals(0, rig.events.stream().filter(row -> row.get("type").equals("NATIVE_TRANSFER_AUTHORIZED")).count());
+            for (int i = 0; i < authorizations.size(); i++) {
+                var payload = assertInstanceOf(Map.class, authorizations.get(i).get("payload"));
+                assertEquals(Set.of("to", "ordinal", "topologyHash", "planHash", "taskOrdinal", "state"), payload.keySet());
+                assertEquals(i + 1, payload.get("ordinal"));
+                assertEquals(i / 2 + 1, payload.get("taskOrdinal"));
+                assertEquals("AUTHORIZED", payload.get("state"));
+                assertTrue(assertInstanceOf(String.class, payload.get("planHash")).matches("[0-9a-f]{64}"));
+                assertFalse(payload.toString().contains("untrusted question"));
+                assertFalse(payload.containsKey("taskId"));
+            }
+        }
+    }
+
+    @Test void bounded_cancellation_at_the_current_append_prevents_native_dispatch_and_completed_finish() {
+        try (var rig = new Rig(false, "bounded")) {
+            rig.nativeMode = true;
+            rig.cancelBeforeAppend = true;
+            assertEquals(AgentRunStatusEnum.CANCELLED, assertDoesNotThrow(rig::execute).status());
+            assertEquals(1, rig.model.calls.get());
+            verify(rig.ledger).finish(eq(rig.actor), eq(rig.lease), anyLong(),
+                    argThat(result -> result.status() == AgentRunStatusEnum.CANCELLED));
+            assertTrue(rig.events.stream().noneMatch(row -> ((String) row.get("type")).startsWith("NATIVE_")));
+            verify(rig.ledger, never()).finish(eq(rig.actor), eq(rig.lease), anyLong(),
+                    argThat(result -> result.status() == AgentRunStatusEnum.COMPLETED));
+        }
+    }
+
     @Test void plausible_root_without_a_confirmed_child_cannot_complete() {
         try (var rig = new Rig(false, "root-only")) {
             rig.nativeMode = true;
@@ -194,13 +252,14 @@ class AdkNativeAgentCompletionTest {
         final AtomicReference<AgentExecutionResult> finished = new AtomicReference<>();
         final List<Map<String,Object>> events = new CopyOnWriteArrayList<>();
         final ScriptModel model;
-        final boolean supervisor;
-        boolean nativeMode, foreignChildModel, cancelAtClaim;
+        final boolean supervisor, bounded;
+        boolean nativeMode, foreignChildModel, cancelAtClaim, cancelBeforeAppend;
         String mutation;
         AgentExecutionSnapshot snapshot;
 
         Rig(boolean supervisor, String script) {
             this.supervisor = supervisor;
+            this.bounded = script.equals("bounded");
             model = new ScriptModel(script);
             current.set(run(AgentRunStatusEnum.QUEUED, 0, 0));
             when(chatModel.getOptions()).thenReturn(ChatOptions.builder().model("fixture-model").build());
@@ -226,6 +285,11 @@ class AdkNativeAgentCompletionTest {
             when(estimator.bindNative(any(), any())).thenReturn(bound);
             when(ledger.appendEvent(eq(actor), eq(lease), anyLong(), anyString(), anyString(), anyMap())).thenAnswer(call -> {
                 long revision = call.getArgument(2); assertEquals(current.get().revision(), revision);
+                if (cancelBeforeAppend && ((String) call.getArgument(3)).startsWith("NATIVE_")) {
+                    cancelAtClaim = true;
+                    current.set(run(AgentRunStatusEnum.RUNNING, revision + 1, current.get().lastEventSequence()));
+                    throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Current run changed");
+                }
                 events.add(Map.of("type", call.getArgument(3), "payload", Map.copyOf(call.getArgument(5))));
                 current.set(run(AgentRunStatusEnum.RUNNING, revision + 1, current.get().lastEventSequence() + 1)); return current.get();
             });
@@ -252,26 +316,26 @@ class AdkNativeAgentCompletionTest {
                     (request, boundary) -> AgentRunAuthorization.Decision.ALLOW).executeQueued(actor, query);
         }
         NativeAgentCompilerStrategy.TemplateSpec spec() {
-            String root = supervisor ? "supervisor" : "conditional_root";
-            List<String> children = supervisor ? List.of("researcher", "critic") : List.of("quick_research", "deep_research");
+            String root = bounded ? "bounded_supervisor" : supervisor ? "supervisor" : "conditional_root";
+            List<String> children = bounded ? List.of("bounded_researcher", "bounded_critic") : supervisor ? List.of("researcher", "critic") : List.of("quick_research", "deep_research");
             List<NativeAgentCompilerStrategy.AgentSpec> agents = new ArrayList<>();
-            agents.add(new NativeAgentCompilerStrategy.AgentSpec(root, null, supervisor ? "supervisor_root_output" : "conditional_root_output", true, true));
+            agents.add(new NativeAgentCompilerStrategy.AgentSpec(root, null, bounded ? "bounded_supervisor_output" : supervisor ? "supervisor_root_output" : "conditional_root_output", true, true));
             children.forEach(name -> agents.add(new NativeAgentCompilerStrategy.AgentSpec(name, root, name + "_output", false, true)));
-            return new NativeAgentCompilerStrategy.TemplateSpec(supervisor ? "supervisor-research-v1" : "conditional-research-v1",
-                    supervisor ? NativeAgentCompilerStrategy.TransferTopologyEnum.SUPERVISOR_RESEARCH_V1 : NativeAgentCompilerStrategy.TransferTopologyEnum.CONDITIONAL_RESEARCH_V1,
-                    "fixtureModel", "fixture-model", ROUTE, "1", "1", root, agents, 2, supervisor ? 4 : 2, children);
+            return new NativeAgentCompilerStrategy.TemplateSpec(bounded ? "bounded-research-v1" : supervisor ? "supervisor-research-v1" : "conditional-research-v1",
+                    bounded ? NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1 : supervisor ? NativeAgentCompilerStrategy.TransferTopologyEnum.SUPERVISOR_RESEARCH_V1 : NativeAgentCompilerStrategy.TransferTopologyEnum.CONDITIONAL_RESEARCH_V1,
+                    "fixtureModel", "fixture-model", ROUTE, "1", bounded ? "2" : "1", root, agents, 2, bounded ? 16 : supervisor ? 4 : 2, children);
         }
         BaseAgent tree() {
             var spec = spec();
             var children = spec.agents().stream().filter(row -> row.parentName() != null).map(row -> LlmAgent.builder()
                     .name(row.name()).outputKey(row.outputKey()).model(foreignChildModel ? new ScriptModel("root-only") : model)
                     .disallowTransferToParent(false).disallowTransferToPeers(true).build()).toList();
-            return LlmAgent.builder().name(spec.rootAgentName()).outputKey(supervisor ? "supervisor_root_output" : "conditional_root_output")
+            return LlmAgent.builder().name(spec.rootAgentName()).outputKey(bounded ? "bounded_supervisor_output" : supervisor ? "supervisor_root_output" : "conditional_root_output")
                     .model(model).subAgents(children.toArray(BaseAgent[]::new)).disallowTransferToParent(true).disallowTransferToPeers(true).build();
         }
         AgentLedgerService.ExecutionMaterial material() {
             var policy = new ExecutionPolicyDTO(Duration.ofSeconds(60), Duration.ofSeconds(5), Duration.ofSeconds(2), 8, 0, 10000, 1000, BigDecimal.TEN, "USD", 1, Set.of(), "retry", null);
-            var definition = new AgentDefinitionSpecDTO("assistant", 1, "CODE_FIRST", spec().codeRef(), "schema".equals(mutation) ? "2" : "1", "1",
+            var definition = new AgentDefinitionSpecDTO("assistant", 1, "CODE_FIRST", spec().codeRef(), "schema".equals(mutation) ? "2" : "1", bounded ? "2" : "1",
                     new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "route".equals(mutation) ? "route@2#" + "c".repeat(64) : ROUTE, POLICY), policy,
                     "configuration".equals(mutation) ? Map.of("unreviewed", true) : Map.of());
             snapshot = new AgentExecutionSnapshot(definition, "d".repeat(64), policy, new AgentInputDTO("Research", null, null), null);
@@ -294,6 +358,20 @@ class AdkNativeAgentCompletionTest {
         ScriptModel(String script) { super("fixture-model"); this.script = script; }
         @Override public Flowable<LlmResponse> generateContent(LlmRequest request, boolean stream) {
             int call = calls.getAndIncrement();
+            if (script.equals("bounded")) return Flowable.just(switch (call) {
+                case 0 -> transfer("bounded_researcher", """
+                        {"schemaVersion":"1","tasks":[
+                          {"taskId":"first","agent":"bounded_researcher","question":"untrusted question one"},
+                          {"taskId":"second","agent":"bounded_researcher","question":"untrusted question two"},
+                          {"taskId":"third","agent":"bounded_critic","question":"untrusted question three"}]}
+                        """, call);
+                case 1 -> transfer("bounded_supervisor", "summary-1", call);
+                case 2 -> transfer("bounded_researcher", null, call);
+                case 3 -> transfer("bounded_supervisor", "summary-2", call);
+                case 4 -> transfer("bounded_critic", null, call);
+                case 5 -> transfer("bounded_supervisor", "summary-3", call);
+                default -> finalText();
+            });
             if (script.equals("supervisor")) return Flowable.just(switch (call) {
                 case 0 -> transfer("researcher", null, call);
                 case 1 -> transfer("supervisor", "research summary", call);

@@ -312,8 +312,10 @@ public final class AdkAgentRunExecutor {
             AgentModelBudgetEstimator selectedEstimator = budgetEstimator;
             if (nativeCompiler != null) {
                 ChatModel model = chatModels.get(nativeSpec.modelBeanName());
+                String transferEventType = nativeSpec.topology() == NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1
+                        ? "NATIVE_TASK_TRANSFER_AUTHORIZED" : "NATIVE_TRANSFER_AUTHORIZED";
                 nativeGate = NativeAgentGate.bind(nativeSpec, root, nativeSpec.topologyHash(dependencies.policyVersionRef()),
-                        (author, payload) -> eventSink.append("NATIVE_TRANSFER_AUTHORIZED", author, payload));
+                        (author, payload) -> eventSink.append(transferEventType, author, payload));
                 selectedEstimator = Objects.requireNonNull(budgetEstimator.bindNative(snapshot,
                         new AgentModelBudgetEstimator.NativeModelBinding(nativeSpec.codeRef(), nativeSpec.modelBeanName(), nativeSpec.modelName(), model)),
                         "Native model budget binding is unavailable");
@@ -393,6 +395,13 @@ public final class AdkAgentRunExecutor {
             String finalAgent = finalAgent(root);
             if (finalAgent != null && agentOutputs.containsKey(finalAgent)) {
                 output.put("text", agentOutputs.get(finalAgent));
+            }
+            if (activeNativeGate != null
+                    && nativeSpec.topology() == NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1) {
+                List<Map<String, Object>> tasks = activeNativeGate.requireCompletedTasks().stream()
+                        .map(task -> Map.<String, Object>of("taskId", task.taskId(), "agent", task.agent(), "summary", task.summary()))
+                        .toList();
+                output.put("tasks", tasks);
             }
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.COMPLETED,
                     output, null, snapshot.definition().outputSchemaVersion(), null, null, sideEffectOutcome);

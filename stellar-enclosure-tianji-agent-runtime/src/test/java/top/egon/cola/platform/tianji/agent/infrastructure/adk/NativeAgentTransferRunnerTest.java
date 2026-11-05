@@ -181,6 +181,97 @@ class NativeAgentTransferRunnerTest {
         }
     }
 
+    @Test void bounded_repeated_role_tasks_use_distinct_windows() {
+        var tasks = List.of(
+                new TaskSeedVO("task-1", "bounded_researcher", "question one", "summary one"),
+                new TaskSeedVO("task-2", "bounded_researcher", "question two", "summary two"),
+                new TaskSeedVO("task-3", "bounded_critic", "question three", "summary three"));
+        try (var rig = new Rig(bounded(), boundedScript(tasks, "{\"answer\":\"bounded final\"}"))) {
+            assertDoesNotThrow(rig::run);
+            assertEquals(List.of("bounded_supervisor", "bounded_researcher", "bounded_supervisor",
+                    "bounded_researcher", "bounded_supervisor", "bounded_critic", "bounded_supervisor"),
+                    rig.modelAuthors());
+            var completed = assertDoesNotThrow(rig.gate::requireCompletedTasks);
+            assertEquals(tasks.stream().map(task -> new NativeAgentGate.TaskResultVO(
+                    task.taskId(), task.agent(), task.summary())).toList(), completed);
+            assertEquals(Map.of("bounded_supervisor", "{\"answer\":\"bounded final\"}",
+                    "bounded_researcher", "summary two", "bounded_critic", "summary three"),
+                    rig.gate.requireCompletedOutputs());
+            assertQuestion(rig.model.requests.get(1), "question one");
+            assertQuestion(rig.model.requests.get(3), "question two");
+            assertQuestion(rig.model.requests.get(5), "question three");
+            assertEquals(0, questionMarkerCount(rig.model.requests.getFirst()));
+            InvocationContext firstRole = rig.modelContexts.get(1).invocationContext();
+            InvocationContext secondRole = rig.modelContexts.get(3).invocationContext();
+            assertNotSame(firstRole, secondRole);
+            assertSame(firstRole.session(), secondRole.session());
+            assertEquals(firstRole.invocationId(), secondRole.invocationId());
+            assertEquals(6, rig.audits.size());
+            for (int index = 0; index < rig.audits.size(); index++) {
+                var payload = rig.audits.get(index).payload();
+                assertEquals(Set.of("to", "ordinal", "topologyHash", "planHash", "taskOrdinal", "state"),
+                        payload.keySet());
+                assertEquals(index + 1, ((Number) payload.get("ordinal")).intValue());
+                assertEquals(index / 2 + 1, ((Number) payload.get("taskOrdinal")).intValue());
+            }
+        }
+    }
+
+    @Test void bounded_max_tasks_share_budget() {
+        var tasks = new ArrayList<TaskSeedVO>();
+        for (int index = 1; index <= 8; index++) {
+            String agent = index % 2 == 0 ? "bounded_critic" : "bounded_researcher";
+            tasks.add(new TaskSeedVO("task-" + index, agent, "question " + index, "summary " + index));
+        }
+        var script = boundedScript(tasks, "bounded aggregate");
+        try (var rig = new Rig(bounded(), script, 17)) {
+            assertDoesNotThrow(rig::run);
+            assertEquals(8, rig.gate.requireCompletedTasks().size());
+            verify(rig.budgets, times(17)).reserveBudget(eq(rig.actor), eq(rig.lease),
+                    argThat(request -> request.kind() == AgentBudgetRequest.Kind.MODEL));
+            verify(rig.budgets, never()).reserveBudget(eq(rig.actor), eq(rig.lease),
+                    argThat(request -> request.kind() == AgentBudgetRequest.Kind.TOOL));
+            for (int index = 0; index < tasks.size(); index++) {
+                assertQuestion(rig.model.requests.get(index * 2 + 1), tasks.get(index).question());
+            }
+        }
+        try (var exhausted = new Rig(bounded(), script, 8)) {
+            assertThrows(RuntimeException.class, exhausted::run);
+            assertTrue(exhausted.model.requests.size() <= 8);
+        }
+    }
+
+    @Test void bounded_final_json_is_answer_only() {
+        var tasks = List.of(new TaskSeedVO("task-json", "bounded_researcher",
+                "question json", "summary json"));
+        String finalJson = "{\"schemaVersion\":\"1\",\"tasks\":[{\"not\":\"a new plan\"}]}";
+        try (var rig = new Rig(bounded(), boundedScript(tasks, finalJson))) {
+            List<Event> events = assertDoesNotThrow(rig::run);
+            assertEquals(List.of(new NativeAgentGate.TaskResultVO(
+                    "task-json", "bounded_researcher", "summary json")),
+                    rig.gate.requireCompletedTasks());
+            assertEquals(finalJson, rig.gate.requireCompletedOutputs().get("bounded_supervisor"));
+            assertTrue(events.stream().anyMatch(event -> event.author().equals("bounded_supervisor")
+                    && event.finalResponse() && visibleText(event).equals(finalJson)));
+            assertTrue(rig.model.steps.isEmpty());
+        }
+    }
+
+    @Test void bounded_failure_remains_sticky() {
+        var tasks = List.of(new TaskSeedVO("task-fail", "bounded_researcher",
+                "private bounded question", "unused summary"));
+        try (var rig = new Rig(bounded(), boundedScript(tasks, "plausible final"))) {
+            rig.authorizationFailure = () -> new IllegalStateException(PRIVATE_FAILURE);
+            var failure = assertThrows(AgentLedgerException.class, rig::run);
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
+            assertNull(failure.getCause());
+            assertFalse(failure.getMessage().contains(PRIVATE_FAILURE));
+            assertThrows(AgentLedgerException.class, rig.gate::requireCompletedTasks);
+            assertSticky(rig, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE);
+            assertTrue(rig.audits.isEmpty());
+        }
+    }
+
     private static void assertConditional(Rig rig, List<Event> events, String child, String summary) {
         assertEquals(Map.of("conditional_root", FINAL, child, summary), rig.gate.requireCompletedOutputs());
         assertEquals(List.of(child, "conditional_root"), rig.confirmedTargets);
@@ -242,6 +333,39 @@ class NativeAgentTransferRunnerTest {
     private static List<ScriptStepVO> conditionalScript(String child, String firstId, String secondId, String summary) {
         return List.of(transfer("conditional_root", child, firstId, null), transfer(child, "conditional_root", secondId, summary), finalResponse("conditional_root", FINAL));
     }
+
+    private static List<ScriptStepVO> boundedScript(List<TaskSeedVO> tasks, String finalText) {
+        List<ScriptStepVO> script = new ArrayList<>();
+        script.add(transfer("bounded_supervisor", tasks.getFirst().agent(), "out-1", boundedPlan(tasks)));
+        for (int index = 0; index < tasks.size(); index++) {
+            TaskSeedVO task = tasks.get(index);
+            script.add(transfer(task.agent(), "bounded_supervisor", "back-" + (index + 1), task.summary()));
+            if (index + 1 < tasks.size()) {
+                script.add(transfer("bounded_supervisor", tasks.get(index + 1).agent(), "out-" + (index + 2), null));
+            }
+        }
+        script.add(finalResponse("bounded_supervisor", finalText));
+        return List.copyOf(script);
+    }
+
+    private static String boundedPlan(List<TaskSeedVO> tasks) {
+        return "{\"schemaVersion\":\"1\",\"tasks\":[" + tasks.stream().map(task ->
+                "{\"taskId\":\"" + task.taskId() + "\",\"agent\":\"" + task.agent()
+                        + "\",\"question\":\"" + task.question() + "\"}")
+                .collect(java.util.stream.Collectors.joining(",")) + "]}";
+    }
+
+    private static void assertQuestion(LlmRequest request, String question) {
+        assertEquals(1, questionMarkerCount(request));
+        assertTrue(request.contents().stream().flatMap(content -> content.parts().orElse(List.of()).stream())
+                .flatMap(part -> part.text().stream()).anyMatch(text -> text.contains(question)));
+    }
+
+    private static long questionMarkerCount(LlmRequest request) {
+        return request.contents().stream().flatMap(content -> content.parts().orElse(List.of()).stream())
+                .flatMap(part -> part.text().stream())
+                .filter(text -> text.contains("TIANJI_UNTRUSTED_TASK_QUESTION_V1")).count();
+    }
     private static NativeAgentCompilerStrategy.TemplateSpec conditional() {
         return new NativeAgentCompilerStrategy.TemplateSpec("conditional-research-v1", NativeAgentCompilerStrategy.TransferTopologyEnum.CONDITIONAL_RESEARCH_V1,
                 "fixtureModel", MODEL, ROUTE, "1", "1", "conditional_root", List.of(
@@ -257,7 +381,21 @@ class NativeAgentTransferRunnerTest {
                 new NativeAgentCompilerStrategy.AgentSpec("critic", "supervisor", "critic_output", false, true)), 2, 4, List.of("researcher", "critic"));
     }
 
+    private static NativeAgentCompilerStrategy.TemplateSpec bounded() {
+        return new NativeAgentCompilerStrategy.TemplateSpec("bounded-research-v1",
+                NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1,
+                "fixtureModel", MODEL, ROUTE, "1", "2", "bounded_supervisor", List.of(
+                new NativeAgentCompilerStrategy.AgentSpec("bounded_supervisor", null,
+                        "bounded_supervisor_output", true, true),
+                new NativeAgentCompilerStrategy.AgentSpec("bounded_researcher", "bounded_supervisor",
+                        "bounded_researcher_output", false, true),
+                new NativeAgentCompilerStrategy.AgentSpec("bounded_critic", "bounded_supervisor",
+                        "bounded_critic_output", false, true)), 2, 16,
+                List.of("bounded_researcher", "bounded_critic"));
+    }
+
     private record ScriptStepVO(String author, LlmResponse response) { }
+    private record TaskSeedVO(String taskId, String agent, String question, String summary) { }
     private record AuthorizationWriteVO(String author, Map<String, Object> payload) { }
     private record ToolObservationVO(String source, String callId, InvocationContext nativeContext, ToolContext wrapper, BaseTool tool) { }
     private record EventStateVO(Event event, Map<String, Object> sessionState, Map<String, Object> stateDelta) { }
@@ -297,6 +435,7 @@ class NativeAgentTransferRunnerTest {
         final AtomicInteger toolErrors = new AtomicInteger(), emptyToolErrorCompletions = new AtomicInteger();
         final AtomicReference<Throwable> toolErrorOutput = new AtomicReference<>();
         final AtomicReference<RuntimeException> injectedFailure = new AtomicReference<>();
+        final int maxModelCalls;
         final ScriptModel model;
         final LlmAgent root;
         final NativeAgentGate gate;
@@ -308,6 +447,11 @@ class NativeAgentTransferRunnerTest {
         volatile Supplier<RuntimeException> authorizationFailure;
 
         Rig(NativeAgentCompilerStrategy.TemplateSpec spec, List<ScriptStepVO> steps) {
+            this(spec, steps, spec.topology() == NativeAgentCompilerStrategy.TransferTopologyEnum.BOUNDED_RESEARCH_V1
+                    ? 17 : 12);
+        }
+        Rig(NativeAgentCompilerStrategy.TemplateSpec spec, List<ScriptStepVO> steps, int maxModelCalls) {
+            this.maxModelCalls = maxModelCalls;
             this.spec = spec; model = new ScriptModel(steps);
             var children = spec.agents().stream().filter(agent -> agent.parentName() != null).map(agent -> agent(agent, List.of())).toList();
             root = agent(spec.agents().stream().filter(agent -> agent.parentName() == null).findFirst().orElseThrow(), children);
@@ -317,8 +461,9 @@ class NativeAgentTransferRunnerTest {
                 if (fail != null) { RuntimeException failure = fail.get(); injectedFailure.set(failure); throw failure; }
                 audits.add(new AuthorizationWriteVO(author, Map.copyOf(payload)));
             });
-            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(5), Duration.ofSeconds(5), 12, 0, 10000, 10000, null, null, 1, Set.of(), null, null);
-            var definition = new AgentDefinitionSpecDTO("native-agent", 1, "CODE_FIRST", spec.codeRef(), "1", "1",
+            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(5), Duration.ofSeconds(5), maxModelCalls, 0, 10000, 10000, null, null, 1, Set.of(), null, null);
+            var definition = new AgentDefinitionSpecDTO("native-agent", 1, "CODE_FIRST", spec.codeRef(),
+                    spec.inputSchemaVersion(), spec.outputSchemaVersion(),
                     new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), ROUTE, POLICY), policy, Map.of());
             var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, new AgentInputDTO("Research", List.of(), Map.of()), null);
             var request = new AgentRunAuthorization.Request(actor, runId, "native-agent", 1, HASH, HASH, HASH, POLICY, false, deadline);
@@ -387,7 +532,7 @@ class NativeAgentTransferRunnerTest {
         EventStateVO stateAt(Event event) { return eventStates.stream().filter(state -> state.event() == event).findFirst().orElseThrow(); }
         List<Event> run() {
             var projector = new AdkEventProjector();
-            return runner.runAsync(user, sessionId, Content.fromParts(Part.fromText("Research")), RunConfig.builder().setAutoCreateSession(false).setMaxLlmCalls(12)
+            return runner.runAsync(user, sessionId, Content.fromParts(Part.fromText("Research")), RunConfig.builder().setAutoCreateSession(false).setMaxLlmCalls(maxModelCalls)
                             .setStreamingMode(RunConfig.StreamingMode.NONE).build())
                     .doOnNext(event -> {
                         gate.observeEvent(event, projector.project(event, agentNames));

@@ -5,6 +5,8 @@ import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
@@ -39,6 +41,44 @@ class AgentJsonCodecTest {
             assertEquals(Set.of("to", "ordinal", "topologyHash", "state"), event.payload().keySet());
             assertEquals("2026-11-05T00:00:00.123456Z", stored.get("occurredAt"));
         }
+    }
+
+    @Test
+    void schema_two_ordered_task_maps_round_trip_through_the_existing_json_contract() {
+        List<Map<String, Object>> tasks = List.of(
+                Map.of("taskId", "first", "agent", "bounded_researcher", "summary", "one"),
+                Map.of("taskId", "second", "agent", "bounded_researcher", "summary", "two"));
+        var result = assertDoesNotThrow(() -> new AgentExecutionResult("run-1", AgentRunStatusEnum.COMPLETED,
+                Map.of("text", "final", "agents", Map.of("bounded_supervisor", "final", "bounded_researcher", "two"),
+                        "tasks", tasks), null, "2", null, null, "UNKNOWN"));
+        String json = assertDoesNotThrow(() -> codec.write(result, AgentJsonCodec.MAX_RESULT_BYTES));
+        var decoded = assertDoesNotThrow(() -> codec.readResult(json));
+        assertEquals(result, decoded);
+        var storedTasks = assertInstanceOf(List.class, decoded.output().get("tasks"));
+        assertEquals(tasks, storedTasks);
+        for (Object task : storedTasks) {
+            var map = assertInstanceOf(Map.class, task);
+            assertEquals(Set.of("taskId", "agent", "summary"), map.keySet());
+        }
+        assertFalse(json.contains("question"));
+        assertThrows(UnsupportedOperationException.class, () -> decoded.output().put("tasks", List.of()));
+        assertThrows(UnsupportedOperationException.class, storedTasks::clear);
+    }
+
+    @Test
+    void raw_task_records_are_rejected_before_the_codec_and_old_schema_one_is_unchanged() {
+        record RawTaskVO(String taskId, String agent, String summary) { }
+        assertThrows(IllegalArgumentException.class, () -> new AgentExecutionResult("run-1",
+                AgentRunStatusEnum.COMPLETED, Map.of("tasks", List.of(new RawTaskVO("first", "bounded_researcher", "one"))),
+                null, "2", null, null, "UNKNOWN"));
+        var legacy = new AgentExecutionResult("run-1", AgentRunStatusEnum.COMPLETED,
+                Map.of("text", "final", "agents", Map.of("conditional_root", "final")),
+                null, "1", null, null, "UNKNOWN");
+        String legacyJson = assertDoesNotThrow(() -> codec.write(legacy, AgentJsonCodec.MAX_RESULT_BYTES));
+        assertEquals(legacy, codec.readResult(legacyJson));
+        assertFalse(legacyJson.contains("tasks"));
+        assertThrows(IllegalArgumentException.class, () -> codec.write(
+                Map.of("summary", "汉".repeat(AgentJsonCodec.MAX_RESULT_BYTES / 3 + 1)), AgentJsonCodec.MAX_RESULT_BYTES));
     }
 
     @Test

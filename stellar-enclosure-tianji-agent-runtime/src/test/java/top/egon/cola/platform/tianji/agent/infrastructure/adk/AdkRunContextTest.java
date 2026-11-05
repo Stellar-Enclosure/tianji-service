@@ -37,6 +37,7 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
@@ -49,6 +50,8 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -449,6 +452,135 @@ class AdkRunContextTest {
     }
 
     @Test
+    void bounded_question_after_history_before_snapshot() {
+        authorization = new AgentRunAuthorization.Request(actor, authorization.runId(), authorization.definitionKey(),
+                authorization.definitionVersion(), authorization.definitionSha256(), authorization.requestSha256(),
+                authorization.snapshotSha256(), authorization.policyVersionRef(), true, authorization.deadlineAt());
+        var historyRead = new AtomicBoolean();
+        when(ledger.sessionContextHistory(eq(actor), eq(lease), eq(authorization), eq("session"), any()))
+                .thenAnswer(call -> {
+                    historyRead.set(true);
+                    return new AgentLedgerService.ContextHistory(List.of(), Set.of(), true, false, true);
+                });
+        var gate = mock(NativeAgentGate.class);
+        safeFatal(gate);
+        doAnswer(call -> {
+            assertTrue(historyRead.get());
+            appendBoundedQuestion(call.getArgument(1), "current bounded question");
+            return null;
+        }).when(gate).prepareModelRequest(any(), any());
+        when(estimator.modelAdapterFingerprint(eq(snapshot), any())).thenReturn("e".repeat(64));
+        var captured = new CopyOnWriteArrayList<AgentContextMetadataDTO>();
+        when(budgets.reserveBudget(eq(actor), eq(lease), any(), any())).thenAnswer(call -> {
+            captured.add(call.getArgument(3)); return reservation(call.getArgument(2));
+        });
+        installHookedPlugin(gate, authorization, new AgentContextRuntimeOptions(true, false), new DefaultContextAssembler());
+        plugin.bindSessionFence(() -> { });
+        var nativeContext = nativeContext("bounded_researcher", true);
+        var request = request();
+        String originalSystem = request.build().config().orElseThrow().systemInstruction().orElseThrow().toJson();
+
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(
+                modelContext(nativeContext, "bounded-question"), request).blockingGet()));
+
+        assertTrue(historyRead.get());
+        assertEquals(1, boundedQuestionCount(request.build()));
+        assertEquals(1, boundedQuestionCount(estimated.getLast()));
+        assertEquals(originalSystem,
+                request.build().config().orElseThrow().systemInstruction().orElseThrow().toJson());
+        var adkContents = captured.getLast().sources().stream()
+                .filter(source -> source.kind() == AgentContextSourceKindEnum.ADK_CONTENTS).findFirst().orElseThrow();
+        String expectedDigest = AdkSemanticJsonDigest.contents(estimated.getLast().contents()).sha256();
+        assertEquals(expectedDigest, adkContents.sourceSha256());
+        assertEquals(expectedDigest, adkContents.modelTextSha256());
+        verify(estimator, atLeastOnce()).estimate(same(snapshot), any());
+    }
+
+    @Test
+    void bounded_question_once_across_capacity_retry_and_trim() {
+        var gate = mock(NativeAgentGate.class);
+        safeFatal(gate);
+        Set<LlmRequest.Builder> prepared = Collections.newSetFromMap(new IdentityHashMap<>());
+        doAnswer(call -> {
+            LlmRequest.Builder request = call.getArgument(1);
+            if (prepared.add(request)) appendBoundedQuestion(request, "retry bounded question");
+            return null;
+        }).when(gate).prepareModelRequest(any(), any());
+        var policy = new AgentModelBudgetEstimator.ContextPolicy("policy-v1", 8, 1, false, true);
+        when(estimator.contextPolicy(eq(snapshot), any())).thenReturn(policy);
+        when(estimator.modelAdapterFingerprint(eq(snapshot), any())).thenReturn("e".repeat(64));
+        when(estimator.contextWindow(eq(snapshot), any())).thenReturn(
+                new AgentModelBudgetEstimator.ContextWindow("fixture-model", "route-v1", "policy-v1", 60, 5));
+        when(estimator.estimate(eq(snapshot), any())).thenAnswer(call -> {
+            LlmRequest value = call.getArgument(1); estimated.add(value);
+            long tokens = value.contents().size() > 1 ? 80 : 20;
+            return new AgentModelBudgetEstimator.Estimate(tokens, 10, BigDecimal.ONE);
+        });
+        var captured = new CopyOnWriteArrayList<AgentContextMetadataDTO>();
+        when(budgets.reserveBudget(eq(actor), eq(lease), any(), any()))
+                .thenThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "controlled capacity"))
+                .thenAnswer(call -> { captured.add(call.getArgument(3)); return reservation(call.getArgument(2)); });
+        installHookedPlugin(gate, authorization, new AgentContextRuntimeOptions(true, true), new DefaultContextAssembler());
+        var nativeContext = nativeContext("bounded_researcher", false);
+        var request = request();
+
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(
+                modelContext(nativeContext, "bounded-retry"), request).blockingGet()));
+
+        assertEquals(1, boundedQuestionCount(request.build()));
+        assertTrue(estimated.stream().allMatch(value -> boundedQuestionCount(value) == 1));
+        assertEquals(1, request.build().contents().size());
+        assertEquals(1, boundedQuestionCount(capturedRequestSource(captured.getLast(), estimated.getLast())));
+        verify(gate, times(2)).prepareModelRequest(any(), same(request));
+    }
+
+    @Test
+    void bounded_partial_semantics_checked_before_return() {
+        var gate = mock(NativeAgentGate.class);
+        safeFatal(gate);
+        var forbidden = new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Native Agent boundary failed");
+        doThrow(forbidden).when(gate).validateResponseEnvelope(any(), any());
+        installHookedPlugin(gate, authorization, new AgentContextRuntimeOptions(false, false), new DefaultContextAssembler());
+        var nativeContext = nativeContext("bounded_researcher", false);
+        CallbackContext callback = modelContext(nativeContext, "bounded-partial");
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(callback, request()).blockingGet()));
+        clearInvocations(budgets, gate);
+        var partial = LlmResponse.builder().partial(true).turnComplete(false)
+                .content(Content.fromParts(Part.fromText("partial frame"))).build();
+
+        assertSame(forbidden, assertThrows(AgentLedgerException.class,
+                () -> plugin.afterModelCallback(callback, partial).blockingGet()));
+        verify(gate).validateResponseEnvelope(same(callback), same(partial));
+        verify(budgets, never()).settleBudget(any(), any(), anyString(), any());
+    }
+
+    @Test
+    void bounded_bad_complete_frame_settles_known_usage() {
+        prepareNativeSettlement();
+        var gate = mock(NativeAgentGate.class);
+        safeFatal(gate);
+        var invalid = new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Native Agent boundary failed");
+        doThrow(invalid).when(gate).observeResponse(any(), any());
+        installHookedPlugin(gate, authorization, new AgentContextRuntimeOptions(false, false), new DefaultContextAssembler());
+        var nativeContext = nativeContext("bounded_researcher", false);
+        CallbackContext callback = modelContext(nativeContext, "bounded-complete");
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(callback, request()).blockingGet()));
+        clearInvocations(budgets, gate);
+        var complete = LlmResponse.builder().partial(false).turnComplete(false)
+                .content(Content.fromParts(Part.fromText("invalid complete frame"))).build();
+
+        assertSame(invalid, assertThrows(AgentLedgerException.class,
+                () -> plugin.afterModelCallback(callback, complete).blockingGet()));
+        var order = inOrder(budgets, gate);
+        order.verify(budgets).settleBudget(eq(actor), eq(lease), eq("bounded-complete"),
+                eq(new AgentBudgetSettlement(20L, 5L, BigDecimal.ONE)));
+        order.verify(gate).observeResponse(same(callback), same(complete));
+        verify(gate, never()).validateResponseEnvelope(any(), any());
+    }
+
+    @Test
     void legacy_constructor_keeps_ordinary_tool_scope_execution_unchanged() {
         var scope = tools();
         var context = nativeContext("writer", false);
@@ -496,6 +628,44 @@ class AdkRunContextTest {
                 new DefaultContextAssembler(List.of(provider)), request,
                 new AgentContextRuntimeOptions(false, false), null, gate));
         return plugin;
+    }
+
+    private AdkRunBudgetPlugin installHookedPlugin(NativeAgentGate gate,
+                                                    AgentRunAuthorization.Request request,
+                                                    AgentContextRuntimeOptions options,
+                                                    DefaultContextAssembler assembler) {
+        plugin.close().blockingAwait();
+        plugin = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, estimator,
+                new AgentExecutionAuthorization((ignored, boundary) -> AgentRunAuthorization.Decision.ALLOW, request),
+                Schedulers.from(control), control, assembler, request, options, null, gate);
+        return plugin;
+    }
+
+    private static void safeFatal(NativeAgentGate gate) {
+        when(gate.markFatal(any())).thenAnswer(call -> {
+            Throwable failure = call.getArgument(0);
+            return failure instanceof RuntimeException runtime ? runtime : new RuntimeException(failure);
+        });
+    }
+
+    private static void appendBoundedQuestion(LlmRequest.Builder request, String question) {
+        var contents = new ArrayList<>(request.build().contents());
+        contents.add(Content.builder().role("user").parts(List.of(Part.fromText(
+                "TIANJI_UNTRUSTED_TASK_QUESTION_V1\n" + question))).build());
+        request.contents(contents);
+    }
+
+    private static long boundedQuestionCount(LlmRequest request) {
+        return request.contents().stream().flatMap(content -> content.parts().orElse(List.of()).stream())
+                .flatMap(part -> part.text().stream())
+                .filter(text -> text.contains("TIANJI_UNTRUSTED_TASK_QUESTION_V1")).count();
+    }
+
+    private static LlmRequest capturedRequestSource(AgentContextMetadataDTO metadata, LlmRequest request) {
+        var source = metadata.sources().stream()
+                .filter(item -> item.kind() == AgentContextSourceKindEnum.ADK_CONTENTS).findFirst().orElseThrow();
+        assertEquals(AdkSemanticJsonDigest.contents(request.contents()).sha256(), source.sourceSha256());
+        return request;
     }
 
     private AgentRunAuthorization allowingAuthorization() {

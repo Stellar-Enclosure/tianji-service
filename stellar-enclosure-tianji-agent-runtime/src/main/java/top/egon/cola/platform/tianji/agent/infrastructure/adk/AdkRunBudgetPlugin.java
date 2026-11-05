@@ -158,6 +158,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             requireSessionFence();
             long sourceDeadline = authorizationRequest.sessionRequired() || contextAssembler.hasProviders() ? System.nanoTime() + sourceTimeout().toNanos() : 0;
             boolean historyValidated = authorizationRequest.sessionRequired() && revalidateHistory(context, sourceDeadline);
+            if (nativeGate != null) nativeGate.prepareModelRequest(context, request);
             if (snapshots != null && preparedContext.get() == null) preparedContext.set(snapshots.prepare(context, request.build()));
             List<ContextProvider.Fragment> fragments = List.of();
             if (contextAssembler.hasProviders()) {
@@ -319,6 +320,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         return callbackErrors(Maybe.defer(() -> {
             if (tracking()) requireNativeContext(context, true);
             if (response.partial().orElse(false)) {
+                if (nativeGate != null) nativeGate.validateResponseEnvelope(context, response);
                 IdleGuard guard = idleGuards.get(context.eventId());
                 if (guard != null) guard.touch();
                 return Maybe.empty();
