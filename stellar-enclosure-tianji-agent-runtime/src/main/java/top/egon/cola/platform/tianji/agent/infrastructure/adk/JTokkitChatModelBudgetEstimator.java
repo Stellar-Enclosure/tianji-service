@@ -18,6 +18,7 @@ import top.egon.cola.platform.tianji.agent.autoconfigure.ModelBudgetProperties;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.math.BigDecimal;
@@ -27,6 +28,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Reviewed text routes use the exact Agent Flow converter, a named BPE encoding and explicit conservative framing allowances. */
 public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEstimator {
@@ -105,6 +107,13 @@ public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEs
         if (configuredOutput == null) configuredOutput = bound.model().getOptions().getMaxTokens();
         if (configuredOutput != null) output = Math.min(output, configuredOutput);
         return new Estimate(input, output, cost(bound.profile(), input, output));
+    }
+
+    @Override public Optional<AgentModelUsagePriceVO> modelUsagePrice(AgentExecutionSnapshot snapshot, LlmRequest request) {
+        Bound bound = require(snapshot, request.model().orElse(null));
+        var profile = bound.profile();
+        return Optional.of(new AgentModelUsagePriceVO(bound.descriptor().modelRouteRef(), profile.modelName(),
+                profile.currency(), profile.inputRatePerMillion(), profile.outputRatePerMillion()));
     }
 
     @Override public ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {

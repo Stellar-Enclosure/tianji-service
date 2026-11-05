@@ -6,14 +6,21 @@ import org.springframework.ai.chat.model.ChatModel;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.math.BigDecimal;
+import java.util.Optional;
 
 /** Host-supplied provider adapter for conservative token and cost bounds and verified usage. */
 public interface AgentModelBudgetEstimator {
     Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request);
     AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response);
+
+    /** An exact tariff is optional and cannot be inferred from a usage or budget estimate. */
+    default Optional<AgentModelUsagePriceVO> modelUsagePrice(AgentExecutionSnapshot snapshot, LlmRequest request) {
+        return Optional.empty();
+    }
 
     default AgentModelBudgetEstimator bindNative(AgentExecutionSnapshot snapshot, NativeModelBinding binding) {
         throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
