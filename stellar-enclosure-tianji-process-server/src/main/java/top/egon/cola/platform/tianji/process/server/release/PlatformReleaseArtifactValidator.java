@@ -89,7 +89,7 @@ final class PlatformReleaseArtifactValidator {
     private final Set<Path> usedPaths = new HashSet<>();
     private final Set<Object> usedFileKeys = new HashSet<>();
 
-    private PlatformReleaseArtifactValidator(Path root) throws IOException {
+    PlatformReleaseArtifactValidator(Path root) throws IOException {
         if (root == null || !root.isAbsolute() || !root.equals(root.normalize())) throw invalid();
         var current = root.getRoot();
         for (Path component : root) {
@@ -142,10 +142,7 @@ final class PlatformReleaseArtifactValidator {
                 "channel", channel, "sourceRevision", revision, "agent", agent.payload(), "process", process.payload(),
                 "agentLink", link, "packages", Map.of("agent", checkedAgentPackage, "process", checkedProcessPackage),
                 "pendingAuthority", List.of("RELEASE_SIGNING", "OWNER_PUBLICATION", "LIVE_REVOCATION", "REVIEW_AND_ACTIVATION"));
-        var digest = sha256();
-        digest.update(DOMAIN.getBytes(StandardCharsets.UTF_8));
-        digest.update((byte) 0);
-        String candidateSha = HexFormat.of().formatHex(digest.digest(canonical(candidate).getBytes(StandardCharsets.UTF_8)));
+        String candidateSha = candidateSha256(candidate);
         if (expectedCandidateSha != null) compare(expectedCandidateSha, candidateSha);
         return (canonical(Map.of("candidateSha256", candidateSha, "candidate", candidate)) + "\n").getBytes(StandardCharsets.UTF_8);
     }
@@ -452,6 +449,12 @@ final class PlatformReleaseArtifactValidator {
         return new FileReference(field(raw, "path"), patterned(raw, "sha256", SHA));
     }
 
+    byte[] readSignatureInput(String relative, int limit) throws IOException {
+        var file = open(relative, limit);
+        if (file.attributes().fileKey() == null) throw unavailable();
+        return read(file);
+    }
+
     private StagedFile open(String relative, int limit) throws IOException {
         if (relative == null || relative.length() > 512) throw invalid();
         String[] parts = relative.split("/", -1);
@@ -516,7 +519,14 @@ final class PlatformReleaseArtifactValidator {
         return HexFormat.of().formatHex(digest.digest());
     }
 
-    private static String hash(byte[] bytes) {
+    static String candidateSha256(Object candidate) {
+        var digest = sha256();
+        digest.update(DOMAIN.getBytes(StandardCharsets.UTF_8));
+        digest.update((byte) 0);
+        return HexFormat.of().formatHex(digest.digest(canonical(candidate).getBytes(StandardCharsets.UTF_8)));
+    }
+
+    static String hash(byte[] bytes) {
         return HexFormat.of().formatHex(sha256().digest(bytes));
     }
 
@@ -542,7 +552,7 @@ final class PlatformReleaseArtifactValidator {
         }
     }
 
-    private static JsonNode parse(byte[] bytes) {
+    static JsonNode parse(byte[] bytes) {
         JsonNode value;
         try {
             value = JSON.readTree(utf8(bytes));
@@ -581,7 +591,7 @@ final class PlatformReleaseArtifactValidator {
         }
     }
 
-    private static void shape(JsonNode node, String... names) {
+    static void shape(JsonNode node, String... names) {
         allowedShape(node, Set.of(names), Set.of());
     }
 
@@ -593,7 +603,7 @@ final class PlatformReleaseArtifactValidator {
         if (node.propertyNames().stream().anyMatch(name -> !required.contains(name) && !optional.contains(name))) throw invalid();
     }
 
-    private static String field(JsonNode node, String name) {
+    static String field(JsonNode node, String name) {
         if (node == null || !node.isObject()) throw invalid();
         JsonNode value = node.get(name);
         if (value == null || !value.isString()) throw invalid();
@@ -603,7 +613,7 @@ final class PlatformReleaseArtifactValidator {
         return text;
     }
 
-    private static long integer(JsonNode node, String name) {
+    static long integer(JsonNode node, String name) {
         JsonNode value = node.get(name);
         if (value == null || !value.isIntegralNumber() || !value.canConvertToLong()) throw invalid();
         return value.longValue();
@@ -629,7 +639,7 @@ final class PlatformReleaseArtifactValidator {
         if (value == null || !value.isArray() || value.size() != 0) throw invalid();
     }
 
-    private static String canonical(Object value) {
+    static String canonical(Object value) {
         return JSON.writeValueAsString(canonicalValue(value));
     }
 
