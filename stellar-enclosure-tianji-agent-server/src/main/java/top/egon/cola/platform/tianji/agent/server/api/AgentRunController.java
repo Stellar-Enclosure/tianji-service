@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -25,6 +26,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
@@ -33,11 +35,15 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.RequiresPermissions;
 
 import java.util.Objects;
+import java.util.Set;
 
 @RestController
 @RequestMapping(path = "/api/tianji/v1/agent-runs", produces = MediaType.APPLICATION_JSON_VALUE)
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
 public class AgentRunController {
+    private static final Set<String> CORRELATION_FILTER = Set.of("correlationId", "fromInclusive", "toExclusive");
+    private static final Set<String> CORRELATION_PARAMETERS = Set.of("correlationId", "fromInclusive", "toExclusive", "cursor");
+
     private final AgentLedgerService ledger;
     private final TianjiAgentAccess access;
     private final TianjiExecutionGrantIssuer executionGrants;
@@ -90,9 +96,21 @@ public class AgentRunController {
     @RequiresPermissions(codes = TianjiAgentPermissions.READ)
     @GetMapping
     public ResponseEntity<AgentRunPageDTO> list(@RequestParam(required = false) String cursor,
-                                                @RequestParam(defaultValue = "20") int limit) {
+                                                @RequestParam(defaultValue = "20") int limit,
+                                                @RequestParam MultiValueMap<String, String> parameters) {
         var actor = access.require(TianjiAgentPermissions.LIST_API).actor();
-        return noStore(ledger.list(actor, new ListAgentRunsQuery(cursor, limit)));
+        if (CORRELATION_FILTER.stream().noneMatch(parameters::containsKey)) {
+            return noStore(ledger.list(actor, new ListAgentRunsQuery(cursor, limit)));
+        }
+        if (!CORRELATION_PARAMETERS.containsAll(parameters.keySet())
+                || parameters.values().stream().anyMatch(values -> values.size() != 1)) {
+            throw new IllegalArgumentException("Agent correlation query is invalid");
+        }
+        var query = new ListAgentRunsByCorrelationQuery(parameters.getFirst("correlationId"),
+                ListAgentRunsByCorrelationQuery.parseUtc(parameters.getFirst("fromInclusive")),
+                ListAgentRunsByCorrelationQuery.parseUtc(parameters.getFirst("toExclusive")),
+                parameters.getFirst("cursor"));
+        return noStore(ledger.listByCorrelation(actor, query));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.GET_API, type = ResourceType.API,

@@ -1,0 +1,399 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Agent Run Correlation Filter",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/tianji/v1/agent-runs": {
+      "get": {
+        "operationId": "listOwnedAgentRuns",
+        "summary": "List current owner Agent runs",
+        "description": "The existing owner list accepts its original limit and cursor when no correlation filter field is present. If any correlation filter field is present, send correlationId, fromInclusive and toExclusive exactly once and optionally a single correlation cursor. The half-open UTC window is limited to 31 days. Filtered pages contain at most 20 runs. A returned cursor is valid for the same authenticated owner, exact correlation and window. Filtered requests cannot include limit or unrelated query parameters.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:agent:read"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_AGENT_READ"
+        ],
+        "x-resource-key": "tianji.api.agent.list",
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "x-correlation-page-size": 20,
+        "parameters": [
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "description": "Existing list cursor or the matching v1 correlation cursor."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 20
+            },
+            "description": "Unfiltered list only."
+          },
+          {
+            "name": "correlationId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "description": "Exact correlation. Required with both window bounds in the filtered branch."
+          },
+          {
+            "name": "fromInclusive",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+            },
+            "description": "Inclusive UTC lower bound."
+          },
+          {
+            "name": "toExclusive",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+            },
+            "description": "Exclusive UTC upper bound."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owned Agent runs in the existing page shape.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRunPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid correlation filter, cursor or page limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current Agent read permission or policy denied.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Tenant context changed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Agent store or permission dependency unavailable.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Deployment supplies its existing identity endpoints.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://identity.example/authorize",
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:agent:read": "Read owned Agent runs"
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:agent:read": "Read owned Agent runs"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "AgentRunPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "items",
+          "nextCursor"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/AgentRun"
+            }
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "AgentRun": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runId",
+          "definitionKey",
+          "definitionVersion",
+          "sessionId",
+          "status",
+          "waitReason",
+          "cancelRequested",
+          "attempt",
+          "revision",
+          "lastEventSequence",
+          "deadlineAt",
+          "createdAt",
+          "finishedAt"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "definitionKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "definitionVersion": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sessionId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "CREATED",
+              "QUEUED",
+              "RUNNING",
+              "WAITING",
+              "SUSPENDED",
+              "COMPLETED",
+              "FAILED",
+              "CANCELLED",
+              "TIMED_OUT"
+            ]
+          },
+          "waitReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cancelRequested": {
+            "type": "boolean"
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "lastEventSequence": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "deadlineAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finishedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^TIANJI_[A-Z_]+$"
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "decisionId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retryAfter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

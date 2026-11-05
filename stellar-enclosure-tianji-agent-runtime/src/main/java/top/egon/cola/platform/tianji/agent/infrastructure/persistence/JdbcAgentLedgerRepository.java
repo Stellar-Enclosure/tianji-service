@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
+import org.springframework.dao.DataRetrievalFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
@@ -15,6 +16,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextMetadataDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
@@ -24,6 +26,8 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -33,7 +37,9 @@ final class JdbcAgentLedgerRepository {
             + "cancel_requested_at, attempt, revision, last_event_sequence, deadline_at, created_at, finished_at";
     private static final String USAGE_RUN_COLUMNS = "run_id, correlation_id, created_at, status, lease_epoch, "
             + "lease_owner IS NOT NULL AS has_lease_owner, lease_expires_at";
-    private static final String USAGE_OWNER = "tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?";
+    private static final String RUN_OWNER = "tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?";
+    private static final String CORRELATION_SCOPE = RUN_OWNER
+            + " AND correlation_id COLLATE \"C\"=? AND created_at>=? AND created_at<?";
     private final JdbcTemplate jdbc;
     private final AgentJsonCodec json;
     private final AgentContextJsonCodec contexts = new AgentContextJsonCodec();
@@ -48,6 +54,15 @@ final class JdbcAgentLedgerRepository {
     }
 
     Instant beginRecoveryObservation() {
+        Instant observed = beginPrimaryReadObservation();
+        if (observed == null) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "Agent recovery evidence is unavailable");
+        }
+        return observed;
+    }
+
+    Instant beginPrimaryReadObservation() {
         jdbc.execute("SET TRANSACTION READ ONLY");
         jdbc.execute("SET LOCAL statement_timeout = '2s'");
         Timestamp observed = jdbc.queryForObject("""
@@ -55,11 +70,7 @@ final class JdbcAgentLedgerRepository {
                 WHERE NOT pg_catalog.pg_is_in_recovery()
                   AND pg_catalog.current_setting('transaction_read_only') = 'on'
                 """, Timestamp.class);
-        if (observed == null) {
-            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
-                    "Agent recovery evidence is unavailable");
-        }
-        return observed.toInstant();
+        return observed == null ? null : observed.toInstant();
     }
 
     Optional<RecoveryRunRow> recoveryRun(TrustedAgentActor actor, String runId) {
@@ -233,16 +244,60 @@ final class JdbcAgentLedgerRepository {
                 Timestamp.from(beforeCreatedAt), beforeRunId, limit);
     }
 
+    boolean hasCorrelationAnchor(TrustedAgentActor actor, ListAgentRunsByCorrelationQuery query,
+                                 Instant createdAt, String runId) {
+        Boolean present = jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM tianji_agent.agent_run WHERE "
+                        + CORRELATION_SCOPE + " AND created_at=? AND run_id COLLATE \"C\"=?)", Boolean.class,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                query.correlationId(), utcOffset(query.fromInclusive()), utcOffset(query.toExclusive()),
+                utcOffset(createdAt), runId);
+        if (present == null) throw new DataRetrievalFailureException("Agent run correlation anchor is unavailable");
+        return present;
+    }
+
+    List<CorrelationRunRow> correlationRuns(TrustedAgentActor actor, ListAgentRunsByCorrelationQuery query,
+                                           Instant beforeCreatedAt, String beforeRunId, int limit) {
+        String select = "SELECT " + RUN_COLUMNS + ", correlation_id FROM tianji_agent.agent_run WHERE " + CORRELATION_SCOPE;
+        String order = " ORDER BY created_at DESC, run_id COLLATE \"C\" DESC LIMIT ?";
+        if (beforeCreatedAt == null) {
+            return jdbc.query(select + order, JdbcAgentLedgerRepository::correlationRun,
+                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    query.correlationId(), utcOffset(query.fromInclusive()), utcOffset(query.toExclusive()), limit);
+        }
+        return jdbc.query(select + " AND (created_at,run_id COLLATE \"C\")<(?,?)" + order,
+                JdbcAgentLedgerRepository::correlationRun,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                query.correlationId(), utcOffset(query.fromInclusive()), utcOffset(query.toExclusive()),
+                utcOffset(beforeCreatedAt), beforeRunId, limit);
+    }
+
+    private static CorrelationRunRow correlationRun(ResultSet rs, int rowNumber) throws SQLException {
+        try {
+            OffsetDateTime finished = rs.getObject("finished_at", OffsetDateTime.class);
+            var run = mapRun(rs, rs.getObject("deadline_at", OffsetDateTime.class).toInstant(),
+                    rs.getObject("created_at", OffsetDateTime.class).toInstant(), finished == null ? null : finished.toInstant());
+            return new CorrelationRunRow(run, rs.getString("correlation_id"), rs.getString("run_id"));
+        } catch (IllegalArgumentException | NullPointerException malformed) {
+            throw new DataRetrievalFailureException("Agent run correlation row is invalid");
+        }
+    }
+
+    private static OffsetDateTime utcOffset(Instant value) {
+        return OffsetDateTime.ofInstant(value, ZoneOffset.UTC);
+    }
+
+    record CorrelationRunRow(AgentRunDTO run, String correlationId, String storedRunId) { }
+
     Optional<ModelUsageRunRow> modelUsageRun(TrustedAgentActor actor, String runId) {
         return jdbc.query("SELECT " + USAGE_RUN_COLUMNS + " FROM tianji_agent.agent_run WHERE "
-                        + USAGE_OWNER + " AND run_id=?", JdbcAgentLedgerRepository::modelUsageRunRow,
+                        + RUN_OWNER + " AND run_id=?", JdbcAgentLedgerRepository::modelUsageRunRow,
                 actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId)
                 .stream().findFirst();
     }
 
     List<ModelUsageRunRow> modelUsageRuns(TrustedAgentActor actor, String correlationId, Instant fromInclusive,
                                         Instant toExclusive, Instant beforeCreatedAt, String beforeRunId, int limit) {
-        String query = "SELECT " + USAGE_RUN_COLUMNS + " FROM tianji_agent.agent_run WHERE " + USAGE_OWNER
+        String query = "SELECT " + USAGE_RUN_COLUMNS + " FROM tianji_agent.agent_run WHERE " + RUN_OWNER
                 + " AND correlation_id COLLATE \"C\"=? AND created_at>=? AND created_at<?";
         String order = " ORDER BY created_at DESC, run_id DESC LIMIT ?";
         if (beforeCreatedAt == null) {
@@ -928,12 +983,16 @@ final class JdbcAgentLedgerRepository {
 
     private static AgentRunDTO mapRun(ResultSet rs) throws SQLException {
         Timestamp finished = rs.getTimestamp("finished_at");
+        return mapRun(rs, rs.getTimestamp("deadline_at").toInstant(), rs.getTimestamp("created_at").toInstant(),
+                finished == null ? null : finished.toInstant());
+    }
+
+    private static AgentRunDTO mapRun(ResultSet rs, Instant deadline, Instant created, Instant finished) throws SQLException {
         return new AgentRunDTO(rs.getString("run_id"), rs.getString("definition_key"),
                 rs.getLong("definition_version"), rs.getString("session_id"),
                 AgentRunStatusEnum.valueOf(rs.getString("status")), rs.getString("wait_reason"),
                 rs.getTimestamp("cancel_requested_at") != null, rs.getInt("attempt"), rs.getLong("revision"),
-                rs.getLong("last_event_sequence"), rs.getTimestamp("deadline_at").toInstant(),
-                rs.getTimestamp("created_at").toInstant(), finished == null ? null : finished.toInstant());
+                rs.getLong("last_event_sequence"), deadline, created, finished);
     }
 
     record DefinitionRow(String hash, top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO specification) { }

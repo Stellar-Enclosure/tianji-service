@@ -37,6 +37,7 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
@@ -66,6 +67,7 @@ import java.time.DateTimeException;
  * this service is not an HTTP entry point and is not automatically enabled.
  */
 public final class AgentLedgerService {
+    private static final int CORRELATION_PAGE_SIZE = 20;
     private final DataSource dataSource;
     private final JdbcAgentLedgerRepository repository;
     private final AgentJsonCodec json = new AgentJsonCodec();
@@ -500,6 +502,105 @@ public final class AgentLedgerService {
         List<AgentRunDTO> items = List.copyOf(more ? rows.subList(0, query.limit()) : rows);
         String next = more ? encodeCursor(items.getLast()) : null;
         return new AgentRunPageDTO(items, next);
+    }
+
+    /** Lists the authenticated owner's exact correlation within a bounded primary snapshot. */
+    public AgentRunPageDTO listByCorrelation(TrustedAgentActor actor, ListAgentRunsByCorrelationQuery query) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Verified Agent owner is required");
+        }
+        if (query == null) throw invalid("Agent run correlation query is invalid");
+        if (Thread.currentThread().isInterrupted() || TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw correlationUnavailable();
+        }
+
+        String binding = json.resultHash("TIANJI_AGENT_RUN_CORRELATION_CURSOR_V1:"
+                + json.write(List.of(actor.identityFingerprint(), query.correlationId(), query.fromInclusive().toString(),
+                query.toExclusive().toString()), 4_096));
+        var cursor = query.cursor() == null ? null : decodeCorrelationCursor(query.cursor(), binding, query);
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        // Route to the owning primary before setting physical read-only mode inside the transaction.
+        read.setReadOnly(false);
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        read.setTimeout(2);
+        try {
+            return read.execute(status -> {
+                if (!TransactionSynchronizationManager.isActualTransactionActive()
+                        || !TransactionSynchronizationManager.hasResource(dataSource)) {
+                    throw correlationUnavailable();
+                }
+                Instant observedAt = repository.beginPrimaryReadObservation();
+                if (observedAt == null) throw correlationUnavailable();
+                if (query.toExclusive().isAfter(observedAt)) throw invalid("Agent run correlation window exceeds the source clock");
+                if (cursor != null && !repository.hasCorrelationAnchor(actor, query, cursor.createdAt(), cursor.runId())) {
+                    throw invalid("Agent run correlation cursor is invalid");
+                }
+                var rows = repository.correlationRuns(actor, query, cursor == null ? null : cursor.createdAt(),
+                        cursor == null ? null : cursor.runId(), CORRELATION_PAGE_SIZE + 1);
+                return correlationPage(rows, query, cursor, binding);
+            });
+        } catch (org.springframework.dao.DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw correlationUnavailable();
+        }
+    }
+
+    private static AgentRunPageDTO correlationPage(List<JdbcAgentLedgerRepository.CorrelationRunRow> rows,
+                                                   ListAgentRunsByCorrelationQuery query, RunCursor cursor, String binding) {
+        if (rows.size() > CORRELATION_PAGE_SIZE + 1) throw correlationUnavailable();
+        var seen = new HashSet<String>();
+        var previous = cursor;
+        if (cursor != null) seen.add(cursor.runId());
+        for (var row : rows) {
+            var run = row.run();
+            var created = run.createdAt();
+            boolean ordered = previous == null || created.isBefore(previous.createdAt())
+                    || created.equals(previous.createdAt()) && run.runId().compareTo(previous.runId()) < 0;
+            if (!query.correlationId().equals(row.correlationId()) || !run.runId().equals(row.storedRunId())
+                    || !correlationRunId(run.runId()) || !seen.add(run.runId()) || !ordered
+                    || created.isBefore(query.fromInclusive()) || !created.isBefore(query.toExclusive())
+                    || created.getNano() % 1_000 != 0) {
+                throw correlationUnavailable();
+            }
+            previous = new RunCursor(created, run.runId());
+        }
+        var items = rows.stream().limit(CORRELATION_PAGE_SIZE)
+                .map(JdbcAgentLedgerRepository.CorrelationRunRow::run).toList();
+        String next = rows.size() > CORRELATION_PAGE_SIZE ? encodeCorrelationCursor(binding,
+                items.getLast().createdAt(), items.getLast().runId()) : null;
+        return new AgentRunPageDTO(items, next);
+    }
+
+    private static RunCursor decodeCorrelationCursor(String value, String binding, ListAgentRunsByCorrelationQuery query) {
+        try {
+            String decoded = new String(Base64.getUrlDecoder().decode(value.substring(3)), StandardCharsets.US_ASCII);
+            String[] fields = decoded.split("\\|", -1);
+            if (fields.length != 3 || !binding.equals(fields[0]) || !correlationRunId(fields[2])) {
+                throw new IllegalArgumentException();
+            }
+            Instant created = ListAgentRunsByCorrelationQuery.parseUtc(fields[1]);
+            if (created.isBefore(query.fromInclusive()) || !created.isBefore(query.toExclusive())
+                    || !value.equals(encodeCorrelationCursor(binding, created, fields[2]))) {
+                throw new IllegalArgumentException();
+            }
+            return new RunCursor(created, fields[2]);
+        } catch (IllegalArgumentException malformed) {
+            throw invalid("Agent run correlation cursor is invalid");
+        }
+    }
+
+    private static String encodeCorrelationCursor(String binding, Instant createdAt, String runId) {
+        String value = binding + "|" + createdAt + "|" + runId;
+        return "v1." + Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private static boolean correlationRunId(String runId) {
+        return runId.matches("[A-Za-z0-9_-]{1,64}");
+    }
+
+    private static AgentLedgerException correlationUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent run correlation is unavailable");
     }
 
     private static String encodeCursor(AgentRunDTO run) {

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -13,6 +14,39 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 
 class AgentContractTest {
+
+    @Test
+    void correlation_query_contract_exists() {
+        var from = ListAgentRunsByCorrelationQuery.parseUtc("2026-10-01T00:00:00.123456Z");
+        var to = ListAgentRunsByCorrelationQuery.parseUtc("2026-11-01T00:00:00.123456Z");
+        var query = new ListAgentRunsByCorrelationQuery("审批 / 42", from, to, "v1.A_bc-D");
+        assertEquals("审批 / 42", query.correlationId());
+        assertEquals(Instant.parse("2026-10-01T00:00:00.123456Z"), query.fromInclusive());
+        assertEquals(Duration.ofDays(31), Duration.between(query.fromInclusive(), query.toExclusive()));
+        assertEquals("v1.A_bc-D", query.cursor());
+        assertNull(new ListAgentRunsByCorrelationQuery("A", from, to, null).cursor());
+    }
+
+    @Test
+    void correlation_query_rejects_nonexact_text_bad_utc_and_unbounded_navigation() {
+        var from = Instant.parse("2026-10-01T00:00:00Z");
+        var to = from.plus(Duration.ofDays(31));
+        for (String key : List.of("", " a", "a ", "a\tb", "a\u0085b", "a" + (char) 0xD800, "a".repeat(129))) {
+            assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery(key, from, to, null));
+        }
+        for (String time : List.of("2026-10-01T00:00:00+00:00", "2026-10-01t00:00:00Z", "2026-10-01T00:00:00z",
+                "2026-10-01T00:00:00.1234567Z", "2026-10-01T24:00:00Z", "2026-10-01T00:00:60Z",
+                "2026-02-29T00:00:00Z", "0000-01-01T00:00:00Z", " 2026-10-01T00:00:00Z")) {
+            assertThrows(IllegalArgumentException.class, () -> ListAgentRunsByCorrelationQuery.parseUtc(time));
+        }
+        for (String cursor : List.of("", " v1.X", "v1.X=", "v2.X", "v1." + "a".repeat(254))) {
+            assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery("A", from, to, cursor));
+        }
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery("A", from, from, null));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery("A", to, from, null));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery("A", from, to.plusNanos(1_000), null));
+        assertThrows(IllegalArgumentException.class, () -> new ListAgentRunsByCorrelationQuery("A", from.plusNanos(1), to, null));
+    }
 
     @Test
     void input_copies_nested_json_without_losing_null_values() {

@@ -28,6 +28,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
@@ -145,10 +146,56 @@ class AgentRunHttpTest {
     }
 
     @Test
+    void rejects_incomplete_agent_correlation_filter_before_ledger_access() throws Exception {
+        mvc.perform(get(BASE).param("correlationId", "flow:exact"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("TIANJI_INVALID_COMMAND"));
+        verifyNoInteractions(ledger);
+    }
+
+    @Test
+    void filters_the_existing_owned_run_list_by_exact_correlation() throws Exception {
+        var from = Instant.parse("2026-11-04T00:00:00Z");
+        var to = Instant.parse("2026-11-05T00:00:00Z");
+        var query = new ListAgentRunsByCorrelationQuery("flow:exact", from, to, "v1.YQ");
+        when(ledger.listByCorrelation(ACTOR, query))
+                .thenReturn(new AgentRunPageDTO(List.of(run(AgentRunStatusEnum.QUEUED, 1)), null));
+        var response = mvc.perform(correlationRequest().param("cursor", "v1.YQ"))
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.items[0].runId").value("run-1"))
+                .andReturn().getResponse().getContentAsString();
+        assertEquals(Set.of("items", "nextCursor"), Set.copyOf(mapper.readTree(response).propertyNames()));
+        verify(guard).requireExecution(TianjiAgentPermissions.LIST_API);
+        verify(ledger).listByCorrelation(ACTOR, query);
+        verifyNoMoreInteractions(ledger);
+    }
+
+    @Test
+    void correlation_filter_requires_current_list_authority_and_exact_parameters() throws Exception {
+        for (var request : List.of(correlationRequest().param("correlationId", "other"),
+                correlationRequest().param("cursor", "v1.YQ", "v1.Yg"),
+                correlationRequest().param("limit", "20"), correlationRequest().param("tenantId", "20"),
+                get(BASE).param("fromInclusive", "2026-11-04T00:00:00Z"))) {
+            mvc.perform(request).andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("TIANJI_INVALID_COMMAND"));
+        }
+        doThrow(new AccessDeniedException("private permission detail")).when(guard)
+                .requireExecution(TianjiAgentPermissions.LIST_API);
+        var denied = assertThrows(jakarta.servlet.ServletException.class,
+                () -> mvc.perform(correlationRequest().param("tenantId", "20")));
+        assertInstanceOf(AccessDeniedException.class, denied.getCause());
+        verifyNoInteractions(ledger);
+    }
+
+    private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder correlationRequest() {
+        return get(BASE).param("correlationId", "flow:exact")
+                .param("fromInclusive", "2026-11-04T00:00:00Z").param("toExclusive", "2026-11-05T00:00:00Z");
+    }
+
+    @Test
     void list_uses_the_verified_actor_and_enforces_page_bounds() throws Exception {
         when(ledger.list(ACTOR, new ListAgentRunsQuery("cursor", 2)))
                 .thenReturn(new AgentRunPageDTO(List.of(run(AgentRunStatusEnum.QUEUED, 1)), null));
-        mvc.perform(get(BASE).param("cursor", "cursor").param("limit", "2"))
+        mvc.perform(get(BASE).param("cursor", "cursor").param("limit", "2").param("unknown", "ignored"))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].runId").value("run-1"));
         verify(guard).requireExecution(TianjiAgentPermissions.LIST_API);
         verify(ledger).list(ACTOR, new ListAgentRunsQuery("cursor", 2));
