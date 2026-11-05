@@ -35,7 +35,13 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -74,6 +80,8 @@ class AdkDurableResumeBoundaryPostgresTest {
     private static final String CALL = "fixture-read-call";
     private static final String RESULT = "continuation response";
     private static final long SECONDS = 5;
+    private static final long CHILD_SECONDS = 12;
+    private static final String CHILD_SWITCH = "tianji.postgres.resume.probe.fork.child";
     private static final RunConfig CONFIG = RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE)
             .setMaxLlmCalls(3).setAutoCreateSession(false).build();
 
@@ -161,17 +169,242 @@ class AdkDurableResumeBoundaryPostgresTest {
         assertEquals(AgentRunStatusEnum.SUSPENDED, fixture.ledger.get(fixture.actor, query).status());
     }
 
+    @Test
+    @EnabledIfSystemProperty(named = "tianji.postgres.resume.probe.fork", matches = "true")
+    void resumes_saved_pre_model_invocation_after_the_original_process_is_killed() throws Exception {
+        for (boolean typedWrites : List.of(false, true)) {
+            var fixture = new Fixture(typedWrites, false);
+            var directory = Files.createTempDirectory("tianji-resume-fork-",
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))).toRealPath();
+            var captureMarker = directory.resolve("capture");
+            var resumeMarker = directory.resolve("resume");
+            try {
+                String url = isolatedSource().getUrl();
+                var captureRequest = new AdkResumeProbeHandoff.Request(url, fixture.actor.tenantId(),
+                        typedWrites, fixture.run, null, null);
+                var original = startChild(captureRequest, captureMarker);
+                long originalPid = original.pid();
+                try {
+                    awaitCapture(original, captureMarker);
+                    assertNotEquals(ProcessHandle.current().pid(), originalPid);
+                    assertTrue(original.isAlive(), "the original child must still be stopped at the pre-model cut");
+                    original.destroyForcibly();
+                    assertTrue(original.waitFor(CHILD_SECONDS, TimeUnit.SECONDS), "original child was not reaped");
+                    assertNotEquals(0, original.exitValue(), "original child was forcibly terminated");
+                } finally {
+                    reap(original);
+                }
+
+                var old = fixture.leaseFact();
+                assertNotNull(old);
+                assertNotNull(old.owner());
+                var prefix = fixture.history();
+                assertEquals(1, prefix.size());
+                String invocationId = prefix.getFirst().invocationId();
+                assertTrue(originalInput(prefix.getFirst(), invocationId));
+                var bytesBefore = fixture.durablePrefix();
+                assertEquals(1, bytesBefore.size());
+                assertEquals(1, fixture.jdbc.update("""
+                        UPDATE tianji_agent.agent_session_lease SET lease_expires_at=clock_timestamp()-interval '1 second'
+                        WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name=? AND session_id=?
+                          AND lease_owner=? AND lease_epoch=?
+                        """, fixture.actor.tenantId(), fixture.actor.subjectType().name(), fixture.actor.issuerFingerprint(),
+                        fixture.actor.subjectId(), APP, SESSION, old.owner(), old.epoch()));
+                var resumeRequest = new AdkResumeProbeHandoff.Request(url, fixture.actor.tenantId(),
+                        typedWrites, fixture.run, invocationId, sha256(old.owner()));
+                var replacement = startChild(resumeRequest, resumeMarker);
+                try {
+                    assertNotEquals(originalPid, replacement.pid());
+                    assertNotEquals(ProcessHandle.current().pid(), replacement.pid());
+                    assertTrue(replacement.waitFor(CHILD_SECONDS, TimeUnit.SECONDS), "replacement child timed out");
+                    assertEquals(0, replacement.exitValue(), "replacement child did not prove continuation");
+                    assertEquals("RESUME " + replacement.pid() + " " + (old.epoch() + 1) + "\n", readMarker(resumeMarker));
+                } finally {
+                    reap(replacement);
+                }
+
+                var after = fixture.durablePrefix();
+                assertTrue(after.size() >= bytesBefore.size(), "stored history must retain its complete prior prefix");
+                assertEquals(bytesBefore, after.subList(0, bytesBefore.size()));
+                var history = fixture.history();
+                assertEquals(1L, history.stream().filter(event -> originalInput(event, invocationId)).count());
+                assertTrue(ended(history, invocationId));
+                assertTrue(history.stream().allMatch(event -> invocationId.equals(event.invocationId())));
+                assertTrue(fixture.ledger.getResult(fixture.actor, new GetAgentRunQuery(fixture.run.runId())).isEmpty(),
+                        "native continuation does not finish or take over the product Run");
+            } finally {
+                Files.deleteIfExists(resumeMarker);
+                Files.deleteIfExists(captureMarker);
+                Files.deleteIfExists(directory);
+            }
+        }
+    }
+
+    private static Process startChild(AdkResumeProbeHandoff.Request request, Path marker) throws IOException {
+        String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
+        var java = Path.of(System.getProperty("java.home"), "bin", "java").toRealPath();
+        if (classpath == null || classpath.isBlank()) throw new IllegalStateException("Missing probe test classpath");
+        var builder = new ProcessBuilder(java.toString(), "-D" + CHILD_SWITCH + "=true", "-cp", classpath,
+                AdkDurableResumeBoundaryPostgresTest.class.getName(), marker.toString())
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
+        builder.environment().clear();
+        Process child = builder.start();
+        try {
+            try (var pipe = child.getOutputStream()) {
+                AdkResumeProbeHandoff.send(pipe, request);
+            }
+            return child;
+        } catch (IOException | RuntimeException failure) {
+            child.destroyForcibly();
+            try {
+                if (!child.waitFor(CHILD_SECONDS, TimeUnit.SECONDS)) {
+                    failure.addSuppressed(new IOException("Probe child was not reaped"));
+                }
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                failure.addSuppressed(interrupted);
+            }
+            throw failure;
+        }
+    }
+
+    private static void awaitCapture(Process child, Path marker) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(CHILD_SECONDS);
+        String expected = "CAPTURE " + child.pid() + "\n";
+        while (System.nanoTime() - deadline < 0 && child.isAlive()) {
+            if (expected.equals(readMarker(marker))) return;
+            Thread.sleep(20);
+        }
+        fail("original child did not acknowledge the persisted pre-model cut");
+    }
+
+    private static String readMarker(Path marker) throws IOException {
+        if (!Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) return "";
+        try (var stream = Files.newInputStream(marker, LinkOption.NOFOLLOW_LINKS)) {
+            byte[] data = stream.readNBytes(65);
+            if (data.length > 64) throw new IllegalStateException("Invalid disposable probe marker");
+            return new String(data, StandardCharsets.US_ASCII);
+        }
+    }
+
+    private static void reap(Process child) throws InterruptedException {
+        if (child.isAlive()) child.destroyForcibly();
+        assertTrue(child.waitFor(CHILD_SECONDS, TimeUnit.SECONDS), "probe child was not reaped");
+    }
+
+    public static void main(String[] arguments) throws Exception {
+        if (!Boolean.getBoolean(CHILD_SWITCH) || arguments.length != 1) {
+            throw new IllegalArgumentException("Disposable probe child is disabled");
+        }
+        var request = AdkResumeProbeHandoff.receive(System.in);
+        var marker = Path.of(arguments[0]);
+        var directory = marker.getParent();
+        if (!marker.isAbsolute() || directory == null || !directory.equals(directory.toRealPath())
+                || !directory.getFileName().toString().startsWith("tianji-resume-fork-")
+                || !Files.getPosixFilePermissions(directory, LinkOption.NOFOLLOW_LINKS)
+                .equals(PosixFilePermissions.fromString("rwx------"))
+                || !(request.resume() ? "resume" : "capture").equals(marker.getFileName().toString())) {
+            throw new IllegalArgumentException("Invalid disposable probe marker target");
+        }
+        var childSource = probeDataSource(request.url());
+        var jdbc = new JdbcTemplate(childSource);
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=9 AND count(DISTINCT version)=9 AND bool_and(success AND version ~ '^[1-9]$')
+                FROM tianji_agent.flyway_schema_history WHERE version IS NOT NULL
+                """, Boolean.class))) throw new IllegalStateException("Unexpected disposable probe schema version");
+        probeFlyway(childSource).validate();
+        var actor = probeActor(request.tenantId());
+        var store = new PostgresAdkSessionService(childSource, actor, APP, false, request.typedWrites());
+        var lease = store.acquireSessionLease(SESSION, request.run(), Duration.ofSeconds(30));
+        var bound = store.withLease(lease);
+        try {
+            if (request.resume()) resumeChild(request, jdbc, actor, bound, marker);
+            else captureChild(bound, marker);
+        } finally {
+            assertTrue(store.releaseSessionLease(lease));
+        }
+    }
+
+    private static void captureChild(PostgresAdkSessionService bound, Path marker) {
+        var model = new ScriptModel(request -> {
+            fail("the capture child must not invoke the fake model");
+            return Flowable.empty();
+        });
+        var original = runner(bound, model, builder ->
+                builder.beforeModelCallback((context, request) -> Maybe.defer(() -> {
+                    var events = read(bound).immutableEvents();
+                    assertEquals(1, events.size());
+                    var saved = events.getFirst();
+                    assertTrue(originalInput(saved, saved.invocationId()));
+                    assertEquals(0, model.calls.get());
+                    writeMarker(marker, "CAPTURE " + ProcessHandle.current().pid());
+                    return Maybe.never();
+                })));
+        try {
+            // The parent bounds and kills this process after the acknowledged cut.
+            fresh(original, bound).blockingSubscribe();
+            fail("capture child exited the pre-model cut before it was killed");
+        } finally {
+            close(original);
+        }
+    }
+
+    private static void resumeChild(AdkResumeProbeHandoff.Request request, JdbcTemplate jdbc,
+                                    TrustedAgentActor actor, PostgresAdkSessionService bound, Path marker) throws IOException {
+        var current = leaseFact(jdbc, actor);
+        assertNotNull(current);
+        assertNotNull(current.owner());
+        assertNotEquals(request.priorSessionOwnerSha256(), sha256(current.owner()));
+        var model = new ScriptModel(candidate -> {
+            assertTrue(candidate.contents().stream().anyMatch(content -> hasText(content, ORIGINAL)));
+            return Flowable.just(response(Part.fromText(RESULT)));
+        });
+        var replacement = runner(bound, model, builder -> { });
+        try {
+            var output = collect(explicit(replacement, bound, request.invocationId()));
+            assertFalse(output.isEmpty());
+            assertTrue(output.stream().allMatch(event -> request.invocationId().equals(event.invocationId())));
+            assertTrue(output.stream().anyMatch(event -> event.content().map(content -> hasText(content, RESULT)).orElse(false)));
+            assertEquals(1, model.calls.get());
+            assertTrue(ended(read(bound).immutableEvents(), request.invocationId()));
+            assertTrue(collect(explicit(replacement, bound, request.invocationId())).isEmpty());
+            assertEquals(1, model.calls.get());
+            writeMarker(marker, "RESUME " + ProcessHandle.current().pid() + " " + current.epoch());
+        } finally {
+            close(replacement);
+        }
+    }
+
+    private static void writeMarker(Path marker, String text) throws IOException {
+        Files.writeString(marker, text + "\n", StandardCharsets.US_ASCII, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+    }
+
+    private static TrustedAgentActor probeActor(long tenant) {
+        return new TrustedAgentActor(tenant, TrustedAgentActor.SubjectType.USER, "native-resume-probe", "a".repeat(64));
+    }
+
+    private static LeaseFact leaseFact(JdbcTemplate jdbc, TrustedAgentActor actor) {
+        return jdbc.queryForObject("""
+                SELECT lease_owner,lease_epoch FROM tianji_agent.agent_session_lease
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name=? AND session_id=?
+                """, (row, index) -> new LeaseFact(row.getString(1), row.getLong(2)),
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), APP, SESSION);
+    }
+
     private static final class Fixture {
         private final JdbcTemplate jdbc = new JdbcTemplate(isolatedSource());
         private final AgentLedgerService ledger = new AgentLedgerService(isolatedSource());
-        private final TrustedAgentActor actor = new TrustedAgentActor(TENANT.incrementAndGet(),
-                TrustedAgentActor.SubjectType.USER, "native-resume-probe", "a".repeat(64));
+        private final TrustedAgentActor actor = probeActor(TENANT.incrementAndGet());
         private final boolean typedWrites;
         private final PostgresAdkSessionService store;
         private final AgentRunLease run;
         private final SessionLease oldLease;
 
         Fixture(boolean typedWrites) {
+            this(typedWrites, true);
+        }
+
+        Fixture(boolean typedWrites, boolean acquireOldSession) {
             this.typedWrites = typedWrites;
             store = newStore();
             assertNotNull(store.createSession(APP, store.adkUserId(), Map.of(), SESSION)
@@ -181,7 +414,7 @@ class AdkDurableResumeBoundaryPostgresTest {
                     null, null, new AgentInputDTO(ORIGINAL, List.of(), Map.of()), null));
             run = ledger.claim(actor, new GetAgentRunQuery(queued.runId()), queued.revision(),
                     "original-run-owner", Duration.ofSeconds(45)).lease();
-            oldLease = store.acquireSessionLease(SESSION, run, Duration.ofSeconds(40));
+            oldLease = acquireOldSession ? store.acquireSessionLease(SESSION, run, Duration.ofSeconds(40)) : null;
         }
 
         private PostgresAdkSessionService newStore() {
@@ -249,11 +482,7 @@ class AdkDurableResumeBoundaryPostgresTest {
         }
 
         private LeaseFact leaseFact() {
-            return jdbc.queryForObject("""
-                    SELECT lease_owner,lease_epoch FROM tianji_agent.agent_session_lease
-                    WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name=? AND session_id=?
-                    """, (row, index) -> new LeaseFact(row.getString(1), row.getLong(2)),
-                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), APP, SESSION);
+            return AdkDurableResumeBoundaryPostgresTest.leaseFact(jdbc, actor);
         }
 
         private List<String> durablePrefix() {
@@ -281,6 +510,27 @@ class AdkDurableResumeBoundaryPostgresTest {
             if (!url.equals(source.getUrl())) throw new IllegalStateException("resume probe database changed");
             return source;
         }
+        var candidate = probeDataSource(url);
+        var database = new JdbcTemplate(candidate);
+        if (!Boolean.TRUE.equals(database.queryForObject(
+                "SELECT NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname='tianji_agent')", Boolean.class))) {
+            throw new IllegalStateException("Resume probe requires a fresh database without a Tianji schema");
+        }
+        var flyway = probeFlyway(candidate);
+        flyway.migrate();
+        flyway.validate();
+        source = candidate;
+        return source;
+    }
+
+    private static Flyway probeFlyway(DriverManagerDataSource candidate) {
+        return Flyway.configure().dataSource(candidate).schemas("tianji_agent")
+                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").target("9")
+                .cleanDisabled(true).lockRetryCount(0).load();
+    }
+
+    private static DriverManagerDataSource probeDataSource(String url) {
+        String expectedDatabase = AdkResumeProbeHandoff.databaseName(url);
         var candidate = new DriverManagerDataSource();
         candidate.setUrl(url);
         var limits = new Properties();
@@ -290,19 +540,11 @@ class AdkDurableResumeBoundaryPostgresTest {
         limits.setProperty("options", "-c statement_timeout=5000 -c lock_timeout=2000");
         candidate.setConnectionProperties(limits);
         var database = new JdbcTemplate(candidate);
-        if (!Boolean.TRUE.equals(database.queryForObject("""
-                SELECT current_database()=? AND NOT pg_is_in_recovery()
-                  AND NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname='tianji_agent')
-                """, Boolean.class, binding.group(2)))) {
-            throw new IllegalStateException("resume probe requires a fresh primary database without a Tianji schema");
+        if (!Boolean.TRUE.equals(database.queryForObject(
+                "SELECT current_database()=? AND NOT pg_is_in_recovery()", Boolean.class, expectedDatabase))) {
+            throw new IllegalStateException("Resume probe requires the exact disposable primary database");
         }
-        var flyway = Flyway.configure().dataSource(candidate).schemas("tianji_agent")
-                .defaultSchema("tianji_agent").locations("classpath:db/tianji-agent").target("9")
-                .cleanDisabled(true).lockRetryCount(0).load();
-        flyway.migrate();
-        flyway.validate();
-        source = candidate;
-        return source;
+        return candidate;
     }
 
     private static Session read(PostgresAdkSessionService store) {
