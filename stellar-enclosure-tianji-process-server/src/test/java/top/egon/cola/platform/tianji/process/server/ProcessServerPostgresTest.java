@@ -89,6 +89,7 @@ import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO;
@@ -547,6 +548,7 @@ class ProcessServerPostgresTest {
             assertEquals(1, cases.createCaseInstanceQuery().caseInstanceBusinessKey("committed").count());
             assertEquals(priorDecisions + 1, decisionHistory.createHistoricDecisionExecutionQuery().decisionKey("baselineDecision").count());
             assertEquals(1, countOutbox(jdbc, "commit"));
+            verifyGovernedServiceStartAgainstDatabase(app, jdbc, validator, bpmn);
         }
 
         try (ConfigurableApplicationContext app = context(TianjiProcessServerApplication.class, scopedUrl, runtimeUser)) {
@@ -2063,6 +2065,41 @@ class ProcessServerPostgresTest {
                      correlation_id, state, resource_id, created_at)
                 VALUES (20, 'USER', 'alice', 'DECISION', 'invalid-null', ?, 'release-one', 'c', 'APPLIED', 'x', clock_timestamp())
                 """, "a".repeat(64)));
+    }
+
+    private static void verifyGovernedServiceStartAgainstDatabase(ConfigurableApplicationContext app, JdbcTemplate observer,
+            ProcessModelValidator validator, byte[] bpmn) {
+        var process = app.getBean(SpringProcessEngineConfiguration.class);
+        var dmn = app.getBean(SpringDmnEngineConfiguration.class);
+        var releases = new ProcessReleaseService(process, dmn, validator);
+        var processes = new ProcessExecutionService(process, dmn, validator);
+        var service = ProcessPermissionIntegrationTest.S07_SERVICE_ACTOR;
+        var publisher = ProcessActor.verified(service.tenantId(), ProcessActor.SubjectType.USER, "fixture-publisher",
+                "https://idp.example/tenants/20");
+        var command = new StartProcessCommand("s07GovernedStart", "s07-guarded-release", "s07-guarded-order", "s07-guarded-intent",
+                "s07-guarded-intent", Map.of("amount", 10L));
+        byte[] model = new String(bpmn, StandardCharsets.UTF_8).replace("id=\"baseline\"", "id=\"s07GovernedStart\"")
+                .getBytes(StandardCharsets.UTF_8);
+        var release = releases.publish(publisher, command.releaseVersion(), List.of(new ProcessReleaseService.ModelResource(
+                Type.BPMN, command.definitionKey(), model, Map.of("amount", ValueType.INTEGER))));
+
+        var instance = ProcessPermissionIntegrationTest.verifyServiceStartRoutes(releases, processes, release, command);
+
+        var runtime = process.getRuntimeService();
+        assertEquals(1L, runtime.createProcessInstanceQuery().processInstanceBusinessKey(command.businessKey()).count());
+        assertEquals(1L, runtime.createProcessInstanceQuery().processInstanceId(instance.instanceId()).processInstanceTenantId(TENANT).count());
+        assertEquals(1L, process.getTaskService().createTaskQuery().processInstanceId(instance.instanceId()).taskDefinitionKey("review").count());
+        assertEquals(1L, observer.queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                WHERE command_type='START' AND release_key=?
+                """, Long.class, command.releaseVersion()));
+        assertEquals(1L, observer.queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                WHERE tenant_id=? AND subject_type='SERVICE' AND subject_issuer=? AND subject_id=?
+                  AND command_type='START' AND command_id=? AND request_sha256=? AND release_key=?
+                  AND correlation_id=? AND state='APPLIED' AND resource_id=?
+                """, Long.class, service.tenantId(), service.issuerFingerprint(), service.subjectId(), command.commandId(),
+                OrchestrationRequestDigests.start(command), command.releaseVersion(), command.correlationId(), instance.instanceId()));
     }
 
     private static void verifyHttpAgainstDatabase(ConfigurableApplicationContext app, ProcessModelValidator validator) throws Exception {
