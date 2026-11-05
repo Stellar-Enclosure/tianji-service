@@ -2,6 +2,8 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.LlmAgent;
+import com.google.adk.agents.ParallelAgent;
+import com.google.adk.agents.SequentialAgent;
 import com.google.adk.models.BaseLlm;
 import com.google.adk.models.BaseLlmConnection;
 import com.google.adk.models.LlmRequest;
@@ -71,6 +73,30 @@ class AdkNativeAgentCompletionTest {
             assertEquals(AgentRunStatusEnum.COMPLETED, rig.execute().status());
             assertEquals("root final", rig.finished.get().output().get("text"));
             verify(rig.estimator, never()).bindNative(any(), any());
+        }
+    }
+
+    @Test
+    void duplicate_output_keys_in_compiled_code_first_topology_fail_before_native_execution() {
+        try (var rig = new Rig(false, "root-only")) {
+            assertEquals(AgentRunStatusEnum.FAILED,
+                    rig.executeWithFactory(scheduler -> rig.parallelTree("private-fixture-output", "private-fixture-output")).status());
+            assertEquals(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE.name(), rig.finished.get().errorCode());
+            assertEquals("NONE", rig.finished.get().sideEffectOutcome());
+            assertTrue(rig.finished.get().output().isEmpty());
+            assertEquals(0, rig.model.calls.get());
+            assertTrue(rig.events.isEmpty());
+            verify(rig.budgets, never()).reserveBudget(any(), any(), any());
+        }
+    }
+
+    @Test
+    void distinct_or_missing_output_keys_keep_the_compiled_parallel_path() {
+        for (boolean twoKeys : List.of(false, true)) try (var rig = new Rig(false, "root-only")) {
+            assertEquals(AgentRunStatusEnum.COMPLETED,
+                    rig.executeWithFactory(scheduler -> rig.parallelTree("FixtureKey", twoKeys ? "fixturekey" : null)).status());
+            assertEquals(Map.of("left", "root final", "right", "root final"), rig.finished.get().output().get("agents"));
+            assertEquals(2, rig.model.calls.get());
         }
     }
 
@@ -311,10 +337,22 @@ class AdkNativeAgentCompletionTest {
                 @Override public boolean usesChatModel(ChatModel candidate) { return candidate == chatModel; }
                 @Override public BaseAgent apply(Scheduler scheduler) { return tree(); }
             } : scheduler -> LlmAgent.builder().name("legacy_root").model(model).build();
+            return executeWithFactory(factory);
+        }
+
+        AgentRunDTO executeWithFactory(Function<Scheduler, ? extends BaseAgent> factory) {
             return new AdkAgentRunExecutor(ledger, mock(AgentFlowFactory.class), mock(AgentFlowConfigValidator.class),
                     Map.of("fixtureModel", chatModel), Map.of(spec().codeRef(), factory), control, estimator, null, false,
                     (request, boundary) -> AgentRunAuthorization.Decision.ALLOW).executeQueued(actor, query);
         }
+        BaseAgent parallelTree(String leftKey, String rightKey) {
+            var left = LlmAgent.builder().name("left").model(model).outputKey(leftKey).build();
+            var right = LlmAgent.builder().name("right").model(model);
+            if (rightKey != null) right.outputKey(rightKey);
+            var nested = SequentialAgent.builder().name("nested").subAgents(right.build()).build();
+            return ParallelAgent.builder().name("fan_out").subAgents(left, nested).build();
+        }
+
         NativeAgentCompilerStrategy.TemplateSpec spec() {
             String root = bounded ? "bounded_supervisor" : supervisor ? "supervisor" : "conditional_root";
             List<String> children = bounded ? List.of("bounded_researcher", "bounded_critic") : supervisor ? List.of("researcher", "critic") : List.of("quick_research", "deep_research");

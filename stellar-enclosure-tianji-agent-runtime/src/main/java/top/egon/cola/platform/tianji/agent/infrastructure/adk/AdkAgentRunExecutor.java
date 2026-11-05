@@ -346,6 +346,8 @@ public final class AdkAgentRunExecutor {
             }
             List<BaseTool> tools = toolScope == null ? List.of() : toolScope.declaredTools();
             BaseAgent root = buildRoot(snapshot.definition(), tools);
+            Set<String> agentNames = new HashSet<>();
+            validateAgentTopology(root, agentNames, new HashSet<>());
             requireGovernedTools(root, tools);
             AgentModelBudgetEstimator selectedEstimator = budgetEstimator;
             if (nativeCompiler != null) {
@@ -405,8 +407,6 @@ public final class AdkAgentRunExecutor {
                                 AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent run lease is no longer valid"));
                     });
             Map<String, String> agentOutputs = new LinkedHashMap<>();
-            Set<String> agentNames = new HashSet<>();
-            collectAgentNames(root, agentNames);
             NativeAgentGate activeNativeGate = nativeGate;
             invocationStarted = true;
             runner.runAsync(userId, sessionId, userInput, config)
@@ -755,11 +755,18 @@ public final class AdkAgentRunExecutor {
         return null;
     }
 
-    private static void collectAgentNames(BaseAgent agent, Set<String> names) {
+    private static void validateAgentTopology(BaseAgent agent, Set<String> names, Set<String> outputKeys) {
         if (!names.add(agent.name())) {
             throw new IllegalArgumentException("Agent names must be unique within a run");
         }
-        agent.subAgents().forEach(child -> collectAgentNames(child, names));
+        if (agent instanceof LlmAgent llm) {
+            String key = llm.outputKey().orElse(null);
+            if (key != null && !outputKeys.add(key)) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+                        "Agent output keys must be unique within a run");
+            }
+        }
+        agent.subAgents().forEach(child -> validateAgentTopology(child, names, outputKeys));
     }
 
     private static boolean isTimeout(Throwable failure) {
