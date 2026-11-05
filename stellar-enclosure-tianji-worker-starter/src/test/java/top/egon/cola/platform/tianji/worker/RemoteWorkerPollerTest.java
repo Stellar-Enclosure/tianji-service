@@ -11,12 +11,14 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -236,6 +238,49 @@ class RemoteWorkerPollerTest {
         poller.stop();
         assertDoesNotThrow(poller::start);
         poller.stop();
+    }
+
+    @Test
+    void callback_delivered_after_executor_rejection_cannot_acquire_or_release_a_slot() {
+        var client = mock(WorkerClient.class);
+        var acquisitions = new AtomicInteger();
+        when(client.acquire(any())).thenAnswer(call -> {
+            acquisitions.incrementAndGet();
+            return new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, null);
+        });
+        var store = store();
+        var scheduler = mock(TaskScheduler.class);
+        var callback = captureScheduler(scheduler);
+        var handedOff = new ArrayList<Runnable>();
+        Executor delayedThenReject = task -> {
+            handedOff.add(task);
+            if (handedOff.size() == 1) throw new RejectedExecutionException("after handoff");
+        };
+        var poller = poller(client, store, List.of(registration(contract())), scheduler, delayedThenReject,
+                properties(1, Duration.ZERO));
+        try {
+            poller.start();
+            var firstGeneration = callback.get();
+            firstGeneration.run();
+            firstGeneration.run();
+            assertEquals(2, handedOff.size());
+
+            handedOff.getFirst().run();
+            assertEquals(0, acquisitions.get());
+            firstGeneration.run();
+            assertEquals(2, handedOff.size());
+
+            handedOff.get(1).run();
+            handedOff.get(1).run();
+            assertEquals(1, acquisitions.get());
+
+            poller.stop();
+            assertDoesNotThrow(poller::start);
+            firstGeneration.run();
+            assertEquals(2, handedOff.size());
+        } finally {
+            poller.stop();
+        }
     }
 
     @Test

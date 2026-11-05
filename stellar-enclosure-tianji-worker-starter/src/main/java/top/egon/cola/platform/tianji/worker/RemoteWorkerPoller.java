@@ -138,15 +138,15 @@ public final class RemoteWorkerPoller implements SmartLifecycle {
             }
             int index = Math.floorMod(nextHandler.getAndIncrement(), handlers.size());
             Handler handler = handlers.get(index);
-            var started = new AtomicBoolean();
+            var completionClaimed = new AtomicBoolean();
             try {
                 executor.execute(() -> {
-                    started.set(true);
+                    if (!completionClaimed.compareAndSet(false, true)) return;
                     try { if (active(current)) process(handler, current); }
                     finally { finished(); }
                 });
             } catch (RuntimeException rejected) {
-                if (!started.get()) finished();
+                if (completionClaimed.compareAndSet(false, true)) finished();
                 warnPolling("executor", rejected);
             }
         }
