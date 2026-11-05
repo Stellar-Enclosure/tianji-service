@@ -14,6 +14,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import javax.sql.DataSource;
@@ -52,6 +53,11 @@ public final class AgentStorageVerifier {
     private static final List<String> RUN_KEY = List.of("tenant_id", "run_id");
     private static final String MODEL_USAGE_FILE = "V15__add_agent_model_usage.sql";
     private static final String MODEL_USAGE_SHA256 = "f5b414af7c1b422697b7ab98823d78fbff0f6327e858a1f5bf816e6b75a74238";
+    private static final String CHECKPOINT_FILE = "V16__add_agent_checkpoint.sql";
+    private static final String CHECKPOINT_SHA256 = "8521cd49e7ae4401f7dd9847b27918eeeca26b2ef926aa3d43821d900ed2ca36";
+    private static final String CHECKPOINT_TABLE = "agent_checkpoint";
+    private static final List<String> CHECKPOINT_KEY = List.of("tenant_id", "run_id", "attempt", "checkpoint_no");
+    private static final List<String> CHECKPOINT_SESSION_KEY = append(SESSION_OWNER, "session_event_sequence");
     private static final List<String> MODEL_USAGE_KEY = List.of("tenant_id", "run_id", "reservation_id");
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
@@ -188,10 +194,127 @@ public final class AgentStorageVerifier {
         } catch (DataAccessException failure) { throw invalid(); }
     }
 
+    /** Validates the optional V16 capture store without installing it or reading checkpoint data. */
+    public void verifyCheckpointCapture() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
+        String migration = pinnedMigration(CHECKPOINT_FILE, CHECKPOINT_SHA256);
+        verify();
+        try {
+            transaction.executeWithoutResult(status -> {
+                if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                        SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'
+                          AND current_setting('server_encoding')='UTF8'
+                          AND current_setting('session_replication_role')='origin'
+                          AND current_setting('standard_conforming_strings')='on'
+                        """, Boolean.class))) throw invalid();
+                int expectedChecksum = checksum(CHECKPOINT_FILE);
+                var history = jdbc.query("""
+                        SELECT type,script,success,checksum FROM tianji_agent.flyway_schema_history
+                        WHERE version='16'
+                        """, (rs, row) -> "SQL".equals(rs.getString("type"))
+                        && CHECKPOINT_FILE.equals(rs.getString("script")) && rs.getBoolean("success")
+                        && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+                if (history.size() != 1 || !history.getFirst()) throw invalid();
+                verifyCheckpointColumns();
+                verifyCheckpointKeysAndIndexes();
+                verifyOptionalChecks(CHECKPOINT_TABLE, migration, 9, AgentStorageVerifier::normalizedCheck);
+                verifyCheckpointRole();
+            });
+        } catch (DataAccessException failure) {
+            throw invalid();
+        }
+    }
+
+    private void verifyCheckpointColumns() {
+        var expected = new HashMap<String, UsageColumn>();
+        for (String name : List.of("tenant_id", "run_lease_epoch", "run_revision", "run_event_sequence",
+                "session_lease_epoch", "prior_session_revision", "session_revision", "prior_session_event_sequence",
+                "session_event_sequence", "definition_version")) {
+            expected.put(name, new UsageColumn("bigint", true, false, null));
+        }
+        for (String name : List.of("attempt", "checkpoint_no")) {
+            expected.put(name, new UsageColumn("integer", true, false, null));
+        }
+        Map.ofEntries(Map.entry("run_id", 64), Map.entry("subject_type", 16), Map.entry("subject_issuer", 64),
+                Map.entry("subject_id", 256), Map.entry("app_name", 128), Map.entry("session_id", 128),
+                Map.entry("native_invocation_id", 128), Map.entry("native_event_id", 128), Map.entry("definition_key", 128),
+                Map.entry("policy_version_ref", 256), Map.entry("engine_version", 32), Map.entry("safe_boundary", 64))
+                .forEach((name, length) -> expected.put(name, new UsageColumn("character varying(" + length + ")", true, true, null)));
+        for (String name : List.of("definition_sha256", "request_sha256", "snapshot_sha256")) {
+            expected.put(name, new UsageColumn("character(64)", true, true, null));
+        }
+        expected.put("tool_receipts", new UsageColumn("jsonb", true, false, null));
+        expected.put("captured_at", new UsageColumn("timestamp(6) with time zone", true, false, null));
+        if (!expected.equals(readOptionalColumns(CHECKPOINT_TABLE))) throw invalid();
+    }
+
+    private void verifyCheckpointKeysAndIndexes() {
+        Set<Key> expected = Set.of(key(CHECKPOINT_TABLE, "p", CHECKPOINT_KEY),
+                foreign(CHECKPOINT_TABLE, RUN_KEY, "agent_run", RUN_KEY, "c"),
+                foreign(CHECKPOINT_TABLE, CHECKPOINT_SESSION_KEY, "agent_session_event", append(SESSION_OWNER, "sequence"), "c"));
+        var actual = readConstraints();
+        actual.removeIf(key -> !CHECKPOINT_TABLE.equals(key.table()));
+        if (!expected.equals(actual)) throw invalid();
+
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=3 AND bool_and(c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
+                    AND (c.contype='p' OR (c.contype='f' AND c.confupdtype='a' AND c.confdeltype='c' AND c.confmatchtype='s')))
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_checkpoint' AND c.contype NOT IN ('c','n')
+                """, Boolean.class))) throw invalid();
+
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=2 AND bool_and(i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
+                    AND am.amname='btree' AND i.indpred IS NULL AND i.indexprs IS NULL AND i.indnkeyatts=i.indnatts
+                    AND NOT EXISTS (SELECT 1 FROM unnest(i.indoption::smallint[]) v(options) WHERE options<>0)
+                    AND NOT EXISTS (SELECT 1 FROM unnest(i.indclass::oid[]) k(oid)
+                                    JOIN pg_opclass op ON op.oid=k.oid WHERE NOT op.opcdefault)
+                    AND NOT EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY co(oid,pos)
+                                    JOIN unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,pos) USING(pos)
+                                    JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num
+                                    WHERE co.oid<>a.attcollation)
+                    AND CASE x.relname WHEN 'agent_checkpoint_pkey'
+                          THEN i.indisprimary AND i.indisunique AND i.indnatts=4
+                        WHEN 'agent_checkpoint_session_event_idx'
+                          THEN NOT i.indisprimary AND NOT i.indisunique AND i.indnatts=7
+                            AND ARRAY(SELECT a.attname::text FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,pos)
+                                      JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num ORDER BY k.pos)
+                                = ARRAY['tenant_id','subject_type','subject_issuer','subject_id','app_name','session_id','session_event_sequence']
+                        ELSE false END)
+                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_checkpoint'
+                """, Boolean.class))) throw invalid();
+    }
+
+    private void verifyCheckpointRole() {
+        Boolean permitted = jdbc.queryForObject("""
+                SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                  AND has_schema_privilege(n.oid,'USAGE') AND NOT has_schema_privilege(n.oid,'CREATE')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user AND (r.rolsuper OR r.rolbypassrls))
+                  AND NOT pg_has_role(c.relowner,'MEMBER') AND NOT pg_has_role(n.nspowner,'MEMBER')
+                  AND has_table_privilege(c.oid,'INSERT') AND NOT has_table_privilege(c.oid,'DELETE,TRUNCATE,TRIGGER')
+                  AND NOT has_any_column_privilege(c.oid,'SELECT,UPDATE,REFERENCES,INSERT WITH GRANT OPTION')
+                  AND CASE WHEN current_setting('server_version_num')::integer >= 170000
+                        THEN NOT has_table_privilege(c.oid,'MAINTAIN') ELSE true END
+                  AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhrelid=c.oid OR h.inhparent=c.oid)
+                  AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
+                    AND (NOT tr.tgisinternal OR tr.tgenabled<>'O'))
+                  AND (SELECT count(*)=2 AND bool_and(
+                         (SELECT count(*)=4 AND bool_and(tr.tgisinternal AND tr.tgenabled='O')
+                          FROM pg_trigger tr WHERE tr.tgconstraint=fk.oid))
+                       FROM pg_constraint fk WHERE fk.conrelid=c.oid AND fk.contype='f')
+                  AND NOT EXISTS (SELECT 1 FROM pg_rewrite rule WHERE rule.ev_class=c.oid)
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent' AND c.relname='agent_checkpoint' AND c.relkind='r'
+                """, Boolean.class);
+        if (!Boolean.TRUE.equals(permitted)) throw invalid();
+    }
+
     /** Checks the optional V15 store on the owning primary, without installing or repairing it. */
     public void verifyModelUsage() {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
-        String migration = modelUsageMigration();
+        String migration = pinnedMigration(MODEL_USAGE_FILE, MODEL_USAGE_SHA256);
         verify();
         try {
             transaction.executeWithoutResult(status -> {
@@ -210,7 +333,7 @@ public final class AgentStorageVerifier {
                 if (history.size() != 1 || !history.getFirst()) throw invalid();
                 verifyModelUsageColumns();
                 verifyModelUsageKeys();
-                verifyModelUsageChecks(migration);
+                verifyOptionalChecks("agent_model_usage", migration, 8, AgentStorageVerifier::modelUsageCheckSignature);
                 verifyModelUsageRole();
             });
         } catch (DataAccessException failure) {
@@ -238,6 +361,10 @@ public final class AgentStorageVerifier {
                 usageColumn("final_sha256", "character(64)", false, true),
                 usageColumn("created_at", "timestamp(6) with time zone", true, false),
                 usageColumn("measured_at", "timestamp(6) with time zone", false, false));
+        if (!expected.equals(readOptionalColumns("agent_model_usage"))) throw invalid();
+    }
+
+    private Map<String, UsageColumn> readOptionalColumns(String table) {
         Map<String, UsageColumn> actual = new HashMap<>();
         jdbc.query("""
                 SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,a.attidentity,a.attgenerated,
@@ -247,7 +374,7 @@ public final class AgentStorageVerifier {
                 LEFT JOIN pg_collation co ON co.oid=a.attcollation
                 LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace
                 LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
-                WHERE n.nspname='tianji_agent' AND t.relname='agent_model_usage' AND t.relkind='r'
+                WHERE n.nspname='tianji_agent' AND t.relname=? AND t.relkind='r'
                 """, rs -> {
             String collation = rs.getString("collname");
             String defaultValue = rs.getString("default_value");
@@ -257,8 +384,8 @@ public final class AgentStorageVerifier {
             var entry = new UsageColumn(rs.getString("type"), rs.getBoolean("attnotnull"),
                     "C".equals(collation), defaultValue == null ? null : normalizedCheck(defaultValue));
             if (actual.put(rs.getString("attname"), entry) != null) throw invalid();
-        });
-        if (!expected.equals(actual)) throw invalid();
+        }, table);
+        return actual;
     }
 
     private void verifyModelUsageKeys() {
@@ -315,38 +442,39 @@ public final class AgentStorageVerifier {
         if (!seen.equals(Set.of("agent_model_usage_pkey", "agent_model_usage_budget_fkey"))) throw invalid();
     }
 
-    private void verifyModelUsageChecks(String migration) {
-        var expected = modelUsageChecks(migration);
+    private void verifyOptionalChecks(String table, String migration, int count, UnaryOperator<String> signature) {
+        var expected = optionalChecks(table, migration, count, signature);
         var actual = new HashMap<String, String>();
         jdbc.query("""
                 SELECT c.conname,c.convalidated,c.connoinherit,pg_get_constraintdef(c.oid) AS definition
                 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
                 JOIN pg_namespace n ON n.oid=t.relnamespace
-                WHERE n.nspname='tianji_agent' AND t.relname='agent_model_usage' AND c.contype='c'
+                WHERE n.nspname='tianji_agent' AND t.relname=? AND c.contype='c'
                 """, rs -> {
             if (!rs.getBoolean("convalidated") || rs.getBoolean("connoinherit")
-                    || actual.put(rs.getString("conname"), modelUsageCheckSignature(rs.getString("definition"))) != null) {
+                    || actual.put(rs.getString("conname"), signature.apply(rs.getString("definition"))) != null) {
                 throw invalid();
             }
-        });
+        }, table);
         if (!expected.equals(actual)) throw invalid();
     }
 
-    private static Map<String, String> modelUsageChecks(String migration) {
+    private static Map<String, String> optionalChecks(String table, String migration, int count,
+                                                      UnaryOperator<String> signature) {
         var checks = new HashMap<String, String>();
-        var clauses = Pattern.compile("CONSTRAINT (agent_model_usage_[a-z_]+) CHECK\\s*\\(").matcher(migration);
+        var clauses = Pattern.compile("CONSTRAINT (" + Pattern.quote(table) + "_[a-z_]+) CHECK\\s*\\(").matcher(migration);
         while (clauses.find()) {
             int open = clauses.end() - 1;
-            int end = modelUsageCheckEnd(migration, open);
-            if (checks.put(clauses.group(1), modelUsageCheckSignature("CHECK " + migration.substring(open, end + 1))) != null) {
+            int end = checkEnd(migration, open);
+            if (checks.put(clauses.group(1), signature.apply("CHECK " + migration.substring(open, end + 1))) != null) {
                 throw invalid();
             }
         }
-        if (checks.size() != 8) throw invalid();
+        if (checks.size() != count) throw invalid();
         return checks;
     }
 
-    private static int modelUsageCheckEnd(String sql, int open) {
+    private static int checkEnd(String sql, int open) {
         int depth = 0;
         boolean quoted = false;
         for (int index = open; index < sql.length(); index++) {
@@ -390,12 +518,12 @@ public final class AgentStorageVerifier {
         if (!Boolean.TRUE.equals(permitted)) throw invalid();
     }
 
-    private static String modelUsageMigration() {
+    private static String pinnedMigration(String file, String sha256) {
         try (InputStream input = AgentStorageVerifier.class.getClassLoader()
-                .getResourceAsStream("db/tianji-agent/" + MODEL_USAGE_FILE)) {
+                .getResourceAsStream("db/tianji-agent/" + file)) {
             if (input == null) throw invalid();
             byte[] bytes = input.readNBytes(8193);
-            if (bytes.length > 8192 || !MODEL_USAGE_SHA256.equals(HexFormat.of()
+            if (bytes.length > 8192 || !sha256.equals(HexFormat.of()
                     .formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {
