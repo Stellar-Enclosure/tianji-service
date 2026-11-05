@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.DEFER_RESULT_UNTIL_TIMER_OR_RESTART;
 import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.DROP_COMMITTED_RESULT_202;
+import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.DROP_COMMITTED_WORKER_COMPLETE_200;
 import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT;
 import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.HOLD_LINKED_SUCCESS;
 import static top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase.OBSERVE_REPLACEMENT_RESEND;
@@ -46,13 +47,16 @@ class WorkerRecoveryIT {
                     var lost = driver.start(tenant, Scenario.RECOVERY, "lost-complete", RECOVERY_AMOUNT);
                     String reacquired = lostAcknowledgement(driver, lost);
                     var baseline = driver.result(lost, Map.of());
+                    var forwarded = driver.start(tenant, Scenario.RECOVERY, "forwarded-complete", RECOVERY_AMOUNT);
+                    forwardedAcknowledgement(driver, forwarded);
+                    driver.result(forwarded, Map.of());
                     var early = driver.start(tenant, Scenario.RECOVERY, "early-agent-restart", RECOVERY_AMOUNT);
                     var delivery = earlyResultAndAgentRestart(driver, early);
                     driver.result(early, Map.of());
                     var wait = driver.start(tenant, Scenario.RECOVERY, "retained-process-wait", RECOVERY_AMOUNT);
                     String retained = processRestart(driver, wait);
                     driver.result(wait, Map.of());
-                    for (RunDTO run : java.util.List.of(lost, early, wait)) {
+                    for (RunDTO run : java.util.List.of(lost, forwarded, early, wait)) {
                         RunDTO firstTenant = prior.putIfAbsent(run.window(), run);
                         if (firstTenant != null) driver.assertDisjoint(firstTenant, run);
                     }
@@ -122,6 +126,32 @@ class WorkerRecoveryIT {
             assertEquals(afterCommit.originalReceiptId(), settled.originalReceiptId());
             assertEquals(1, settled.originalCount());
             return join(job, fresh.occurrenceId(), original.leasedAt().toEpochMilli(), fresh.leasedAt().toEpochMilli());
+        } finally {
+            driver.stopWorker(run);
+        }
+    }
+
+    private static void forwardedAcknowledgement(Driver driver, RunDTO run) {
+        var relay = driver.relay();
+        String job = driver.await(run, () -> driver.workerJob(run));
+        arm(driver, run, DROP_COMMITTED_WORKER_COMPLETE_200, job, job, null, null);
+        driver.startWorker(run, false);
+        try {
+            var replay = relay.awaitObserved(DROP_COMMITTED_WORKER_COMPLETE_200, driver.relayBudget());
+            var original = driver.droppedComplete(run).orElseThrow();
+            assertEquals(job, original.taskId());
+            assertEquals(original.activityOccurrenceId(), replay.occurrenceId());
+            driver.assertNormalEnd(run);
+            var leases = driver.leaseRows(run, "reserveExpense");
+            assertEquals(1, leases.size(), "Committed ACK replay keeps the original lease");
+            var completed = leases.getFirst();
+            assertEquals(job, completed.jobId());
+            assertEquals(original.activityOccurrenceId(), completed.occurrenceId());
+            assertEquals(WorkerLeaseStore.tokenHash(original.leaseToken()), completed.tokenSha256());
+            assertEquals("COMPLETED", completed.state());
+            var effects = driver.effects(run);
+            assertEquals(original.businessReceiptId(), effects.originalReceiptId());
+            assertEquals(1, effects.originalCount());
         } finally {
             driver.stopWorker(run);
         }

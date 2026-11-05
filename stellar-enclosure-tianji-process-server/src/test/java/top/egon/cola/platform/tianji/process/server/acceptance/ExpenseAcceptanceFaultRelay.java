@@ -15,6 +15,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartResult;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceHarness.ExpenseAcceptanceManifestDTO;
 
 import javax.net.ssl.SSLContext;
@@ -32,9 +34,12 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -161,6 +166,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         Window window = matchingWindow(route, exchange);
         if (window == null) return Decision.PASS_THROUGH;
         requireRemaining(window, now);
+        if (window.workerCompletion != null) return Decision.OBSERVE_RESEND;
         return decision(window.definition.phase());
     }
 
@@ -217,11 +223,57 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
                 finish(window, observed);
                 throw new ConnectionDropped();
             }
+            case DROP_COMMITTED_WORKER_COMPLETE_200 -> forwardWorkerCompletion(window, candidate, request, decoded);
             case HOLD_LINKED_SUCCESS -> holdLinked(window, candidate, request, route, observed);
             case DEFER_RESULT_UNTIL_TIMER_OR_RESTART -> deferResult(window, request, route, observed);
             case DROP_COMMITTED_RESULT_202 -> dropCommittedResult(window, candidate, request, route, observed, traceLink);
             case OBSERVE_REPLACEMENT_RESEND -> observeResend(window, candidate, request, route, observed, traceLink);
         };
+    }
+
+    private ResponseDTO forwardWorkerCompletion(Window window, FaultWindowDTO candidate, RequestDTO request, Decoded decoded) {
+        var observed = decoded.observed();
+        String requestSha256 = workerCompletionDigest(request.body);
+        WorkerCompletionWitness original;
+        synchronized (this) {
+            original = window.workerCompletion;
+            if (original != null && !original.requestSha256().equals(requestSha256)) throw unavailable();
+            claim(window);
+        }
+        try {
+            if (original == null && !witnesses.businessCommitted(candidate, observed, decoded.leaseToken(), decoded.receiptId())) {
+                throw unavailable();
+            }
+            var reply = forwardChecked(request, timeFor(window), Route.WORKER_COMPLETE);
+            if (reply.status() != 200) throw unavailable();
+            var receipt = read(reply.body(), WorkerReceiptDTO.class);
+            if (receipt == null || !observed.jobId().equals(receipt.taskId())
+                    || !observed.occurrenceId().equals(receipt.activityOccurrenceId())
+                    || receipt.outcome() != WorkerReceiptOutcomeEnum.COMPLETED) throw unavailable();
+            if (original != null) {
+                if (!original.receipt().equals(receipt)) throw unavailable();
+                finish(window, observed);
+                return reply;
+            }
+            synchronized (this) {
+                requireOpen();
+                requireRemaining(window, nanoTime.getAsLong());
+                window.workerCompletion = new WorkerCompletionWitness(requestSha256, receipt);
+                window.claimed = false;
+            }
+        } catch (RuntimeException failure) {
+            fail(window);
+            throw failure;
+        }
+        throw new ConnectionDropped();
+    }
+
+    private static String workerCompletionDigest(byte[] body) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(body));
+        } catch (NoSuchAlgorithmException missingSha256) {
+            throw new IllegalStateException("Expense relay SHA-256 is unavailable", missingSha256);
+        }
     }
 
     private ResponseDTO holdLinked(Window window, FaultWindowDTO candidate, RequestDTO request, Route route,
@@ -435,7 +487,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
 
     private static Route route(FaultPhase phase) {
         return switch (phase) {
-            case DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT -> Route.WORKER_COMPLETE;
+            case DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT, DROP_COMMITTED_WORKER_COMPLETE_200 -> Route.WORKER_COMPLETE;
             case HOLD_LINKED_SUCCESS -> Route.LINKED_SUBMIT;
             case DEFER_RESULT_UNTIL_TIMER_OR_RESTART, DROP_COMMITTED_RESULT_202, OBSERVE_REPLACEMENT_RESEND -> Route.RESULT;
         };
@@ -455,7 +507,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
             case DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT -> Decision.DROP_BEFORE_UPSTREAM;
             case HOLD_LINKED_SUCCESS -> Decision.HOLD_RESPONSE;
             case DEFER_RESULT_UNTIL_TIMER_OR_RESTART -> Decision.DEFER_RETRYABLY;
-            case DROP_COMMITTED_RESULT_202 -> Decision.DROP_RESPONSE;
+            case DROP_COMMITTED_RESULT_202, DROP_COMMITTED_WORKER_COMPLETE_200 -> Decision.DROP_RESPONSE;
             case OBSERVE_REPLACEMENT_RESEND -> Decision.OBSERVE_RESEND;
         };
     }
@@ -465,11 +517,12 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
                 || !safeId(window.sourceId(), 128) || !safeId(window.instanceId(), 255)) throw invalid();
         boolean mayResolveOccurrence = switch (window.phase()) {
             case HOLD_LINKED_SUCCESS, DEFER_RESULT_UNTIL_TIMER_OR_RESTART, DROP_COMMITTED_RESULT_202 -> true;
-            case DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT, OBSERVE_REPLACEMENT_RESEND -> false;
+            case DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT, DROP_COMMITTED_WORKER_COMPLETE_200,
+                    OBSERVE_REPLACEMENT_RESEND -> false;
         };
         if (window.occurrenceId() == null ? !mayResolveOccurrence : !safeId(window.occurrenceId(), 255)) throw invalid();
         bounded(window.budget(), window.phase() == FaultPhase.HOLD_LINKED_SUCCESS ? MAX_HOLD : MAX_WINDOW);
-        boolean worker = window.phase() == FaultPhase.DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT;
+        boolean worker = route(window.phase()) == Route.WORKER_COMPLETE;
         if (worker ? !safeId(window.jobId(), 255) : window.jobId() != null) throw invalid();
         if (window.phase() == FaultPhase.OBSERVE_REPLACEMENT_RESEND && window.eventId() == null
                 || (window.eventId() == null) != (window.fingerprint() == null)
@@ -720,7 +773,8 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     enum Direction { WORKER, LINKED, RESULT }
 
     enum FaultPhase {
-        DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT, HOLD_LINKED_SUCCESS, DEFER_RESULT_UNTIL_TIMER_OR_RESTART,
+        DROP_WORKER_COMPLETE_AFTER_BUSINESS_COMMIT, DROP_COMMITTED_WORKER_COMPLETE_200, HOLD_LINKED_SUCCESS,
+        DEFER_RESULT_UNTIL_TIMER_OR_RESTART,
         DROP_COMMITTED_RESULT_202, OBSERVE_REPLACEMENT_RESEND
     }
 
@@ -780,6 +834,10 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         @Override public String toString() { return "Expense relay scope"; }
     }
 
+    private record WorkerCompletionWitness(String requestSha256, WorkerReceiptDTO receipt) {
+        @Override public String toString() { return "Expense Worker completion witness"; }
+    }
+
     private enum Route {
         WORKER_ACQUIRE(262_144, 2_097_152), WORKER_COMPLETE(262_144, 2_097_152), WORKER_FAIL(262_144, 2_097_152),
         LINKED_SUBMIT(2_097_152, 65_536), LINKED_LOOKUP(16_384, 65_536), RESULT(16_384, 16_384);
@@ -798,6 +856,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         private final long started;
         private ObservationDTO observation;
         private String committedResultLink;
+        private WorkerCompletionWitness workerCompletion;
         private String boundOccurrenceId;
         private boolean claimed;
         private boolean finished;
