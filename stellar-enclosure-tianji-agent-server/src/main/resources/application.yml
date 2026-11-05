@@ -40,6 +40,9 @@ egon:
 stellar:
   tianji:
     agent:
+      storage:
+        model-usage-enabled: false
+        model-usage-cumulative-route-refs: []
       native-templates:
         enabled: false
         model-bean-name: ""
