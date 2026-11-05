@@ -64,6 +64,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private final AdkContextSnapshotProjector snapshots;
     private final boolean trimming;
     private final AdkGovernedToolBridge.Scope toolScope;
+    private final NativeAgentGate nativeGate;
     private final Set<InvocationContext> admittedContexts = Collections.newSetFromMap(new IdentityHashMap<>());
     private boolean closed;
     private int toolEntries;
@@ -111,6 +112,16 @@ final class AdkRunBudgetPlugin implements Plugin {
                        ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
                        AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions,
                        AdkGovernedToolBridge.Scope toolScope) {
+        this(ledger, actor, lease, snapshot, estimator, authorization, retryScheduler, controlExecutor,
+                contextAssembler, authorizationRequest, contextOptions, toolScope, null);
+    }
+
+    AdkRunBudgetPlugin(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunLease lease,
+                       AgentExecutionSnapshot snapshot, AgentModelBudgetEstimator estimator,
+                       AgentExecutionAuthorization authorization, Scheduler retryScheduler,
+                       ScheduledExecutorService controlExecutor, DefaultContextAssembler contextAssembler,
+                       AgentRunAuthorization.Request authorizationRequest, AgentContextRuntimeOptions contextOptions,
+                       AdkGovernedToolBridge.Scope toolScope, NativeAgentGate nativeGate) {
         this.ledger = ledger;
         this.actor = actor;
         this.lease = lease;
@@ -124,6 +135,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         this.snapshots = contextOptions.snapshots() ? new AdkContextSnapshotProjector(snapshot, authorizationRequest, lease, contextAssembler) : null;
         this.trimming = contextOptions.trimming();
         this.toolScope = toolScope;
+        this.nativeGate = nativeGate;
     }
 
     void bindSessionFence(Runnable fence) {
@@ -139,8 +151,9 @@ final class AdkRunBudgetPlugin implements Plugin {
         var contextApplied = new java.util.concurrent.atomic.AtomicBoolean();
         var preparedContext = new java.util.concurrent.atomic.AtomicReference<AdkContextSnapshotProjector.PreparedCall>();
         var contextPlan = new java.util.concurrent.atomic.AtomicReference<AdkContextWindowPlan>();
-        return safeErrors(Maybe.<LlmResponse>defer(() -> {
-            if (toolScope != null) requireNativeContext(context, false);
+        return callbackErrors(Maybe.<LlmResponse>defer(() -> {
+            if (tracking()) requireNativeContext(context, false);
+            if (nativeGate != null) nativeGate.requireExpectedAgent(context);
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
             requireSessionFence();
             long sourceDeadline = authorizationRequest.sessionRequired() || contextAssembler.hasProviders() ? System.nanoTime() + sourceTimeout().toNanos() : 0;
@@ -203,7 +216,8 @@ final class AdkRunBudgetPlugin implements Plugin {
                         "model call reservation was already used");
             }
             synchronized (admittedContexts) {
-                if (toolScope != null) requireNativeContext(context, false);
+                if (tracking()) requireNativeContext(context, false);
+                if (nativeGate != null) nativeGate.requireExpectedAgent(context);
                 IdleGuard guard = new IdleGuard(snapshot.effectivePolicy().modelIdleTimeout().toNanos());
                 if (idleGuards.putIfAbsent(context.eventId(), guard) != null) {
                     throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
@@ -211,7 +225,7 @@ final class AdkRunBudgetPlugin implements Plugin {
                 }
                 guard.touch();
                 if (snapshots == null) request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
-                if (toolScope != null) {
+                if (tracking()) {
                     InvocationContext nativeContext = context.invocationContext();
                     nativeSessionId = context.sessionId(); nativeInvocationId = context.invocationId();
                     admittedContexts.add(nativeContext);
@@ -302,7 +316,8 @@ final class AdkRunBudgetPlugin implements Plugin {
 
     @Override
     public Maybe<LlmResponse> afterModelCallback(CallbackContext context, LlmResponse response) {
-        return safeErrors(Maybe.defer(() -> {
+        return callbackErrors(Maybe.defer(() -> {
+            if (tracking()) requireNativeContext(context, true);
             if (response.partial().orElse(false)) {
                 IdleGuard guard = idleGuards.get(context.eventId());
                 if (guard != null) guard.touch();
@@ -312,6 +327,8 @@ final class AdkRunBudgetPlugin implements Plugin {
             if (response.errorMessage().isPresent() || response.errorCode().isPresent()
                     || response.interrupted().orElse(false)) {
                 ledger.budgets().settleBudget(actor, lease, context.eventId(), new AgentBudgetSettlement(null, null, null));
+                if (nativeGate != null) nativeGate.markFatal(new AgentLedgerException(
+                        AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Native Agent model response failed"));
                 return Maybe.just(LlmResponse.builder()
                         .errorMessage(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name())
                         .interrupted(true).build());
@@ -325,6 +342,7 @@ final class AdkRunBudgetPlugin implements Plugin {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_USAGE_UNKNOWN,
                         "model usage cannot be verified against its reservation");
             }
+            if (nativeGate != null) nativeGate.observeResponse(context, response);
             return Maybe.empty();
         }));
     }
@@ -333,6 +351,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     public Maybe<LlmResponse> onModelErrorCallback(CallbackContext context, LlmRequest.Builder request,
                                                    Throwable failure) {
         closeIdleGuard(context.eventId());
+        if (nativeGate != null) nativeGate.markFatal(failure);
         log.warn("Agent model stage=CALL outcome=ERROR errorType={}", failure.getClass().getSimpleName());
         return Maybe.just(LlmResponse.builder().errorMessage(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name())
                 .interrupted(true).build());
@@ -344,6 +363,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             synchronized (admittedContexts) { closed = true; admittedContexts.clear(); }
             idleGuards.values().forEach(IdleGuard::close);
             idleGuards.clear();
+            if (nativeGate != null) nativeGate.close();
             idleSignal.onComplete();
         });
     }
@@ -397,6 +417,16 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<Map<String, Object>> beforeToolCallback(BaseTool tool, Map<String, Object> arguments,
                                                           ToolContext context) {
+        if (nativeGate != null) {
+            return Maybe.<Map<String, Object>>fromAction(() -> {
+                requireNativeContext(context, true);
+                nativeGate.requireExpectedAgent(context);
+                authorization.require(AgentRunAuthorization.Boundary.MODEL);
+                requireSessionFence();
+                nativeGate.beforeTool(tool, arguments, context);
+            }).onErrorResumeNext(failure -> Maybe.error(nativeGate.markFatal(failure)))
+                    .subscribeOn(AgentFlowSchedulers.contextAwareIo());
+        }
         if (toolScope == null) return Maybe.error(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                 "governed tool execution is not available"));
         return safeErrors(Maybe.fromCallable(() -> {
@@ -414,6 +444,28 @@ final class AdkRunBudgetPlugin implements Plugin {
             }
             return Objects.requireNonNull(toolScope.execute(tool, arguments, UUID.randomUUID(), context.agentName(), callFence), "governed tool result");
         }).subscribeOn(AgentFlowSchedulers.contextAwareIo()));
+    }
+
+    @Override
+    public Maybe<Map<String, Object>> afterToolCallback(BaseTool tool, Map<String, Object> arguments,
+                                                         ToolContext context, Map<String, Object> result) {
+        if (nativeGate == null) return Maybe.empty();
+        return Maybe.<Map<String, Object>>fromAction(() -> nativeGate.afterTool(tool, arguments, context, result))
+                .onErrorResumeNext(failure -> Maybe.error(nativeGate.markFatal(failure)));
+    }
+
+    @Override
+    public Maybe<Map<String, Object>> onToolErrorCallback(BaseTool tool, Map<String, Object> arguments,
+                                                          ToolContext context, Throwable failure) {
+        if (nativeGate == null) return Maybe.empty();
+        return Maybe.defer(() -> {
+            RuntimeException safe = nativeGate.onToolError(tool, arguments, context, failure);
+            return nativeGate.incomingAlreadySafe(failure) ? Maybe.empty() : Maybe.error(safe);
+        });
+    }
+
+    private boolean tracking() {
+        return toolScope != null || nativeGate != null;
     }
 
     private void requireNativeContext(CallbackContext context, boolean admitted) {
@@ -446,7 +498,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         try {
             return Objects.requireNonNull(estimator.estimate(snapshot, request), "model budget estimate");
         } catch (RuntimeException failure) {
-            throw safeFailure(failure);
+            throw estimatorFailure(failure);
         }
     }
 
@@ -454,7 +506,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         try {
             return Objects.requireNonNull(estimator.contextWindow(snapshot, request), "model context window");
         } catch (RuntimeException failure) {
-            throw safeFailure(failure);
+            throw estimatorFailure(failure);
         }
     }
 
@@ -462,8 +514,17 @@ final class AdkRunBudgetPlugin implements Plugin {
         try {
             return estimator.actualUsage(snapshot, response);
         } catch (RuntimeException failure) {
-            throw safeFailure(failure);
+            throw estimatorFailure(failure);
         }
+    }
+
+    private RuntimeException estimatorFailure(RuntimeException failure) {
+        return nativeGate == null ? safeFailure(failure) : failure;
+    }
+
+    private <T> Maybe<T> callbackErrors(Maybe<T> source) {
+        if (nativeGate == null) return safeErrors(source);
+        return source.onErrorResumeNext(failure -> Maybe.error(nativeGate.markFatal(failure)));
     }
 
     private <T> Maybe<T> safeErrors(Maybe<T> source) {

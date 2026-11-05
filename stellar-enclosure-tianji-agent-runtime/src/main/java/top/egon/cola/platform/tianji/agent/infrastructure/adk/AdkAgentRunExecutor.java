@@ -289,20 +289,37 @@ public final class AdkAgentRunExecutor {
         PostgresAdkSessionService sessions = null;
         SessionLease sessionLease = null;
         AdkGovernedToolBridge.Scope toolScope = null;
+        NativeAgentGate nativeGate = null;
+        boolean nativeSelected = "CODE_FIRST".equals(material.snapshot().definition().executionMode())
+                && material.snapshot().definition().codeRef() != null
+                && codeFirstFactories.get(material.snapshot().definition().codeRef()) instanceof NativeAgentCompilerStrategy;
         boolean invocationStarted = false;
         try {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
             var input = contextAssembler.assemble(snapshot.input());
             var dependencies = snapshot.definition().dependencies();
+            NativeAgentCompilerStrategy nativeCompiler = nativeSelected
+                    ? (NativeAgentCompilerStrategy) codeFirstFactories.get(snapshot.definition().codeRef()) : null;
+            NativeAgentCompilerStrategy.TemplateSpec nativeSpec = nativeCompiler == null ? null
+                    : requireNativeDefinition(snapshot, nativeCompiler);
             if (!dependencies.tools().isEmpty() || !snapshot.effectivePolicy().allowedToolVersions().isEmpty()) {
                 toolScope = governedTools().bindScope(material, lease, eventSink::tool);
             }
             List<BaseTool> tools = toolScope == null ? List.of() : toolScope.declaredTools();
             BaseAgent root = buildRoot(snapshot.definition(), tools);
             requireGovernedTools(root, tools);
-            AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, budgetEstimator,
-                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextOptions, toolScope);
+            AgentModelBudgetEstimator selectedEstimator = budgetEstimator;
+            if (nativeCompiler != null) {
+                ChatModel model = chatModels.get(nativeSpec.modelBeanName());
+                nativeGate = NativeAgentGate.bind(nativeSpec, root, nativeSpec.topologyHash(dependencies.policyVersionRef()),
+                        (author, payload) -> eventSink.append("NATIVE_TRANSFER_AUTHORIZED", author, payload));
+                selectedEstimator = Objects.requireNonNull(budgetEstimator.bindNative(snapshot,
+                        new AgentModelBudgetEstimator.NativeModelBinding(nativeSpec.codeRef(), nativeSpec.modelBeanName(), nativeSpec.modelName(), model)),
+                        "Native model budget binding is unavailable");
+            }
+            AdkRunBudgetPlugin budget = new AdkRunBudgetPlugin(ledger, actor, lease, snapshot, selectedEstimator,
+                    authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextOptions, toolScope, nativeGate);
             String userId;
             String sessionId;
             if (running.sessionId() == null) {
@@ -348,15 +365,25 @@ public final class AdkAgentRunExecutor {
             Map<String, String> agentOutputs = new LinkedHashMap<>();
             Set<String> agentNames = new HashSet<>();
             collectAgentNames(root, agentNames);
+            NativeAgentGate activeNativeGate = nativeGate;
             invocationStarted = true;
             runner.runAsync(userId, sessionId, Content.fromParts(input.parts().stream().map(Part::fromText).toArray(Part[]::new)), config)
-                    .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout()))
-                    .blockingForEach(event -> projector.project(event, agentNames).ifPresent(projected -> {
-                        if (projected.completeAgentOutput()) {
-                            agentOutputs.put(projected.author(), (String) projected.payload().get("text"));
-                        }
-                        eventSink.append(projected.type(), projected.author(), projected.payload());
-                    }));
+                    .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout(),
+                            activeNativeGate == null ? Flowable.never() : activeNativeGate.failureSignal()))
+                    .blockingForEach(event -> {
+                        var projection = projector.project(event, agentNames);
+                        if (activeNativeGate != null) activeNativeGate.observeEvent(event, projection);
+                        projection.ifPresent(projected -> {
+                            if (projected.completeAgentOutput()) {
+                                agentOutputs.put(projected.author(), (String) projected.payload().get("text"));
+                            }
+                            eventSink.append(projected.type(), projected.author(), projected.payload());
+                        });
+                    });
+            if (activeNativeGate != null) {
+                agentOutputs.clear();
+                agentOutputs.putAll(activeNativeGate.requireCompletedOutputs());
+            }
             String sideEffectOutcome = sealAndFreeze(eventSink, toolScope, "UNKNOWN");
             if (agentOutputs.isEmpty()) {
                 throw new IllegalStateException("ADK root completed without a usable agent output");
@@ -404,15 +431,20 @@ public final class AdkAgentRunExecutor {
                     : failure instanceof AgentLedgerException ledgerFailure ? ledgerFailure.code().name()
                     : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), status, Map.of(), null, null,
-                    null, code, !invocationStarted && (toolScope == null || toolScope.declaredTools().isEmpty()) ? "NONE" : sideEffectOutcome);
+                    null, code, !nativeSelected && !invocationStarted && (toolScope == null || toolScope.declaredTools().isEmpty()) ? "NONE" : sideEffectOutcome);
             if (status == AgentRunStatusEnum.TIMED_OUT) {
                 AgentRunDTO latest = ledger.get(actor, query);
-                return AgentRunTransitions.terminal(latest.status()) ? latest
-                        : expireDeadlineOrResolve(actor, query, lease, latest.revision(), sideEffectOutcome);
+                if (AgentRunTransitions.terminal(latest.status())) return latest;
+                // A native callback can time out while the database run deadline is still in the future.
+                if (nativeSelected && latest.deadlineAt().isAfter(ledger.databaseNow())) {
+                    return finishOrResolve(actor, query, lease, latest.revision(), result);
+                }
+                return expireDeadlineOrResolve(actor, query, lease, latest.revision(), sideEffectOutcome);
             }
             return finishOrResolve(actor, query, lease, current.get().revision(), result);
         } finally {
             eventSink.seal();
+            if (nativeGate != null) nativeGate.close();
             if (toolScope != null) toolScope.close();
             if (runner != null) {
                 try {
@@ -516,6 +548,26 @@ public final class AdkAgentRunExecutor {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
                     "governed tool execution is not available");
         }
+    }
+
+    private NativeAgentCompilerStrategy.TemplateSpec requireNativeDefinition(AgentExecutionSnapshot snapshot,
+                                                                             NativeAgentCompilerStrategy compiler) {
+        var definition = snapshot.definition();
+        var spec = Objects.requireNonNull(compiler.templateSpec(), "Native template metadata is unavailable");
+        ChatModel model = chatModels.get(spec.modelBeanName());
+        if (!"CODE_FIRST".equals(definition.executionMode()) || !spec.codeRef().equals(definition.codeRef())
+                || !definition.configuration().isEmpty() || !definition.dependencies().tools().isEmpty()
+                || !snapshot.effectivePolicy().allowedToolVersions().isEmpty() || snapshot.effectivePolicy().maxToolCalls() != 0
+                || !spec.inputSchemaVersion().equals(definition.inputSchemaVersion())
+                || !spec.outputSchemaVersion().equals(definition.outputSchemaVersion())
+                || !spec.modelRouteRef().equals(definition.dependencies().modelRouteRef())
+                || model == null || !compiler.usesChatModel(model) || model.getOptions() == null
+                || !spec.modelName().equals(model.getOptions().getModel())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Native template binding is unavailable");
+        }
+        if (model.getOptions() instanceof ToolCallingChatOptions options && options.getToolCallbacks() != null
+                && !options.getToolCallbacks().isEmpty()) throw unsupportedAgentCallbacks();
+        return spec;
     }
 
     private BaseAgent buildRoot(AgentDefinitionSpecDTO definition, List<BaseTool> tools) {

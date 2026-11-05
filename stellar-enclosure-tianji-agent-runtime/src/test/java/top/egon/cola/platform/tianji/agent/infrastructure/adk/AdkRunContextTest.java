@@ -3,13 +3,23 @@ package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 import com.google.adk.agents.CallbackContext;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LlmAgent;
+import com.google.adk.events.EventActions;
+import com.google.adk.flows.llmflows.AgentTransfer;
+import com.google.adk.models.BaseLlm;
+import com.google.adk.models.BaseLlmConnection;
+import com.google.adk.models.LlmRequest;
+import com.google.adk.models.LlmResponse;
+import com.google.adk.sessions.BaseSessionService;
 import com.google.adk.sessions.Session;
 import com.google.adk.tools.BaseTool;
+import com.google.adk.tools.FunctionTool;
 import com.google.adk.tools.ToolContext;
-import com.google.adk.models.LlmRequest;
 import com.google.genai.types.Content;
+import com.google.genai.types.FunctionCall;
 import com.google.genai.types.GenerateContentConfig;
 import com.google.genai.types.Part;
+import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Scheduler;
 import io.reactivex.rxjava3.schedulers.Schedulers;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -18,6 +28,7 @@ import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -33,9 +44,11 @@ import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 
+import java.lang.reflect.Constructor;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -43,6 +56,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -51,6 +65,8 @@ import static org.mockito.Mockito.*;
 
 class AdkRunContextTest {
     private static final Instant NOW = Instant.parse("2026-10-30T00:00:00Z");
+    private static final String NATIVE_ROUTE = "research-route@1#" + "d".repeat(64);
+    private static final String NATIVE_POLICY = "research-policy@1#" + "e".repeat(64);
     private final AgentLedgerService ledger = mock(AgentLedgerService.class);
     private final AgentBudgetService budgets = mock(AgentBudgetService.class);
     private final AgentModelBudgetEstimator estimator = mock(AgentModelBudgetEstimator.class);
@@ -282,11 +298,177 @@ class AdkRunContextTest {
         verify(scope, never()).execute(any(), anyMap(), any(), anyString());
     }
 
+    @Test
+    void native_gate_tracks_without_tool_scope_and_preserves_old_constructor_surface() {
+        var fixture = nativeFixture(false, (author, payload) -> { });
+        NativeAgentGate gate = spy(fixture.gate());
+        var authorizer = allowingAuthorization();
+        installNativePlugin(gate, authorizer, authorization);
+
+        assertDoesNotThrow(() -> AdkRunBudgetPlugin.class.getDeclaredConstructor(
+                AgentLedgerService.class, TrustedAgentActor.class, AgentRunLease.class,
+                AgentExecutionSnapshot.class, AgentModelBudgetEstimator.class, AgentExecutionAuthorization.class,
+                Scheduler.class, ScheduledExecutorService.class, DefaultContextAssembler.class,
+                AgentRunAuthorization.Request.class, AgentContextRuntimeOptions.class, AdkGovernedToolBridge.Scope.class));
+        CallbackContext context = nativeCallback(fixture.rootContext(), "native-root");
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(context, request()).blockingGet()));
+        verify(budgets).reserveBudget(eq(actor), eq(lease), any());
+        verify(gate, times(2)).requireExpectedAgent(same(context));
+    }
+
+    @Test
+    void known_unexpected_agent_fails_before_authorization_estimation_or_reservation() {
+        var fixture = nativeFixture(false, (author, payload) -> { });
+        var authorizer = allowingAuthorization();
+        installNativePlugin(fixture.gate(), authorizer, authorization);
+        clearInvocations(authorizer, estimator, budgets);
+        InvocationContext earlyChild = fixture.rootContext().toBuilder().agent(fixture.tree().deep()).build();
+
+        assertThrows(AgentLedgerException.class,
+                () -> plugin.beforeModelCallback(nativeCallback(earlyChild, "early-child"), request()).blockingGet());
+        verify(authorizer, never()).authorize(any(), eq(AgentRunAuthorization.Boundary.MODEL));
+        verifyNoInteractions(estimator, budgets);
+    }
+
+    @Test
+    void confirmed_return_to_root_allows_distinct_per_agent_contexts_but_not_equal_looking_foreign_identity()
+            throws Exception {
+        prepareNativeSettlement();
+        var fixture = nativeFixture(false, (author, payload) -> { });
+        installNativePlugin(fixture.gate(), allowingAuthorization(), authorization);
+        InvocationContext root = fixture.rootContext();
+        InvocationContext child = root.toBuilder().agent(fixture.tree().quick()).build();
+        InvocationContext returnedRoot = child.toBuilder().agent(fixture.tree().root()).build();
+
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(
+                nativeCallback(root, "root-model"), request()).blockingGet()));
+        nativeTransfer(root, "root-model", "quick_research", "root-call", null);
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(
+                nativeCallback(child, "child-model"), request()).blockingGet()));
+        nativeTransfer(child, "child-model", "conditional_root", "child-call", "current summary");
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(
+                nativeCallback(returnedRoot, "root-return"), request()).blockingGet()));
+
+        InvocationContext copiedChild = child.toBuilder().build();
+        assertNotSame(child, copiedChild);
+        assertThrows(AgentLedgerException.class, () -> plugin.beforeToolCallback(transferTool(),
+                Map.of("agent_name", "conditional_root"), nativeToolContext(copiedChild, "foreign-call")).blockingGet());
+    }
+
+    @Test
+    void complete_native_response_is_observed_only_after_durable_settlement() {
+        prepareNativeSettlement();
+        var fixture = nativeFixture(false, (author, payload) -> { });
+        NativeAgentGate gate = spy(fixture.gate());
+        installNativePlugin(gate, allowingAuthorization(), authorization);
+        CallbackContext context = nativeCallback(fixture.rootContext(), "root-model");
+        LlmResponse response = nativeTransferResponse("quick_research", "root-call", null);
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(context, request()).blockingGet()));
+        clearInvocations(budgets, gate);
+
+        assertNull(assertDoesNotThrow(() -> plugin.afterModelCallback(context, response).blockingGet()));
+
+        var order = inOrder(budgets, gate);
+        order.verify(budgets).settleBudget(eq(actor), eq(lease), eq("root-model"), any());
+        order.verify(gate).observeResponse(same(context), same(response));
+
+        var unadmitted = nativeFixture(false, (author, payload) -> { });
+        installNativePlugin(unadmitted.gate(), allowingAuthorization(), authorization);
+        var partial = LlmResponse.builder().partial(true).turnComplete(false).build();
+        assertThrows(AgentLedgerException.class, () -> plugin.afterModelCallback(
+                nativeCallback(unadmitted.rootContext(), "unadmitted-partial"), partial).blockingGet());
+    }
+
+    @Test
+    void native_before_tool_reauthorizes_model_and_refences_session_without_ordinary_tool_accounting()
+            throws Exception {
+        prepareNativeSettlement();
+        authorization = new AgentRunAuthorization.Request(actor, authorization.runId(), authorization.definitionKey(),
+                authorization.definitionVersion(), authorization.definitionSha256(), authorization.requestSha256(),
+                authorization.snapshotSha256(), authorization.policyVersionRef(), true, authorization.deadlineAt());
+        when(ledger.sessionContextHistory(eq(actor), eq(lease), eq(authorization), eq("session"), any()))
+                .thenReturn(new AgentLedgerService.ContextHistory(List.of(), Set.of(), true, false, true));
+        var audits = new AtomicInteger();
+        var fixture = nativeFixture(true, (author, payload) -> audits.incrementAndGet());
+        var authorizer = allowingAuthorization();
+        installNativePlugin(fixture.gate(), authorizer, authorization);
+        var fences = new AtomicInteger();
+        plugin.bindSessionFence(fences::incrementAndGet);
+        CallbackContext model = nativeCallback(fixture.rootContext(), "root-model");
+        assertNull(assertDoesNotThrow(() -> plugin.beforeModelCallback(model, request()).blockingGet()));
+        assertNull(assertDoesNotThrow(() -> plugin.afterModelCallback(
+                model, nativeTransferResponse("quick_research", "root-call", null)).blockingGet()));
+
+        assertNull(assertDoesNotThrow(() -> plugin.beforeToolCallback(transferTool(),
+                Map.of("agent_name", "quick_research"),
+                nativeToolContext(fixture.rootContext(), "root-call")).blockingGet()));
+
+        assertEquals(1, audits.get());
+        assertEquals(3, fences.get());
+        verify(authorizer, times(2)).authorize(eq(authorization), eq(AgentRunAuthorization.Boundary.MODEL));
+        assertEquals(0, snapshot.effectivePolicy().maxToolCalls());
+    }
+
+    @Test
+    void native_error_callbacks_keep_gate_typed_safe_fatal_classification() throws Exception {
+        var deniedFixture = nativeFixture(false, (author, payload) -> { });
+        installNativePlugin(deniedFixture.gate(), allowingAuthorization(), authorization);
+        var denied = new AgentExecutionAuthorization.Failure(AgentRunAuthorization.Decision.DENY);
+        assertNull(plugin.onToolErrorCallback(transferTool(), Map.of("agent_name", "quick_research"),
+                nativeToolContext(deniedFixture.rootContext(), "denied-call"), denied).blockingGet());
+        deniedFixture.gate().failureSignal().test().assertError(error ->
+                error instanceof AgentExecutionAuthorization.Failure value
+                        && value.decision() == AgentRunAuthorization.Decision.DENY);
+
+        var rawToolFixture = nativeFixture(false, (author, payload) -> { });
+        installNativePlugin(rawToolFixture.gate(), allowingAuthorization(), authorization);
+        var rawToolFailure = assertThrows(AgentLedgerException.class, () -> plugin.onToolErrorCallback(
+                transferTool(), Map.of("agent_name", "quick_research"),
+                nativeToolContext(rawToolFixture.rootContext(), "unknown-tool-call"),
+                new IllegalStateException("private-tool-sentinel")).blockingGet());
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, rawToolFailure.code());
+        assertNull(rawToolFailure.getCause());
+        assertFalse(rawToolFailure.getMessage().contains("private-tool-sentinel"));
+        rawToolFixture.gate().failureSignal().test().assertError(error ->
+                error instanceof AgentLedgerException value
+                        && value.code() == AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE
+                        && value.getCause() == null
+                        && !value.getMessage().contains("private-tool-sentinel"));
+
+        var unknownFixture = nativeFixture(false, (author, payload) -> { });
+        installNativePlugin(unknownFixture.gate(), allowingAuthorization(), authorization);
+        var response = plugin.onModelErrorCallback(nativeCallback(unknownFixture.rootContext(), "model-error"),
+                request(), new IllegalStateException("private-sentinel")).blockingGet();
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name(),
+                response.errorMessage().orElseThrow());
+        assertTrue(response.interrupted().orElseThrow());
+        unknownFixture.gate().failureSignal().test().assertError(error ->
+                error instanceof AgentLedgerException value
+                        && value.code() == AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE
+                        && !value.getMessage().contains("private-sentinel"));
+    }
+
+    @Test
+    void legacy_constructor_keeps_ordinary_tool_scope_execution_unchanged() {
+        var scope = tools();
+        var context = nativeContext("writer", false);
+        var tool = scope.declaredTools().getFirst();
+        when(scope.execute(eq(tool), anyMap(), any(), eq("writer"))).thenReturn(Map.of("status", "SUCCEEDED"));
+
+        plugin.beforeModelCallback(modelContext(context, "legacy-model"), request()).blockingGet();
+        assertEquals("SUCCEEDED", plugin.beforeToolCallback(tool, Map.of(), toolContext(context))
+                .blockingGet().get("status"));
+        verify(scope).execute(eq(tool), eq(Map.of()), any(), eq("writer"));
+    }
+
     private AdkReadOnlyDecisionToolBridge.RunScope tools() {
         plugin.close().blockingAwait();
         var scope = mock(AdkReadOnlyDecisionToolBridge.RunScope.class); var tool = mock(BaseTool.class);
         when(tool.name()).thenReturn("fixed_decision"); when(scope.declaredTools()).thenReturn(List.of(tool));
-        doCallRealMethod().when(scope).execute(any(), anyMap(), any(), anyString(), any(Runnable.class));
+        doAnswer(call -> {
+            ((Runnable) call.getArgument(4)).run();
+            return scope.execute(call.getArgument(0), call.getArgument(1), call.getArgument(2), call.getArgument(3));
+        }).when(scope).execute(any(), anyMap(), any(), anyString(), any(Runnable.class));
         var toolSnapshot = snapshot(2);
         when(estimator.estimate(eq(toolSnapshot), any())).thenAnswer(call -> {
             estimated.add(call.getArgument(1)); return new AgentModelBudgetEstimator.Estimate(20, 10, BigDecimal.ONE);
@@ -297,6 +479,83 @@ class AdkRunContextTest {
                 Schedulers.from(control), control, new DefaultContextAssembler(List.of(provider)), authorization,
                 new AgentContextRuntimeOptions(false, false), scope);
         return scope;
+    }
+
+    private AdkRunBudgetPlugin installNativePlugin(NativeAgentGate gate, AgentRunAuthorization authorizer,
+                                                    AgentRunAuthorization.Request request) {
+        plugin.close().blockingAwait();
+        Constructor<AdkRunBudgetPlugin> constructor = assertDoesNotThrow(() ->
+                AdkRunBudgetPlugin.class.getDeclaredConstructor(
+                        AgentLedgerService.class, TrustedAgentActor.class, AgentRunLease.class,
+                        AgentExecutionSnapshot.class, AgentModelBudgetEstimator.class,
+                        AgentExecutionAuthorization.class, Scheduler.class, ScheduledExecutorService.class,
+                        DefaultContextAssembler.class, AgentRunAuthorization.Request.class,
+                        AgentContextRuntimeOptions.class, AdkGovernedToolBridge.Scope.class, NativeAgentGate.class));
+        plugin = assertDoesNotThrow(() -> constructor.newInstance(ledger, actor, lease, snapshot, estimator,
+                new AgentExecutionAuthorization(authorizer, request), Schedulers.from(control), control,
+                new DefaultContextAssembler(List.of(provider)), request,
+                new AgentContextRuntimeOptions(false, false), null, gate));
+        return plugin;
+    }
+
+    private AgentRunAuthorization allowingAuthorization() {
+        var authorizer = mock(AgentRunAuthorization.class);
+        when(authorizer.authorize(any(), any())).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+        return authorizer;
+    }
+
+    private void prepareNativeSettlement() {
+        when(estimator.actualUsage(eq(snapshot), any())).thenReturn(
+                new AgentBudgetSettlement(20L, 5L, BigDecimal.ONE));
+        when(budgets.settleBudget(eq(actor), eq(lease), anyString(), any())).thenAnswer(call ->
+                new AgentBudgetReservation(call.getArgument(2), 1, AgentBudgetRequest.Kind.MODEL,
+                        null, 20, 10, BigDecimal.ONE, AgentBudgetReservation.State.SETTLED,
+                        20L, 5L, BigDecimal.ONE, false));
+    }
+
+    private void nativeTransfer(InvocationContext context, String eventId, String target,
+                                String callId, String branchText) throws Exception {
+        assertDoesNotThrow(() -> {
+            plugin.afterModelCallback(nativeCallback(context, eventId),
+                    nativeTransferResponse(target, callId, branchText)).blockingGet();
+            ToolContext toolContext = nativeToolContext(context, callId);
+            plugin.beforeToolCallback(transferTool(), Map.of("agent_name", target), toolContext).blockingGet();
+            AgentTransfer.transferToAgent(target, toolContext);
+            plugin.afterToolCallback(transferTool(), Map.of("agent_name", target), toolContext, Map.of()).blockingGet();
+        });
+    }
+
+    private NativeFixture nativeFixture(boolean durable, NativeAgentGate.AuthorizationAppender appender) {
+        var model = new ScriptedLlm("fixture-model");
+        var quick = LlmAgent.builder().name("quick_research").model(model).outputKey("quick_research_output")
+                .disallowTransferToParent(false).disallowTransferToPeers(true).build();
+        var deep = LlmAgent.builder().name("deep_research").model(model).outputKey("deep_research_output")
+                .disallowTransferToParent(false).disallowTransferToPeers(true).build();
+        var root = LlmAgent.builder().name("conditional_root").model(model).outputKey("conditional_root_output")
+                .subAgents(quick, deep).disallowTransferToParent(true).disallowTransferToPeers(true).build();
+        var tree = new NativeTree(root, quick, deep);
+        var spec = nativeSpec();
+        var gate = NativeAgentGate.bind(spec, root, spec.topologyHash(NATIVE_POLICY), appender);
+        String app = durable ? "tianji" : "tianji_run_one";
+        String user = durable ? "USER:alice" : "20:USER:alice";
+        Session session = Session.builder("session").appName(app).userId(user).state(Map.of()).build();
+        InvocationContext context = InvocationContext.builder().sessionService(mock(BaseSessionService.class))
+                .agent(root).session(session).invocationId("invocation").build();
+        return new NativeFixture(gate, tree, context);
+    }
+
+    private static NativeAgentCompilerStrategy.TemplateSpec nativeSpec() {
+        return new NativeAgentCompilerStrategy.TemplateSpec("conditional-research-v1",
+                NativeAgentCompilerStrategy.TransferTopologyEnum.CONDITIONAL_RESEARCH_V1,
+                "researchModel", "fixture-model", NATIVE_ROUTE, "1", "1", "conditional_root",
+                List.of(
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "conditional_root", null, "conditional_root_output", true, true),
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "quick_research", "conditional_root", "quick_research_output", false, true),
+                        new NativeAgentCompilerStrategy.AgentSpec(
+                                "deep_research", "conditional_root", "deep_research_output", false, true)),
+                2, 2, List.of("quick_research", "deep_research"));
     }
 
     private InvocationContext nativeContext(String name, boolean durable) {
@@ -326,6 +585,30 @@ class AdkRunContextTest {
         when(context.functionCallId()).thenReturn(java.util.Optional.of("private-native-call-id")); return context;
     }
 
+    private static CallbackContext nativeCallback(InvocationContext context, String eventId) {
+        return new CallbackContext(context, EventActions.builder().build(), eventId);
+    }
+
+    private static ToolContext nativeToolContext(InvocationContext context, String callId) {
+        return ToolContext.builder(context).actions(EventActions.builder().build())
+                .functionCallId(callId).eventId("tool-" + callId).build();
+    }
+
+    private static FunctionTool transferTool() throws Exception {
+        return FunctionTool.create(AgentTransfer.class.getMethod(
+                "transferToAgent", String.class, ToolContext.class));
+    }
+
+    private static LlmResponse nativeTransferResponse(String target, String callId, String text) {
+        var call = FunctionCall.builder().name("transfer_to_agent").args(Map.of("agent_name", target));
+        if (callId != null) call.id(callId);
+        List<Part> parts = new ArrayList<>();
+        if (text != null) parts.add(Part.fromText(text));
+        parts.add(Part.builder().functionCall(call.build()).build());
+        return LlmResponse.builder().content(Content.builder().role("model").parts(parts).build())
+                .partial(false).turnComplete(false).build();
+    }
+
     private AgentBudgetReservation reservation(AgentBudgetRequest request) {
         return new AgentBudgetReservation(request.reservationId(), 1, AgentBudgetRequest.Kind.MODEL, null, request.inputTokens(), request.outputTokens(),
                 request.estimatedCost(), AgentBudgetReservation.State.RESERVED, null, null, null, true);
@@ -349,5 +632,18 @@ class AdkRunContextTest {
         var definition = new AgentDefinitionSpecDTO("assistant", 2, "CONFIG", null, "1", "1",
                 new DefinitionDependenciesDTO(List.of(new DefinitionResourceRef("fixed", 2, "d".repeat(64))), List.of(), List.of(), "route-v1", "policy-v1"), policy, Map.of());
         return new AgentExecutionSnapshot(definition, "a".repeat(64), policy, new AgentInputDTO("current task", null, null), null);
+    }
+
+    private record NativeTree(LlmAgent root, LlmAgent quick, LlmAgent deep) { }
+    private record NativeFixture(NativeAgentGate gate, NativeTree tree, InvocationContext rootContext) { }
+
+    private static final class ScriptedLlm extends BaseLlm {
+        private ScriptedLlm(String model) { super(model); }
+        @Override public Flowable<LlmResponse> generateContent(LlmRequest request, boolean stream) {
+            return Flowable.never();
+        }
+        @Override public BaseLlmConnection connect(LlmRequest request) {
+            throw new UnsupportedOperationException();
+        }
     }
 }

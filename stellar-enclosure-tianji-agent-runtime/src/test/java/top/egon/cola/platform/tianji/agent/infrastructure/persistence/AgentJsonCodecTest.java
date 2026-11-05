@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
@@ -23,6 +24,22 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class AgentJsonCodecTest {
     private final AgentJsonCodec codec = new AgentJsonCodec();
+
+    @Test
+    void native_authorization_and_future_unknown_event_types_keep_the_existing_json_envelope() {
+        Map<String, Object> payload = Map.of("to", "quick_research", "ordinal", 1,
+                "topologyHash", "a".repeat(64), "state", "AUTHORIZED");
+        for (String type : List.of("NATIVE_TRANSFER_AUTHORIZED", "FUTURE_REVIEWED_EVENT")) {
+            var event = new AgentEventDTO("event-1", "run-1", 1, type, "conditional_root", null, null,
+                    Instant.parse("2026-11-05T00:00:00.123456Z"), "trace-1", "1", payload);
+            var stored = codec.readObject(codec.write(event, AgentJsonCodec.MAX_EVENT_BYTES));
+            assertEquals(type, stored.get("type"));
+            assertEquals("1", stored.get("payloadSchemaVersion"));
+            assertEquals(payload, stored.get("payload"));
+            assertEquals(Set.of("to", "ordinal", "topologyHash", "state"), event.payload().keySet());
+            assertEquals("2026-11-05T00:00:00.123456Z", stored.get("occurredAt"));
+        }
+    }
 
     @Test
     void definition_hash_is_stable_across_map_and_tool_set_order() {

@@ -6,7 +6,7 @@
 | Template Version | `5` |
 | Status | `Draft` |
 | Created | `2026-11-05 05:22 Asia/Shanghai` |
-| Updated | `2026-11-05 05:22 Asia/Shanghai` |
+| Updated | `2026-11-05 07:42 Asia/Shanghai` |
 | Owner | `Root; only Root may run Maven, stage, commit, or authorize source execution` |
 | Repository | `tianji-service` |
 | Scope | `Three sequential source-only Steps: compiler/budget capability, native gate/runtime integration, then default-off AS templates` |
@@ -14,7 +14,7 @@
 | Baseline Revision | `main@b0cf55c8d4696fac5bea30875c24f169503957a5 clean at Root inspection; native AR/AS capability-surface digest remains 10acddda5e6a4a63d1008f7f9d7f99d78ba158b500df4fac3f8aa18cbff03209` |
 | Implements Spec | [Native Agentic transfer templates](../spec/2026-11-05-04-45-native-agentic-transfer-templates.md) |
 | Spec Status | `Review` |
-| Spec Revision | `Updated 2026-11-05 05:22 Asia/Shanghai; Root-reviewed controlled corrections through explicit BaseLlm, exact snapshot, safe-fatal disposition and ISO-control harmonization; SHA-256 85c1538ed38c604005556148c6f019c52251e0941b188a46738019839fdfa369` |
+| Spec Revision | `Updated 2026-11-05 07:42 Asia/Shanghai; SDK outputKey authority correction; SHA-256 03a94fa8730193f0d0cbc887374fdb618e4795196913d91cf2d1f8ced8a67270` |
 | Effective Specs | [Primary native-template Spec](../spec/2026-11-05-04-45-native-agentic-transfer-templates.md); [Agent Framework Upgrade Plan](../../../../docs/plans/agent-framework-upgrade-plan.md) `§15.1, §17.3 T3-09, §17.4 S03` |
 | Depends On Plans | [Agent Framework Upgrade Plan](../../../../docs/plans/agent-framework-upgrade-plan.md) `§15.1, §17.3 T3-09, §17.4 S03; normative remainder only` |
 | Supersedes | `None` |
@@ -33,14 +33,14 @@ Every new behavior follows a genuine assertion RED -> compile seam A -> typed be
 
 - Path: [Native Agentic transfer templates](../spec/2026-11-05-04-45-native-agentic-transfer-templates.md)
 - Status: `Review`, intentionally not `Accepted` or `Implemented`.
-- Revision: `Updated 2026-11-05 05:22 Asia/Shanghai`; Root-authorized current-role, explicit-BaseLlm, provider-ID, exact-snapshot, safe-fatal and ISO-control clarifications, EVENT-901 codec-test target-tree reconciliation and Draft Related Plan link; SHA-256 `85c1538ed38c604005556148c6f019c52251e0941b188a46738019839fdfa369`; clean execution baseline `b0cf55c8d4696fac5bea30875c24f169503957a5` with unchanged native surface digest.
+- Revision: `Updated 2026-11-05 07:42 Asia/Shanghai`; prior controlled corrections plus SDK outputKey authority correction; SHA-256 `03a94fa8730193f0d0cbc887374fdb618e4795196913d91cf2d1f8ced8a67270`; clean execution baseline `b0cf55c8d4696fac5bea30875c24f169503957a5` with unchanged native surface digest.
 - Approval evidence: Root read the full design and approved its A-E corrections, `PLAN-CLAR-901`, and the pre-budget current-expected-role clarification for Plan drafting only. This is the same original T3-09 goal, not user acceptance and not source execution authorization.
 
 ### 2.2 Effective Spec set
 
 | Role | Spec/link | Status/revision | Effective sections | Why included |
 | --- | --- | --- | --- | --- |
-| Primary | [Native-template Spec](../spec/2026-11-05-04-45-native-agentic-transfer-templates.md) | Review / SHA `85c1538ed38c604005556148c6f019c52251e0941b188a46738019839fdfa369` | all | Complete first-slice requirements, contracts, reconciled test tree, relationships, security, tests and rollout, including current-role pre-budget fencing |
+| Primary | [Native-template Spec](../spec/2026-11-05-04-45-native-agentic-transfer-templates.md) | Review / SHA `03a94fa8730193f0d0cbc887374fdb618e4795196913d91cf2d1f8ced8a67270` | all | Complete first-slice requirements, corrected outputKey authority, security, tests and rollout |
 | Normative roadmap dependency | [Agent Framework Upgrade Plan](../../../../docs/plans/agent-framework-upgrade-plan.md) | current source at planning inspection | §15.1; §17.3 T3-09; §17.4 S03 | Keeps full task decomposition/Graph remainder Required and fixes same-AgentRun acceptance boundary |
 
 ### 2.3 Superseded or excluded content
@@ -57,7 +57,7 @@ None is superseded. Excluded from implementation: dynamic task decomposition, Gr
 | `REQ-904` | §4/§7 | fixed CODE_FIRST definitions, empty config/tools/allowlist, maxToolCalls0 | invalid snapshot pre-model failure | Steps1-3 validation |
 | `REQ-905` | §4/§7/§10 | conditional root -> one child -> root | quick/deep success; max2/one returned child | Steps2-3 policy/Runner |
 | `REQ-906` | §4/§7/§10 | supervisor root/researcher/root/critic/root | exact order/max4/two unique returned children | Steps2-3 policy/Runner |
-| `REQ-907` | §4/§7 | unique nonreserved output keys; handoff nonfinal | overlap rejected; child outputKey absent | Steps1-3 tree/Runner |
+| `REQ-907` | §4/§7 | unique nonreserved output keys; handoff Event nonfinal; outputKey non-authoritative | overlap rejected; handoff stateDelta has no child-key write; final child key may equal root final and is ignored | Steps1-3 tree/Runner |
 | `REQ-908` | §4/§7/§9 | exact pinned AgentTransfer FunctionTool only | all same-name/method/schema spoofs fail | Step2 Gate |
 | `REQ-909` | §4/§7 | current MODEL/session/context/lease CAS before native action | no action/state on auth/CAS failure | Step2 plugin/gate/sink |
 | `REQ-910` | §4/§7 | actual context+safe ToolContext call ID, absent/exact-empty versus safe-present provider ID, strict before single-use | absent/empty binds generated actual ID once; unsafe present/actual IDs reject; safe present matches exactly; repeated before fails | Step2 collector/gate |
@@ -96,15 +96,15 @@ Every RED command must fail only named JUnit assertions. A compile, dependency, 
 
 | Step | Depends on | May run in parallel with | Must not overlap with | Reason |
 | --- | --- | --- | --- | --- |
-| Step 1 | Spec/Plan Root execution GO | Only disjoint workers inside Step1 after Root assigns nonoverlapping exact file ownership | No Step2/3 path, no shared file/staging scope | Defines consumed ABI/accounting before any runtime consumer |
-| Step 2 | Step1 committed and path hashes verified | Only disjoint workers inside Step2, for example Gate/codec test versus plugin/executor test preparation, under the listed integration order | No Step3 path and no two workers on plugin/executor/Gate or one staged path | Consumes the committed strategy/bound estimator and integrates one atomic runtime result |
+| Step 1 | Spec/Plan Root execution GO | Only disjoint workers inside Step1 after Root assigns nonoverlapping exact file ownership | No Step2/3 source/test/config path; Spec/Plan are created here and may receive the exact Step2 SDK-fact correction | Defines consumed ABI/accounting before any runtime consumer |
+| Step 2 | Step1 committed and path hashes verified | Only disjoint workers inside Step2, for example Gate/codec test versus plugin/executor test preparation, under the listed integration order | No Step3 source/config and no two workers on one source path; Root alone owns the repeated Spec/Plan governance paths | Consumes the committed strategy/bound estimator and integrates one atomic runtime result plus verified SDK fact |
 | Step 3 | Step2 committed and path hashes verified | Only disjoint workers inside Step3, such as the two factory test/implementation pairs, before Root integrates configuration/YAML | No earlier-Step edit and no shared configuration/YAML ownership | Exposes already-governed behavior only after runtime is committed |
 
 The three Step commits remain strictly sequential: Step N+1 never edits, validates as complete, stages or commits before Step N's semantic commit exists. Within the current Step, Root may delegate nonoverlapping files in parallel; workers do not stage or commit, do not revert another worker, and must preserve the RED -> compile A -> typed RED -> minimum B -> GREEN integration order. Root alone reviews the combined diff, stages the exact Step paths and creates the one Step commit.
 
 ### 4.4 Commit boundaries
 
-Exactly three commits, one per Step. Root runs/integrates RED/GREEN in the declared order, checks every Manual Check/Rule, stages only explicit Step paths, commits, records the hash/file list, and confirms unrelated concurrent work remains. Disjoint same-Step worker edits are allowed only under §4.3; shared files are single-owner and no file appears in more than one Step.
+Exactly three commits, one per Step. Root runs/integrates RED/GREEN in the declared order, checks every Manual Check/Rule, stages only explicit Step paths, commits, records the hash/file list, and confirms unrelated concurrent work remains. Disjoint same-Step worker edits are allowed only under §4.3. Source/test/config files remain single-owner; the already-created Spec and Plan are the only repeated governance paths, modified in Step2 solely for the verified SDK outputKey fact before Step2 evidence.
 
 ### 4.5 Spec Simplicity and Implementation-necessity Audit
 
@@ -208,8 +208,8 @@ stellar-enclosure-tianji-agent-server/
     TianjiNativeAgentTemplateConfigurationTest.java          CREATE [Step3]
   src/main/resources/application.yml                         MODIFY [Step3]
 docs/egon/
-  spec/2026-11-05-04-45-native-agentic-transfer-templates.md CREATE [Step1]
-  plan/2026-11-05-05-22-native-agentic-transfer-templates.md CREATE [Step1]
+  spec/2026-11-05-04-45-native-agentic-transfer-templates.md CREATE [Step1], MODIFY [Step2 SDK fact]
+  plan/2026-11-05-05-22-native-agentic-transfer-templates.md CREATE [Step1], MODIFY [Step2 SDK fact]
   evidence/2026-11-05-native-agent-compiler.md               CREATE [Step1]
   evidence/2026-11-05-native-agent-gate.md                   CREATE [Step2]
   evidence/2026-11-05-native-agent-templates.md              CREATE [Step3]
@@ -222,8 +222,8 @@ docs/egon/
 | CREATE | `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentCompilerStrategy.java` | plain Function map only | Strategy/TemplateSpec/topologyHash | additive compiler metadata | 1 | 901-907 | S1 tests/JAR |
 | MODIFY | `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AgentModelBudgetEstimator.java` | five-method estimator SPI | default fail-closed `bindNative` + nested binding | backward-compatible budget seam | 1 | 902/917/919 | S1 tests/compile |
 | MODIFY | `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/JTokkitChatModelBudgetEstimator.java` | CONFIG-only `require` | private exact bound execution view | native profile/model authority | 1 | 902/917/919 | S1 tests |
-| CREATE | `docs/egon/spec/2026-11-05-04-45-native-agentic-transfer-templates.md` | reviewed `/tmp` artifact | Review Template9 governing Spec | design authority | 1 | 901-920 | strict Spec |
-| CREATE | `docs/egon/plan/2026-11-05-05-22-native-agentic-transfer-templates.md` | this reviewed `/tmp` draft | Draft Template5 three-Step Plan | execution authority boundary | 1 | 901-920 | strict Plan |
+| CREATE/MODIFY | `docs/egon/spec/2026-11-05-04-45-native-agentic-transfer-templates.md` | Step1 reviewed design; Step2 pinned bytecode/Runner fact | Review Template9 with corrected outputKey authority | design authority | 1/2 | 901-920 | strict Spec + SDK evidence |
+| CREATE/MODIFY | `docs/egon/plan/2026-11-05-05-22-native-agentic-transfer-templates.md` | Step1 reviewed Plan; Step2 scope reconciliation | Draft Template5 with 11-path Step2 | execution authority boundary | 1/2 | 901-920 | strict Plan + path audit |
 | CREATE | `docs/egon/evidence/2026-11-05-native-agent-compiler.md` | absent | actual S1 evidence | honest Step1 proof | 1 | 901-907/917/919/920 | S1 outputs |
 | CREATE | `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGateTest.java` | absent | full provenance/FSM/collector tests | Gate RED/GREEN | 2 | 905-916/918 | S2 tests |
 | CREATE | `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGate.java` | no transfer state owner | bound Gate/state/audit/fatal/completion | secure native control | 2 | 905-918 | S2 tests/JAR |
@@ -244,7 +244,7 @@ docs/egon/
 | MODIFY | `stellar-enclosure-tianji-agent-server/src/main/resources/application.yml` | one base profile, no native keys | four complete default-off keys | operator activation surface | 3 | 903/919 | S3 resource/JAR |
 | CREATE | `docs/egon/evidence/2026-11-05-native-agent-templates.md` | absent | actual S3/final/JAR evidence | honest final proof | 3 | 901-920 | final outputs |
 
-Every path appears in exactly one owning Step. POMs, Components, C/CL, Controllers, permissions, SQL/manifests, frontend and existing migrations are intentionally absent.
+There are still 26 unique paths. Every source/test/config/evidence path has one owning Step; only the Spec and Plan governance paths are created in Step1 and narrowly modified in Step2 for the verified SDK fact. POMs, Components, C/CL, Controllers, permissions, SQL/manifests, frontend and existing migrations are intentionally absent.
 
 ## 6. Prerequisites, Constraints, and Plan Clarifications
 
@@ -292,7 +292,7 @@ Expected result at the documented baseline is the digest above. A mismatch is no
 
 ### 6.3 Immutable constraints and approved decisions
 
-- Spec SHA `85c1538ed38c604005556148c6f019c52251e0941b188a46738019839fdfa369`; Review status; three Steps only; no source GO yet.
+- Spec SHA `03a94fa8730193f0d0cbc887374fdb618e4795196913d91cf2d1f8ced8a67270`; Review status; Step1 committed as `919ddc3`; this Step2 SDK clarification awaits Root review of the exact revision; Step3 remains unauthorized.
 - Existing Function map/constructors/routes/DTOs/event envelope/database/POMs remain compatible.
 - Exact codeRefs, schema versions `"1"`, topology names/output keys/caps, transfer provenance, safe-text bounds, event payload and `bindNative` design are immutable for this Plan.
 - No AgentTool/Graph/DSL/nested Runner/tool PDP/journal/new table/resume/provider credential.
@@ -312,6 +312,7 @@ Expected result at the documented baseline is the digest above. A mismatch is no
 | `PLAN-CLAR-908` | Provider FunctionCall ID absent or exactly empty is unbound because pinned ADK populates both; a present nonempty provider ID and the actual ToolContext ID must each be untrimmed, nonblank and ISO-control-free, and a retained provider ID must equal the actual ID | Pinned `Functions.populateClientFunctionCallId` handles missing/empty; Root clarification closes whitespace/control ambiguity | Makes the existing optional-ID/actual-ID decision executable without normalization or a second ID source | Different SDK population behavior or accepted unsafe IDs blocks enablement |
 | `PLAN-CLAR-909` | The private JTokkit native view accepts only the exact `AgentExecutionSnapshot` object passed to `bindNative`; `candidateSnapshot != boundSnapshot` fails before all five calculations | Executor/plugin reuse one snapshot field; Root clarification forbids semantic-hash fallback and forged CONFIG copies | Prevents an equal-looking snapshot from borrowing a bound model/profile while adding no global/thread-local state | Any caller that copies snapshots must be redesigned in the Spec rather than weakening identity |
 | `PLAN-CLAR-910` | Gate fatal state is a sanitized classification token, not a generic error or retained Throwable; callback and replayed control channels reconstruct the same authorization decision, ledger code, timeout cause or safe policy/unknown failure | Executor already distinguishes `AgentExecutionAuthorization.Failure`, revision/lease `AgentLedgerException`, timeout causes and generic failures; Root found the race where a generic Gate signal could win and change disposition | Preserves the Spec's existing SUSPENDED/current-run resolver/TIMED_OUT/FAILED semantics under either race winner and adds no error transport/API | Any failure that cannot be classified without retaining sensitive details blocks implementation and returns to the Spec |
+| `PLAN-CLAR-911` | ADK outputKey is final-Event state, not child-branch authority: the child handoff Event is non-final and its own stateDelta has no child-key write, while the later root-final Event can leave the final child outputKey equal to root-final text | Pinned `LlmAgent#maybeSaveOutputToState`/`runAsyncImpl`, `BaseLlmFlow#followTransfer` bytecode and two finite Runner diagnostics; historical Spec SHA `85c1538...` asserted absence too strongly | This is a blocking governance correction: Files9/10 are reviewed and frozen before File4 finite validation resumes, then committed in the same Step2; source file order and all three Step commits remain unchanged | Any future SDK change still returns to Spec review; do not infer live provider behavior from this finite fixture |
 
 ## 7. Ordered File-by-file Implementation Steps
 
@@ -568,7 +569,7 @@ state NativeExecutionRegistered=false, ASFactoryPresent=false, RuntimeUnverified
 - Dependencies: Step1 is committed and its exact strategy/budget tests are GREEN. No AS `NativeAgentCompilerStrategy` is registered.
 - Baseline state: Step1 exposes immutable template metadata and a bound estimator view, but the executor still treats every map value as a plain Function; the plugin tracks only ordinary tool scopes; no native callback is admitted.
 - Observable outcome: one synthetic reviewed strategy can execute the two fixed transition policies through the pinned ADK transfer function, with pre-budget current-role fencing, current MODEL/session/run authority, durable authorization audit, two-phase child collection, sticky fatal control, genuine root completion and unchanged legacy/tool behavior.
-- End state: AR contains the Gate and complete runtime integration plus fake-SDK/real-Runner evidence; no AS factory or production configuration can select it yet.
+- End state: AR contains the Gate and complete runtime integration plus fake-SDK/real-Runner evidence; the Spec/Plan record corrected outputKey authority; no AS factory or production configuration can select it yet.
 - Test-first gate: `Required` — Gate reflection assertions fail first; after its minimal signatures compile, typed Gate behavior fails; plugin reflection/constructor tests and real Runner scripts then fail for absent native routing; executor completion tests fail until the native branch is wired. Codec unknown-type checks are compatibility regressions expected to remain GREEN before and after production changes.
 - Manual Checks: all 17 are evaluated separately: `MC-ARCH-001`, `MC-REUSE-001`, `MC-DEP-001`, `MC-NAME-001`, `MC-VALID-001`, `MC-MODEL-001`, `MC-CONVERT-001`, `MC-LOG-001`, `MC-BEAN-001`, `MC-UTIL-001`, `MC-JSON-001`, `MC-TIME-001`, `MC-CONFIG-001`, `MC-PATTERN-001`, `MC-SCOPE-001`, `MC-TEST-001`, `MC-BLOCKER-001`. Applicable: ARCH, REUSE, DEP, NAME, VALID, MODEL, UTIL, JSON, TIME, PATTERN, SCOPE, TEST, BLOCKER. Evidence-backed N/A: CONVERT (no new projection/Converter), LOG/BEAN (only established technical classes, no new managed business Bean or injection surface), CONFIG (no key/profile file in this Step).
 - Literal Rules: all ten are evaluated separately: `Rule 1`, `Rule 2`, `Rule 3`, `Rule 4`, `Rule 5`, `Rule 6`, `Rule 7`, `Rule 9`, `Rule 10`, `Rule 11`. Applicable: Rules 1, 2, 3, 5, 6, 9, 10, 11. Evidence-backed N/A: Rule 4 (no new Spring-managed business class and existing technical logger style is preserved), Rule 7 (no profile key changes). Rule 11 is blocking for every file.
@@ -789,13 +790,13 @@ final class NativeAgentGate implements AutoCloseable {
 #### File 4 — `CREATE stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentTransferRunnerTest.java`
 
 - Purpose: Prove the public ADK 1.13 callback/tool ordering and native transfer semantics with a real `Runner`, scripted `BaseLlm`, in-memory Session and the Tianji plugin/Gate; no `App`, Spring context, provider or database.
-- Symbols: `conditional_transfer_with_safe_provider_id_preserves_text_and_call`; `conditional_transfer_without_provider_id_binds_sdk_id`; `conditional_transfer_with_empty_provider_id_binds_sdk_id`; `supervisor_round_trip_is_researcher_then_critic`; `child_handoff_is_nonfinal_and_does_not_write_output_key`; `callback_failure_rethrows_and_sticky_state_rejects_simulated_later_root`.
+- Symbols: `conditional_transfer_with_safe_provider_id_preserves_text_and_call`; `conditional_transfer_without_provider_id_binds_sdk_id`; `conditional_transfer_with_empty_provider_id_binds_sdk_id`; `supervisor_round_trip_is_researcher_then_critic`; `child_handoff_is_nonfinal_and_later_root_output_key_is_ignored`; `callback_failure_rethrows_and_sticky_state_rejects_simulated_later_root`.
 - Repository evidence: `AdkSessionPostgresTest.ScriptModel` shows repository-native scripted BaseLlm/Runner fixtures; packaged JAR proves FunctionCall ID optional and ToolContext ID/action public; Spec requires Fake SDK proof instead of a live provider.
 - Dependencies and consumers: constructs a fixed actual LlmAgent tree with the exact ADK native transfer AutoFlow, `Runner.builder()` + `InMemorySessionService`, File2 Gate and File5 plugin. Scripted responses cover safe-present, absent and exact-empty provider IDs plus final root response.
 - Why now: this test must exist before plugin integration and protects assumptions that unit mocks cannot prove.
 - Contract/signature changes: none external; the fixture consumes exact Plugin callback signatures and current Runner API.
-- Input/output and state mapping: scripted root transfer -> actual FunctionTool before/after callbacks -> EventActions target -> child transfer response text+call -> confirmed summary -> later genuine root final; inspect emitted Events and Session state.
-- Error and edge behavior: a callback/CAS failure records one sanitized disposition token. If the incoming error is already a matching safe authorization/ledger/timeout/policy boundary, native `onToolError` returns empty and pinned ADK rethrows it; a raw unknown error is replaced with `Maybe.error` carrying the token's safe dependency failure. The Gate control stream reconstructs the same classification and terminates the Runner. A separate direct callback/final-health regression simulates future SDK/other-callback conversion and proves a later plausible root response still cannot succeed. Absent/exact-empty provider ID is populated by pinned ADK after afterModel and accepted only when the later actual ToolContext ID binds once.
+- Input/output and state mapping: scripted root transfer -> actual FunctionTool callbacks -> child non-final text+call Event whose own stateDelta has no child-key write -> confirmed collector summary -> later genuine root final and final child outputKey containing root-final text, which result assembly ignores.
+- Error and edge behavior: a callback/CAS failure records one sanitized disposition token. An unknown appender failure is sanitized inside the Plugin boundary before SDK handling, so `onToolError` receives an already-safe error, returns empty and the SDK rethrows it; a direct Plugin unit call with a raw unknown error asserts `Maybe.error(safeBoundaryFailure)`. No boundary-external spy is expected to protect SDK logging. The Gate signal retains the same classification. Absent/exact-empty provider ID is populated by pinned ADK after afterModel and accepted only when the later actual ToolContext ID binds once.
 - Standards impact: `MC-REUSE-001`, `MC-DEP-001`, `MC-VALID-001`, `MC-JSON-001`, `MC-PATTERN-001`, `MC-SCOPE-001`, `MC-TEST-001` — uses actual pinned public SDK with no new fake production layer/dependency/network.
 - Literal rule enforcement: `Rule 2`, `Rule 5`, `Rule 6`, `Rule 9`, `Rule 11` — exercises exact callback inputs/event content through existing SDK/Jackson-compatible models in the current test package.
 - Implementation pseudocode:
@@ -808,13 +809,14 @@ ScriptModel responses = script(
 Runner runner = Runner.builder().agent(actualTree(responses)).appName(APP)
     .sessionService(new InMemorySessionService()).plugins(pluginWithGate).build();
 events = runner.runAsync(USER, SESSION, userContent, SSE_MAX_CALLS).toList().blockingGet();
-assert handoff response/event is !finalResponse and retains full text plus function call;
-assert session.state lacks quick_research_output;
-assert Gate confirms quick text once and accepts only later root final;
+assert handoff Event is !finalResponse, retains full text+call and has no quick_research_output stateDelta;
+assert final Session quick_research_output equals genuine root final and is never read as branch evidence;
+assert Gate/output.agents keeps quick_research=current summary and output.text=genuine root final;
 assert safe-present provider ID matches the actual ToolContext ID;
 assert both absent and exact-empty provider IDs receive/bind the generated nonblank ADK ToolContext ID;
 force a known safe native before/tool failure; assert pinned Runner rethrows after plugin onToolError returns empty;
-force a raw unknown tool failure; assert onToolError emits only the sanitized same-classification error;
+force unknown appender failure through Plugin; assert it is sanitized before SDK and onToolError empty-rethrows already-safe error;
+directly call Plugin onToolError with raw unknown; assert Maybe.error exposes only the sanitized safe classification;
 then directly feed a simulated converted FunctionResponse/later root projection and assert Gate remains fatal/incomplete;
 ```
 
@@ -1008,12 +1010,58 @@ finally seal/close scope/Runner/Session as today; Gate is closed by Plugin/Runne
 - Verification contribution: makes File6 native completion/control tests GREEN; Files1/3/4/7 remain GREEN; old projector/factory/tool/context tests prove compatibility.
 - After this file: AR native capability is complete and finite-testable, but production AS still supplies no native strategy; marker-only default runtime remains safe.
 
-#### File 9 — `CREATE docs/egon/evidence/2026-11-05-native-agent-gate.md`
+#### File 9 — `MODIFY docs/egon/spec/2026-11-05-04-45-native-agentic-transfer-templates.md`
+
+- Purpose: Correct the pinned ADK outputKey authority fact without changing native runtime behavior.
+- Symbols: `EVD-912`, `REQ-907`, result rules, output-key model, `TEST-911`, trace/review text.
+- Repository evidence: pinned `maybeSaveOutputToState`/`followTransfer` bytecode and finite Runner diagnostics show non-final handoff Event state versus later root-final child-key value.
+- Dependencies and consumers: Files1-5 establish the bounded SDK validation fact; File10 and File11 consume the corrected requirement.
+- Why now: the SDK fact was proven during Step2 Runner validation and must precede Step2 evidence/commit.
+- Contract/signature changes: documentation only; outputKey remains unique metadata but never branch authority.
+- Input/output and state mapping: non-final handoff Event -> no child-key write in that Event; later root final -> child key may equal root-final text; Gate collector -> current child summary.
+- Error and edge behavior: prohibit claims that final child outputKey is absent or contains the child summary; provider/live-runtime scope remains unclaimed.
+- Standards impact: `MC-ARCH-001`, `MC-JSON-001`, `MC-SCOPE-001`, `MC-TEST-001`, `MC-BLOCKER-001` — reconcile one SDK fact with unchanged contracts/scope.
+- Literal rule enforcement: `Rule 6`, `Rule 11` — preserve existing JSON/event shape and architecture.
+- Implementation pseudocode:
+
+```text
+replace outputKey-absence claims with the proven non-final handoff Event stateDelta fact
+record that later root-final propagation can leave child outputKey equal to root-final text
+retain the current two-phase collector as the only accepted branch-summary authority
+```
+
+- Verification contribution: strict Spec validation and controlled bytecode/Runner evidence review.
+- After this file: the primary Review Spec is factually aligned with pinned ADK 1.13.
+
+#### File 10 — `MODIFY docs/egon/plan/2026-11-05-05-22-native-agentic-transfer-templates.md`
+
+- Purpose: Reconcile Step2 assertions and path ownership with the corrected Spec fact.
+- Symbols: metadata/Spec SHA, `PLAN-CLAR-911`, §4.3/§4.4, §5 inventory, Step2 File4/9-11, trace/review rows.
+- Repository evidence: File9 correction and the same finite Runner/bytecode evidence; historical frozen SHA remains historical only.
+- Dependencies and consumers: File9 first; Root execution/evidence workflow and Step3 final regression consume this Plan.
+- Why now: Step2 must commit its verified governance correction with the implementation that exposed it.
+- Contract/signature changes: documentation/path ownership only; three sequential commits and 26 unique paths remain.
+- Input/output and state mapping: Step1-created Spec/Plan -> narrow Step2 modifications -> strict validators -> File11 evidence.
+- Error and edge behavior: no new source path, schema, API, dependency, topology, or SDK adaptation; stale absence assertions block commit.
+- Standards impact: `MC-ARCH-001`, `MC-SCOPE-001`, `MC-TEST-001`, `MC-BLOCKER-001` — exact 11-path Step2 scope and validation.
+- Literal rule enforcement: `Rule 11` — governance documents remain within the existing technical vertical workflow.
+- Implementation pseudocode:
+
+```text
+update current Spec revision and add PLAN-CLAR-911 with bytecode plus finite Runner evidence
+allow only the Spec/Plan governance paths to repeat from Step1 CREATE into Step2 MODIFY
+place both document modifications before Step2 evidence and validate at their actual eventual paths
+```
+
+- Verification contribution: strict Plan validation, unique-path audit and Step2 commit-scope review.
+- After this file: Step2 owns 11 paths while source scope and Step3 remain unchanged.
+
+#### File 11 — `CREATE docs/egon/evidence/2026-11-05-native-agent-gate.md`
 
 - Purpose: Record actual Step2 assertion RED, Gate A/B, plugin/Runner RED/GREEN, completion GREEN, event regression, static/JAR/API facts and runtime exclusions.
 - Symbols: baseline/Step1 commit; exact commands/exits/Surefire counts; ADK/GenAI hashes; event payload/privacy; no AS factory; remaining Step3/T3-09.
 - Repository evidence: established append-only per-Step evidence convention and Step1 evidence.
-- Dependencies and consumers: only actual Root outputs after Files1-8 freeze; final conformance audit consumes it.
+- Dependencies and consumers: only actual Root outputs after Files1-10 freeze; final conformance audit consumes it.
 - Why now: prevents a source-only or mocked proof from being mislabeled real provider/runtime acceptance.
 - Contract/signature changes: documentation only.
 - Input/output and state mapping: actual logs/reports/diff/hashes -> bounded evidence; no prefilled PASS.
@@ -1036,12 +1084,12 @@ set RuntimeUnverified=true, ASFactoriesRegistered=false, T3_09Complete=false; li
 - Plugin/Runner RED command: the same base plus `-Dtest=NativeAgentGateTest,AdkRunContextTest,NativeAgentTransferRunnerTest`; expected nonzero only for missing native plugin routing/current-role/SDK behavior.
 - Focused GREEN command: the same base plus `-Dtest=NativeAgentGateTest,AdkRunContextTest,NativeAgentTransferRunnerTest,AdkNativeAgentCompletionTest,AgentJsonCodecTest,AdkEventProjectorTest,JTokkitChatModelBudgetEstimatorTest,AdkContextWindowPlanTest,AdkReadOnlyDecisionLoopTest,AdkGovernedProcessLoopTest,TianjiAgentRuntimeAutoConfigurationTest`; expected exit 0; all named owning-module reports exist with zero failure/error/unexpected skip; no `*PostgresTest`, listener or provider selector.
 - Static gates: exact Step2 path diff; no POM/C/CL/API/SQL/Components/frontend/config path; no `AgentTool`, Graph/DSL/nested Runner, new scheduler/thread, `java.util.Date/Calendar/SimpleDateFormat`, unsafe event field or `HttpProcessClientTest` selector; `git diff --check`.
-- Verification command: the exact §8 S2 Gate RED/A, plugin/Runner RED and focused GREEN selectors plus Step2 static path/rule checks.
-- Expected result: all named S2/legacy reports exist and pass with zero failure/error/unexpected skip; no AS strategy is registered; no PG/listener/provider path runs.
-- Failure returns to: File1/2 for Gate contract/state; File3/5 for plugin order/context; File4 for real SDK fixture/order; File6/8 for selection/control/completion; File7 for Jackson/unknown-type compatibility; Step1 if bound estimator/metadata contract is wrong.
-- Completion criteria: all allowed/failure transitions, explicit BaseLlm binding, current-role pre-budget cases, exact native Method, audit-before-action, safe actual call ID, identical after replay, sticky fatal with preserved SUSPENDED/current-run resolver/TIMED_OUT/FAILED disposition, genuine root outputs, exact-snapshot shared model budgets/zero tools and legacy regressions are GREEN; AS still registers nothing.
+- Verification command: the exact §8 S2 Gate RED/A, plugin/Runner RED and focused GREEN selectors, strict Spec/Plan validators, and Step2 static 11-path/rule checks.
+- Expected result: all named S2/legacy reports and both SDK diagnostics pass with zero failure/error/unexpected skip; strict docs pass; no AS strategy, PG, listener or provider path runs.
+- Failure returns to: File1/2 for Gate contract/state; File3/5 for plugin order/context; File4 for real SDK/outputKey facts; File6/8 for selection/control/completion; File7 for Jackson compatibility; Files9/10 for governance drift; Step1 if bound estimator/metadata is wrong.
+- Completion criteria: all planned finite unit/SDK checks are GREEN; handoff Event/root-final outputKey facts and collector authority are reconciled in Files9/10; exact-snapshot budgets/zero tools and legacy regressions remain GREEN; AS still registers nothing.
 - Rollback: revert only Step2 paths; no data/config/runtime effect. Authorization event rows cannot exist because no runtime/database is started by execution validation.
-- Commit paths: `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGateTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGate.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkRunContextTest.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentTransferRunnerTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkRunBudgetPlugin.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkNativeAgentCompletionTest.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/persistence/AgentJsonCodecTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkAgentRunExecutor.java`, `docs/egon/evidence/2026-11-05-native-agent-gate.md`.
+- Commit paths: `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGateTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentGate.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkRunContextTest.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/NativeAgentTransferRunnerTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkRunBudgetPlugin.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkNativeAgentCompletionTest.java`, `stellar-enclosure-tianji-agent-runtime/src/test/java/top/egon/cola/platform/tianji/agent/infrastructure/persistence/AgentJsonCodecTest.java`, `stellar-enclosure-tianji-agent-runtime/src/main/java/top/egon/cola/platform/tianji/agent/infrastructure/adk/AdkAgentRunExecutor.java`, `docs/egon/spec/2026-11-05-04-45-native-agentic-transfer-templates.md`, `docs/egon/plan/2026-11-05-05-22-native-agentic-transfer-templates.md`, `docs/egon/evidence/2026-11-05-native-agent-gate.md`.
 - Commit: `feat(agent): govern native transfer callbacks`
 
 ### Step 3 — Register two fixed templates behind default-off host configuration
@@ -1382,7 +1430,7 @@ Each row appends exactly the shown `-Dtest=...` selector before the script-suppl
 | S2 Gate assertion RED | `tianji-service` | common base + `-Dtest=NativeAgentGateTest` | absent Gate | nonzero only named missing Gate assertion | Step2 File1 | 905-916 |
 | S2 Gate A / typed RED | same | same selector after Gate signatures | provenance/FSM/collector | compile succeeds; only named behavior assertions fail | Step2 Files1-2 | 905-916 |
 | S2 plugin/Runner RED | same | common base + `-Dtest=NativeAgentGateTest,AdkRunContextTest,NativeAgentTransferRunnerTest` | native tracking and real SDK order | nonzero only missing native plugin/current-role behavior | Step2 Files3-5 | 908-917; in-memory Runner only |
-| S2 GREEN/regression | same | common base + `-Dtest=NativeAgentGateTest,AdkRunContextTest,NativeAgentTransferRunnerTest,AdkNativeAgentCompletionTest,AgentJsonCodecTest,AdkEventProjectorTest,JTokkitChatModelBudgetEstimatorTest,AdkContextWindowPlanTest,AdkReadOnlyDecisionLoopTest,AdkGovernedProcessLoopTest,AdkToolTelemetryPrivacyTest,TianjiAgentRuntimeAutoConfigurationTest` | Gate/plugin/executor/event/legacy tools | exit 0; named owning reports present and zero fail/error/skip | Step2 Files1-8 or Step1 | 901-919; no PG/listener/provider |
+| S2 GREEN/regression | same | common base + `-Dtest=NativeAgentGateTest,AdkRunContextTest,NativeAgentTransferRunnerTest,AdkNativeAgentCompletionTest,AgentJsonCodecTest,AdkEventProjectorTest,JTokkitChatModelBudgetEstimatorTest,AdkContextWindowPlanTest,AdkReadOnlyDecisionLoopTest,AdkGovernedProcessLoopTest,AdkToolTelemetryPrivacyTest,TianjiAgentRuntimeAutoConfigurationTest`; then strict Spec/Plan validation | Gate/plugin/executor/event/legacy tools + SDK fact governance | exit 0; named reports and both validators pass | Step2 Files1-10 or Step1 | 901-919; no PG/listener/provider |
 | S3 reflection/resource RED | same | common base + `-Dtest=TianjiNativeAgentTemplateConfigurationTest,ConditionalResearchAgentFactoryTest,SupervisorResearchAgentFactoryTest` | absent AS types/YAML | nonzero only named missing type/resource assertions | Step3 Files1/3/5 | 902-907 |
 | S3 typed GREEN | same | common base + `-Dtest=TianjiNativeAgentTemplateConfigurationTest,ConditionalResearchAgentFactoryTest,SupervisorResearchAgentFactoryTest,NativeAgentCompilerStrategyTest,NativeAgentGateTest,NativeAgentTransferRunnerTest,AdkNativeAgentCompletionTest,JTokkitChatModelBudgetEstimatorTest,AdkRunContextTest,AgentJsonCodecTest,TianjiAgentRuntimeAutoConfigurationTest,TianjiAgentServerApplicationTest` | factories/default-off/wiring + core | exit 0; named owning reports present and zero fail/error/skip | Step3 Files1-8 | 901-920; contexts only, no server |
 | Final clean finite verify | same | exact command below | Components + AR + AS selected source reactor | exit 0; exact finite tests only, fresh JARs produced | owning Step; material drift to Spec | all; static/JUnit/package only |
@@ -1513,7 +1561,7 @@ N/A for data/schema/generated code. The Spec §11 and §16 explicitly require no
 | `REQ-904` | §4/§7 | 1-3 | TemplateSpec, executor, config | snapshot/admission negatives | fixed CODE_FIRST/v1/empty/zero-tool |
 | `REQ-905` | §4/§7/§10 | 2-3 | Gate/conditional factory/executor | Gate + conditional Runner/factory | one quick/deep, max2, one returned |
 | `REQ-906` | §4/§7/§10 | 2-3 | Gate/supervisor factory/executor | Gate + supervisor Runner/factory | researcher then critic, max4 |
-| `REQ-907` | §4/§7 | 1-3 | Strategy/Gate/factories | key/tree/Runner outputKey tests | unique keys; child handoff nonfinal/absent state |
+| `REQ-907` | §4/§7 | 1-3 | Strategy/Gate/factories | key/tree/Runner outputKey diagnostics | unique keys; handoff Event non-final; final child key root-text and non-authoritative |
 | `REQ-908` | §4/INTERNAL-903 | 2 | Gate/plugin | provenance/spoof matrix | exact public static Method/name/schema only |
 | `REQ-909` | §4/§7 | 2 | Gate/plugin/executor sink | auth/session/CAS order tests | current authority and CAS before action |
 | `REQ-910` | §4/§7 | 2 | Gate/plugin | safe-present/absent/exact-empty/unsafe ID; repeated-before; Runner | actual context+safe SDK ID, strict single use |
@@ -1553,11 +1601,11 @@ The Plan covers the reviewed first T3-09 fixed conditional/supervisor slice in t
 
 ### 12.2 Spec consistency
 
-Every target source/test/config path matches reconciled Spec §8. The only documentation/evidence additions are required Plan workflow artifacts. `PLAN-CLAR-901` keeps policy-dependent hashing in `TemplateSpec`; `PLAN-CLAR-902` nests the model binding; `PLAN-CLAR-903` places the Root-authorized current-role check before budget spend; `PLAN-CLAR-904`/`905` pin actual SDK ordering and fail-fast error semantics; `PLAN-CLAR-906` makes the already-required EVENT-901 codec regression explicit; `PLAN-CLAR-907`/`908` correct the pinned model-getter and call-ID mechanics; `PLAN-CLAR-909` requires exact snapshot object identity; `PLAN-CLAR-910` preserves existing terminal disposition across callback/control races. None changes public behavior beyond the reviewed Spec. The simplicity audit found no fetch-then-forward API, client-derived authority, duplicate registry/store/result type or speculative layer.
+Every target source/test/config path matches reconciled Spec §8. The only documentation/evidence additions are required Plan workflow artifacts. `PLAN-CLAR-901` through `910` retain the prior reviewed mechanics; `PLAN-CLAR-911` corrects only the pinned SDK outputKey authority fact from bytecode and finite Runner evidence. No runtime behavior, public contract, topology, schema or dependency changes. The simplicity audit found no fetch-then-forward API, client-derived authority, duplicate registry/store/result type or speculative layer.
 
 ### 12.3 Repository executability
 
-The Plan uses clean `b0cf55c8d4696fac5bea30875c24f169503957a5` with the native capability digest unchanged from the original `c731f3f` inspection, current Plugin/Runner/FunctionTool/ToolContext/EventActions APIs, the exact `LlmAgent.model()->Model.model()->BaseLlm` getter chain, existing Agent Flow Beans/adapter, one base YAML, source-reactor command and exact artifact names. Every file has one owning Step and exact consumers/mapping/errors/verification/after-state. Root recomputes the surface digest before Step1 and preserves unrelated work; material drift stops execution.
+The Plan uses clean `b0cf55c8d4696fac5bea30875c24f169503957a5` with the native capability digest unchanged from the original `c731f3f` inspection, current Plugin/Runner/FunctionTool/ToolContext/EventActions APIs, the exact `LlmAgent.model()->Model.model()->BaseLlm` getter chain, existing Agent Flow Beans/adapter, one base YAML, source-reactor command and exact artifact names. Every source/test/config/evidence file has one owning Step; only the Spec/Plan governance files repeat under the explicit Step2 SDK-fact exception. Root recomputes the surface digest before Step1 and preserves unrelated work; material drift stops execution.
 
 ### 12.4 Test and release completeness
 
