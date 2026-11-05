@@ -13,6 +13,7 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
@@ -44,6 +45,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
@@ -175,6 +177,37 @@ public final class ProcessReleaseService {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
         return Objects.requireNonNull(read.execute(status -> load(actor.tenantId(), releaseKey, false)));
+    }
+
+    /** Read within an existing owner snapshot without marking it rollback-only for an absent release. */
+    public Optional<Release> readMigrationRelease(ProcessActor actor, String releaseKey) {
+        Objects.requireNonNull(actor, "actor");
+        requireReleaseKey(releaseKey);
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())) {
+            throw new IllegalStateException("Process migration release requires the owning snapshot");
+        }
+        try {
+            return Optional.of(load(actor.tenantId(), releaseKey, false));
+        } catch (ProcessResourceNotFoundException missing) {
+            return Optional.empty();
+        }
+    }
+
+    public boolean usesStorage(SpringProcessEngineConfiguration engine, DataSource source,
+                               DataSourceTransactionManager manager) {
+        return engine == process && source != null && jdbc.getDataSource() == source && manager != null
+                && read.getTransactionManager() == manager && write.getTransactionManager() == manager
+                && schema.equals(engine.getDatabaseSchema());
+    }
+
+    public boolean verifiesSingleBpmnManifest(Release release, Definition binding, ValidatedProcessModel model) {
+        if (release == null || binding == null || model == null || binding.type() != Type.BPMN
+                || model.type() != Type.BPMN || !binding.definitionKey().equals(model.definitionKey())
+                || !binding.inputs().isEmpty() || release.definitions().size() != 1
+                || !release.definitions().getFirst().equals(binding)) return false;
+        String digest = manifestHash(List.of(new ModelResource(Type.BPMN, binding.definitionKey(), model.xml(), binding.inputs())));
+        return digest.equals(release.manifestSha256());
     }
 
     /** Internal lookup for an already-running Flowable instance, not a caller authorization check. */

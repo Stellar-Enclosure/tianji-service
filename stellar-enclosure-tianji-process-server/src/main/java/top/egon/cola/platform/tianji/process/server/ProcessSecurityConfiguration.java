@@ -37,6 +37,7 @@ import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCancellationReceiptStore;
@@ -549,6 +550,22 @@ public class ProcessSecurityConfiguration {
             var audit = new ProcessWorkerRecoveryReceiptStore(source, schema);
             audit.verifyStorage();
             return new ProcessWorkerRecoveryService(configuration, releases, commands, nativeAccess, audit, workers);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process",
+            name = {"api.enabled", "migration-preflight.enabled"}, havingValue = "true")
+    static class MigrationPreflightConfiguration {
+        @Bean("processMigrationPreflightService")
+        ProcessMigrationPreflightService processMigrationPreflightService(ProcessEngine process, DmnEngine dmn,
+                @Qualifier("processReleaseService") ProcessReleaseService releases,
+                @Qualifier("processModelValidator") ProcessModelValidator validator,
+                @Qualifier("tianjiProcessAccess") TianjiProcessAccess access) {
+            var service = new ProcessMigrationPreflightService(process, decisionConfiguration(dmn), releases, validator, access);
+            service.verifyReadiness();
+            return service;
         }
     }
 

@@ -7,6 +7,8 @@ import org.flowable.engine.HistoryService;
 import org.flowable.engine.ManagementService;
 import org.flowable.engine.RuntimeService;
 import org.flowable.engine.TaskService;
+import org.flowable.engine.impl.jobexecutor.TimerEventHandler;
+import org.flowable.engine.impl.jobexecutor.TriggerTimerEventJobHandler;
 import org.flowable.eventsubscription.api.EventSubscription;
 import org.flowable.job.api.Job;
 import org.flowable.job.api.JobNotFoundException;
@@ -29,6 +31,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -181,6 +185,205 @@ public final class ProcessControlNativeAccess {
         if (value == null) throw unavailable();
         return value.toInstant();
     }
+
+    Instant beginMigrationObservation() {
+        requireBoundMigrationTransaction();
+        jdbc.execute("SET TRANSACTION READ ONLY");
+        jdbc.execute("SET LOCAL statement_timeout = '2s'");
+        requireMigrationReadOnly();
+        Timestamp observed = jdbc.queryForObject("SELECT pg_catalog.clock_timestamp()", Timestamp.class);
+        if (observed == null) throw unavailable();
+        return observed.toInstant();
+    }
+
+    void requireMigrationReadOnly() {
+        requireBoundMigrationTransaction();
+        if (!ZoneOffset.UTC.equals(ZoneId.systemDefault().normalized())
+                || !Boolean.TRUE.equals(jdbc.queryForObject("""
+                        SELECT NOT pg_catalog.pg_is_in_recovery()
+                            AND pg_catalog.current_schema()=?
+                            AND pg_catalog.current_setting('server_encoding')='UTF8'
+                            AND pg_catalog.current_setting('session_replication_role')='origin'
+                            AND pg_catalog.current_setting('transaction_read_only')='on'
+                            AND pg_catalog.current_setting('transaction_isolation')='repeatable read'
+                            AND pg_catalog.current_setting('TimeZone')='UTC'
+                        """, Boolean.class, engine.getDatabaseSchema()))) throw unavailable();
+    }
+
+    private void requireBoundMigrationTransaction() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source)
+                || Thread.currentThread().isInterrupted()) throw unavailable();
+    }
+
+    void verifyMigrationReadCoverage() {
+        var columns = migrationColumns();
+        var parameters = new ArrayList<Object>(columns.size() * 3 + 1);
+        for (var column : columns) {
+            parameters.add(column.table());
+            parameters.add(column.name());
+            parameters.add(column.type());
+        }
+        parameters.add(engine.getDatabaseSchema());
+        String rows = String.join(",", java.util.Collections.nCopies(columns.size(), "(?::text,?::text,?::text)"));
+        String sql = "WITH required(table_name,column_name,type_name) AS (VALUES " + rows + ") " + """
+                SELECT NOT EXISTS (
+                    SELECT 1 FROM required r
+                    LEFT JOIN pg_catalog.pg_namespace n ON n.nspname=?
+                    LEFT JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=r.table_name
+                    LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=c.oid AND a.attname=r.column_name
+                        AND a.attnum>0 AND NOT a.attisdropped
+                    WHERE c.oid IS NULL OR c.relkind<>'r' OR c.relpersistence<>'p' OR c.relispartition
+                        OR c.relrowsecurity OR c.relforcerowsecurity
+                        OR NOT pg_catalog.has_schema_privilege(n.oid,'USAGE')
+                        OR NOT pg_catalog.has_table_privilege(c.oid,'SELECT')
+                        OR EXISTS (SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid=c.oid OR inhparent=c.oid)
+                        OR a.atttypid IS DISTINCT FROM pg_catalog.to_regtype(r.type_name)
+                )
+                """;
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(sql, Boolean.class, parameters.toArray()))) throw unavailable();
+    }
+
+    Optional<LockedRoot> readMigrationRoot(ProcessCommandReceiptStore.TaskOrigin start) {
+        var root = readRecoveryRoot(start);
+        if (root.isEmpty() && Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM "
+                + executionTable + " WHERE id_=?)", Boolean.class, start.instanceId()))) throw unavailable();
+        return root;
+    }
+
+    boolean hasExactPlainTimer(ProcessCommandReceiptStore.TaskOrigin start, LockedRoot root, String activityId, Instant observedAt) {
+        var scope = scope(start, null, null);
+        if (!definitionValue(activityId)) throw invalid();
+        var rows = jdbc.query("""
+                SELECT id_,rev_,proc_inst_id_,root_proc_inst_id_,parent_id_,proc_def_id_,tenant_id_,act_id_,
+                    suspension_state_,is_active_,is_scope_,is_concurrent_,is_event_scope_,is_mi_root_,
+                    super_exec_ IS NULL AND callback_id_ IS NULL AND callback_type_ IS NULL
+                        AND reference_id_ IS NULL AND reference_type_ IS NULL AND propagated_stage_inst_id_ IS NULL AS unlinked,
+                    lock_owner_ IS NULL AND lock_time_ IS NULL AS unlocked
+                FROM %s WHERE proc_inst_id_=? OR root_proc_inst_id_=? LIMIT 3
+                """.formatted(executionTable), (rs, row) -> new MigrationExecution(
+                rs.getString("id_"), rs.getInt("rev_"), rs.getString("proc_inst_id_"), rs.getString("root_proc_inst_id_"),
+                rs.getString("parent_id_"), rs.getString("proc_def_id_"), rs.getString("tenant_id_"), rs.getString("act_id_"),
+                rs.getInt("suspension_state_"), rs.getObject("is_active_", Boolean.class),
+                rs.getObject("is_scope_", Boolean.class), rs.getObject("is_concurrent_", Boolean.class),
+                rs.getObject("is_event_scope_", Boolean.class), rs.getObject("is_mi_root_", Boolean.class),
+                rs.getBoolean("unlinked"), rs.getBoolean("unlocked")), scope.instanceId(), scope.instanceId());
+        if (rows.stream().anyMatch(row -> !scope.tenantText().equals(row.tenant()) || !textValue(row.id(), 64))) {
+            throw unavailable();
+        }
+        if (rows.size() != 2) return false;
+        var owner = rows.stream().filter(row -> scope.instanceId().equals(row.id())).findFirst().orElseThrow(ProcessControlNativeAccess::unavailable);
+        var leaf = rows.getFirst().equals(owner) ? rows.getLast() : rows.getFirst();
+        if (!sameMigrationExecutionScope(owner, scope, root) || !sameMigrationExecutionScope(leaf, scope, root)) return false;
+        if (owner.revision() != root.revision() || owner.parentId() != null || owner.activityId() != null
+                || owner.rootId() != null && !scope.instanceId().equals(owner.rootId())
+                || !Boolean.TRUE.equals(owner.scope()) || !scope.instanceId().equals(leaf.parentId())
+                || !scope.instanceId().equals(leaf.rootId()) || !activityId.equals(leaf.activityId())
+                || !Boolean.TRUE.equals(leaf.active()) || !Boolean.FALSE.equals(leaf.scope())) return false;
+
+        // Pinned ordinary timer JSON has only an ASCII activity id; the engine helper needs a command context.
+        String handlerConfiguration = "{\"" + TimerEventHandler.PROPERTYNAME_TIMER_ACTIVITY_ID + "\":\"" + activityId + "\"}";
+        var timers = jdbc.query("""
+                SELECT tenant_id_= ? AND proc_def_id_= ? AND process_instance_id_= ? AND execution_id_= ?
+                    AND element_id_= ? AND rev_>0 AND type_='timer' AND handler_type_= ? AND handler_cfg_= ?
+                    AND repeat_ IS NULL AND lock_owner_ IS NULL AND lock_exp_time_ IS NULL AND exception_msg_ IS NULL
+                    AND scope_id_ IS NULL AND sub_scope_id_ IS NULL AND scope_type_ IS NULL
+                    AND scope_definition_id_ IS NULL AND correlation_id_ IS NULL
+                    AND duedate_ AT TIME ZONE 'UTC' > ? AS exact_timer
+                FROM %sact_ru_timer_job
+                WHERE process_instance_id_=? OR execution_id_ IN (?,?) LIMIT 2
+                """.formatted(recoveryTablePrefix), (rs, row) -> rs.getBoolean("exact_timer"),
+                scope.tenantText(), root.engineDefinitionId(), scope.instanceId(), leaf.id(), activityId,
+                TriggerTimerEventJobHandler.TYPE, handlerConfiguration,
+                java.time.OffsetDateTime.ofInstant(observedAt, ZoneOffset.UTC), scope.instanceId(), owner.id(), leaf.id());
+        return timers.size() == 1 && timers.getFirst() && !hasOtherMigrationState(start, owner.id(), leaf.id());
+    }
+
+    private static boolean sameMigrationExecutionScope(MigrationExecution row, Scope scope, LockedRoot root) {
+        return scope.instanceId().equals(row.instanceId()) && root.engineDefinitionId().equals(row.definitionId())
+                && row.revision() > 0 && row.suspensionState() == 1 && Boolean.FALSE.equals(row.concurrent())
+                && Boolean.FALSE.equals(row.eventScope()) && Boolean.FALSE.equals(row.miRoot()) && row.unlinked() && row.unlocked();
+    }
+
+    private boolean hasOtherMigrationState(ProcessCommandReceiptStore.TaskOrigin start, String rootId, String leafId) {
+        String instance = start.instanceId();
+        for (String table : List.of("act_ru_job", "act_ru_suspended_job", "act_ru_deadletter_job", "act_ru_external_job")) {
+            if (migrationExists(table, "process_instance_id_=? OR execution_id_ IN (?,?)", instance, rootId, leafId)) return true;
+        }
+        for (String table : List.of("act_ru_task", "act_ru_event_subscr", "act_ru_variable")) {
+            if (migrationExists(table, "proc_inst_id_=? OR execution_id_ IN (?,?)", instance, rootId, leafId)) return true;
+        }
+        long tenant = start.requester().tenantId();
+        return migrationExists("tianji_worker_lease_receipt", "tenant_id=? AND scope_type='BPMN' AND scope_id=?", tenant, instance)
+                || migrationExists("tianji_process_agent_dispatch", "tenant_id=? AND scope_type='BPMN' AND scope_id=?", tenant, instance)
+                || migrationExists("tianji_process_agent_result_inbox", "tenant_id=? AND scope_type='BPMN' AND scope_id=?", tenant, instance)
+                || migrationExists("tianji_case_start_provenance", "tenant_id=? AND start_kind='LINKED_BPMN' AND parent_process_instance_id=?", tenant, instance)
+                || migrationExists("tianji_process_worker_recovery_receipt", "tenant_id=? AND process_instance_id=?", tenant, instance);
+    }
+
+    private boolean migrationExists(String fixedTable, String fixedPredicate, Object... arguments) {
+        Boolean found = jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + recoveryTablePrefix + fixedTable
+                + " WHERE " + fixedPredicate + ')', Boolean.class, arguments);
+        if (found == null) throw unavailable();
+        return found;
+    }
+
+    private static List<MigrationColumn> migrationColumns() {
+        var columns = new ArrayList<MigrationColumn>();
+        migrationColumns(columns, "act_ru_execution", "varchar", "id_", "proc_inst_id_", "root_proc_inst_id_", "parent_id_",
+                "proc_def_id_", "tenant_id_", "act_id_", "super_exec_", "callback_id_", "callback_type_", "reference_id_",
+                "reference_type_", "propagated_stage_inst_id_", "lock_owner_", "business_key_");
+        migrationColumns(columns, "act_ru_execution", "int4", "rev_", "suspension_state_");
+        migrationColumns(columns, "act_ru_execution", "bool", "is_active_", "is_scope_", "is_concurrent_", "is_event_scope_", "is_mi_root_");
+        migrationColumns(columns, "act_ru_execution", "timestamp", "lock_time_");
+        migrationColumns(columns, "act_ru_timer_job", "varchar", "tenant_id_", "proc_def_id_", "process_instance_id_", "execution_id_",
+                "element_id_", "type_", "handler_type_", "handler_cfg_", "repeat_", "lock_owner_", "exception_msg_", "scope_id_",
+                "sub_scope_id_", "scope_type_", "scope_definition_id_", "correlation_id_");
+        migrationColumns(columns, "act_ru_timer_job", "int4", "rev_");
+        migrationColumns(columns, "act_ru_timer_job", "timestamp", "lock_exp_time_", "duedate_");
+        for (String table : List.of("act_ru_job", "act_ru_suspended_job", "act_ru_deadletter_job", "act_ru_external_job")) {
+            migrationColumns(columns, table, "varchar", "process_instance_id_", "execution_id_");
+        }
+        for (String table : List.of("act_ru_task", "act_ru_event_subscr", "act_ru_variable")) {
+            migrationColumns(columns, table, "varchar", "proc_inst_id_", "execution_id_");
+        }
+        for (String table : List.of("tianji_worker_lease_receipt", "tianji_process_agent_dispatch", "tianji_process_agent_result_inbox")) {
+            migrationColumns(columns, table, "int8", "tenant_id");
+            migrationColumns(columns, table, "varchar", "scope_type", "scope_id");
+        }
+        migrationColumns(columns, "tianji_case_start_provenance", "int8", "tenant_id");
+        migrationColumns(columns, "tianji_case_start_provenance", "varchar", "start_kind", "parent_process_instance_id");
+        migrationColumns(columns, "tianji_process_worker_recovery_receipt", "int8", "tenant_id");
+        migrationColumns(columns, "tianji_process_worker_recovery_receipt", "varchar", "process_instance_id");
+        migrationColumns(columns, "tianji_process_command_receipt", "int8", "tenant_id");
+        migrationColumns(columns, "tianji_process_command_receipt", "varchar", "subject_type", "subject_id", "command_type",
+                "command_id", "release_key", "correlation_id", "state", "resource_id");
+        migrationColumns(columns, "tianji_process_command_receipt", "varchar", "subject_issuer");
+        migrationColumns(columns, "tianji_process_command_receipt", "bpchar", "request_sha256");
+        migrationColumns(columns, "tianji_process_command_receipt", "timestamptz", "created_at");
+        migrationColumns(columns, "tianji_process_release", "int8", "tenant_id");
+        migrationColumns(columns, "tianji_process_release", "varchar", "release_key", "state");
+        migrationColumns(columns, "tianji_process_release", "bpchar", "manifest_sha256");
+        migrationColumns(columns, "tianji_process_release", "timestamptz", "created_at");
+        migrationColumns(columns, "tianji_process_release_definition", "int8", "tenant_id");
+        migrationColumns(columns, "tianji_process_release_definition", "varchar", "release_key", "model_type", "definition_key",
+                "engine_definition_id", "engine_deployment_id");
+        migrationColumns(columns, "tianji_process_release_definition", "int4", "engine_version");
+        migrationColumns(columns, "tianji_process_release_definition", "bpchar", "model_sha256");
+        migrationColumns(columns, "tianji_process_release_definition", "jsonb", "input_schema");
+        return columns;
+    }
+
+    private static void migrationColumns(List<MigrationColumn> columns, String table, String type, String... names) {
+        for (String name : names) columns.add(new MigrationColumn(table, name, "pg_catalog." + type));
+    }
+
+    private record MigrationColumn(String table, String name, String type) { }
+
+    private record MigrationExecution(String id, int revision, String instanceId, String rootId, String parentId,
+                                      String definitionId, String tenant, String activityId, int suspensionState,
+                                      Boolean active, Boolean scope, Boolean concurrent, Boolean eventScope, Boolean miRoot,
+                                      boolean unlinked, boolean unlocked) { }
 
     public void verifyRecoveryTransaction() {
         requireTransaction();

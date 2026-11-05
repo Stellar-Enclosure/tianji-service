@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayInputStream;
 import java.time.Duration;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -129,6 +130,50 @@ class ProcessModelValidatorTest {
         assertNotEquals(linkedCase, caseWithError, "case-source-attachment");
         assertThrows(IllegalArgumentException.class,
                 () -> validator.validateBpmn(bytes(caseWithError), "linkedProcess"), "case-source-attachment");
+    }
+
+    @Test
+    void derives_exact_plain_migration_timer() {
+        var released = validator.validateBpmn(bytes(plainMigrationTimerXml()), "migrationTimer");
+        assertEquals(new ProcessModelValidator.PlainMigrationTimerVO("wait", Duration.ofSeconds(1)),
+                validator.plainMigrationTimer(released).orElse(null));
+    }
+
+    @Test
+    void rejects_nonplain_migration_timer_models() throws Exception {
+        var taskThenTimer = validator.validateBpmn(fixture("baseline.bpmn20.xml"), "baseline");
+        var linkedCase = validator.validateBpmn(fixture("formal-case-linked.bpmn20.xml"), "linkedProcess");
+        var linkedAgent = validator.validateBpmn(fixture("agent-dispatch-wait.bpmn20.xml"), "agentDispatch");
+        var humanBoundary = validator.validateBpmn(fixture("governed-human-task-timer.bpmn20.xml"), "timedHumanReview");
+        String fractional = plainMigrationTimerXml().replace("PT1S", "PT1.5S");
+        String nonCanonical = plainMigrationTimerXml().replace("PT1S", "P1D");
+        var fractionalTimer = validator.validateBpmn(bytes(fractional), "migrationTimer");
+        var nonCanonicalTimer = validator.validateBpmn(bytes(nonCanonical), "migrationTimer");
+
+        for (var model : List.of(taskThenTimer, linkedCase, linkedAgent, humanBoundary,
+                fractionalTimer, nonCanonicalTimer)) {
+            assertTrue(validator.plainMigrationTimer(model).isEmpty(), model.definitionKey());
+        }
+        assertEquals(Map.of("wait", Duration.ofSeconds(1)), taskThenTimer.timerWaits());
+        assertEquals(Map.of("wait", Duration.ofMillis(1500)), fractionalTimer.timerWaits());
+        assertEquals(Map.of("wait", Duration.ofDays(1)), nonCanonicalTimer.timerWaits());
+    }
+
+    private static String plainMigrationTimerXml() {
+        return """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="https://stellar-enclosure.example/test">
+                    <process id="migrationTimer" name="Migration timer" isExecutable="true">
+                        <startEvent id="start"/>
+                        <sequenceFlow id="toTimer" sourceRef="start" targetRef="wait"/>
+                        <intermediateCatchEvent id="wait">
+                            <timerEventDefinition><timeDuration>PT1S</timeDuration></timerEventDefinition>
+                        </intermediateCatchEvent>
+                        <sequenceFlow id="toEnd" sourceRef="wait" targetRef="end"/>
+                        <endEvent id="end"/>
+                    </process>
+                </definitions>
+                """;
     }
 
     @Test

@@ -71,6 +71,8 @@ stellar:
     process:
       cancellation:
         enabled: false
+      migration-preflight:
+        enabled: false
       worker-recovery:
         enabled: false
       cases:

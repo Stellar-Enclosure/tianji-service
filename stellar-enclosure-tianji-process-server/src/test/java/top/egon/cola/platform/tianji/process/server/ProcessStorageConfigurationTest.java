@@ -9,7 +9,10 @@ import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.beans.factory.config.YamlMapFactoryBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.ApplicationContext;
+import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -17,15 +20,18 @@ import org.springframework.web.context.WebApplicationContext;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -185,6 +191,32 @@ class ProcessStorageConfigurationTest {
                 .afterSingletonsInstantiated());
         var disabled = new MockEnvironment().withProperty("stellar.tianji.process.worker-recovery.enabled", "false");
         assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(disabled, nonServlet).afterSingletonsInstantiated());
+    }
+
+    @Test
+    void migration_preflight_defaults_off() {
+        var yaml = new YamlMapFactoryBean();
+        yaml.setResources(new ClassPathResource("application.yml"));
+        var process = section(yaml.getObject(), "stellar", "tianji", "process");
+        Object flag = process.get("migration-preflight");
+        assertEquals(Boolean.FALSE, flag instanceof Map<?, ?> mapping ? mapping.get("enabled") : null);
+    }
+
+    @Test
+    void migration_preflight_requires_enabled_servlet_api() {
+        var configuration = ProcessSecurityConfiguration.MigrationPreflightConfiguration.class;
+        var servlet = configuration.getAnnotation(ConditionalOnWebApplication.class);
+        assertEquals(ConditionalOnWebApplication.Type.SERVLET, servlet.type());
+        var condition = configuration.getAnnotation(ConditionalOnProperty.class);
+        assertEquals("stellar.tianji.process", condition.prefix());
+        assertEquals(List.of("api.enabled", "migration-preflight.enabled"), List.of(condition.name()));
+        assertEquals("true", condition.havingValue());
+        assertFalse(condition.matchIfMissing());
+
+        var factory = Arrays.stream(configuration.getDeclaredMethods())
+                .filter(method -> "processMigrationPreflightService".equals(method.getName())).findFirst().orElseThrow();
+        assertEquals(ProcessMigrationPreflightService.class, factory.getReturnType());
+        assertEquals(List.of("processMigrationPreflightService"), List.of(factory.getAnnotation(Bean.class).value()));
     }
 
     @Test

@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -92,6 +93,67 @@ public final class ProcessModelValidator {
             Map.entry("inputExpression", Set.of("id", "typeRef")), Map.entry("output", Set.of("id", "name", "label", "typeRef")),
             Map.entry("rule", Set.of("id")), Map.entry("inputEntry", Set.of("id")),
             Map.entry("outputEntry", Set.of("id")), Map.entry("text", Set.of()));
+
+    public Optional<PlainMigrationTimerVO> plainMigrationTimer(ValidatedProcessModel model) {
+        if (model == null || model.type() != Type.BPMN || model.timerWaits().size() != 1) return Optional.empty();
+        Element definitions = SafeModelXml.parse(model.xml(), true).getDocumentElement();
+        var definitionsChildren = children(definitions);
+        if (!plainElement(definitions, "definitions") || definitionsChildren.size() != 1) return Optional.empty();
+        Element process = definitionsChildren.getFirst();
+        if (!plainElement(process, "process") || !"true".equals(process.getAttribute("isExecutable"))
+                || !model.definitionKey().equals(process.getAttribute("id"))) return Optional.empty();
+        var nodes = children(process);
+        if (nodes.size() != 5) return Optional.empty();
+
+        var starts = children(process, "startEvent");
+        var ends = children(process, "endEvent");
+        var catches = children(process, "intermediateCatchEvent");
+        var flows = children(process, "sequenceFlow");
+        if (starts.size() != 1 || ends.size() != 1 || catches.size() != 1 || flows.size() != 2) return Optional.empty();
+        Element start = starts.getFirst(), end = ends.getFirst(), timer = catches.getFirst();
+        if (!plainElement(start, "startEvent") || !plainElement(end, "endEvent")
+                || !plainElement(timer, "intermediateCatchEvent")
+                || !children(start).isEmpty() || !children(end).isEmpty()) return Optional.empty();
+        String startId = start.getAttribute("id"), endId = end.getAttribute("id"), timerId = timer.getAttribute("id");
+        if (!IDENTIFIER.matcher(startId).matches() || !IDENTIFIER.matcher(endId).matches()
+                || !IDENTIFIER.matcher(timerId).matches() || startId.equals(timerId) || timerId.equals(endId)
+                || startId.equals(endId) || !isPlainFlowPair(flows, startId, timerId, endId)) return Optional.empty();
+
+        var timerChildren = children(timer);
+        if (timerChildren.size() != 1 || !plainElement(timerChildren.getFirst(), "timerEventDefinition")) return Optional.empty();
+        var durationChildren = children(timerChildren.getFirst());
+        if (durationChildren.size() != 1 || !plainElement(durationChildren.getFirst(), "timeDuration")
+                || !children(durationChildren.getFirst()).isEmpty()) return Optional.empty();
+        Duration duration = model.timerWaits().get(timerId);
+        if (duration == null || duration.getNano() != 0 || !duration.toString().equals(durationChildren.getFirst().getTextContent())) {
+            return Optional.empty();
+        }
+        return Optional.of(new PlainMigrationTimerVO(timerId, duration));
+    }
+
+    private static boolean isPlainFlowPair(List<Element> flows, String start, String timer, String end) {
+        Element first = flows.getFirst(), second = flows.getLast();
+        return plainFlow(first, start, timer) && plainFlow(second, timer, end)
+                || plainFlow(first, timer, end) && plainFlow(second, start, timer);
+    }
+
+    private static boolean plainFlow(Element element, String source, String target) {
+        return plainElement(element, "sequenceFlow") && children(element).isEmpty()
+                && source.equals(element.getAttribute("sourceRef")) && target.equals(element.getAttribute("targetRef"));
+    }
+
+    private static boolean plainElement(Element element, String localName) {
+        if (!BPMN.equals(element.getNamespaceURI()) || !localName.equals(element.getLocalName())) return false;
+        var attributes = element.getAttributes();
+        for (int index = 0; index < attributes.getLength(); index++) {
+            var attribute = attributes.item(index);
+            if (XMLConstants.XMLNS_ATTRIBUTE_NS_URI.equals(attribute.getNamespaceURI())) continue;
+            if (attribute.getNamespaceURI() != null || !BPMN_ATTRIBUTES.get(localName).contains(attribute.getLocalName())) return false;
+        }
+        return true;
+    }
+
+    public record PlainMigrationTimerVO(String activityId, Duration duration) { }
 
     public ValidatedProcessModel validateBpmn(byte[] source, String expectedKey) {
         byte[] bytes = copy(source, expectedKey);
