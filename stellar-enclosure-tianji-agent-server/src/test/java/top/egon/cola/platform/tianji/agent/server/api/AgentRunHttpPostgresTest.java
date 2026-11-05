@@ -1,5 +1,8 @@
 package top.egon.cola.platform.tianji.agent.server.api;
 
+import com.google.adk.models.LlmRequest;
+import com.google.adk.models.LlmResponse;
+import jakarta.validation.Validation;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -7,6 +10,16 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
+import org.springframework.ai.chat.metadata.ChatResponseMetadata;
+import org.springframework.ai.chat.metadata.DefaultUsage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
+import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.chat.prompt.Prompt;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -14,7 +27,21 @@ import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
+import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
+import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
+import top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory;
+import top.egon.cola.component.agentflow.workflow.SequentialAgentWorkflowBuilderStrategy;
+import top.egon.cola.component.common.core.validation.ValidationUtils;
+import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
@@ -22,11 +49,15 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.CurrentEffectivePermissionView;
@@ -41,9 +72,14 @@ import java.net.URI;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
@@ -152,6 +188,171 @@ class AgentRunHttpPostgresTest {
         assertFalse(resumed.contains("id: 1\n"));
         assertTrue(resumed.contains("id: 2\n"));
         assertTrue(resumed.endsWith("event: stream.complete\n\n"));
+    }
+
+    @Test
+    void one_http_start_projects_and_replays_two_durable_deltas_with_atomic_completion() throws Exception {
+        var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(12), Duration.ofSeconds(10),
+                2, 0, 100, 40, BigDecimal.ONE, "USD", 2, Set.of(), null, null);
+        var configuration = Map.<String, Object>of(
+                "chatModelBeanName", "s01Model", "modelName", "s01-model", "rootAgentName", "writer",
+                "agents", List.of(Map.of("name", "writer", "instruction", "Write a two-part fixture response.")));
+        ledger.publish(OWNER, new AgentDefinitionSpecDTO("s01-stream", 1, "CONFIG", null, "1", "1",
+                new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "s01-route", "s01-policy"),
+                policy, configuration));
+        var command = new StartAgentRunCommand("s01-stream", 1, null, "s01-once", null, "s01-stream",
+                new AgentInputDTO("fixture question", List.of(), Map.of()), null);
+        String accepted = mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(command))).andExpect(status().isAccepted())
+                .andReturn().getResponse().getContentAsString();
+        var queued = mapper.readValue(accepted, AgentRunDTO.class);
+        assertEquals(AgentRunStatusEnum.QUEUED, queued.status());
+        assertEquals(0, queued.attempt());
+        var query = new GetAgentRunQuery(queued.runId());
+        var model = new TwoChunkModel();
+
+        try (var validators = Validation.buildDefaultValidatorFactory();
+             var control = Executors.newScheduledThreadPool(2);
+             var worker = Executors.newSingleThreadExecutor()) {
+            var validator = new AgentFlowConfigValidator(new ValidationUtils(validators.getValidator()));
+            var factory = new AgentFlowFactory(new SpringAiModelAdapterFactory(),
+                    new AgentWorkflowStrategyFactory(List.of(new SequentialAgentWorkflowBuilderStrategy())));
+            var executor = new AdkAgentRunExecutor(ledger, factory, validator, Map.of("s01Model", model), Map.of(),
+                    control, s01Budget(), null, false, (request, boundary) -> AgentRunAuthorization.Decision.ALLOW);
+            try (var dispatcher = new AgentRunDispatcher(worker, executor, ledger)) {
+                var completion = dispatcher.dispatch(OWNER, query).toCompletableFuture();
+                try {
+                    assertTrue(model.entered.await(8, TimeUnit.SECONDS), "ADK must enter the Fake stream");
+                    assertEquals(AgentRunStatusEnum.RUNNING, ledger.get(OWNER, query).status());
+                    assertTrue(ledger.getResult(OWNER, query).isEmpty());
+                } finally {
+                    model.release.countDown();
+                }
+                var finished = completion.get(15, TimeUnit.SECONDS);
+                assertEquals(AgentRunStatusEnum.COMPLETED, finished.status());
+                assertEquals(1, finished.attempt());
+                assertAtomicCompletion(finished);
+                assertReplayAndResult(finished);
+                assertEquals(1, model.subscriptions.get(), "reopening SSE cannot invoke the model");
+            }
+        }
+    }
+
+    private void assertReplayAndResult(AgentRunDTO finished) throws Exception {
+        String runPath = BASE + "/" + finished.runId();
+        String full = mvc.perform(get(runPath + "/events").accept(MediaType.TEXT_EVENT_STREAM))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        var events = readEvents(full, finished.runId(), 0);
+        assertEquals(finished.lastEventSequence(), events.getLast().sequence());
+        var deltas = events.stream().filter(event -> "TEXT_DELTA".equals(event.type())).toList();
+        assertEquals(List.of("First ", "second."), deltas.stream().map(event -> event.payload().get("text")).toList());
+        var terminal = events.getLast();
+        assertEquals("RUN_STATUS_CHANGED", terminal.type());
+        assertEquals("COMPLETED", terminal.payload().get("status"));
+        long cursor = deltas.getFirst().sequence();
+        String replay = mvc.perform(get(runPath + "/events").accept(MediaType.TEXT_EVENT_STREAM)
+                        .header("Last-Event-ID", Long.toString(cursor)))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        assertEquals(events.stream().filter(event -> event.sequence() > cursor).toList(),
+                readEvents(replay, finished.runId(), cursor));
+        String body = mvc.perform(get(runPath + "/result")).andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        var result = mapper.readValue(body, AgentExecutionResult.class);
+        assertEquals(finished.runId(), result.runId());
+        assertEquals(AgentRunStatusEnum.COMPLETED, result.status());
+        assertEquals("First second.", result.output().get("text"));
+    }
+
+    private List<AgentEventDTO> readEvents(String body, String runId, long after) {
+        assertTrue(body.endsWith("event: stream.complete\n\n"), "stream must close at the terminal watermark");
+        String[] frames = body.split("\n\n");
+        assertEquals("event: stream.complete", frames[frames.length - 1]);
+        var events = new ArrayList<AgentEventDTO>();
+        long expected = after;
+        for (int index = 0; index < frames.length - 1; index++) {
+            String[] fields = frames[index].split("\n", -1);
+            assertEquals(3, fields.length);
+            assertEquals("id: " + ++expected, fields[0]);
+            assertEquals("event: agent.event", fields[1]);
+            assertTrue(fields[2].startsWith("data: "));
+            var event = mapper.readValue(fields[2].substring("data: ".length()), AgentEventDTO.class);
+            assertEquals(expected, event.sequence());
+            assertEquals(runId, event.runId());
+            events.add(event);
+        }
+        assertFalse(events.isEmpty());
+        return List.copyOf(events);
+    }
+
+    private static void assertAtomicCompletion(AgentRunDTO finished) {
+        assertEquals(Boolean.TRUE, new JdbcTemplate(source).queryForObject("""
+                SELECT r.status = 'COMPLETED' AND r.result->>'status' = 'COMPLETED'
+                   AND r.result->>'runId' = r.run_id AND r.attempt = 1
+                   AND r.result#>>'{output,text}' = 'First second.'
+                   AND e.event_type = 'RUN_STATUS_CHANGED' AND e.payload->>'status' = 'COMPLETED'
+                   AND r.xmin = e.xmin
+                FROM tianji_agent.agent_run r
+                JOIN tianji_agent.agent_event e ON e.tenant_id = r.tenant_id AND e.run_id = r.run_id
+                   AND e.sequence = r.last_event_sequence
+                WHERE r.tenant_id = ? AND r.subject_type = ? AND r.subject_issuer = ? AND r.subject_id = ?
+                   AND r.idempotency_key = 's01-once' AND r.run_id = ? AND r.last_event_sequence = ?
+                """, Boolean.class, OWNER.tenantId(), OWNER.subjectType().name(), OWNER.issuerFingerprint(),
+                OWNER.subjectId(), finished.runId(), finished.lastEventSequence()));
+    }
+
+    private static AgentModelBudgetEstimator s01Budget() {
+        return new AgentModelBudgetEstimator() {
+            @Override
+            public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new Estimate(20, 30, new BigDecimal("0.10"));
+            }
+
+            @Override
+            public ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
+                        snapshot.definition().dependencies().policyVersionRef(), 1_000, 10);
+            }
+
+            @Override
+            public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) {
+                return response.usageMetadata().map(usage -> new AgentBudgetSettlement(
+                        usage.promptTokenCount().map(Integer::longValue).orElse(null),
+                        usage.candidatesTokenCount().map(Integer::longValue).orElse(null), new BigDecimal("0.05")))
+                        .orElseGet(() -> new AgentBudgetSettlement(null, null, null));
+            }
+        };
+    }
+
+    private static final class TwoChunkModel implements ChatModel {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final AtomicInteger subscriptions = new AtomicInteger();
+
+        @Override
+        public ChatResponse call(Prompt prompt) {
+            throw new AssertionError("The S01 fixture must use the streaming model");
+        }
+
+        @Override
+        public Flux<ChatResponse> stream(Prompt prompt) {
+            return Mono.fromCallable(() -> {
+                subscriptions.incrementAndGet();
+                entered.countDown();
+                assertTrue(release.await(10, TimeUnit.SECONDS), "The fixture must release the Fake stream");
+                return Boolean.TRUE;
+            }).thenMany(Flux.just(response("First ", ""), response("second.", "stop")));
+        }
+
+        @Override
+        public ChatOptions getOptions() {
+            return ToolCallingChatOptions.builder().model("s01-model").build();
+        }
+
+        private static ChatResponse response(String text, String finishReason) {
+            return new ChatResponse(List.of(new Generation(new AssistantMessage(text),
+                    ChatGenerationMetadata.builder().finishReason(finishReason).build())),
+                    ChatResponseMetadata.builder().usage(new DefaultUsage(10, 5, 15)).build());
+        }
     }
 
     @Test
