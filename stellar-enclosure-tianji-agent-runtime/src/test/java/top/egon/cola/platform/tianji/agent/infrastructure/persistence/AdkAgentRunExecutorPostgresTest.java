@@ -488,6 +488,58 @@ class AdkAgentRunExecutorPostgresTest {
     }
 
     @Test
+    void continuous_deltas_cannot_extend_the_total_deadline() throws Exception {
+        var total = Duration.ofSeconds(5);
+        var idle = Duration.ofSeconds(2);
+        var cancelled = new CountDownLatch(1);
+        var emitted = new AtomicInteger();
+        var model = new FixtureModel();
+        // The safety cap is longer than the Run deadline and emits no final provider response.
+        model.script = prompt -> Flux.interval(Duration.ZERO, Duration.ofMillis(100))
+                .take(90)
+                .map(index -> {
+                    emitted.incrementAndGet();
+                    return FixtureModel.response("tick-" + index, "");
+                })
+                .doOnCancel(cancelled::countDown);
+
+        var actor = actor();
+        ledger.publish(actor, singleSpec("continuous-total-deadline", policy(total, idle)));
+        var query = start(actor, "continuous-total-deadline", "key");
+        var accepted = ledger.get(actor, query);
+        var worker = executor(model, Map.of());
+        var timedOut = worker.executeQueued(actor, query);
+
+        assertEquals(TIMED_OUT, timedOut.status());
+        assertEquals(accepted.deadlineAt(), timedOut.deadlineAt());
+        assertFalse(ledger.databaseNow().isBefore(accepted.deadlineAt()));
+        var result = ledger.getResult(actor, query).orElseThrow();
+        assertEquals(TIMED_OUT, result.status());
+        assertEquals(AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(), result.errorCode());
+        assertTrue(cancelled.await(2, TimeUnit.SECONDS));
+        assertEquals(1, model.streams.get());
+        assertTrue(emitted.get() < 90, "the Run deadline must cancel before the fixture safety cap");
+
+        var events = ledger.events(actor, new AgentEventsQuery(query.runId(), 0, 100));
+        var deltas = events.stream().filter(event -> "TEXT_DELTA".equals(event.type())).toList();
+        assertTrue(deltas.size() >= 2, "the real Runner must persist multiple partial deltas");
+        assertTrue(deltas.getFirst().sequence() < deltas.getLast().sequence());
+        var lastDelta = deltas.getLast().occurredAt();
+        assertFalse(lastDelta.isAfter(accepted.deadlineAt()));
+        assertTrue(lastDelta.isAfter(accepted.deadlineAt().minus(idle)),
+                "a committed delta must still be within the idle window when the Run deadline falls");
+        assertTrue(events.stream().noneMatch(event -> "AGENT_OUTPUT".equals(event.type())));
+        var terminal = events.getLast();
+        assertEquals(timedOut.lastEventSequence(), terminal.sequence());
+        assertEquals("RUN_STATUS_CHANGED", terminal.type());
+        assertEquals("TIMED_OUT", terminal.payload().get("status"));
+
+        assertEquals(timedOut, worker.executeQueued(actor, query));
+        assertEquals(1, model.streams.get());
+        assertEquals(events, ledger.events(actor, new AgentEventsQuery(query.runId(), 0, 100)));
+    }
+
+    @Test
     void model_idle_timeout_stops_the_subscription_before_the_total_deadline() throws Exception {
         FixtureModel model = new FixtureModel();
         CountDownLatch subscribed = new CountDownLatch(1);
