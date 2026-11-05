@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "profileId": "expense-release-evidence-v1",
+  "windowMode": "DECLARED_UTC_AUDIT_WINDOW",
+  "groups": [
+    {
+      "id": "U_SOURCE",
+      "level": "U",
+      "reports": [
+        {
+          "module": "stellar-enclosure-tianji-agent-server",
+          "className": "top.egon.cola.platform.tianji.agent.server.acceptance.ExpenseAcceptanceModelTest",
+          "selector": "ExpenseAcceptanceModelTest",
+          "minimumTests": 2,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-agent-server",
+          "className": "top.egon.cola.platform.tianji.agent.server.integration.process.AgentResultDeliveryHandlerTest",
+          "selector": "AgentResultDeliveryHandlerTest",
+          "minimumTests": 6,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceHarnessTest",
+          "selector": "ExpenseAcceptanceHarnessTest",
+          "minimumTests": 9,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.acceptance.ExpenseFixtureModelsTest",
+          "selector": "ExpenseFixtureModelsTest",
+          "minimumTests": 4,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.bridge.AgentStartWorkerTest",
+          "selector": "AgentStartWorkerTest",
+          "minimumTests": 10,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.compensation.CompensationBusinessFixtureTest",
+          "selector": "CompensationBusinessFixtureTest",
+          "minimumTests": 15,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.release.CmmnModelValidatorTest",
+          "selector": "CmmnModelValidatorTest",
+          "minimumTests": 67,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.release.HumanTaskModelTest",
+          "selector": "HumanTaskModelTest",
+          "minimumTests": 5,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.release.HumanTaskTimerModelTest",
+          "selector": "HumanTaskTimerModelTest",
+          "minimumTests": 5,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.release.ProcessModelValidatorTest",
+          "selector": "ProcessModelValidatorTest",
+          "minimumTests": 19,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.release.WorkerCompensationModelTest",
+          "selector": "WorkerCompensationModelTest",
+          "minimumTests": 12,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerServiceTest",
+          "selector": "FlowableWorkerServiceTest",
+          "minimumTests": 16,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistryTest",
+          "selector": "WorkerTopicRegistryTest",
+          "minimumTests": 2,
+          "methods": []
+        },
+        {
+          "module": "stellar-enclosure-tianji-worker-starter",
+          "className": "top.egon.cola.platform.tianji.worker.RemoteWorkerPollerTest",
+          "selector": "RemoteWorkerPollerTest",
+          "minimumTests": 11,
+          "methods": []
+        }
+      ]
+    },
+    {
+      "id": "I_CASE",
+      "level": "I",
+      "reports": [
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.FormalCasePostgresTest",
+          "selector": "FormalCasePostgresTest",
+          "minimumTests": 1,
+          "methods": [
+            "native_case_lifecycle_and_exact_bpmn_continuation_are_atomic_and_recoverable"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "E_BUSINESS",
+      "level": "E",
+      "reports": [
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.acceptance.BusinessProcessAgentAcceptanceIT",
+          "selector": "BusinessProcessAgentAcceptanceIT",
+          "minimumTests": 3,
+          "methods": [
+            "normalWorkflowAcrossBothTenants",
+            "failedAgentCompensatesAcrossBothTenants",
+            "manualCaseAndAuthorizedReviewAcrossBothTenants"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "E_RECOVERY",
+      "level": "E",
+      "reports": [
+        {
+          "module": "stellar-enclosure-tianji-process-server",
+          "className": "top.egon.cola.platform.tianji.process.server.acceptance.WorkerRecoveryIT",
+          "selector": "WorkerRecoveryIT",
+          "minimumTests": 1,
+          "methods": [
+            "recoversLostAcknowledgementEarlyResultAndIndependentRestartsAcrossBothTenants"
+          ]
+        }
+      ]
+    }
+  ],
+  "baseWitnesses": [
+    "START_COMMAND",
+    "PROCESS_INSTANCE",
+    "DECISION_EXECUTION",
+    "DECISION_RULE",
+    "AGENT_DISPATCH",
+    "AGENT_RUN",
+    "AGENT_STATUS",
+    "PROCESS_END",
+    "WORKER_JOB",
+    "WORKER_OCCURRENCE",
+    "ORIGINAL_RECEIPT"
+  ],
+  "expensePaths": {
+    "NORMAL": {
+      "suite": "BUSINESS",
+      "ruleId": "smallExpense",
+      "agentStatus": "COMPLETED",
+      "processEnd": "normalEnd",
+      "extraWitnesses": [
+        "NOTICE_RECEIPT"
+      ]
+    },
+    "AGENT_FAILURE": {
+      "suite": "BUSINESS",
+      "ruleId": "smallExpense",
+      "agentStatus": "FAILED",
+      "processEnd": "compensatedEnd",
+      "extraWitnesses": [
+        "UNDO_RECEIPT"
+      ]
+    },
+    "MANUAL_CASE": {
+      "suite": "BUSINESS",
+      "ruleId": "largeExpense",
+      "agentStatus": "COMPLETED",
+      "processEnd": "compensatedEnd",
+      "extraWitnesses": [
+        "UNDO_RECEIPT",
+        "HUMAN_TASK",
+        "CASE_INSTANCE",
+        "CASE_COMPLETION"
+      ]
+    },
+    "RECOVERY": {
+      "suite": "RECOVERY",
+      "ruleId": "smallExpense",
+      "agentStatus": "COMPLETED",
+      "processEnd": "normalEnd",
+      "extraWitnesses": [
+        "NOTICE_RECEIPT",
+        "WORKER_REACQUIRED",
+        "EARLY_INBOX_PENDING",
+        "OUTBOX_RETRY_CONFIRMED",
+        "PROCESS_WAIT_RETAINED"
+      ]
+    }
+  }
+}
