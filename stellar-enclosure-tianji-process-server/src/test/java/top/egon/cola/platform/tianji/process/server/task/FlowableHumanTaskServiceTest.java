@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.process.server.task;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.flowable.common.engine.api.FlowableOptimisticLockingException;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.TaskService;
@@ -46,6 +47,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -56,11 +58,107 @@ import static org.mockito.Mockito.*;
 
 /** Native markers and real domain/result construction, without starting an engine or a database. */
 class FlowableHumanTaskServiceTest {
+    private static final String COMPLETION_TIMER = "tianji.process.human.task.completion.duration";
     private static final Instant NOW = Instant.parse("2026-10-31T00:00:00Z");
     private static final String HASH = "a".repeat(64);
     private static final ProcessActor ACTOR = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "reviewer", "https://idp.example/20");
     private static final ProcessActor STARTER = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "applicant", "https://idp.example/20");
     private static final TaskOrigin ORIGIN = new TaskOrigin(STARTER, "start", HASH, "release", "correlation", "instance", NOW);
+
+    @Test
+    void observes_only_fresh_committed_task_completion() throws Exception {
+        var registry = new SimpleMeterRegistry();
+        try (var fixture = new Fixture(HumanTaskCompletionObservation.enabled(() -> registry))) {
+            when(fixture.task.getCreateTime()).thenReturn(Date.from(NOW.minusSeconds(15)));
+            when(fixture.task.getDueDate()).thenReturn(Date.from(NOW));
+            var claim = context("claim", Set.of("50"));
+            fixture.service.claim(claim, new ClaimHumanTaskCommand("claim", "task", fixture.version()));
+            assertTrue(registry.getMeters().isEmpty());
+            var complete = context("complete", Set.of("50"));
+            var command = new CompleteHumanTaskCommand("complete", "task", fixture.version(), Map.of("approved", false, "comment", "example"));
+            doAnswer(call -> {
+                assertTrue(registry.getMeters().isEmpty());
+                fixture.last.set(call.getArgument(1));
+                return null;
+            }).when(fixture.receipts).apply(eq(complete), any());
+            doAnswer(call -> { assertTrue(registry.getMeters().isEmpty()); return null; }).when(fixture.connection).commit();
+            var receipt = fixture.service.complete(complete, command);
+            assertEquals(NOW, receipt.occurredAt());
+            assertEquals(1, registry.getMeters().size());
+            var timer = registry.get(COMPLETION_TIMER).tags("scope", "process", "due", "on_time").timer();
+            assertEquals(1, timer.count());
+            assertEquals(15, timer.totalTime(TimeUnit.SECONDS));
+            assertEquals(Set.of("scope", "due"), timer.getId().getTags().stream()
+                    .map(io.micrometer.core.instrument.Tag::getKey).collect(java.util.stream.Collectors.toSet()));
+
+            clearInvocations(fixture.connection);
+            doNothing().when(fixture.connection).commit();
+            when(fixture.receipts.lockCommand(any(), eq(HumanTaskActionEnum.COMPLETE), eq("complete"), anyString()))
+                    .thenReturn(Optional.of(fixture.last.get()));
+            assertEquals(receipt, fixture.service.complete(complete, command));
+            verify(fixture.tasks, times(1)).complete(eq("task"), anyString(), anyMap());
+            assertEquals(1, timer.count());
+        }
+    }
+
+    @Test
+    void classifies_only_fixed_due_postures_and_never_emits_invalid_or_rolled_back_times() throws Exception {
+        var registry = new SimpleMeterRegistry();
+        try (var fixture = new Fixture()) {
+            var observation = HumanTaskCompletionObservation.enabled(() -> registry);
+            var transaction = new TransactionTemplate(fixture.manager);
+            observation.recordOnCommit(HumanTaskScopeTypeEnum.PROCESS, NOW, NOW, NOW);
+            assertTrue(registry.getMeters().isEmpty());
+            transaction.executeWithoutResult(status -> {
+                observation.recordOnCommit(HumanTaskScopeTypeEnum.PROCESS, NOW.minusSeconds(3), NOW.minusNanos(1), NOW);
+                observation.recordOnCommit(HumanTaskScopeTypeEnum.CASE, NOW, null, NOW);
+                observation.recordOnCommit(HumanTaskScopeTypeEnum.PROCESS, NOW.plusNanos(1), NOW, NOW);
+                observation.recordOnCommit(HumanTaskScopeTypeEnum.PROCESS, Instant.EPOCH,
+                        null, Instant.parse("9999-01-01T00:00:00Z"));
+                assertTrue(registry.getMeters().isEmpty());
+            });
+            assertEquals(2, registry.getMeters().size());
+            var late = registry.get(COMPLETION_TIMER).tags("scope", "process", "due", "late").timer();
+            var unscheduled = registry.get(COMPLETION_TIMER).tags("scope", "case", "due", "unscheduled").timer();
+            assertEquals(1, late.count());
+            assertEquals(3, late.totalTime(TimeUnit.SECONDS));
+            assertEquals(1, unscheduled.count());
+            assertEquals(0, unscheduled.totalTime(TimeUnit.NANOSECONDS));
+            transaction.executeWithoutResult(status -> {
+                observation.recordOnCommit(HumanTaskScopeTypeEnum.PROCESS, NOW, NOW, NOW);
+                status.setRollbackOnly();
+            });
+            verify(fixture.connection).rollback();
+            assertEquals(2, registry.getMeters().size());
+        }
+    }
+
+    @Test
+    void failed_commit_and_unavailable_registry_do_not_claim_a_sample() throws Exception {
+        var registry = new SimpleMeterRegistry();
+        try (var fixture = new Fixture(HumanTaskCompletionObservation.enabled(() -> registry))) {
+            var complete = context("complete", Set.of("50"));
+            fixture.assignee.set(complete.userKey());
+            var command = new CompleteHumanTaskCommand("complete", "task", fixture.version(), Map.of("approved", true, "comment", "example"));
+            doThrow(new java.sql.SQLException("private commit failure")).when(fixture.connection).commit();
+            assertThrows(org.springframework.transaction.TransactionException.class, () -> fixture.service.complete(complete, command));
+            verify(fixture.receipts).apply(eq(complete), any());
+            assertTrue(registry.getMeters().isEmpty());
+        }
+        var registryLookups = new AtomicInteger();
+        var failing = HumanTaskCompletionObservation.enabled(() -> {
+            registryLookups.incrementAndGet();
+            throw new IllegalStateException("private registry failure");
+        });
+        try (var fixture = new Fixture(failing)) {
+            var complete = context("complete", Set.of("50"));
+            fixture.assignee.set(complete.userKey());
+            var command = new CompleteHumanTaskCommand("complete", "task", fixture.version(), Map.of("approved", true, "comment", "example"));
+            assertEquals(HumanTaskActionEnum.COMPLETE, fixture.service.complete(complete, command).action());
+            verify(fixture.connection).commit();
+            assertEquals(1, registryLookups.get());
+        }
+    }
 
     @Test void ambient_transactions_and_a_different_store_source_are_rejected_before_native_work() throws Exception {
         try (var fixture = new Fixture()) {
@@ -278,6 +376,10 @@ class FlowableHumanTaskServiceTest {
         final org.mockito.MockedConstruction<ProcessCommandReceiptStore> origins; final org.mockito.MockedConstruction<HumanTaskNativeAccess> nativeConstruction;
         final ValidatedProcessModel model; final Definition definition;
         Fixture() throws Exception {
+            this(HumanTaskCompletionObservation.disabled());
+        }
+
+        Fixture(HumanTaskCompletionObservation completion) throws Exception {
             byte[] xml = """
                     <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:task="urn:stellar-enclosure:tianji:task:1" targetNamespace="urn:test">
                       <process id="humanReview" isExecutable="true"><startEvent id="start"/><sequenceFlow id="toReview" sourceRef="start" targetRef="review"/>
@@ -305,7 +407,7 @@ class FlowableHumanTaskServiceTest {
             models = mockConstruction(VerifiedProcessModels.class, (value, ignored) -> when(value.runningProcess(20, definition)).thenReturn(model));
             origins = mockConstruction(ProcessCommandReceiptStore.class, (value, ignored) -> when(value.taskOrigin(any(), eq("instance"))).thenReturn(ORIGIN));
             nativeConstruction = mockConstruction(HumanTaskNativeAccess.class, (value, ignored) -> { nativeAccess.set(value); when(value.find(any(), eq("task"), anyBoolean())).thenAnswer(call -> alive.get() ? Optional.of(task) : Optional.empty()); });
-            service = new FlowableHumanTaskService(engine, dmn, new ProcessModelValidator(), receipts);
+            service = new FlowableHumanTaskService(engine, null, dmn, new ProcessModelValidator(), receipts, null, completion);
         }
         String version() { return new HumanTaskSnapshot(task, links(), ORIGIN, definition, model).version(); }
         List<IdentityLink> links() { return roles.stream().sorted().map(role -> { var link = mock(IdentityLink.class); when(link.getTaskId()).thenReturn("task"); when(link.getType()).thenReturn("candidate"); when(link.getGroupId()).thenReturn("role:" + role); return link; }).toList(); }

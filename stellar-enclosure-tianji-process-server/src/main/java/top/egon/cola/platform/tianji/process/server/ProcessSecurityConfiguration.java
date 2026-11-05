@@ -54,6 +54,7 @@ import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess
 import top.egon.cola.platform.tianji.process.server.security.TianjiCaseAccess;
 import top.egon.cola.platform.tianji.process.server.security.TianjiHumanTaskAccess;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskCompletionObservation;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
 import top.egon.cola.platform.tianji.process.server.task.ApprovalConsumerRegistry;
 import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationProperties;
@@ -328,6 +329,8 @@ public class ProcessSecurityConfiguration {
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "human-tasks.enabled"}, havingValue = "true")
     static class HumanTaskConfiguration {
+        private static final String COMPLETION_METRICS_ENABLED = "stellar.tianji.process.human-tasks.completion-metrics-enabled";
+
         @Bean("humanTaskReceiptStore")
         @ConditionalOnMissingBean(HumanTaskReceiptStore.class)
         HumanTaskReceiptStore caseAwareHumanTaskReceiptStore(ProcessEngine process, Environment environment,
@@ -347,13 +350,19 @@ public class ProcessSecurityConfiguration {
         @Bean
         @ConditionalOnMissingBean(FlowableHumanTaskService.class)
         FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts,
-                Environment environment, ObjectProvider<CmmnEngine> caseEngines, ObjectProvider<CaseStartProvenanceStore> provenance) {
+                Environment environment, ObjectProvider<CmmnEngine> caseEngines, ObjectProvider<CaseStartProvenanceStore> provenance,
+                ObjectProvider<MeterRegistry> registries) {
+            var completion = environment.getProperty(COMPLETION_METRICS_ENABLED, Boolean.class, false)
+                    ? HumanTaskCompletionObservation.enabled(registries::getIfUnique)
+                    : HumanTaskCompletionObservation.disabled();
             if (environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) {
                 var cmmn = caseEngines.getIfAvailable();
                 if (cmmn == null) throw new IllegalStateException("Case tasks require the initialized CMMN engine");
-                return new FlowableHumanTaskService(processConfiguration(process), caseConfiguration(cmmn), decisionConfiguration(dmn), validator, receipts, provenance.getObject());
+                return new FlowableHumanTaskService(processConfiguration(process), caseConfiguration(cmmn),
+                        decisionConfiguration(dmn), validator, receipts, provenance.getObject(), completion);
             }
-            return new FlowableHumanTaskService(processConfiguration(process), decisionConfiguration(dmn), validator, receipts);
+            return new FlowableHumanTaskService(processConfiguration(process), null,
+                    decisionConfiguration(dmn), validator, receipts, null, completion);
         }
 
         @Bean

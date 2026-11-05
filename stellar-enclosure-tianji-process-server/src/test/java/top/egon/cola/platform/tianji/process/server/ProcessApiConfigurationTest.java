@@ -27,6 +27,8 @@ import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationPro
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskReceiptStore;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
+import top.egon.cola.platform.tianji.process.server.task.HumanTaskCompletionObservation;
+import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 
 import javax.sql.DataSource;
@@ -41,6 +43,9 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
+import org.flowable.cmmn.engine.CmmnEngine;
+import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
+import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
@@ -163,6 +168,62 @@ class ProcessApiConfigurationTest {
                     .withBean(FlowableHumanTaskService.class, () -> mock(FlowableHumanTaskService.class))
                     .withBean(ApprovalConsumerRegistry.class, () -> new ApprovalConsumerRegistry(java.util.List.of(approvalBinding())))
                     .run(context -> { assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(HumanTaskReceiptStore.class); assertThat(stores.constructed()).hasSize(1); verify(stores.constructed().getFirst()).verifyStorage(); });
+        }
+    }
+
+    @Test
+    void humanTaskCompletionObservationIsExplicitAndKeepsExistingPrerequisites() throws Exception {
+        String flag = "stellar.tianji.process.human-tasks.completion-metrics-enabled";
+        runner.withPropertyValues(flag + "=true").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).doesNotHaveBean(FlowableHumanTaskService.class);
+        });
+        var yaml = new YamlPropertySourceLoader().load("process-defaults", new ClassPathResource("application.yml"));
+        assertThat(yaml.getFirst().getProperty(flag)).isEqualTo(false);
+
+        var process = mock(ProcessEngine.class);
+        var processConfig = mock(SpringProcessEngineConfiguration.class);
+        when(process.getProcessEngineConfiguration()).thenReturn(processConfig);
+        var decision = mock(DmnEngine.class);
+        var decisionConfig = mock(SpringDmnEngineConfiguration.class);
+        when(decision.getDmnEngineConfiguration()).thenReturn(decisionConfig);
+        var cmmn = mock(CmmnEngine.class);
+        var cmmnConfig = mock(SpringCmmnEngineConfiguration.class);
+        when(cmmn.getCmmnEngineConfiguration()).thenReturn(cmmnConfig);
+        var validator = mock(ProcessModelValidator.class);
+        var receipts = mock(HumanTaskReceiptStore.class);
+        var provenanceStore = mock(CaseStartProvenanceStore.class);
+        var beans = new StaticListableBeanFactory();
+        beans.addBean("caseEngine", cmmn);
+        beans.addBean("caseProvenance", provenanceStore);
+        var caseEngines = beans.getBeanProvider(CmmnEngine.class);
+        var provenance = beans.getBeanProvider(CaseStartProvenanceStore.class);
+        ObjectProvider<MeterRegistry> registries = beans.getBeanProvider(MeterRegistry.class);
+        var factory = new ProcessSecurityConfiguration.HumanTaskConfiguration();
+        var arguments = new java.util.ArrayList<java.util.List<?>>();
+        try (var services = mockConstruction(FlowableHumanTaskService.class, (service, construction) -> arguments.add(construction.arguments()))) {
+            factory.flowableHumanTaskService(process, decision, validator, receipts, new MockEnvironment(),
+                    caseEngines, provenance, registries);
+            factory.flowableHumanTaskService(process, decision, validator, receipts, new MockEnvironment().withProperty(flag, "false"),
+                    caseEngines, provenance, registries);
+            factory.flowableHumanTaskService(process, decision, validator, receipts, new MockEnvironment().withProperty(flag, "true"),
+                    caseEngines, provenance, registries);
+            var cases = new MockEnvironment().withProperty(flag, "true")
+                    .withProperty("stellar.tianji.process.cases.enabled", "true");
+            factory.flowableHumanTaskService(process, decision, validator, receipts, cases, caseEngines, provenance, registries);
+            assertThat(services.constructed()).hasSize(4);
+            for (var invocation : arguments.subList(0, 3)) {
+                assertThat(invocation.subList(0, 6)).isEqualTo(java.util.Arrays.asList(
+                        processConfig, null, decisionConfig, validator, receipts, null));
+            }
+            assertThat(arguments.get(0).getLast()).isSameAs(HumanTaskCompletionObservation.disabled());
+            assertThat(arguments.get(1).getLast()).isSameAs(HumanTaskCompletionObservation.disabled());
+            assertThat(arguments.get(2).getLast()).isInstanceOf(HumanTaskCompletionObservation.class)
+                    .isNotSameAs(HumanTaskCompletionObservation.disabled());
+            assertThat(arguments.get(3).subList(0, 6)).isEqualTo(java.util.List.of(
+                    processConfig, cmmnConfig, decisionConfig, validator, receipts, provenanceStore));
+            assertThat(arguments.get(3).getLast()).isInstanceOf(HumanTaskCompletionObservation.class)
+                    .isNotSameAs(HumanTaskCompletionObservation.disabled());
         }
     }
 
@@ -354,8 +415,10 @@ class ProcessApiConfigurationTest {
                         assertThat(caseArguments.getFirst().get(8)).isSameAs(inboxes.constructed().getFirst());
                         var ready = (java.util.function.BooleanSupplier) caseArguments.getFirst().get(9);
                         assertThat(ready.getAsBoolean()).isFalse(); org.mockito.Mockito.when(pollers.constructed().getFirst().isRunning()).thenReturn(true); assertThat(ready.getAsBoolean()).isTrue();
-                        assertThat(taskArguments).hasSize(1); assertThat(taskArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration, caseConfiguration, decisionConfiguration,
-                                context.getBean(ProcessModelValidator.class), human, origin));
+                        assertThat(taskArguments).hasSize(1);
+                        assertThat(taskArguments.getFirst()).isEqualTo(java.util.List.of(processConfiguration,
+                                caseConfiguration, decisionConfiguration, context.getBean(ProcessModelValidator.class),
+                                human, origin, HumanTaskCompletionObservation.disabled()));
                         assertThat(receiptArguments).containsExactly(java.util.List.of(source, "tianji_process", origin));
                         assertThat(releaseArguments).hasSize(1); assertThat(releaseArguments.getFirst()).hasSize(13);
                         assertThat(releaseArguments.getFirst().get(1)).isSameAs(caseConfiguration);

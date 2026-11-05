@@ -118,6 +118,9 @@ public final class HumanTaskSnapshot {
     }
     public CaseStartProvenanceStore.Entry caseProvenance() { return caseProvenance; }
 
+    Instant createdAt() { return createdAt; }
+    Instant dueAt() { return dueAt; }
+
     public String version() { return version; }
     public String taskId() { return taskId; }
     public String taskDefinitionKey() { return taskDefinitionKey; }

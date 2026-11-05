@@ -59,6 +59,7 @@ public final class FlowableHumanTaskService {
     private final ProcessCommandReceiptStore origins;
     private final HumanTaskNativeAccess nativeAccess;
     private final HumanTaskReceiptStore receipts;
+    private final HumanTaskCompletionObservation completionObservation;
     private final TransactionTemplate read;
     private final TransactionTemplate write;
 
@@ -67,7 +68,14 @@ public final class FlowableHumanTaskService {
 
     public FlowableHumanTaskService(SpringProcessEngineConfiguration engine, SpringCmmnEngineConfiguration cmmn,
             SpringDmnEngineConfiguration dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts, CaseStartProvenanceStore provenance) {
+        this(engine, cmmn, dmn, validator, receipts, provenance, HumanTaskCompletionObservation.disabled());
+    }
+
+    public FlowableHumanTaskService(SpringProcessEngineConfiguration engine, SpringCmmnEngineConfiguration cmmn,
+            SpringDmnEngineConfiguration dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts,
+            CaseStartProvenanceStore provenance, HumanTaskCompletionObservation completionObservation) {
         Objects.requireNonNull(engine, "engine"); this.validator = Objects.requireNonNull(validator, "validator"); this.receipts = Objects.requireNonNull(receipts, "receipts");
+        this.completionObservation = Objects.requireNonNull(completionObservation, "completionObservation");
         if (!(engine.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null || !receipts.usesDataSource(manager.getDataSource())) throw new IllegalArgumentException("Human task execution requires its exact owning receipt store and JDBC manager");
         if ((cmmn == null) != (provenance == null) || provenance != null && (!provenance.usesDataSource(manager.getDataSource()) || !receipts.usesCaseProvenance(provenance))) throw new IllegalArgumentException("Case task execution requires its exact verified provenance participant");
         tasks = Objects.requireNonNull(engine.getTaskService(), "taskService"); caseProvenance = provenance;
@@ -159,7 +167,13 @@ public final class FlowableHumanTaskService {
                 HumanTaskSnapshot after = null;
                 if (action == HumanTaskActionEnum.COMPLETE) { if (remaining.isPresent()) throw unavailable(); }
                 else after = load(context, remaining.orElseThrow(FlowableHumanTaskService::unavailable)).orElseThrow(FlowableHumanTaskService::unavailable);
-                var result = HumanTaskActionResult.applied(context, action, commandId, hash, before, after, targetLane, form, receipts.current(context)); receipts.apply(context, result); return result.receipt();
+                var result = HumanTaskActionResult.applied(context, action, commandId, hash, before, after, targetLane, form, receipts.current(context));
+                receipts.apply(context, result);
+                var receipt = result.receipt();
+                if (action == HumanTaskActionEnum.COMPLETE) {
+                    completionObservation.recordOnCommit(receipt.scopeType(), before.createdAt(), before.dueAt(), receipt.occurredAt());
+                }
+                return receipt;
             }));
         } catch (FlowableOptimisticLockingException | FlowableTaskAlreadyClaimedException | FlowableObjectNotFoundException | ConcurrencyFailureException race) { throw new ProcessConflictException(); }
     }

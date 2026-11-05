@@ -88,6 +88,7 @@ stellar:
       human-tasks:
         enabled: false
         publish-enabled: false
+        completion-metrics-enabled: false
       agent-results:
         receive-span-links-enabled: false
         lag-metrics-enabled: false
