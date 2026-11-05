@@ -32,6 +32,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunCorrelationClient;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentSessionClient;
@@ -43,6 +44,7 @@ import top.egon.cola.platform.tianji.contract.agent.CreateAgentSessionCommand;
 import top.egon.cola.platform.tianji.contract.agent.DeleteAgentSessionCommand;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentSessionQuery;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 
@@ -66,7 +68,7 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral Agent contract. It does not initiate write retries. */
-public final class HttpAgentClient implements AgentClient, AgentSessionClient, MemoryClient {
+public final class HttpAgentClient implements AgentClient, AgentSessionClient, MemoryClient, AgentRunCorrelationClient {
     private static final int MAX_JSON_BYTES = 2_097_152;
     private final URI baseUri;
     private final HttpClient http;
@@ -117,6 +119,16 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
         String suffix = "?limit=" + query.limit() + (query.cursor() == null ? ""
                 : "&cursor=" + URLEncoder.encode(query.cursor(), StandardCharsets.UTF_8));
         return call("GET", URI.create(path("").toString() + suffix), null, AgentRunPageDTO.class);
+    }
+
+    @Override
+    public AgentRunPageDTO listByCorrelation(ListAgentRunsByCorrelationQuery query) {
+        Objects.requireNonNull(query, "query");
+        OwnerObservationResponseCodec.requireSecureBase(baseUri);
+        String suffix = OwnerObservationResponseCodec.windowQuery(
+                query.correlationId(), query.fromInclusive(), query.toExclusive(), query.cursor());
+        return call("GET", URI.create(path("").toString() + suffix), null, AgentRunPageDTO.class, null,
+                bytes -> OwnerObservationResponseCodec.agentRuns(bytes, query), OwnerObservationResponseCodec.MAX_BYTES, true);
     }
 
     @Override
@@ -323,17 +335,33 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
     }
 
     private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId, Function<byte[], T> decoder, int responseLimit) {
+        return call(method, uri, body, type, expectedSessionId, decoder, responseLimit, false);
+    }
+
+    private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId,
+                       Function<byte[], T> decoder, int responseLimit, boolean ownerObservation) {
         byte[] bytes = body == null ? null : mapper.writeValueAsBytes(body);
         if (bytes != null && bytes.length > MAX_JSON_BYTES) {
             throw new IllegalArgumentException("Agent request exceeds its size limit");
         }
         HttpRequest.Builder builder = request(uri).timeout(requestTimeout).header("Accept", "application/json");
+        if (ownerObservation) builder.header("Cache-Control", "no-store");
         HttpRequest request = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json")
                         .method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
-        var call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
+        java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> call;
+        try {
+            call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
+        } catch (RuntimeException failure) {
+            if (!ownerObservation) throw failure;
+            throw new AgentClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+        }
         try {
             HttpResponse<byte[]> response = call.get(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
+            if (ownerObservation) {
+                String code = OwnerObservationResponseCodec.failureCode(response, OwnerObservationResponseCodec.Route.AGENT_RUNS);
+                if (code != null) throw new AgentClientException(response.statusCode(), code, null, null);
+            }
             if (response.statusCode() < 200 || response.statusCode() >= 300) {
                 throw error(response, response.body());
             }

@@ -4,7 +4,12 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessAgentOutcomesQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessAgentOutcomePageDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessOwnerObservationClient;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
@@ -78,7 +83,8 @@ import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
 public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient,
-        HumanTaskClient, ApprovalClient, CaseClient, ProcessControlClient, ProcessWorkerRecoveryClient, ProcessStartReceiptClient {
+        HumanTaskClient, ApprovalClient, CaseClient, ProcessControlClient, ProcessWorkerRecoveryClient, ProcessStartReceiptClient,
+        ProcessOwnerObservationClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
     private static final int MAX_RECOVERY_REQUEST_BYTES = 8192;
@@ -154,6 +160,23 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         ProcessInstanceDTO result = call("GET", "process-instances/" + segment(query.instanceId()), null, ProcessInstanceDTO.class);
         if (!query.instanceId().equals(result.instanceId())) throw invalidResponse();
         return result;
+    }
+
+    @Override
+    public ProcessInstanceCorrelationPageDTO listByCorrelation(ListProcessInstancesByCorrelationQuery query) {
+        Objects.requireNonNull(query, "query");
+        String suffix = OwnerObservationResponseCodec.windowQuery(
+                query.correlationId(), query.fromInclusive(), query.toExclusive(), query.cursor());
+        return call("GET", "process-instance-correlations" + suffix, null, ProcessInstanceCorrelationPageDTO.class, null,
+                bytes -> OwnerObservationResponseCodec.processInstances(bytes, query));
+    }
+
+    @Override
+    public ProcessAgentOutcomePageDTO getAgentOutcomes(GetProcessAgentOutcomesQuery query) {
+        Objects.requireNonNull(query, "query");
+        String suffix = query.cursor() == null ? "" : "?cursor=" + query.cursor();
+        return call("GET", "process-instances/" + segment(query.instanceId()) + "/agent-outcomes" + suffix,
+                null, ProcessAgentOutcomePageDTO.class, null, bytes -> OwnerObservationResponseCodec.agentOutcomes(bytes, query));
     }
 
     @Override
@@ -349,7 +372,11 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         boolean recoveryCommand = type == RecoverProcessWorkerResult.class;
         boolean recoveryOperation = recoveryCommand || type == ProcessWorkerFailuresDTO.class;
         boolean startReceipt = type == ProcessStartReceiptDTO.class;
+        var ownerObservation = type == ProcessInstanceCorrelationPageDTO.class
+                ? OwnerObservationResponseCodec.Route.PROCESS_INSTANCES
+                : type == ProcessAgentOutcomePageDTO.class ? OwnerObservationResponseCodec.Route.PROCESS_AGENT_OUTCOMES : null;
         boolean closedObservation = recoveryOperation || startReceipt;
+        if (ownerObservation != null) OwnerObservationResponseCodec.requireSecureBase(baseUri);
         if (closedObservation && (!baseUri.normalize().equals(baseUri)
                 || !"https".equalsIgnoreCase(baseUri.getScheme())
                 && !("http".equalsIgnoreCase(baseUri.getScheme())
@@ -376,20 +403,25 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         if (token == null || !token.matches("[A-Za-z0-9._~+/-]+=*")) throw new IllegalArgumentException("a valid access token is required");
         HttpRequest.Builder builder = HttpRequest.newBuilder(baseUri.resolve("api/tianji/v1/" + path)).timeout(timeout)
                 .header("Authorization", "Bearer " + token).header("Accept", "application/json");
-        if (caseOperation || processControl || closedObservation) builder.header("Cache-Control", "no-store");
+        if (caseOperation || processControl || closedObservation || ownerObservation != null) builder.header("Cache-Control", "no-store");
         HttpRequest request = bytes == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
-        int responseLimit = startReceipt ? ProcessStartReceiptResponseCodec.MAX_BYTES
+        int responseLimit = ownerObservation != null ? OwnerObservationResponseCodec.MAX_BYTES
+                : startReceipt ? ProcessStartReceiptResponseCodec.MAX_BYTES
                 : caseOperation ? CaseResponseCodec.MAX_BYTES : MAX_RESPONSE_BYTES;
         java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> call;
         try {
             call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
         } catch (RuntimeException failure) {
-            if (caseOperation || processControl || closedObservation) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            if (caseOperation || processControl || closedObservation || ownerObservation != null) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
             throw failure;
         }
         try {
             HttpResponse<byte[]> response = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
+            if (ownerObservation != null) {
+                String code = OwnerObservationResponseCodec.failureCode(response, ownerObservation);
+                if (code != null) throw new ProcessClientException(response.statusCode(), code, null, null);
+            }
             if (closedObservation) {
                 var contentTypes = response.headers().allValues("Content-Type");
                 if (contentTypes.size() != 1
