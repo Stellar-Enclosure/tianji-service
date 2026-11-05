@@ -6,6 +6,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessControlSnapshotDTO;
@@ -18,6 +19,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorker
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.PublishProcessReleaseCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
@@ -64,6 +67,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.Map;
+import java.util.List;
 import java.util.HexFormat;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
@@ -74,7 +78,7 @@ import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral orchestration contracts. Writes are sent once. */
 public final class HttpProcessClient implements ProcessReleaseClient, ProcessClient, DecisionClient, WorkerClient,
-        HumanTaskClient, ApprovalClient, CaseClient, ProcessControlClient, ProcessWorkerRecoveryClient {
+        HumanTaskClient, ApprovalClient, CaseClient, ProcessControlClient, ProcessWorkerRecoveryClient, ProcessStartReceiptClient {
     private static final int MAX_REQUEST_BYTES = 9 * 1_048_576;
     private static final int MAX_RESPONSE_BYTES = 2 * 1_048_576;
     private static final int MAX_RECOVERY_REQUEST_BYTES = 8192;
@@ -150,6 +154,14 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         ProcessInstanceDTO result = call("GET", "process-instances/" + segment(query.instanceId()), null, ProcessInstanceDTO.class);
         if (!query.instanceId().equals(result.instanceId())) throw invalidResponse();
         return result;
+    }
+
+    @Override
+    public ProcessStartReceiptDTO getStartReceipt(GetProcessStartReceiptQuery query) {
+        Objects.requireNonNull(query, "query");
+        return call("GET", "process-start-receipts?commandId=" + segment(query.commandId())
+                        + "&requestSha256=" + query.requestSha256(),
+                null, ProcessStartReceiptDTO.class, null, ProcessStartReceiptResponseCodec::receipt);
     }
 
     @Override
@@ -336,11 +348,14 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         boolean processControl = type == ProcessControlSnapshotDTO.class || type == CancelProcessResult.class;
         boolean recoveryCommand = type == RecoverProcessWorkerResult.class;
         boolean recoveryOperation = recoveryCommand || type == ProcessWorkerFailuresDTO.class;
-        if (recoveryOperation && (!baseUri.normalize().equals(baseUri)
+        boolean startReceipt = type == ProcessStartReceiptDTO.class;
+        boolean closedObservation = recoveryOperation || startReceipt;
+        if (closedObservation && (!baseUri.normalize().equals(baseUri)
                 || !"https".equalsIgnoreCase(baseUri.getScheme())
                 && !("http".equalsIgnoreCase(baseUri.getScheme())
                     && LOOPBACK_HOSTS.contains(baseUri.getHost().toLowerCase(java.util.Locale.ROOT))))) {
-            throw new IllegalArgumentException("Worker recovery transport requires HTTPS or a loopback fixture");
+            throw new IllegalArgumentException(startReceipt ? "START receipt transport requires HTTPS or a loopback fixture"
+                    : "Worker recovery transport requires HTTPS or a loopback fixture");
         }
         if (humanTask && (!baseUri.normalize().equals(baseUri) || !"https".equalsIgnoreCase(baseUri.getScheme())
                 && !("http".equalsIgnoreCase(baseUri.getScheme()) && java.util.Set.of("localhost", "127.0.0.1", "[::1]", "::1").contains(baseUri.getHost().toLowerCase(java.util.Locale.ROOT))))) {
@@ -361,26 +376,32 @@ public final class HttpProcessClient implements ProcessReleaseClient, ProcessCli
         if (token == null || !token.matches("[A-Za-z0-9._~+/-]+=*")) throw new IllegalArgumentException("a valid access token is required");
         HttpRequest.Builder builder = HttpRequest.newBuilder(baseUri.resolve("api/tianji/v1/" + path)).timeout(timeout)
                 .header("Authorization", "Bearer " + token).header("Accept", "application/json");
-        if (caseOperation || processControl || recoveryOperation) builder.header("Cache-Control", "no-store");
+        if (caseOperation || processControl || closedObservation) builder.header("Cache-Control", "no-store");
         HttpRequest request = bytes == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
+        int responseLimit = startReceipt ? ProcessStartReceiptResponseCodec.MAX_BYTES
+                : caseOperation ? CaseResponseCodec.MAX_BYTES : MAX_RESPONSE_BYTES;
         java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> call;
         try {
-            call = http.sendAsync(request, info -> new BoundedBodySubscriber(caseOperation ? CaseResponseCodec.MAX_BYTES : MAX_RESPONSE_BYTES));
+            call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
         } catch (RuntimeException failure) {
-            if (caseOperation || processControl || recoveryOperation) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            if (caseOperation || processControl || closedObservation) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
             throw failure;
         }
         try {
             HttpResponse<byte[]> response = call.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
-            if (recoveryOperation) {
+            if (closedObservation) {
                 var contentTypes = response.headers().allValues("Content-Type");
                 if (contentTypes.size() != 1
                         || !"application/json".equalsIgnoreCase(contentTypes.getFirst().split(";", 2)[0].trim())) {
                     throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
                 }
+                if (startReceipt && !List.of("no-store").equals(response.headers().allValues("Cache-Control"))) {
+                    throw new ProcessClientException(response.statusCode(), "TIANJI_INVALID_RESPONSE", null, null);
+                }
                 if (response.statusCode() != 200) {
-                    String code = recoveryResponses.errorCode(response.body(), response.statusCode(), recoveryCommand);
+                    String code = startReceipt ? ProcessStartReceiptResponseCodec.errorCode(response.body(), response.statusCode())
+                            : recoveryResponses.errorCode(response.body(), response.statusCode(), recoveryCommand);
                     throw new ProcessClientException(response.statusCode(), code == null ? "TIANJI_INVALID_RESPONSE" : code,
                             null, null);
                 }
