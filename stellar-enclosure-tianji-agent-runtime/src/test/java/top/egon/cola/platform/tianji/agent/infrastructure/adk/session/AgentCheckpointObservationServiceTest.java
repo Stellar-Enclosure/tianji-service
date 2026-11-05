@@ -9,7 +9,9 @@ import org.mockito.invocation.InvocationOnMock;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -39,6 +41,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -184,6 +187,31 @@ class AgentCheckpointObservationServiceTest {
         }
     }
 
+    @Test
+    void takeover_rechecks_the_identical_cut_on_the_bound_writable_snapshot() throws Exception {
+        try (var fixture = new Fixture(true)) {
+            var detached = fixture.service.matchForTakeover(OWNER, QUERY).orElseThrow();
+            assertEquals(2, detached.runEpoch());
+            assertEquals(1, detached.sessionEpoch());
+            assertEquals("fixture-session", detached.sessionId());
+            assertTrue(detached.cutSha256().matches("[0-9a-f]{64}"));
+            assertThrows(IllegalStateException.class,
+                    () -> fixture.service.matchInTakeoverTransaction(OWNER, QUERY));
+
+            fixture.writable = true;
+            var write = new TransactionTemplate(new DataSourceTransactionManager(fixture.source));
+            write.setIsolationLevel(org.springframework.transaction.TransactionDefinition.ISOLATION_READ_COMMITTED);
+            assertEquals(detached, write.execute(status ->
+                    fixture.service.matchInTakeoverTransaction(OWNER, QUERY)).orElseThrow());
+            fixture.row.put("captured_session_epoch", 2L);
+            var changed = write.execute(status -> fixture.service.matchInTakeoverTransaction(OWNER, QUERY)).orElseThrow();
+            assertNotEquals(detached, changed);
+            assertNotEquals(detached.cutSha256(), changed.cutSha256());
+            doReturn(false).when(fixture.verifier).checkpointTakeoverEvidenceReadable();
+            assertTrue(write.execute(status -> fixture.service.matchInTakeoverTransaction(OWNER, QUERY)).isEmpty());
+        }
+    }
+
     private static AgentLedgerService.ExecutionMaterial material() {
         Duration timeout = Duration.ofSeconds(30);
         var policy = new ExecutionPolicyDTO(timeout, timeout, timeout, 1, 0, 100, 100,
@@ -214,6 +242,7 @@ class AgentCheckpointObservationServiceTest {
         private String observationSql;
         private String toolSql;
         private boolean primary = true;
+        private boolean writable;
         private boolean noTool = true;
         private RuntimeException observationFailure;
 
@@ -234,6 +263,9 @@ class AgentCheckpointObservationServiceTest {
                     Map.entry("definition_sha256", request.definitionSha256()), Map.entry("request_sha256", request.requestSha256()),
                     Map.entry("snapshot_sha256", request.snapshotSha256()), Map.entry("policy_version_ref", request.policyVersionRef()),
                     Map.entry("checkpoint_event_id", event.id()), Map.entry("native_invocation_id", event.invocationId()),
+                    Map.entry("checkpoint_session_id", "fixture-session"), Map.entry("captured_run_epoch", 1L),
+                    Map.entry("captured_session_epoch", 1L), Map.entry("captured_session_revision", 1L),
+                    Map.entry("captured_session_sequence", 1L),
                     Map.entry("state_codec_version", typed ? 2 : 1),
                     Map.entry("session_state", new AdkSessionStateCodec(typed).encode(Map.of())),
                     Map.entry("event_timestamp_ms", event.timestamp()), Map.entry("event_payload", new AdkSessionEventCodec(typed).encode(event))));
@@ -245,6 +277,11 @@ class AgentCheckpointObservationServiceTest {
                     return true;
                 });
                 when(mock.checkpointToolEvidenceReadable()).thenReturn(true);
+                when(mock.checkpointTakeoverEvidenceReadable()).thenAnswer(ignored -> {
+                    assertFalse(TransactionSynchronizationManager.isCurrentTransactionReadOnly());
+                    assertTrue(TransactionSynchronizationManager.hasResource(source));
+                    return true;
+                });
             });
             ledgerMocks = mockConstruction(AgentLedgerService.class, (mock, context) -> {
                 assertEquals(List.of(source), context.arguments());
@@ -265,14 +302,18 @@ class AgentCheckpointObservationServiceTest {
             Object[] args = invocation.getArguments();
             if (args.length == 0 || !(args[0] instanceof String sql)) return RETURNS_DEFAULTS.answer(invocation);
             assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
-            assertTrue(TransactionSynchronizationManager.isCurrentTransactionReadOnly());
+            assertEquals(!writable, TransactionSynchronizationManager.isCurrentTransactionReadOnly());
             assertTrue(TransactionSynchronizationManager.hasResource(source));
             if ("execute".equals(invocation.getMethod().getName())) {
                 assertTrue(sql.equals("SET LOCAL statement_timeout = '2s'")
                         || sql.equals("SET LOCAL search_path = pg_catalog, tianji_agent"));
                 return null;
             }
-            if (sql.contains("pg_catalog.pg_is_in_recovery()")) return primary;
+            if (sql.contains("pg_catalog.pg_is_in_recovery()")) {
+                assertEquals(writable ? "off" : "on", args[2]);
+                assertEquals(writable ? "read committed" : "repeatable read", args[3]);
+                return primary;
+            }
             if (sql.contains("AS checkpoint_present")) {
                 if (observationFailure != null) throw observationFailure;
                 observationSql = sql;

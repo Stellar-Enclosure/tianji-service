@@ -127,6 +127,22 @@ final class JdbcAdkSessionRepository {
                 .stream().findFirst();
     }
 
+    Optional<LeaseRow> acquireCheckpoint(String id, String owner, long expectedEpoch, Instant expiry) {
+        return jdbc.query("""
+                UPDATE tianji_agent.agent_session_lease
+                SET lease_owner=?, lease_epoch=lease_epoch+1, lease_expires_at=?
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name=? AND session_id=?
+                  AND lease_epoch=? AND lease_epoch<9223372036854775807
+                  AND ((lease_owner IS NULL AND lease_expires_at IS NULL)
+                      OR (lease_owner IS NOT NULL AND pg_catalog.isfinite(lease_expires_at)
+                          AND lease_expires_at<=clock_timestamp()))
+                  AND CAST(? AS timestamptz)>clock_timestamp()
+                RETURNING lease_epoch, lease_owner, lease_expires_at, true AS live
+                """, (rs, row) -> leaseRow(rs), owner, Timestamp.from(expiry), actor.tenantId(), type(),
+                actor.issuerFingerprint(), actor.subjectId(), app, id, expectedEpoch, Timestamp.from(expiry))
+                .stream().findFirst();
+    }
+
     Optional<LeaseRow> renew(String id, String owner, long epoch, long millis) {
         return jdbc.query("""
                 UPDATE tianji_agent.agent_session_lease

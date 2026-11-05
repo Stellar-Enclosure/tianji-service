@@ -6,6 +6,8 @@ import com.google.adk.sessions.Session;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import org.junit.jupiter.api.Test;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -108,6 +110,37 @@ class AdkCheckpointCaptureTest {
         var method = AdkAgentRunExecutor.class.getDeclaredMethod("checkpointEngineVersion");
         method.setAccessible(true);
         assertEquals("1.13.0", method.invoke(null));
+    }
+
+    @Test
+    void takeover_session_lease_uses_the_bound_connection_and_exact_prior_epoch() throws Exception {
+        var actor = new TrustedAgentActor(40001, TrustedAgentActor.SubjectType.USER, "fixture", "a".repeat(64));
+        var source = mock(DataSource.class);
+        var connection = mock(Connection.class);
+        when(source.getConnection()).thenReturn(connection);
+        when(connection.getAutoCommit()).thenReturn(true);
+        var expires = NOW.plusSeconds(30);
+        var run = new AgentRunLease("run", "takeover-worker", 3, expires);
+        try (var repositories = mockConstruction(JdbcAdkSessionRepository.class)) {
+            var store = new PostgresAdkSessionService(source, actor, "tianji");
+            var repository = repositories.constructed().getFirst();
+            assertThrows(IllegalStateException.class,
+                    () -> store.acquireCheckpointLeaseInTransaction(SESSION, run, 7, expires));
+            verifyNoInteractions(repository);
+            when(repository.lockRun(run.runId())).thenReturn(Optional.of(new JdbcAdkSessionRepository.RunFence(
+                    SESSION, "RUNNING", false, run.owner(), run.epoch(), expires, NOW.plusSeconds(60))));
+            when(repository.databaseNow()).thenReturn(NOW);
+            when(repository.acquireCheckpoint(eq(SESSION), anyString(), eq(7L), eq(expires))).thenAnswer(call ->
+                    Optional.of(new JdbcAdkSessionRepository.LeaseRow(8, call.getArgument(1), expires, true)));
+            when(repository.liveFences(eq(SESSION), eq(run), anyString(), eq(8L))).thenReturn(true);
+
+            var write = new TransactionTemplate(new DataSourceTransactionManager(source));
+            assertNotNull(write.execute(status -> store.acquireCheckpointLeaseInTransaction(SESSION, run, 7, expires)));
+            verify(source).getConnection();
+            verify(repository).acquireCheckpoint(eq(SESSION), anyString(), eq(7L), eq(expires));
+            verify(repository).liveFences(eq(SESSION), eq(run), anyString(), eq(8L));
+            verify(connection).commit();
+        }
     }
 
     private static Event userEvent(Content input) {

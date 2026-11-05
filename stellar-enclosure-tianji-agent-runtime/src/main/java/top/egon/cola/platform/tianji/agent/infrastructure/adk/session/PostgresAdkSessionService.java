@@ -18,6 +18,7 @@ import io.reactivex.rxjava3.core.Single;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -53,6 +54,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     private static final long MAX_SCOPE_BYTES = 4L * 1_048_576;
     private static final Duration MIN_LEASE = Duration.ofSeconds(1);
     private static final Duration MAX_LEASE = Duration.ofMinutes(5);
+    private final DataSource dataSource;
     private final TrustedAgentActor actor;
     private final String appName;
     private final String userId;
@@ -79,7 +81,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     /** Enable typed writes only after every session reader has been upgraded to understand codec version 2. */
     public PostgresAdkSessionService(DataSource dataSource, TrustedAgentActor actor, String appName,
                                      boolean allowAppStateWrites, boolean typedWrites) {
-        Objects.requireNonNull(dataSource, "dataSource");
+        this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.actor = Objects.requireNonNull(actor, "actor");
         if (!validApp(appName) || actor.subjectId().indexOf('\0') >= 0) throw invalid();
         this.appName = appName;
@@ -98,6 +100,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
 
     private PostgresAdkSessionService(PostgresAdkSessionService source, SessionLease lease,
                                       FirstInputCheckpointBO firstInputCheckpoint) {
+        this.dataSource = source.dataSource;
         this.actor = source.actor;
         this.appName = source.appName;
         this.userId = source.userId;
@@ -130,6 +133,31 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             if (!repository.liveFences(id, runLease, owner, row.epoch())) throw leaseExpired();
             return new SessionLease(actor, appName, id, owner, row.epoch(), row.expiresAt(), runLease);
         });
+    }
+
+    /** Joins the caller's already-locked takeover transaction on the same primary connection. */
+    SessionLease acquireCheckpointLeaseInTransaction(String sessionId, AgentRunLease runLease,
+                                                      long expectedOldSessionEpoch, Instant expiry) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw new IllegalStateException("Agent checkpoint lease requires its bound writable transaction");
+        }
+        String id = sessionId(sessionId);
+        Objects.requireNonNull(runLease, "runLease");
+        Objects.requireNonNull(expiry, "expiry");
+        if (actor.subjectType() != TrustedAgentActor.SubjectType.USER || "LEGACY".equals(actor.issuerFingerprint())
+                || expectedOldSessionEpoch <= 0 || expectedOldSessionEpoch == Long.MAX_VALUE
+                || expiry.isAfter(runLease.expiresAt())) throw invalid();
+        requireRunFence(id, runLease);
+        String owner = UUID.randomUUID().toString();
+        var row = repository.acquireCheckpoint(id, owner, expectedOldSessionEpoch, expiry)
+                .orElseThrow(PostgresAdkSessionService::leaseExpired);
+        if (row.epoch() != expectedOldSessionEpoch + 1 || !owner.equals(row.owner())
+                || !expiry.equals(row.expiresAt()) || !repository.liveFences(id, runLease, owner, row.epoch())) {
+            throw leaseExpired();
+        }
+        return new SessionLease(actor, appName, id, owner, row.epoch(), row.expiresAt(), runLease);
     }
 
     public SessionLease renewSessionLease(SessionLease existing, Duration duration) {

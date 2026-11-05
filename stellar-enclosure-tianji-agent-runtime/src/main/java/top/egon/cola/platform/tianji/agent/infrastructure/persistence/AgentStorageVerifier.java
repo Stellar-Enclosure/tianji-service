@@ -262,14 +262,31 @@ public final class AgentStorageVerifier {
                 """, Boolean.class));
     }
 
+    /** Checks exact V16 read and V13 evidence access on a bound writable takeover transaction. */
+    public boolean checkpointTakeoverEvidenceReadable() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) return false;
+        try {
+            verifyCheckpointPrimary("off");
+            verifyCheckpointRole(true);
+            return checkpointObservationCoreTables() && checkpointToolEvidenceReadable("off");
+        } catch (DataAccessException | AgentLedgerException failure) {
+            return false;
+        }
+    }
+
     /** Confirms the V13 evidence relations in the caller's already-bound physical primary read transaction. */
     public boolean checkpointToolEvidenceReadable() {
+        return checkpointToolEvidenceReadable("on");
+    }
+
+    private boolean checkpointToolEvidenceReadable(String readOnly) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()
                 || !TransactionSynchronizationManager.hasResource(dataSource)) return false;
         try {
             if (!Boolean.TRUE.equals(jdbc.queryForObject("""
                     SELECT NOT pg_catalog.pg_is_in_recovery()
-                      AND pg_catalog.current_setting('transaction_read_only')='on'
+                      AND pg_catalog.current_setting('transaction_read_only')=?
                       AND (SELECT count(*)=2 FROM pg_catalog.pg_class c
                         JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
                         WHERE n.nspname='tianji_agent' AND c.relname IN ('agent_tool_invocation','agent_tool_action_intent')
@@ -283,7 +300,7 @@ public final class AgentStorageVerifier {
                                WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
                                  AND a.attname IN ('tenant_id',CASE c.relname WHEN 'agent_tool_invocation'
                                                        THEN 'run_id' ELSE 'origin_run_id' END)))
-                    """, Boolean.class))) return false;
+                    """, Boolean.class, readOnly))) return false;
             String script = ToolExecutionStorageVerifier.FILE;
             int expected = checksum(script);
             var history = jdbc.query("""
