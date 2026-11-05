@@ -325,6 +325,17 @@ class ProcessReleaseServiceTest {
     }
 
     @Test
+    void manifest_digest_has_package_scope() {
+        var method = assertDoesNotThrow(() -> ProcessReleaseService.class.getDeclaredMethod("manifestHash", List.class));
+        int modifiers = method.getModifiers();
+        assertEquals(String.class, method.getReturnType());
+        assertTrue(java.lang.reflect.Modifier.isStatic(modifiers));
+        assertTrue(method.canAccess(null), "manifest digest is callable within the release package");
+        assertEquals(0, modifiers & (java.lang.reflect.Modifier.PRIVATE | java.lang.reflect.Modifier.PROTECTED
+                | java.lang.reflect.Modifier.PUBLIC));
+    }
+
+    @Test
     void legacy_constructor_overloads_and_two_type_manifest_bytes_remain_compatible() throws Exception {
         var source = mock(DataSource.class); var process = process(source); var dmn = decision(source, (DataSourceTransactionManager) process.getTransactionManager());
         var validator = new ProcessModelValidator();
@@ -333,12 +344,14 @@ class ProcessReleaseServiceTest {
         assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null));
         assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false));
         assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true));
-        var service = assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true, false));
-        var prepare = ProcessReleaseService.class.getDeclaredMethod("prepare", List.class, long.class); prepare.setAccessible(true);
-        var models = prepare.invoke(service, List.of(new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", fixture("baseline.dmn"), Map.of()),
-                new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", fixture("baseline.bpmn20.xml"), Map.of())), 20L);
-        var digest = ProcessReleaseService.class.getDeclaredMethod("manifestHash", List.class); digest.setAccessible(true);
-        assertEquals("2633baa271f32928b180858f00c49923f813011e00a00aa4fc3df162cfcc1049", digest.invoke(null, models));
+        assertDoesNotThrow(() -> new ProcessReleaseService(process, dmn, validator, false, null, false, () -> true, false));
+        var dmnModel = validator.validateDmn(fixture("baseline.dmn"), "baselineDecision");
+        var bpmnModel = validator.validateBpmn(fixture("baseline.bpmn20.xml"), "baseline");
+        var models = List.of(new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", dmnModel.xml(), dmnModel.inputs()),
+                new ProcessReleaseService.ModelResource(Type.BPMN, "baseline", bpmnModel.xml(), Map.of()));
+        String expected = "2633baa271f32928b180858f00c49923f813011e00a00aa4fc3df162cfcc1049";
+        assertEquals(expected, ProcessReleaseService.manifestHash(models));
+        assertEquals(expected, ProcessReleaseService.manifestHash(models.reversed()));
         verifyNoInteractions(source);
     }
 
@@ -351,6 +364,7 @@ class ProcessReleaseServiceTest {
             configureLinkedProcess(f);
             var service = sourcePublisher(f, registry, () -> true, true);
             var release = assertDoesNotThrow(() -> service.publish(f.actor, "release", sourceBundle(f)));
+            assertEquals("cf7819f270487cd29941ee68d1c3c067ca0335e57e6e09b32556186a0b9bfee3", release.manifestSha256());
             assertEquals(Set.of(Type.BPMN, Type.CMMN), release.definitions().stream().map(ProcessReleaseService.Definition::type).collect(java.util.stream.Collectors.toSet()));
             verify(registry).require(key); verify(registry).current(registration); verify(f.connection).commit();
         }

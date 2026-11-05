@@ -166,7 +166,8 @@ public final class ProcessReleaseService {
         requireReleaseKey(releaseKey);
         List<PreparedModel> models = prepare(resources, actor.tenantId());
         validateCaseSources(actor.tenantId(), releaseKey, models);
-        String manifestHash = manifestHash(models);
+        String manifestHash = manifestHash(models.stream().map(item ->
+                new ModelResource(item.type(), item.definitionKey(), item.xml(), item.inputs())).toList());
         return Objects.requireNonNull(write.execute(status -> publishInTransaction(actor, releaseKey, manifestHash, models)));
     }
 
@@ -364,11 +365,14 @@ public final class ProcessReleaseService {
         PinnedCaseActivityBehaviorFactory.requireConfigured(cmmn);
     }
 
-    private static String manifestHash(List<PreparedModel> models) {
+    /** Frames validated model bytes and effective schemas identically for publication and offline verification. */
+    static String manifestHash(List<ModelResource> models) {
+        var ordered = models.stream().sorted(Comparator.comparing((ModelResource item) -> item.type().name())
+                .thenComparing(ModelResource::definitionKey)).toList();
         MessageDigest digest = sha256();
         try (DataOutputStream output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
-            output.writeInt(models.size());
-            for (PreparedModel item : models) {
+            output.writeInt(ordered.size());
+            for (ModelResource item : ordered) {
                 writeField(output, item.type().name().getBytes(StandardCharsets.UTF_8));
                 writeField(output, item.definitionKey().getBytes(StandardCharsets.UTF_8));
                 writeField(output, item.xml());
