@@ -503,6 +503,9 @@ public final class AdkAgentRunExecutor {
             if (agentOutputs.isEmpty()) {
                 throw new IllegalStateException("ADK root completed without a usable agent output");
             }
+            if (activeNativeGate == null && toolScope == null) {
+                requireStaticParallelOutputs(root, agentOutputs.keySet());
+            }
             Map<String, Object> output = new LinkedHashMap<>();
             output.put("agents", new TreeMap<>(agentOutputs));
             String finalAgent = finalAgent(root);
@@ -858,6 +861,35 @@ public final class AdkAgentRunExecutor {
             if (event.errorCode() != null) payload.put("errorCode", event.errorCode());
             append(event.phase() == AdkGovernedToolBridge.Phase.STARTED ? "TOOL_STARTED" : "TOOL_FINISHED", event.author(), Map.copyOf(payload));
         }
+    }
+
+    private static void requireStaticParallelOutputs(BaseAgent root, Set<String> outputs) {
+        Set<String> required = new HashSet<>();
+        if (collectStaticParallelOutputs(root, false, required) && !outputs.containsAll(required)) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "ADK root completed without every required parallel branch output");
+        }
+    }
+
+    private static boolean collectStaticParallelOutputs(BaseAgent agent, boolean terminalRequired, Set<String> required) {
+        if (!agent.beforeAgentCallback().isEmpty() || !agent.afterAgentCallback().isEmpty()) {
+            return false;
+        }
+        var children = agent.subAgents();
+        if (agent.getClass() == LlmAgent.class && children.isEmpty()) {
+            if (terminalRequired) required.add(agent.name());
+            return true;
+        }
+        boolean parallel = agent.getClass() == ParallelAgent.class;
+        if ((!parallel && agent.getClass() != SequentialAgent.class) || children.isEmpty()) {
+            return false;
+        }
+        for (int index = 0; index < children.size(); index++) {
+            // All parallel branches are required. A sequential branch contributes its last child's output.
+            boolean childTerminalRequired = parallel || (terminalRequired && index == children.size() - 1);
+            if (!collectStaticParallelOutputs(children.get(index), childTerminalRequired, required)) return false;
+        }
+        return true;
     }
 
     private static String finalAgent(BaseAgent root) {

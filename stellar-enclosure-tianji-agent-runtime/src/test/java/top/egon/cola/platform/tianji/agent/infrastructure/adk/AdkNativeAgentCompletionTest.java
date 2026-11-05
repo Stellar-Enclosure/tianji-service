@@ -100,6 +100,63 @@ class AdkNativeAgentCompletionTest {
         }
     }
 
+    @Test
+    void static_parallel_completion_rejects_missing_required_branch_output() {
+        for (boolean nestedInSequence : List.of(false, true)) try (var rig = new Rig(false, "root-only")) {
+            var blank = new ScriptModel("blank-output");
+            var left = LlmAgent.builder().name("left").model(rig.model).build();
+            var right = LlmAgent.builder().name("right").model(blank).build();
+            var branch = SequentialAgent.builder().name("right_sequence").subAgents(right).build();
+            var parallel = ParallelAgent.builder().name("parallel").subAgents(left, branch).build();
+            BaseAgent root = nestedInSequence
+                    ? SequentialAgent.builder().name("sequence").subAgents(parallel,
+                            LlmAgent.builder().name("tail").model(rig.model).build()).build()
+                    : parallel;
+
+            assertEquals(AgentRunStatusEnum.FAILED, rig.executeWithFactory(scheduler -> root).status());
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name(), rig.finished.get().errorCode());
+            assertTrue(rig.finished.get().output().isEmpty());
+            assertEquals(1, blank.calls.get());
+            assertEquals(nestedInSequence ? 2 : 1, rig.model.calls.get());
+            assertEquals(nestedInSequence ? 2 : 1,
+                    rig.events.stream().filter(event -> "AGENT_OUTPUT".equals(event.get("type"))).count());
+        }
+    }
+
+    @Test
+    void static_parallel_requires_the_sequential_terminal_but_not_its_intermediate_output() {
+        try (var rig = new Rig(false, "root-only")) {
+            var blank = new ScriptModel("blank-output");
+            var left = LlmAgent.builder().name("left").model(rig.model).build();
+            var intermediate = LlmAgent.builder().name("intermediate").model(blank).build();
+            var right = LlmAgent.builder().name("right").model(rig.model).build();
+            var branch = SequentialAgent.builder().name("right_sequence").subAgents(intermediate, right).build();
+            var root = ParallelAgent.builder().name("parallel").subAgents(left, branch).build();
+
+            assertEquals(AgentRunStatusEnum.COMPLETED, rig.executeWithFactory(scheduler -> root).status());
+            assertEquals(Map.of("left", "root final", "right", "root final"), rig.finished.get().output().get("agents"));
+            assertEquals(1, blank.calls.get());
+            assertEquals(2, rig.model.calls.get());
+        }
+    }
+
+    @Test
+    void parallel_with_a_delegating_leaf_keeps_its_existing_completion_rules() {
+        try (var rig = new Rig(false, "root-only")) {
+            var blank = new ScriptModel("blank-output");
+            var optional = new ScriptModel("root-only");
+            var left = LlmAgent.builder().name("left").model(rig.model)
+                    .subAgents(LlmAgent.builder().name("optional").model(optional).build()).build();
+            var right = LlmAgent.builder().name("right").model(blank).build();
+            var root = ParallelAgent.builder().name("parallel").subAgents(left, right).build();
+
+            assertEquals(AgentRunStatusEnum.COMPLETED, rig.executeWithFactory(scheduler -> root).status());
+            assertEquals(Map.of("left", "root final"), rig.finished.get().output().get("agents"));
+            assertEquals(0, optional.calls.get());
+            assertEquals(1, blank.calls.get());
+        }
+    }
+
     @Test void conditional_collects_only_the_current_selected_child_and_root() {
         for (String branch : List.of("quick_research", "deep_research")) try (var rig = new Rig(false, branch)) {
             rig.nativeMode = true;
@@ -396,6 +453,11 @@ class AdkNativeAgentCompletionTest {
         ScriptModel(String script) { super("fixture-model"); this.script = script; }
         @Override public Flowable<LlmResponse> generateContent(LlmRequest request, boolean stream) {
             int call = calls.getAndIncrement();
+            if (script.equals("blank-output")) {
+                return Flowable.just(LlmResponse.builder()
+                        .content(Content.builder().role("model").parts(Part.fromText(" ")).build())
+                        .partial(false).turnComplete(true).build());
+            }
             if (script.equals("bounded")) return Flowable.just(switch (call) {
                 case 0 -> transfer("bounded_researcher", """
                         {"schemaVersion":"1","tasks":[
