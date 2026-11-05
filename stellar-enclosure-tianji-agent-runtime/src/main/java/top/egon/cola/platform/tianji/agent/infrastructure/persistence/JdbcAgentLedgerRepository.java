@@ -47,6 +47,106 @@ final class JdbcAgentLedgerRepository {
         return jdbc.queryForObject("SELECT clock_timestamp()", Timestamp.class).toInstant();
     }
 
+    Instant beginRecoveryObservation() {
+        jdbc.execute("SET TRANSACTION READ ONLY");
+        jdbc.execute("SET LOCAL statement_timeout = '2s'");
+        Timestamp observed = jdbc.queryForObject("""
+                SELECT pg_catalog.clock_timestamp()
+                WHERE NOT pg_catalog.pg_is_in_recovery()
+                  AND pg_catalog.current_setting('transaction_read_only') = 'on'
+                """, Timestamp.class);
+        if (observed == null) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "Agent recovery evidence is unavailable");
+        }
+        return observed.toInstant();
+    }
+
+    Optional<RecoveryRunRow> recoveryRun(TrustedAgentActor actor, String runId) {
+        List<RecoveryRunRow> rows = jdbc.query("""
+                SELECT run_id,status,revision,attempt,
+                    CASE WHEN pg_catalog.isfinite(deadline_at) THEN deadline_at END AS deadline_at,
+                    CASE WHEN pg_catalog.isfinite(lease_expires_at) THEN lease_expires_at END AS lease_expires_at,
+                    lease_expires_at IS NOT NULL AND NOT pg_catalog.isfinite(lease_expires_at) AS invalid_lease_time,
+                    lease_owner IS NOT NULL AS has_lease_owner,lease_epoch>0 AS has_lease_epoch,
+                    cancel_requested_at IS NOT NULL AS cancel_requested,
+                    CASE WHEN wait_reason IN ('LEASE_EXPIRED','AUTHORIZATION_DENIED','AUTHORIZATION_UNAVAILABLE')
+                        THEN wait_reason END AS safe_wait_reason,
+                    CASE WHEN pg_catalog.jsonb_typeof(result)='object'
+                        AND pg_catalog.jsonb_typeof(result->'runId')='string' AND result->>'runId'=run_id
+                        AND pg_catalog.jsonb_typeof(result->'status')='string' AND result->>'status'=status
+                        AND pg_catalog.jsonb_typeof(result->'sideEffectOutcome')='string'
+                        AND result->>'sideEffectOutcome' IN ('NONE','CONFIRMED','UNKNOWN')
+                        THEN result->>'sideEffectOutcome' END AS terminal_effect
+                FROM tianji_agent.agent_run
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?
+                LIMIT 2
+                """, (rs, row) -> new RecoveryRunRow(rs.getString("run_id"), rs.getString("status"),
+                rs.getObject("revision", Long.class), rs.getObject("attempt", Integer.class),
+                optionalInstant(rs, "deadline_at"), optionalInstant(rs, "lease_expires_at"),
+                rs.getBoolean("invalid_lease_time"), rs.getBoolean("has_lease_owner"), rs.getBoolean("has_lease_epoch"),
+                rs.getBoolean("cancel_requested"), rs.getString("safe_wait_reason"), rs.getString("terminal_effect")),
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId);
+        if (rows.size() > 1) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "Agent recovery evidence is unavailable");
+        }
+        return rows.stream().findFirst();
+    }
+
+    boolean recoveryToolReadable() {
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=2 FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent' AND c.relname IN ('agent_tool_invocation','flyway_schema_history')
+                  AND c.relkind='r' AND c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity
+                  AND pg_catalog.has_schema_privilege(n.oid,'USAGE')
+                  AND pg_catalog.has_table_privilege(c.oid,'SELECT')
+                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits
+                      WHERE inhrelid=c.oid OR inhparent=c.oid)
+                """, Boolean.class))) return false;
+
+        String script = ToolExecutionStorageVerifier.FILE;
+        int checksum = AgentStorageVerifier.checksum(script);
+        var history = jdbc.query("""
+                SELECT type,script,success,checksum FROM tianji_agent.flyway_schema_history
+                WHERE version=? LIMIT 2
+                """, (rs, row) -> "SQL".equals(rs.getString("type")) && script.equals(rs.getString("script"))
+                && rs.getBoolean("success") && rs.getObject("checksum") != null && rs.getInt("checksum") == checksum, "13");
+        return history.size() == 1 && history.getFirst();
+    }
+
+    List<RecoveryToolRow> recoveryToolRows(TrustedAgentActor actor, String runId) {
+        return jdbc.query("""
+                SELECT owner_matches,
+                    CASE WHEN owner_matches THEN state END AS state,
+                    CASE WHEN owner_matches THEN risk END AS risk,
+                    CASE WHEN owner_matches THEN side_effect_outcome END AS side_effect_outcome,
+                    CASE WHEN owner_matches AND business_receipt_id IS NULL THEN false
+                         WHEN owner_matches AND business_receipt_id<>''
+                             AND business_receipt_id=pg_catalog.btrim(business_receipt_id)
+                             AND business_receipt_id !~ '[[:cntrl:]]' THEN true END AS has_local_receipt
+                FROM (
+                    SELECT invocation_id,state,risk,side_effect_outcome,business_receipt_id,
+                        owner_type=? AND owner_issuer=? AND owner_id=? AS owner_matches
+                    FROM ONLY tianji_agent.agent_tool_invocation
+                    WHERE tenant_id=? AND run_id=?
+                    ORDER BY invocation_id
+                    LIMIT 65
+                ) bounded
+                ORDER BY invocation_id
+                """, (rs, row) -> new RecoveryToolRow(rs.getBoolean("owner_matches"), rs.getString("state"),
+                rs.getString("risk"), rs.getString("side_effect_outcome"), rs.getObject("has_local_receipt", Boolean.class)),
+                actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), actor.tenantId(), runId);
+    }
+
+    record RecoveryRunRow(String runId, String status, Long revision, Integer attempt, Instant deadlineAt,
+                          Instant leaseExpiresAt, boolean invalidLeaseTime, boolean hasLeaseOwner, boolean hasLeaseEpoch,
+                          boolean cancelRequested, String safeWaitReason, String terminalEffect) { }
+
+    record RecoveryToolRow(boolean ownerMatches, String state, String risk, String sideEffectOutcome,
+                           Boolean hasLocalReceipt) { }
+
     Optional<String> linkedSubmissionKey(TrustedAgentActor actor, String runId, String linkSha256) {
         List<String> keys = jdbc.query("SELECT idempotency_key FROM tianji_agent.agent_process_dispatch "
                         + "WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND run_id=? AND link_sha256=?",

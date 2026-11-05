@@ -145,6 +145,174 @@ public final class AgentLedgerService {
         return read.execute(status -> terminalReference(actor, requireRun(actor, query)));
     }
 
+    /** Observes the exact owner's recorded recovery evidence on the bound Agent primary. */
+    public AgentRecoveryDispositionDTO inspectRecovery(TrustedAgentActor actor, GetAgentRunQuery query) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Verified Agent owner is required");
+        }
+        if (query == null || !modelUsageText(query.runId(), 64)) {
+            throw invalid("Agent recovery query is invalid");
+        }
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Agent recovery must own its snapshot transaction");
+        }
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        // Route to the owning primary before setting physical read-only mode inside the transaction.
+        read.setReadOnly(false);
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        read.setTimeout(2);
+        try {
+            return Objects.requireNonNull(read.execute(status -> {
+                Instant observedAt = repository.beginRecoveryObservation();
+                var run = repository.recoveryRun(actor, query.runId()).orElseThrow(AgentLedgerService::notFound);
+                if (!query.runId().equals(run.runId())) throw recoveryUnavailable();
+                var reason = recoveryReason(run, observedAt);
+                var effect = reason == AgentRecoveryReasonEnum.TERMINAL_RECORDED
+                        ? recoveryEffect(run.terminalEffect()) : AgentRecoveryEffectEnum.UNVERIFIED;
+                var tool = repository.recoveryToolReadable()
+                        ? recoveryToolEvidence(repository.recoveryToolRows(actor, query.runId())) : toolEvidenceUnavailable();
+                return new AgentRecoveryDispositionDTO(run.runId(),
+                        run.revision() != null && run.revision() >= 0 ? run.revision() : null,
+                        run.attempt() != null && run.attempt() >= 0 ? run.attempt() : null, observedAt,
+                        recoveryLifecycle(reason), reason, effect, tool,
+                        effect == AgentRecoveryEffectEnum.RECORDED_NONE && Boolean.TRUE.equals(tool.hasUnresolvedWrite()));
+            }));
+        } catch (org.springframework.dao.DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw recoveryUnavailable();
+        }
+    }
+
+    private static AgentRecoveryReasonEnum recoveryReason(JdbcAgentLedgerRepository.RecoveryRunRow run,
+                                                           Instant observedAt) {
+        if (run.status() == null || run.revision() == null || run.revision() < 0
+                || run.attempt() == null || run.attempt() < 0 || run.deadlineAt() == null) {
+            return AgentRecoveryReasonEnum.SOURCE_UNAVAILABLE;
+        }
+        AgentRunStatusEnum status;
+        try {
+            status = AgentRunStatusEnum.valueOf(run.status());
+        } catch (IllegalArgumentException failure) {
+            return AgentRecoveryReasonEnum.SOURCE_UNAVAILABLE;
+        }
+        if (AgentRunTransitions.terminal(status)) return AgentRecoveryReasonEnum.TERMINAL_RECORDED;
+        if (switch (status) {
+            case QUEUED, RUNNING, WAITING, SUSPENDED -> !run.deadlineAt().isAfter(observedAt);
+            default -> false;
+        }) {
+            return AgentRecoveryReasonEnum.DEADLINE_DUE;
+        }
+        return switch (status) {
+            case QUEUED -> AgentRecoveryReasonEnum.QUEUE_DISCOVERY;
+            case RUNNING -> {
+                if (run.invalidLeaseTime()) yield AgentRecoveryReasonEnum.FENCE_UNVERIFIED;
+                if (run.leaseExpiresAt() == null) yield AgentRecoveryReasonEnum.LEASE_MISSING;
+                if (!run.hasLeaseOwner() || !run.hasLeaseEpoch() || run.attempt() == 0) {
+                    yield AgentRecoveryReasonEnum.FENCE_UNVERIFIED;
+                }
+                if (!run.leaseExpiresAt().isAfter(observedAt)) yield AgentRecoveryReasonEnum.LEASE_EXPIRED;
+                yield run.cancelRequested() ? AgentRecoveryReasonEnum.CANCEL_REQUESTED : AgentRecoveryReasonEnum.CURRENT_LEASE;
+            }
+            case SUSPENDED -> switch (run.safeWaitReason()) {
+                case "LEASE_EXPIRED" -> AgentRecoveryReasonEnum.LEASE_EXPIRED;
+                case "AUTHORIZATION_DENIED" -> AgentRecoveryReasonEnum.AUTHORIZATION_DENIED;
+                case "AUTHORIZATION_UNAVAILABLE" -> AgentRecoveryReasonEnum.AUTHORIZATION_UNAVAILABLE;
+                case null, default -> AgentRecoveryReasonEnum.SUSPENSION_UNVERIFIED;
+            };
+            case CREATED, WAITING -> AgentRecoveryReasonEnum.LEGACY_WAIT_UNVERIFIED;
+            default -> AgentRecoveryReasonEnum.SOURCE_UNAVAILABLE;
+        };
+    }
+
+    private static AgentRecoveryLifecycleEnum recoveryLifecycle(AgentRecoveryReasonEnum reason) {
+        return switch (reason) {
+            case QUEUE_DISCOVERY -> AgentRecoveryLifecycleEnum.QUEUED;
+            case CURRENT_LEASE, CANCEL_REQUESTED -> AgentRecoveryLifecycleEnum.ACTIVE;
+            case DEADLINE_DUE, LEASE_MISSING, LEASE_EXPIRED, AUTHORIZATION_DENIED, AUTHORIZATION_UNAVAILABLE ->
+                    AgentRecoveryLifecycleEnum.STALLED;
+            case TERMINAL_RECORDED -> AgentRecoveryLifecycleEnum.TERMINAL;
+            case FENCE_UNVERIFIED, SUSPENSION_UNVERIFIED, LEGACY_WAIT_UNVERIFIED, SOURCE_UNAVAILABLE ->
+                    AgentRecoveryLifecycleEnum.UNVERIFIED;
+        };
+    }
+
+    private static AgentRecoveryEffectEnum recoveryEffect(String effect) {
+        return switch (effect) {
+            case "NONE" -> AgentRecoveryEffectEnum.RECORDED_NONE;
+            case "CONFIRMED" -> AgentRecoveryEffectEnum.RECORDED_CONFIRMED;
+            case "UNKNOWN" -> AgentRecoveryEffectEnum.UNKNOWN;
+            case null, default -> AgentRecoveryEffectEnum.UNVERIFIED;
+        };
+    }
+
+    private static AgentRecoveryToolEvidenceDTO recoveryToolEvidence(List<JdbcAgentLedgerRepository.RecoveryToolRow> rows) {
+        if (rows.size() > 65 || rows.stream().anyMatch(row -> !validRecoveryToolRow(row))) return toolEvidenceUnavailable();
+        boolean truncated = rows.size() > 64;
+        boolean dispatching = false;
+        boolean unknown = false;
+        boolean unresolved = false;
+        boolean receipt = false;
+        for (var row : rows.subList(0, Math.min(64, rows.size()))) {
+            dispatching |= "DISPATCHING".equals(row.state());
+            unknown |= "UNKNOWN".equals(row.state());
+            unresolved |= "UNKNOWN".equals(row.sideEffectOutcome());
+            receipt |= Boolean.TRUE.equals(row.hasLocalReceipt());
+        }
+        return new AgentRecoveryToolEvidenceDTO(
+                truncated ? AgentRecoveryToolCoverageEnum.TRUNCATED : AgentRecoveryToolCoverageEnum.COMPLETE,
+                recoveryFlag(dispatching, truncated), recoveryFlag(unknown, truncated),
+                recoveryFlag(unresolved, truncated), recoveryFlag(receipt, truncated));
+    }
+
+    private static boolean validRecoveryToolRow(JdbcAgentLedgerRepository.RecoveryToolRow row) {
+        if (!row.ownerMatches() || row.state() == null || row.risk() == null || row.hasLocalReceipt() == null) return false;
+        boolean readOnly = "READ_ONLY".equals(row.risk());
+        boolean approvalRequired = "APPROVAL_REQUIRED".equals(row.risk());
+        if (!readOnly && !approvalRequired && !"IDEMPOTENT_WRITE".equals(row.risk())) return false;
+        String effect = switch (row.state()) {
+            case "PREPARED", "REJECTED", "FAILED_KNOWN" -> "NONE";
+            case "AWAITING_APPROVAL" -> approvalRequired ? "NONE" : null;
+            case "DISPATCHING", "UNKNOWN" -> readOnly ? "NONE" : "UNKNOWN";
+            case "SUCCEEDED" -> readOnly ? "NONE" : "CONFIRMED";
+            default -> null;
+        };
+        return effect != null && effect.equals(row.sideEffectOutcome())
+                && row.hasLocalReceipt() == (!readOnly && "SUCCEEDED".equals(row.state()));
+    }
+
+    private static Boolean recoveryFlag(boolean observed, boolean truncated) {
+        if (observed) return Boolean.TRUE;
+        return truncated ? null : Boolean.FALSE;
+    }
+
+    private static AgentRecoveryToolEvidenceDTO toolEvidenceUnavailable() {
+        return new AgentRecoveryToolEvidenceDTO(AgentRecoveryToolCoverageEnum.UNAVAILABLE, null, null, null, null);
+    }
+
+    private static AgentLedgerException recoveryUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent recovery evidence is unavailable");
+    }
+
+    public enum AgentRecoveryLifecycleEnum { QUEUED, ACTIVE, STALLED, TERMINAL, UNVERIFIED }
+
+    public enum AgentRecoveryReasonEnum {
+        QUEUE_DISCOVERY, CURRENT_LEASE, CANCEL_REQUESTED, DEADLINE_DUE, LEASE_MISSING, LEASE_EXPIRED,
+        AUTHORIZATION_DENIED, AUTHORIZATION_UNAVAILABLE, FENCE_UNVERIFIED, SUSPENSION_UNVERIFIED,
+        LEGACY_WAIT_UNVERIFIED, TERMINAL_RECORDED, SOURCE_UNAVAILABLE
+    }
+
+    public enum AgentRecoveryEffectEnum { RECORDED_NONE, RECORDED_CONFIRMED, UNKNOWN, UNVERIFIED }
+
+    public enum AgentRecoveryToolCoverageEnum { COMPLETE, TRUNCATED, UNAVAILABLE }
+
+    public record AgentRecoveryToolEvidenceDTO(AgentRecoveryToolCoverageEnum coverage, Boolean hasDispatching,
+                                               Boolean hasUnknownResult, Boolean hasUnresolvedWrite,
+                                               Boolean hasLocalReceipt) { }
+
+    public record AgentRecoveryDispositionDTO(String runId, Long revision, Integer attempt, Instant observedAt,
+                                              AgentRecoveryLifecycleEnum lifecycle, AgentRecoveryReasonEnum reason,
+                                              AgentRecoveryEffectEnum agentEffect, AgentRecoveryToolEvidenceDTO toolEvidence,
+                                              boolean evidenceConflict) { }
+
     /** Retained for existing callers; PostgreSQL is the authoritative clock for the ledger. */
     @Deprecated
     public AgentLedgerService(DataSource dataSource, Clock clock) {
