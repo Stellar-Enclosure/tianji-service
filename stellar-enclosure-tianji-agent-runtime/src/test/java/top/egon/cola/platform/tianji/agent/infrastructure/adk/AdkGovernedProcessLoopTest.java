@@ -11,6 +11,7 @@ import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.Timeout;
+import org.mockito.ArgumentCaptor;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
@@ -68,6 +69,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
@@ -82,10 +84,14 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.math.BigDecimal;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -119,6 +125,140 @@ class AdkGovernedProcessLoopTest {
             new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
             new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
             new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "fixed.approved.action", ProcessClient.START_RESOURCE_KEY, HASH, "approval-v1"));
+
+
+    @Test
+    void fixed_fake_agent_quality_v1() throws Exception {
+        var mapper = JsonMapper.builder(JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
+                .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS, DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES,
+                        DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES, DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
+                .build();
+        byte[] fixture;
+        try (var input = getClass().getResourceAsStream("/evaluation/agent-run-quality-v1.json")) {
+            assertNotNull(input);
+            fixture = input.readNBytes(8193);
+        }
+        assertTrue(fixture.length <= 8192);
+        var corpus = mapper.readValue(fixture, QualityCorpus.class);
+        assertEquals(1, corpus.schemaVersion());
+        assertEquals(List.of("no-tool", "authorized-read", "forged-start", "tool-entry-cap", "model-context-cap"),
+                corpus.samples().stream().map(QualitySample::id).toList());
+
+        var measurements = new ArrayList<QualityMeasurement>();
+        for (var sample : corpus.samples()) {
+            measurements.add(evaluateQualitySample(mapper, corpus.definition(), sample));
+        }
+
+        var summary = new LinkedHashMap<String, Object>();
+        summary.put("reportVersion", 1);
+        summary.put("fixtureSha256", HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(fixture)));
+        summary.put("mode", "FAKE_PROTOCOL");
+        summary.put("definition", corpus.definition());
+        summary.put("samples", measurements.size());
+        summary.put("structuredOutputMatches", measurements.stream().filter(QualityMeasurement::outputMatched).count());
+        summary.put("toolSelectionMatches", measurements.stream().filter(QualityMeasurement::toolsMatched).count());
+        summary.put("budgetMatches", measurements.stream().filter(QualityMeasurement::budgetMatched).count());
+        summary.put("modelCalls", measurements.stream().mapToInt(QualityMeasurement::modelCalls).sum());
+        summary.put("modelReservations", measurements.stream().mapToInt(QualityMeasurement::reservations).sum());
+        summary.put("modelSettlements", measurements.stream().mapToInt(QualityMeasurement::settlements).sum());
+        summary.put("observedDurationNanos", measurements.stream().mapToLong(QualityMeasurement::elapsedNanos).sum());
+        summary.put("citationQuality", "NOT_AVAILABLE");
+        summary.put("realModelQuality", "NOT_RUN");
+        System.out.println("TIANJI_AGENT_QUALITY_V1 " + mapper.writeValueAsString(summary));
+    }
+
+    private static QualityMeasurement evaluateQualitySample(JsonMapper mapper, QualityDefinition expectedDefinition, QualitySample sample)
+            throws Exception {
+        try (var rig = new Rig("SINGLE", sample.maxToolEntries())) {
+            rig.tools = sample.maxToolEntries() > 0;
+            rig.input = new AgentInputDTO(sample.input(), List.of(), Map.of());
+            rig.model.scripts.put("writer", sample.toolCalls().stream().map(QualityToolCall::name).toList());
+            rig.model.scriptArguments.put("writer", sample.toolCalls().stream().map(call -> mapper.writeValueAsString(call.arguments())).toList());
+            when(rig.estimator.contextWindow(any(), any())).thenReturn(new AgentModelBudgetEstimator.ContextWindow(
+                    expectedDefinition.model(), expectedDefinition.route(), expectedDefinition.policy(), sample.windowTokens(), 5));
+            assertQualityDefinition(expectedDefinition, rig);
+            long started = System.nanoTime();
+            var run = rig.executor().executeQueued(rig.actor, rig.query);
+            long elapsed = System.nanoTime() - started;
+            var result = rig.finished.get();
+            assertNotNull(result, sample.id());
+            var expected = sample.expected();
+            assertEquals(expected.status(), run.status(), sample.id());
+            assertEquals(expected.status(), result.status(), sample.id());
+            assertEquals(expected.error().isEmpty() ? null : expected.error(), result.errorCode(), sample.id());
+            assertEquals(expected.sideEffect(), result.sideEffectOutcome(), sample.id());
+
+            Map<String, Object> expectedOutput = expected.outputText().isEmpty() ? Map.of()
+                    : Map.of("agents", Map.of("writer", expected.outputText()), "text", expected.outputText());
+            boolean outputMatched = expectedOutput.equals(result.output());
+            assertTrue(outputMatched, sample.id() + " structured output");
+            if (run.status() == AgentRunStatusEnum.COMPLETED) assertEquals(expectedDefinition.outputSchemaVersion(), result.outputSchemaVersion(), sample.id());
+
+            assertEquals(expected.reads(), rig.reads.get(), sample.id() + " fixed read dispatch count");
+            assertEquals(rig.reads.get(), rig.readPreparations.size(), sample.id());
+            for (var read : rig.readPreparations) {
+                assertEquals(READ.reference(), read.descriptor().reference(), sample.id());
+                assertEquals(Map.of("amount", 7L), read.arguments(), sample.id());
+            }
+            assertEquals(0, rig.writes.get(), sample.id() + " writes");
+            assertEquals(0, rig.delegates.get(), sample.id() + " write transports");
+            assertEquals(0, rig.model.calls.get(), sample.id() + " blocking model calls");
+            int observedStreams = rig.model.streams.get();
+            assertEquals(expected.modelCalls(), observedStreams, sample.id() + " streaming model calls");
+
+            var reservations = ArgumentCaptor.forClass(AgentBudgetRequest.class);
+            verify(rig.budgets, times(expected.modelCalls())).reserveBudget(eq(rig.actor), eq(rig.lease), reservations.capture());
+            for (var reservation : reservations.getAllValues()) {
+                assertEquals(AgentBudgetRequest.Kind.MODEL, reservation.kind(), sample.id());
+                assertEquals(10L, reservation.inputTokens(), sample.id());
+                assertEquals(5L, reservation.outputTokens(), sample.id());
+            }
+            var settlements = ArgumentCaptor.forClass(AgentBudgetSettlement.class);
+            var settlementIds = ArgumentCaptor.forClass(String.class);
+            verify(rig.budgets, times(expected.modelCalls()))
+                    .settleBudget(eq(rig.actor), eq(rig.lease), settlementIds.capture(), settlements.capture());
+            assertEquals(reservations.getAllValues().stream().map(AgentBudgetRequest::reservationId).toList(),
+                    settlementIds.getAllValues(), sample.id() + " settlement reservation binding");
+            for (var settlement : settlements.getAllValues()) {
+                assertEquals(10L, settlement.inputTokens(), sample.id());
+                assertEquals(3L, settlement.outputTokens(), sample.id());
+            }
+            return new QualityMeasurement(outputMatched, expected.reads() == rig.reads.get() && rig.writes.get() == 0
+                    && rig.delegates.get() == 0, observedStreams == reservations.getAllValues().size()
+                    && observedStreams == settlements.getAllValues().size(), observedStreams, reservations.getAllValues().size(),
+                    settlements.getAllValues().size(), elapsed);
+        }
+    }
+
+    private static void assertQualityDefinition(QualityDefinition expected, Rig rig) throws Exception {
+        var definition = rig.material().snapshot().definition();
+        assertEquals(expected.key(), definition.definitionKey());
+        assertEquals(expected.version(), definition.version());
+        assertEquals(expected.inputSchemaVersion(), definition.inputSchemaVersion());
+        assertEquals(expected.outputSchemaVersion(), definition.outputSchemaVersion());
+        assertEquals(expected.model(), definition.configuration().get("modelName"));
+        assertEquals(expected.route(), definition.dependencies().modelRouteRef());
+        assertEquals(expected.policy(), definition.dependencies().policyVersionRef());
+        assertTrue(definition.dependencies().prompts().isEmpty());
+        var configuredAgents = (List<?>) definition.configuration().get("agents");
+        var root = (Map<?, ?>) configuredAgents.getFirst();
+        var instruction = (String) root.get("instruction");
+        assertEquals(expected.inlineInstructionSha256(), HexFormat.of().formatHex(
+                MessageDigest.getInstance("SHA-256").digest(instruction.getBytes(StandardCharsets.UTF_8))));
+        assertEquals(rig.tools ? expected.tools() : List.of(), definition.dependencies().tools());
+    }
+
+    private record QualityCorpus(int schemaVersion, QualityDefinition definition, List<QualitySample> samples) { }
+    private record QualityDefinition(String key, long version, String inputSchemaVersion, String outputSchemaVersion,
+                                     String model, String route, String policy, String inlineInstructionSha256,
+                                     List<DefinitionResourceRef> tools) { }
+    private record QualitySample(String id, String input, int maxToolEntries, int windowTokens,
+                                 List<QualityToolCall> toolCalls, QualityExpected expected) { }
+    private record QualityToolCall(String name, Map<String, Object> arguments) { }
+    private record QualityExpected(AgentRunStatusEnum status, String error, String sideEffect, String outputText,
+                                   int reads, int modelCalls) { }
+    private record QualityMeasurement(boolean outputMatched, boolean toolsMatched, boolean budgetMatched, int modelCalls,
+                                      int reservations, int settlements, long elapsedNanos) { }
 
     @Test void governed_process_injection_corpus_is_present() {
         assertNotNull(getClass().getResource("/evaluation/governed-process-injection-v1.json"));

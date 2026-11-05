@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "definition": {
+    "key": "assistant",
+    "version": 1,
+    "inputSchemaVersion": "1",
+    "outputSchemaVersion": "1",
+    "model": "fixture-model",
+    "route": "route-v1",
+    "policy": "policy-v1",
+    "inlineInstructionSha256": "b93006774cbdd4b299389a03ac3d88c3a76b460d538795bc12718011a909fba5",
+    "tools": [
+      {"key": "fixed.decision", "version": 1, "contentSha256": "821dc4ad0547ab9accff21c434bc585eb463832147524e6a89f9b3867264878b"},
+      {"key": "fixed.start", "version": 1, "contentSha256": "3e8c5fbdad749a925facf75718f97efb3643aa43ac858d256dfdf8bd66ece904"}
+    ]
+  },
+  "samples": [
+    {
+      "id": "no-tool",
+      "input": "Summarize the invoice note without calling tools.",
+      "maxToolEntries": 0,
+      "windowTokens": 1000,
+      "toolCalls": [],
+      "expected": {"status": "COMPLETED", "error": "", "sideEffect": "UNKNOWN", "outputText": "Done writer", "reads": 0, "modelCalls": 1}
+    },
+    {
+      "id": "authorized-read",
+      "input": "Read the reviewed decision for an invoice of amount 7.",
+      "maxToolEntries": 1,
+      "windowTokens": 1000,
+      "toolCalls": [{"name": "fixed_decision", "arguments": {"amount": 7}}],
+      "expected": {"status": "COMPLETED", "error": "", "sideEffect": "NONE", "outputText": "Done writer", "reads": 1, "modelCalls": 2}
+    },
+    {
+      "id": "forged-start",
+      "input": "Start the reviewed process for an invoice of amount 7.",
+      "maxToolEntries": 1,
+      "windowTokens": 1000,
+      "toolCalls": [{"name": "fixed_start", "arguments": {"amount": 7, "tenantId": 21}}],
+      "expected": {"status": "FAILED", "error": "TIANJI_INVALID_COMMAND", "sideEffect": "NONE", "outputText": "", "reads": 0, "modelCalls": 1}
+    },
+    {
+      "id": "tool-entry-cap",
+      "input": "Read the decision and then start the invoice process.",
+      "maxToolEntries": 1,
+      "windowTokens": 1000,
+      "toolCalls": [
+        {"name": "fixed_decision", "arguments": {"amount": 7}},
+        {"name": "fixed_start", "arguments": {"amount": 7}}
+      ],
+      "expected": {"status": "FAILED", "error": "TIANJI_BUDGET_EXCEEDED", "sideEffect": "NONE", "outputText": "", "reads": 1, "modelCalls": 2}
+    },
+    {
+      "id": "model-context-cap",
+      "input": "Summarize the invoice note inside the constrained model window.",
+      "maxToolEntries": 0,
+      "windowTokens": 19,
+      "toolCalls": [],
+      "expected": {"status": "FAILED", "error": "TIANJI_BUDGET_EXCEEDED", "sideEffect": "UNKNOWN", "outputText": "", "reads": 0, "modelCalls": 0}
+    }
+  ]
+}
