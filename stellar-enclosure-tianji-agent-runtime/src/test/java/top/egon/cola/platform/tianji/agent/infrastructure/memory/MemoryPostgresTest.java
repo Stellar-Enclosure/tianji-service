@@ -1,9 +1,21 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.memory;
 
+import com.google.adk.models.LlmRequest;
+import com.google.adk.models.LlmResponse;
+import jakarta.validation.Validation;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
+import org.springframework.ai.chat.metadata.ChatResponseMetadata;
+import org.springframework.ai.chat.metadata.DefaultUsage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.Generation;
+import org.springframework.ai.chat.prompt.ChatOptions;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.embedding.Embedding;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.embedding.EmbeddingOptions;
@@ -14,14 +26,25 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import reactor.core.publisher.Flux;
+import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
+import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
+import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
+import top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory;
+import top.egon.cola.component.common.core.validation.ValidationUtils;
+import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryPreferenceAdmission;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryPreferenceCommands;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.memory.MemoryContextBinding;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryOperationContext;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryReadGrant;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryRetentionPolicy;
@@ -30,6 +53,9 @@ import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceSourceB
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceExtraction;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceIntent;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceWritePermit;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryReadGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.MemoryStorageVerifier;
@@ -38,6 +64,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentContextSourceKindEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
@@ -71,13 +101,19 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -93,8 +129,45 @@ class MemoryPostgresTest {
     private static final MemoryRetentionPolicy POLICY = new MemoryRetentionPolicy("personal", 1, Duration.ofDays(1), Duration.ofDays(30), 100,
             Set.of(MemorySensitivityEnum.CONFIDENTIAL), Set.of(MemorySensitivityEnum.CONFIDENTIAL), true);
 
+    private static final String S04_DEFINITION = "s04-session-memory";
+    private static final String S04_SESSION = "s04-shared-session";
+    private static final String S04_SCOPE = "s04-reviewed-scope";
+    private static final String S04_SIBLING_SCOPE = "s04-other-scope";
+    private static final String S04_MEMORY = "s04-same-memory-id";
+
     @Test
     void v10_fact_receipt_index_visibility_forget_concurrency_grants_and_catalog_fences() throws Exception {
+        MemoryAuthorization authority = request -> request.owner().type() == MemoryOwnerTypeEnum.TEAM ? MemoryAuthorization.Decision.DENY : MemoryAuthorization.Decision.ALLOW;
+        try (var fixture = openV10Fixture(ignored -> authority,
+                event -> { if (event.tenantId() != 20) throw new IllegalArgumentException("untrusted test origin"); })) {
+            var jdbc = fixture.jdbc();
+            var memory = fixture.memory();
+            var work = fixture.work();
+            var events = fixture.events();
+            var ledger = fixture.ledger();
+            var source = fixture.source();
+            var version = fixture.vectorVersion();
+            assertThrows(AgentLedgerException.class, () -> new MemoryStorageVerifier(source, 3, version, fixture.publication().binding()).verify());
+            lifecycle(jdbc, memory, work, events);
+            contextSelection(memory, work, events);
+            candidates(memory);
+            mergeSuggestions(jdbc, memory, work, events, fixture.delegate());
+            preferenceAdmission(ledger, memory, authority, jdbc);
+            rollback(jdbc, memory, fixture.failPublication());
+            concurrency(memory);
+            lateEmbedding(jdbc, memory, work, events, fixture.delegate());
+            retention(source, jdbc, memory, work, fixture.publication(), events, fixture.failPublication());
+            grants(ledger, source);
+            serviceGrantCorrection(ledger, source, jdbc); memory.verifyStorage(2, version);
+            preferenceIntents(ledger, source, memory, jdbc); memory.verifyStorage(2, version);
+            jdbc.execute("ALTER TABLE tianji_agent.agent_memory_entry DROP CONSTRAINT memory_entry_confirmation");
+            assertThrows(AgentLedgerException.class, () -> memory.verifyStorage(2, version));
+            assertThrows(AgentLedgerException.class, () -> memory.get(context(), new GetMemoryQuery(OWNER, "research", "main")));
+        }
+    }
+
+    private static MemoryFixture openV10Fixture(Function<AgentLedgerService, MemoryAuthorization> authority,
+                                                 Consumer<MemoryIndexPublication.Event> buildAuthority) {
         String url = System.getProperty("tianji.memory.postgres.test.url");
         if (!url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) throw new IllegalArgumentException("Memory tests require an empty loopback tianji_it_ database");
         String version = System.getProperty("tianji.memory.postgres.vector.version");
@@ -126,27 +199,268 @@ class MemoryPostgresTest {
                 TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() { @Override public void afterCommit() { events.put(event.eventId(), event); } });
             }
         };
-        MemoryAuthorization authority = request -> request.owner().type() == MemoryOwnerTypeEnum.TEAM ? MemoryAuthorization.Decision.DENY : MemoryAuthorization.Decision.ALLOW;
-        try (var index = new PgVectorMemoryIndex(source, binding, model, 2, Clock.systemUTC())) {
-            var memory = new PostgresMemoryService(ledger, source, authority, List.of(POLICY), publication, Clock.systemUTC(), index);
+        var index = new PgVectorMemoryIndex(source, binding, model, 2, Clock.systemUTC());
+        try {
+            var memory = new PostgresMemoryService(ledger, source, authority.apply(ledger), List.of(POLICY), publication, Clock.systemUTC(), index);
             memory.verifyStorage(2, version);
-            assertThrows(AgentLedgerException.class, () -> new MemoryStorageVerifier(source, 3, version, binding).verify());
-            var work = new MemoryIndexWork(source, memory, index, event -> { if (event.tenantId() != 20) throw new IllegalArgumentException("untrusted test origin"); }, Clock.systemUTC());
-            lifecycle(jdbc, memory, work, events);
-            contextSelection(memory, work, events);
-            candidates(memory);
-            mergeSuggestions(jdbc, memory, work, events, delegate);
-            preferenceAdmission(ledger, memory, authority, jdbc);
-            rollback(jdbc, memory, failPublication);
-            concurrency(memory);
-            lateEmbedding(jdbc, memory, work, events, delegate);
-            retention(source, jdbc, memory, work, publication, events, failPublication);
-            grants(ledger, source);
-            serviceGrantCorrection(ledger, source, jdbc); memory.verifyStorage(2, version);
-            preferenceIntents(ledger, source, memory, jdbc); memory.verifyStorage(2, version);
-            jdbc.execute("ALTER TABLE tianji_agent.agent_memory_entry DROP CONSTRAINT memory_entry_confirmation");
-            assertThrows(AgentLedgerException.class, () -> memory.verifyStorage(2, version));
-            assertThrows(AgentLedgerException.class, () -> memory.get(context(), new GetMemoryQuery(OWNER, "research", "main")));
+            var work = new MemoryIndexWork(source, memory, index, buildAuthority, Clock.systemUTC());
+            return new MemoryFixture(source, jdbc, ledger, memory, index, work, publication, events, failPublication, delegate, version);
+        } catch (RuntimeException | Error failure) {
+            index.close();
+            throw failure;
+        }
+    }
+
+    private record MemoryFixture(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
+                                 PostgresMemoryService memory, PgVectorMemoryIndex index, MemoryIndexWork work,
+                                 MemoryIndexPublication publication, Map<String, MemoryIndexPublication.Event> events,
+                                 AtomicBoolean failPublication, EmbeddingModel delegate, String vectorVersion) implements AutoCloseable {
+        @Override public void close() { index.close(); }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "tianji.memory.postgres.session-context.enabled", matches = "true")
+    void replacement_executor_revalidates_owned_durable_memory_history_and_blocks_forgotten_sources() {
+        var secondTenant = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/21");
+        var owners = Set.of(ALICE, secondTenant);
+        var memoryReads = new ConcurrentHashMap<String, List<MemoryAuthorization.Operation>>();
+        try (var fixture = openV10Fixture(ledger -> s04Authority(ledger, owners, memoryReads), event -> {
+            if (!OWNER.equals(event.owner()) || !Set.of(S04_SCOPE, S04_SIBLING_SCOPE).contains(event.scopeId())
+                    || owners.stream().noneMatch(actor -> actor.tenantId() == event.tenantId()
+                    && actor.issuerFingerprint().equals(event.ownerIssuer()))) throw new IllegalArgumentException("untrusted S04 fixture origin");
+        });
+             var validators = Validation.buildDefaultValidatorFactory();
+             var control = Executors.newScheduledThreadPool(2)) {
+            var ledger = fixture.ledger();
+            var factory = new AgentFlowFactory(new SpringAiModelAdapterFactory(), new AgentWorkflowStrategyFactory(List.of()));
+            var validator = new AgentFlowConfigValidator(new ValidationUtils(validators.getValidator()));
+            var runPolicy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(8), Duration.ofSeconds(5),
+                    2, 0, 2000, 100, BigDecimal.ONE, "USD", 1, Set.of(), "retry", "approval");
+            var definition = new AgentDefinitionSpecDTO(S04_DEFINITION, 1, "CONFIG", null, "1", "1",
+                    new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "s04-fixture-route", "s04-fixture-policy"),
+                    runPolicy, Map.of("chatModelBeanName", "s04Model", "modelName", "s04-fixture-model",
+                    "rootAgentName", "assistant", "agents", List.of(Map.of("name", "assistant", "instruction", "Summarize fixture evidence."))));
+            var bindings = owners.stream().map(actor -> {
+                var published = ledger.publish(actor, definition);
+                return new MemoryContextBinding("s04-binding-" + actor.tenantId(), actor.tenantId(), actor.issuerFingerprint(),
+                        actor.subjectType(), S04_DEFINITION, 1, published.contentSha256(), MemoryOwnerTypeEnum.USER,
+                        null, S04_SCOPE, MemoryKindEnum.PREFERENCE, true, 3, Set.of(POLICY.reference()));
+            }).toList();
+
+            var primaryCommand = s04Fact(S04_SCOPE, "s04-owner-memory-marker");
+            var original = fixture.memory().upsert(s04Context(ALICE), primaryCommand);
+            var originalBuild = buildScoped(fixture.events(), ALICE, S04_SCOPE);
+            fixture.work().apply(originalBuild, Instant.now().plusSeconds(10));
+            fixture.memory().upsert(s04Context(secondTenant), s04Fact(S04_SCOPE, "s04-foreign-tenant-marker"));
+            fixture.work().apply(buildScoped(fixture.events(), secondTenant, S04_SCOPE), Instant.now().plusSeconds(10));
+            fixture.memory().upsert(s04Context(ALICE), s04Fact(S04_SIBLING_SCOPE, "s04-sibling-scope-marker"));
+            fixture.work().apply(buildScoped(fixture.events(), ALICE, S04_SIBLING_SCOPE), Instant.now().plusSeconds(10));
+
+            for (var actor : owners) {
+                var sessions = new PostgresAdkSessionService(fixture.source(), actor, "tianji");
+                sessions.createSession("tianji", sessions.adkUserId(), Map.of(), S04_SESSION).blockingGet();
+            }
+            AgentRunAuthorization runAuthority = (request, boundary) -> {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                if (!owners.contains(request.actor()) || !request.sessionRequired()
+                        || !S04_DEFINITION.equals(request.definitionKey())) return AgentRunAuthorization.Decision.DENY;
+                var current = ledger.executionMaterial(request.actor(), new GetAgentRunQuery(request.runId()));
+                var expected = boundary == AgentRunAuthorization.Boundary.CLAIM ? AgentRunStatusEnum.QUEUED : AgentRunStatusEnum.RUNNING;
+                return current.authorization().equals(request) && current.run().status() == expected
+                        ? AgentRunAuthorization.Decision.ALLOW : AgentRunAuthorization.Decision.DENY;
+            };
+
+            var originalModel = new S04Model("s04-first-owned-answer");
+            AgentContextSourceDTO originalSource;
+            try (var provider = new MemoryContextProvider(fixture.memory(), bindings, List.of(POLICY), 1, Clock.systemUTC())) {
+                var firstExecutor = s04Executor(fixture, factory, validator, control, provider, runAuthority, originalModel);
+                var first = s04Run(ledger, firstExecutor, ALICE, S04_SESSION, "s04-first", "s04-first-owned-question", AgentRunStatusEnum.COMPLETED);
+                originalSource = s04MemorySnapshot(ledger, ALICE, first);
+                assertPrompt(originalModel, List.of("s04-first-owned-question", "s04-owner-memory-marker"),
+                        List.of("s04-foreign-tenant-marker", "s04-sibling-scope-marker"));
+            }
+
+            // Replace the executor and its Memory provider, leaving the durable Session and V9 metadata intact.
+            var replacementModel = new S04Model("s04-second-owned-answer");
+            try (var provider = new MemoryContextProvider(fixture.memory(), bindings, List.of(POLICY), 1, Clock.systemUTC())) {
+                var replacement = s04Executor(fixture, factory, validator, control, provider, runAuthority, replacementModel);
+                var second = s04Run(ledger, replacement, ALICE, S04_SESSION, "s04-second", "s04-second-owned-question", AgentRunStatusEnum.COMPLETED);
+                var replacementSource = s04MemorySnapshot(ledger, ALICE, second);
+                assertEquals(originalSource.provenanceId(), replacementSource.provenanceId());
+                assertEquals(originalSource.sourceSha256(), replacementSource.sourceSha256());
+                assertPrompt(replacementModel, List.of("s04-first-owned-question", "s04-first-owned-answer",
+                                "s04-second-owned-question", "s04-owner-memory-marker"),
+                        List.of("s04-foreign-tenant-marker", "s04-sibling-scope-marker"));
+            }
+
+            var foreignModel = new S04Model("s04-foreign-answer");
+            try (var provider = new MemoryContextProvider(fixture.memory(), bindings, List.of(POLICY), 1, Clock.systemUTC())) {
+                var foreign = s04Executor(fixture, factory, validator, control, provider, runAuthority, foreignModel);
+                s04Run(ledger, foreign, secondTenant, S04_SESSION, "s04-first", "s04-foreign-question", AgentRunStatusEnum.COMPLETED);
+                assertPrompt(foreignModel, List.of("s04-foreign-tenant-marker", "s04-foreign-question"),
+                        List.of("s04-first-owned-question", "s04-first-owned-answer", "s04-owner-memory-marker", "s04-sibling-scope-marker"));
+            }
+
+            fixture.memory().forget(s04Context(ALICE), new ForgetMemoryCommand(
+                    "s04-forget", OWNER, S04_SCOPE, S04_MEMORY, original.revision(), "USER_FORGET"));
+            int eventsAfterForget = fixture.events().size();
+            // Replay both the original command and its already delivered BUILD event after the tombstone.
+            assertEquals(original, fixture.memory().upsert(s04Context(ALICE), primaryCommand));
+            assertEquals(eventsAfterForget, fixture.events().size());
+            fixture.work().apply(originalBuild, Instant.now().plusSeconds(10));
+            assertEquals(MemoryStateEnum.FORGOTTEN,
+                    fixture.memory().get(s04Context(ALICE), new GetMemoryQuery(OWNER, S04_SCOPE, S04_MEMORY)).state());
+            assertTrue(fixture.memory().retrieve(s04Context(ALICE), s04Search(S04_SCOPE)).items().isEmpty());
+            assertEquals(0, fixture.jdbc().queryForObject(
+                    "SELECT count(*) FROM tianji_agent.agent_memory_vector_v1 WHERE id=?", Integer.class, originalBuild.documentId()));
+
+            var blockedModel = new S04Model("s04-must-not-be-produced");
+            try (var provider = new MemoryContextProvider(fixture.memory(), bindings, List.of(POLICY), 1, Clock.systemUTC())) {
+                var blocked = s04Executor(fixture, factory, validator, control, provider, runAuthority, blockedModel);
+                var failed = s04Run(ledger, blocked, ALICE, S04_SESSION, "s04-third", "s04-third-owned-question", AgentRunStatusEnum.FAILED);
+                var result = ledger.getResult(ALICE, new GetAgentRunQuery(failed.runId())).orElseThrow();
+                assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name(), result.errorCode());
+                assertTrue(result.output().isEmpty());
+                assertNull(blockedModel.prompt.get());
+                assertEquals(List.of(MemoryAuthorization.Operation.RETRIEVE), memoryReads.get(failed.runId()));
+                assertEquals(0, fixture.jdbc().queryForObject("""
+                        SELECT count(*) FROM tianji_agent.agent_budget_reservation
+                        WHERE tenant_id=? AND run_id=? AND kind='MODEL'
+                        """, Integer.class, ALICE.tenantId(), failed.runId()));
+            }
+            assertEquals("s04-foreign-tenant-marker",
+                    fixture.memory().retrieve(s04Context(secondTenant), s04Search(S04_SCOPE)).items().getFirst().entry().content().text());
+            assertEquals("s04-sibling-scope-marker",
+                    fixture.memory().retrieve(s04Context(ALICE), s04Search(S04_SIBLING_SCOPE)).items().getFirst().entry().content().text());
+
+            // A clean Session remains runnable by the same owner; only stale history was denied.
+            var sessions = new PostgresAdkSessionService(fixture.source(), ALICE, "tianji");
+            sessions.createSession("tianji", sessions.adkUserId(), Map.of(), "s04-fresh-session").blockingGet();
+            var cleanModel = new S04Model("s04-clean-answer");
+            try (var provider = new MemoryContextProvider(fixture.memory(), bindings, List.of(POLICY), 1, Clock.systemUTC())) {
+                var clean = s04Executor(fixture, factory, validator, control, provider, runAuthority, cleanModel);
+                s04Run(ledger, clean, ALICE, "s04-fresh-session", "s04-fresh", "s04-clean-question", AgentRunStatusEnum.COMPLETED);
+                assertPrompt(cleanModel, List.of("s04-clean-question"),
+                        List.of("s04-owner-memory-marker", "s04-first-owned-answer", "s04-foreign-tenant-marker", "s04-sibling-scope-marker"));
+            }
+        }
+    }
+
+    /** Local, exact test authority. Production IAM and grant issuance remain separate gates. */
+    private static MemoryAuthorization s04Authority(AgentLedgerService ledger, Set<TrustedAgentActor> owners,
+                                                     Map<String, List<MemoryAuthorization.Operation>> reads) {
+        return request -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            var actor = request.context().actor();
+            if (!owners.contains(actor) || !OWNER.equals(request.owner()) || !Set.of(S04_SCOPE, S04_SIBLING_SCOPE).contains(request.scopeId())) {
+                return MemoryAuthorization.Decision.DENY;
+            }
+            var run = request.context().runAuthorization();
+            if (run == null) return MemoryAuthorization.Decision.ALLOW;
+            if (!actor.equals(run.actor()) || !S04_SCOPE.equals(request.scopeId()) || !S04_DEFINITION.equals(run.definitionKey())
+                    || !run.sessionRequired() || !Set.of(MemoryAuthorization.Operation.RETRIEVE, MemoryAuthorization.Operation.SEARCH).contains(request.operation())) {
+                return MemoryAuthorization.Decision.DENY;
+            }
+            var current = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId()));
+            if (!run.equals(current.authorization()) || current.run().status() != AgentRunStatusEnum.RUNNING) {
+                return MemoryAuthorization.Decision.DENY;
+            }
+            reads.computeIfAbsent(run.runId(), ignored -> new CopyOnWriteArrayList<>()).add(request.operation());
+            return MemoryAuthorization.Decision.ALLOW;
+        };
+    }
+
+    private static UpsertMemoryCommand s04Fact(String scope, String text) {
+        return new UpsertMemoryCommand("s04-fact", OWNER, scope, S04_MEMORY, MemoryKindEnum.PREFERENCE, 0,
+                new MemoryContentDTO(text, Map.of()), PROVENANCE, BigDecimal.ONE, true,
+                MemorySensitivityEnum.CONFIDENTIAL, POLICY.reference(), null, null);
+    }
+
+    private static MemoryRetrievalQuery s04Search(String scope) {
+        return new MemoryRetrievalQuery(OWNER, scope, MemoryKindEnum.PREFERENCE, "fixture", null, 3);
+    }
+
+    private static MemoryOperationContext s04Context(TrustedAgentActor actor) {
+        return new MemoryOperationContext(actor, Instant.now().plusSeconds(15), null);
+    }
+
+    private static MemoryIndexPublication.Event buildScoped(Map<String, MemoryIndexPublication.Event> events,
+                                                              TrustedAgentActor actor, String scope) {
+        return events.values().stream().filter(event -> event.action() == MemoryIndexPublication.Action.BUILD
+                && event.tenantId() == actor.tenantId() && actor.issuerFingerprint().equals(event.ownerIssuer())
+                && OWNER.equals(event.owner()) && scope.equals(event.scopeId()) && S04_MEMORY.equals(event.memoryId())
+                && event.revision() == 1).findFirst().orElseThrow();
+    }
+
+    private static AgentRunDTO s04Run(AgentLedgerService ledger, AdkAgentRunExecutor executor, TrustedAgentActor actor,
+                                      String session, String command, String input, AgentRunStatusEnum expected) {
+        var run = ledger.start(actor, new StartAgentRunCommand(S04_DEFINITION, 1, session, command, null, null,
+                new AgentInputDTO(input, List.of(), Map.of()), null));
+        var query = new GetAgentRunQuery(run.runId());
+        assertEquals(expected, executor.executeQueued(actor, query).status());
+        var persisted = ledger.get(actor, query);
+        assertEquals(expected, persisted.status());
+        return persisted;
+    }
+
+    private static AdkAgentRunExecutor s04Executor(MemoryFixture fixture, AgentFlowFactory factory, AgentFlowConfigValidator validator,
+                                                    ScheduledExecutorService control, MemoryContextProvider provider,
+                                                    AgentRunAuthorization authority, S04Model model) {
+        var estimator = new AgentModelBudgetEstimator() {
+            @Override public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new Estimate(20, 20, new BigDecimal("0.10"));
+            }
+            @Override public ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
+                        snapshot.definition().dependencies().policyVersionRef(), 2000, 10);
+            }
+            @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) {
+                return new AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05"));
+            }
+        };
+        return new AdkAgentRunExecutor(fixture.ledger(), factory, validator, Map.of("s04Model", model), Map.of(),
+                control, estimator, fixture.source(), true, authority, new DefaultContextAssembler(List.of(provider)), true);
+    }
+
+    private static AgentContextSourceDTO s04MemorySnapshot(AgentLedgerService ledger, TrustedAgentActor actor, AgentRunDTO run) {
+        var snapshots = ledger.contextSnapshots(actor, new AgentContextSnapshotsQuery(run.runId(), 0, 2)).items();
+        assertEquals(1, snapshots.size());
+        var metadata = snapshots.getFirst().metadata();
+        assertEquals(S04_SESSION, metadata.nativeSessionId());
+        assertEquals(actor.identityFingerprint(), metadata.ownerSha256());
+        var sources = metadata.sources().stream().filter(source -> source.kind() == AgentContextSourceKindEnum.MEMORY).toList();
+        assertEquals(1, sources.size());
+        return sources.getFirst();
+    }
+
+    private static void assertPrompt(S04Model model, List<String> expected, List<String> excluded) {
+        var prompt = model.prompt.get();
+        assertNotNull(prompt);
+        for (var marker : expected) assertTrue(prompt.stream().anyMatch(text -> text.contains(marker)), "Expected fixture marker was missing");
+        for (var marker : excluded) assertTrue(prompt.stream().noneMatch(text -> text.contains(marker)), "Unexpected fixture marker crossed scope");
+    }
+
+    private static final class S04Model implements ChatModel {
+        private final String output;
+        private final AtomicReference<List<String>> prompt = new AtomicReference<>();
+
+        private S04Model(String output) { this.output = output; }
+
+        @Override public ChatOptions getOptions() { return ChatOptions.builder().model("s04-fixture-model").build(); }
+
+        @Override public ChatResponse call(Prompt ignored) {
+            throw new AssertionError("S04 fixture requires streaming");
+        }
+
+        @Override public Flux<ChatResponse> stream(Prompt request) {
+            return Flux.defer(() -> {
+                var messages = request.getInstructions().stream().map(message -> message.getText()).filter(Objects::nonNull).toList();
+                assertTrue(prompt.compareAndSet(null, messages), "Unexpected repeat model subscription");
+                var response = new ChatResponse(List.of(new Generation(new AssistantMessage(output),
+                        ChatGenerationMetadata.builder().finishReason("stop").build())),
+                        ChatResponseMetadata.builder().usage(new DefaultUsage(10, 5, 15)).build());
+                return Flux.just(response);
+            });
         }
     }
 
