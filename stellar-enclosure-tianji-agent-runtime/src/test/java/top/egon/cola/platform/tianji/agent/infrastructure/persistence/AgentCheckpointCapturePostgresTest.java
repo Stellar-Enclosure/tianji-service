@@ -20,6 +20,7 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import reactor.core.publisher.Flux;
 import top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigDTO;
@@ -41,9 +42,14 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntim
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointObservationService;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointObservationService.Observation;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.Acknowledgement;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumeCommand;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumePermit;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
@@ -63,6 +69,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +80,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -203,6 +211,28 @@ class AgentCheckpointCapturePostgresTest {
     @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture.native-resume", matches = "true")
     void resumes_product_first_input_checkpoint_after_process_death_under_original_run_lease() throws Exception {
         verifyProductCheckpointForks(provision(), NATIVE_RESUME, (fixture, cut) -> { });
+    }
+
+    @Test
+    @Timeout(150)
+    @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.takeover", matches = "true")
+    void takes_over_reconciled_product_checkpoint_once_under_scoped_resume_permit() throws Exception {
+        String role = System.getProperty("tianji.postgres.checkpoint.takeover.role", "");
+        if (!role.matches("tianji_it_checkpoint_takeover_[a-z0-9_]{1,24}")) {
+            throw new IllegalArgumentException("checkpoint takeover requires an exact disposable takeover role");
+        }
+        // Reuse the existing third-role checks and V16 SELECT-only grants before adding bounded claim DML.
+        var database = provision(role);
+        var takeoverSource = dataSource(database.setup().getUrl(), role);
+        var takeoverJdbc = new JdbcTemplate(takeoverSource);
+        assertCheckpointReaderPrivileges(takeoverJdbc);
+        grantCheckpointTakeover(database.observer(), '"' + role + '"');
+        assertTrue(Boolean.TRUE.equals(takeoverJdbc.queryForObject("""
+                SELECT current_user=? AND has_table_privilege('tianji_agent.agent_checkpoint','SELECT')
+                  AND NOT has_any_column_privilege('tianji_agent.agent_checkpoint','INSERT,UPDATE,REFERENCES')
+                  AND NOT has_table_privilege('tianji_agent.agent_checkpoint','DELETE,TRUNCATE,TRIGGER')
+                """, Boolean.class, role)));
+        verifyProductCheckpointForks(database, RECONCILE, (fixture, cut) -> fixture.assertCheckpointTakeover(cut, takeoverSource));
     }
 
     private static void verifyProductCheckpointForks(Database database, AgentCheckpointForkHandoff.Phase replacementPhase,
@@ -525,6 +555,10 @@ class AgentCheckpointCapturePostgresTest {
         @Override public String toString() { return "ForkCut[redacted]"; }
     }
 
+    private record TakeoverCommitWitness(String leaseSha256, List<AgentEventDTO> events) {
+        @Override public String toString() { return "TakeoverCommitWitness[redacted]"; }
+    }
+
     private record NativeForkWitness(ForkCut cut, AgentRunLease runLease, NativeRow prefix, String checkpointSha256) {
         String handoffSha256() {
             String owner = runLease.owner();
@@ -649,6 +683,27 @@ class AgentCheckpointCapturePostgresTest {
                 """ + quotedReader);
         observer.execute("GRANT SELECT (tenant_id,run_id) ON tianji_agent.agent_tool_invocation TO " + quotedReader);
         observer.execute("GRANT SELECT (tenant_id,origin_run_id) ON tianji_agent.agent_tool_action_intent TO " + quotedReader);
+    }
+
+    private static void grantCheckpointTakeover(JdbcTemplate observer, String quotedRole) {
+        observer.execute("GRANT SELECT ON tianji_agent.agent_run_command_receipt TO " + quotedRole);
+        observer.execute("""
+                GRANT UPDATE (status, wait_reason, revision, last_event_sequence, lease_epoch, lease_owner, lease_expires_at)
+                  ON tianji_agent.agent_run TO
+                """ + quotedRole);
+        // SELECT FOR UPDATE needs UPDATE privilege on at least one column of this locked relation.
+        observer.execute("GRANT UPDATE (revision) ON tianji_agent.agent_session TO " + quotedRole);
+        observer.execute("""
+                GRANT UPDATE (lease_epoch, lease_owner, lease_expires_at) ON tianji_agent.agent_session_lease TO
+                """ + quotedRole);
+        observer.execute("""
+                GRANT INSERT (tenant_id, run_id, sequence, event_id, event_type, schema_version, correlation_id, payload, occurred_at)
+                  ON tianji_agent.agent_event TO
+                """ + quotedRole);
+        observer.execute("""
+                GRANT INSERT (tenant_id, subject_type, subject_issuer, subject_id, command_id, operation, request_hash, run_id, created_at),
+                  UPDATE (result) ON tianji_agent.agent_run_command_receipt TO
+                """ + quotedRole);
     }
 
     private static void assertCheckpointReaderPrivileges(JdbcTemplate reader) {
@@ -978,21 +1033,7 @@ class AgentCheckpointCapturePostgresTest {
 
         void assertCheckpointObservation(ForkCut cut, AgentCheckpointObservationService service,
                                          JdbcTemplate reader, String quotedReader) {
-            assertNotNull(cut.sessionLeaseOwner());
-            assertEquals(1, database.observer().update("""
-                    UPDATE tianji_agent.agent_session_lease l SET lease_expires_at=clock_timestamp()-interval '1 second'
-                    FROM tianji_agent.agent_checkpoint c JOIN tianji_agent.agent_run r
-                      ON (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
-                         (c.tenant_id,c.run_id,c.subject_type,c.subject_issuer,c.subject_id,c.session_id)
-                    WHERE (l.tenant_id,l.subject_type,l.subject_issuer,l.subject_id,l.app_name,l.session_id)=
-                          (c.tenant_id,c.subject_type,c.subject_issuer,c.subject_id,c.app_name,c.session_id)
-                      AND c.tenant_id=? AND c.run_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
-                      AND c.app_name=? AND c.session_id=? AND c.attempt=1 AND c.checkpoint_no=1
-                      AND r.status='SUSPENDED' AND r.wait_reason='LEASE_EXPIRED' AND r.lease_epoch=? AND r.revision=?
-                      AND l.lease_epoch=c.session_lease_epoch AND l.lease_epoch=? AND l.lease_owner=?
-                      AND l.lease_expires_at IS NOT NULL
-                    """, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
-                    APP, SESSION, cut.epoch() + 1, cut.revision() + 1, cut.sessionEpoch(), cut.sessionLeaseOwner()));
+            expireReconciledSessionLease(cut);
             assertEquals(Observation.BOUNDARY_OBSERVED, service.observe(actor, query));
 
             var otherOwner = TrustedAgentActor.verified(actor.tenantId(), TrustedAgentActor.SubjectType.USER,
@@ -1021,6 +1062,24 @@ class AgentCheckpointCapturePostgresTest {
             assertReconciled(cut);
         }
 
+        private void expireReconciledSessionLease(ForkCut cut) {
+            assertNotNull(cut.sessionLeaseOwner());
+            assertEquals(1, database.observer().update("""
+                    UPDATE tianji_agent.agent_session_lease l SET lease_expires_at=clock_timestamp()-interval '1 second'
+                    FROM tianji_agent.agent_checkpoint c JOIN tianji_agent.agent_run r
+                      ON (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
+                         (c.tenant_id,c.run_id,c.subject_type,c.subject_issuer,c.subject_id,c.session_id)
+                    WHERE (l.tenant_id,l.subject_type,l.subject_issuer,l.subject_id,l.app_name,l.session_id)=
+                          (c.tenant_id,c.subject_type,c.subject_issuer,c.subject_id,c.app_name,c.session_id)
+                      AND c.tenant_id=? AND c.run_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
+                      AND c.app_name=? AND c.session_id=? AND c.attempt=1 AND c.checkpoint_no=1
+                      AND r.status='SUSPENDED' AND r.wait_reason='LEASE_EXPIRED' AND r.lease_epoch=? AND r.revision=?
+                      AND l.lease_epoch=c.session_lease_epoch AND l.lease_epoch=? AND l.lease_owner=?
+                      AND l.lease_expires_at IS NOT NULL
+                    """, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    APP, SESSION, cut.epoch() + 1, cut.revision() + 1, cut.sessionEpoch(), cut.sessionLeaseOwner()));
+        }
+
         private void changeObservationSessionRevision(long previous, long replacement) {
             assertEquals(1, database.observer().update("""
                     UPDATE tianji_agent.agent_session SET revision=?
@@ -1028,6 +1087,133 @@ class AgentCheckpointCapturePostgresTest {
                       AND revision=? AND last_event_sequence=1
                     """, replacement, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                     APP, SESSION, previous));
+        }
+
+        void assertCheckpointTakeover(ForkCut cut, DriverManagerDataSource takeoverSource) {
+            expireReconciledSessionLease(cut);
+            assertReconciled(cut);
+            var ledger = new AgentLedgerService(database.setup());
+            var suspended = ledger.get(actor, query);
+            var prefix = nativeRows();
+            assertEquals(1, prefix.size());
+            String checkpoint = checkpointDigest();
+            var command = new ResumeCommand(query.runId(), "checkpoint-takeover", suspended.revision());
+            var expired = new ResumeCommand(query.runId(), "checkpoint-takeover-expired", suspended.revision());
+            var decisions = new AtomicInteger();
+            var allowedUntil = new AtomicReference<Instant>();
+            var takeover = new AgentCheckpointTakeoverService(takeoverSource, request -> {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive(),
+                        "the trusted authority port must be called outside the claim transaction");
+                assertEquals(authorization, request.execution());
+                assertTrue(request.command().equals(command) || request.command().equals(expired),
+                        "only the exact expected commands may reach fixture authority");
+                assertTrue(request.cutSha256().matches("[0-9a-f]{64}"));
+                decisions.incrementAndGet();
+                Instant now = database.observer().queryForObject("SELECT clock_timestamp()",
+                        (row, index) -> row.getTimestamp(1).toInstant());
+                assertNotNull(now);
+                if (request.command().equals(expired)) {
+                    return Optional.of(new ResumePermit(request, now.minusSeconds(1)));
+                }
+                Instant expiry = now.plusSeconds(20);
+                allowedUntil.set(expiry);
+                return Optional.of(new ResumePermit(request, expiry));
+            });
+
+            var wrongOwner = TrustedAgentActor.verified(actor.tenantId(), TrustedAgentActor.SubjectType.USER,
+                    "checkpoint-other-owner", "https://checkpoint-fixture.example");
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND,
+                    assertThrows(AgentLedgerException.class, () -> takeover.takeOver(wrongOwner, command, "checkpoint-worker")).code());
+            var stale = new ResumeCommand(query.runId(), "checkpoint-takeover-stale", suspended.revision() - 1);
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                    assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, stale, "checkpoint-worker")).code());
+            assertEquals(0, decisions.get());
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                    assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, expired, "checkpoint-worker")).code());
+            assertEquals(1, decisions.get());
+            assertEquals(0, resumeReceipts());
+            assertReconciled(cut);
+
+            String worker = "checkpoint-worker";
+            var expected = new Acknowledgement(query.runId(), AgentRunStatusEnum.RUNNING, 1, suspended.revision() + 2);
+            assertEquals(expected, takeover.takeOver(actor, command, worker).acknowledgement());
+            assertEquals(2, decisions.get());
+            assertNotNull(allowedUntil.get());
+            var committed = assertTakeoverCommitted(cut, suspended.lastEventSequence(), expected, worker, allowedUntil.get());
+            String receipt = resumeReceiptDigest(command, expected);
+            assertEquals(expected, takeover.takeOver(actor, command, "checkpoint-replay-worker").acknowledgement());
+            var reused = new ResumeCommand(query.runId(), command.commandId(), command.expectedRevision() + 1);
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
+                    assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, reused, worker)).code());
+            assertEquals(2, decisions.get());
+            assertEquals(committed, assertTakeoverCommitted(cut, suspended.lastEventSequence(), expected, worker, allowedUntil.get()));
+            assertEquals(receipt, resumeReceiptDigest(command, expected));
+            assertEquals(1, resumeReceipts());
+            assertEquals(1, checkpoints());
+            assertEquals(checkpoint, checkpointDigest());
+            assertEquals(prefix, nativeRows());
+            assertNoExecutionEvidence();
+            assertEquals(0, database.observer().queryForObject("""
+                    SELECT count(*) FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND origin_run_id=?
+                    """, Integer.class, actor.tenantId(), query.runId()));
+        }
+
+        private int resumeReceipts() {
+            return database.observer().queryForObject("""
+                    SELECT count(*) FROM tianji_agent.agent_run_command_receipt
+                    WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=? AND operation='RESUME'
+                    """, Integer.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(),
+                    actor.subjectId(), query.runId());
+        }
+
+        private String resumeReceiptDigest(ResumeCommand command, Acknowledgement expected) {
+            String receipt = database.observer().queryForObject("""
+                    SELECT pg_catalog.jsonb_build_array(pg_catalog.to_jsonb(c)-'created_at',
+                               extract(epoch FROM c.created_at))::text
+                    FROM tianji_agent.agent_run_command_receipt c
+                    WHERE c.tenant_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
+                      AND c.operation='RESUME' AND c.run_id=? AND c.command_id=?
+                      AND c.result=pg_catalog.jsonb_build_object('runId',c.run_id,'status','RUNNING','attempt',1,'revision',CAST(? AS bigint))
+                    """, String.class, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(),
+                    actor.subjectId(), query.runId(), command.commandId(), expected.revision());
+            return forkDigest(receipt);
+        }
+
+        private TakeoverCommitWitness assertTakeoverCommitted(ForkCut cut, long suspendedSequence, Acknowledgement expected,
+                                                              String worker, Instant permitExpiry) {
+            var ledger = new AgentLedgerService(database.setup());
+            var run = ledger.get(actor, query);
+            assertEquals(expected.runId(), run.runId());
+            assertEquals(expected.status(), run.status());
+            assertEquals(expected.attempt(), run.attempt());
+            assertEquals(expected.revision(), run.revision());
+            assertEquals(suspendedSequence + 2, run.lastEventSequence());
+            String lease = database.observer().queryForObject("""
+                    SELECT CASE WHEN r.status='RUNNING' AND r.wait_reason IS NULL
+                      AND r.lease_epoch=? AND r.lease_owner=? AND r.lease_expires_at>pg_catalog.clock_timestamp()
+                      AND r.lease_expires_at<=? AND r.lease_expires_at<=r.deadline_at
+                      AND l.lease_epoch=? AND l.lease_owner IS NOT NULL AND l.lease_owner<>?
+                      AND l.lease_expires_at=r.lease_expires_at
+                      THEN pg_catalog.jsonb_build_array(r.lease_epoch,r.lease_owner,extract(epoch FROM r.lease_expires_at),
+                               l.lease_epoch,l.lease_owner,extract(epoch FROM l.lease_expires_at))::text END
+                    FROM tianji_agent.agent_run r JOIN tianji_agent.agent_session_lease l
+                      ON (r.tenant_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
+                         (l.tenant_id,l.subject_type,l.subject_issuer,l.subject_id,l.session_id)
+                    WHERE r.tenant_id=? AND r.run_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                      AND l.app_name=? AND l.session_id=?
+                    """, String.class, cut.epoch() + 2, worker, java.sql.Timestamp.from(permitExpiry),
+                    cut.sessionEpoch() + 1, cut.sessionLeaseOwner(), actor.tenantId(), query.runId(),
+                    actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), APP, SESSION);
+            assertNotNull(lease, "the committed Run and Session leases must be live, exact and bounded by authority");
+            var events = ledger.events(actor, new AgentEventsQuery(query.runId(), suspendedSequence, 3));
+            assertEquals(2, events.size());
+            assertEquals(suspendedSequence + 1, events.getFirst().sequence());
+            assertEquals(suspendedSequence + 2, events.getLast().sequence());
+            assertTrue(events.stream().allMatch(event -> "RUN_STATUS_CHANGED".equals(event.type())));
+            assertEquals(Map.of("from", "SUSPENDED", "status", "QUEUED", "reason", "CHECKPOINT_RESUME"), events.getFirst().payload());
+            assertEquals(Map.of("from", "QUEUED", "status", "RUNNING", "reason", "CHECKPOINT_RESUME"), events.getLast().payload());
+            assertTrue(ledger.getResult(actor, query).isEmpty());
+            return new TakeoverCommitWitness(forkDigest(lease), events);
         }
 
         void assertCommittedCut() {
