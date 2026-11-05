@@ -18,6 +18,12 @@ public final class PlatformReleaseArtifactCli {
     private static final Set<String> SIGNATURE_OPTIONS = Set.of("--root", "--candidate", "--signature", "--trust",
             "--expect-candidate-sha256", "--expect-trust-sha256", "--tenant", "--channel");
 
+    private static final String SNAPSHOT_USAGE = "TIANJI_RELEASE_PROCESS_SNAPSHOT_USAGE";
+    private static final String SNAPSHOT = "--process-snapshot";
+    private static final String SNAPSHOT_PIN = "--expect-process-snapshot-sha256";
+    private static final Set<String> SNAPSHOT_OPTIONS = Set.of("--root", "--candidate", "--signature", "--trust",
+            "--expect-candidate-sha256", "--expect-trust-sha256", "--tenant", "--channel", SNAPSHOT, SNAPSHOT_PIN);
+
     private PlatformReleaseArtifactCli() { }
 
     public static void main(String[] args) {
@@ -30,8 +36,9 @@ public final class PlatformReleaseArtifactCli {
     }
 
     static int run(String[] args, OutputStream stdout, PrintStream stderr, Clock clock) {
-        if (args != null && args.length > 0 && "verify-signature".equals(args[0])) {
-            return runSignature(args, stdout, stderr, clock);
+        if (args != null && args.length > 0) {
+            if ("verify-signature".equals(args[0])) return runSignature(args, stdout, stderr, clock, false);
+            if ("compare-process-snapshot".equals(args[0])) return runSignature(args, stdout, stderr, clock, true);
         }
         Options options;
         try {
@@ -51,22 +58,24 @@ public final class PlatformReleaseArtifactCli {
         return write(candidate, stdout, stderr, IO_UNAVAILABLE);
     }
 
-    private static int runSignature(String[] args, OutputStream stdout, PrintStream stderr, Clock clock) {
+    private static int runSignature(String[] args, OutputStream stdout, PrintStream stderr, Clock clock,
+                                    boolean compareProcessSnapshot) {
         SignatureOptionsDTO options;
         try {
-            options = parseSignature(args);
+            options = parseSignature(args, compareProcessSnapshot);
         } catch (IllegalArgumentException invalid) {
-            return fail(stderr, 64, SIGNATURE_USAGE);
+            return fail(stderr, 64, compareProcessSnapshot ? SNAPSHOT_USAGE : SIGNATURE_USAGE);
         }
         byte[] proof;
         try {
             proof = PlatformReleaseSignatureVerifier.verify(options.root(), options.candidate(), options.signature(),
                     options.trust(), options.expectedCandidateSha(), options.expectedTrustSha(), options.tenant(),
-                    options.channel(), clock);
+                    options.channel(), clock, options.snapshot());
         } catch (PlatformReleaseSignatureVerifier.SignatureFailure invalid) {
             return fail(stderr, invalid.exitCode(), invalid.code());
         }
-        return write(proof, stdout, stderr, PlatformReleaseSignatureVerifier.IO_UNAVAILABLE);
+        return write(proof, stdout, stderr, compareProcessSnapshot ? PlatformReleaseSignatureVerifier.SNAPSHOT_IO_UNAVAILABLE
+                : PlatformReleaseSignatureVerifier.IO_UNAVAILABLE);
     }
 
     private static int write(byte[] result, OutputStream stdout, PrintStream stderr, String unavailableCode) {
@@ -93,17 +102,24 @@ public final class PlatformReleaseArtifactCli {
         return new Options(root(root), input, Long.parseLong(tenant), channel, expected);
     }
 
-    private static SignatureOptionsDTO parseSignature(String[] args) {
-        if (args.length != 1 + 2 * SIGNATURE_OPTIONS.size()) throw new IllegalArgumentException();
-        var values = options(args, SIGNATURE_OPTIONS);
+    private static SignatureOptionsDTO parseSignature(String[] args, boolean compareProcessSnapshot) {
+        var allowed = compareProcessSnapshot ? SNAPSHOT_OPTIONS : SIGNATURE_OPTIONS;
+        if (args.length != 1 + 2 * allowed.size()) throw new IllegalArgumentException();
+        var values = options(args, allowed);
         String tenant = values.get("--tenant"), channel = values.get("--channel");
         String candidateSha = values.get("--expect-candidate-sha256"), trustSha = values.get("--expect-trust-sha256");
         if (!tenant.matches("[1-9][0-9]{0,18}") || !channel.matches("[a-z][a-z0-9._-]{0,63}")
                 || !candidateSha.matches("[0-9a-f]{64}") || !trustSha.matches("[0-9a-f]{64}")) {
             throw new IllegalArgumentException();
         }
-        return new SignatureOptionsDTO(root(values.get("--root")), values.get("--candidate"),
-                values.get("--signature"), values.get("--trust"), candidateSha, trustSha, Long.parseLong(tenant), channel);
+        PlatformReleaseSignatureVerifier.ProcessSnapshotInputDTO snapshot = null;
+        if (compareProcessSnapshot) {
+            String snapshotSha = values.get(SNAPSHOT_PIN);
+            if (!snapshotSha.matches("[0-9a-f]{64}")) throw new IllegalArgumentException();
+            snapshot = new PlatformReleaseSignatureVerifier.ProcessSnapshotInputDTO(values.get(SNAPSHOT), snapshotSha);
+        }
+        return new SignatureOptionsDTO(root(values.get("--root")), values.get("--candidate"), values.get("--signature"),
+                values.get("--trust"), candidateSha, trustSha, Long.parseLong(tenant), channel, snapshot);
     }
 
     private static HashMap<String, String> options(String[] args, Set<String> allowed) {
@@ -131,5 +147,6 @@ public final class PlatformReleaseArtifactCli {
 
     private record Options(Path root, String input, long tenant, String channel, String expectedSha256) { }
     private record SignatureOptionsDTO(Path root, String candidate, String signature, String trust,
-                                       String expectedCandidateSha, String expectedTrustSha, long tenant, String channel) { }
+                                       String expectedCandidateSha, String expectedTrustSha, long tenant, String channel,
+                                       PlatformReleaseSignatureVerifier.ProcessSnapshotInputDTO snapshot) { }
 }

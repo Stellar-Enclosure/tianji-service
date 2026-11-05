@@ -3,7 +3,9 @@ package top.egon.cola.platform.tianji.process.server.release;
 import tools.jackson.databind.JsonNode;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 
 import java.io.IOException;
@@ -47,6 +49,14 @@ import static top.egon.cola.platform.tianji.process.server.release.PlatformRelea
 
 final class PlatformReleaseSignatureVerifier {
     static final String IO_UNAVAILABLE = "TIANJI_RELEASE_SIGNATURE_IO_UNAVAILABLE";
+    static final String SNAPSHOT_IO_UNAVAILABLE = "TIANJI_RELEASE_PROCESS_SNAPSHOT_IO_UNAVAILABLE";
+
+    private static final String SNAPSHOT_INVALID = "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID";
+    private static final String SNAPSHOT_DIGEST_MISMATCH = "TIANJI_RELEASE_PROCESS_SNAPSHOT_DIGEST_MISMATCH";
+    private static final String SNAPSHOT_MISMATCH = "TIANJI_RELEASE_PROCESS_SNAPSHOT_MISMATCH";
+    private static final int SNAPSHOT_LIMIT = 65_536;
+    private static final String SNAPSHOT_UTC =
+            "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,9})?Z";
 
     private static final String INVALID = "TIANJI_RELEASE_SIGNATURE_INVALID";
     private static final String DIGEST_MISMATCH = "TIANJI_RELEASE_SIGNATURE_DIGEST_MISMATCH";
@@ -78,7 +88,8 @@ final class PlatformReleaseSignatureVerifier {
     private PlatformReleaseSignatureVerifier() { }
 
     static byte[] verify(Path root, String candidatePath, String signaturePath, String trustPath,
-                         String expectedCandidateSha, String expectedTrustSha, long tenant, String channel, Clock clock) {
+                         String expectedCandidateSha, String expectedTrustSha, long tenant, String channel, Clock clock,
+                         ProcessSnapshotInputDTO snapshot) {
         try {
             var input = new PlatformReleaseArtifactValidator(root);
             byte[] candidateBytes = input.readSignatureInput(candidatePath, 1_048_576);
@@ -126,7 +137,8 @@ final class PlatformReleaseSignatureVerifier {
 
             var result = new ReleaseSignatureResultDTO(candidateSha, envelopeSha, field(candidate, "sourceRevision"),
                     tenantText, channel, trust.scope().get("keyId"), expectedTrustSha, claims.issuedAt(), claims.expiresAt());
-            return canonicalLine(result.payload());
+            if (snapshot == null) return canonicalLine(result.payload());
+            return canonicalLine(compareSnapshot(input, snapshot, candidate.get("process"), result));
         } catch (PlatformReleaseArtifactValidator.ValidationFailure failure) {
             throw failure.exitCode() == 66 ? unavailable() : invalid();
         } catch (IllegalArgumentException malformed) {
@@ -134,6 +146,66 @@ final class PlatformReleaseSignatureVerifier {
         } catch (IOException | UnsupportedOperationException | SecurityException | ProviderException failure) {
             throw unavailable();
         }
+    }
+
+    private static Map<String, Object> compareSnapshot(PlatformReleaseArtifactValidator input,
+                                                       ProcessSnapshotInputDTO reference, JsonNode candidate,
+                                                       ReleaseSignatureResultDTO signature) {
+        try {
+            byte[] bytes = input.readSignatureInput(reference.path(), SNAPSHOT_LIMIT);
+            String snapshotSha = hash(bytes);
+            if (!snapshotSha.equals(reference.expectedSha())) throw new SignatureFailure(65, SNAPSHOT_DIGEST_MISMATCH);
+
+            var snapshot = parse(bytes);
+            shape(snapshot, "releaseVersion", "manifestSha256", "createdAt", "models");
+            var published = new ProcessReleaseDTO(field(snapshot, "releaseVersion"), field(snapshot, "manifestSha256"),
+                    snapshotCreatedAt(snapshot), models(snapshot.get("models"), "contentSha256"));
+            if (!published.releaseVersion().equals(field(candidate, "releaseVersion"))
+                    || !published.manifestSha256().equals(field(candidate, "manifestSha256"))
+                    || !Set.copyOf(published.models()).equals(Set.copyOf(models(candidate.get("models"), "modelSha256")))) {
+                throw new SignatureFailure(65, SNAPSHOT_MISMATCH);
+            }
+
+            var proof = new HashMap<>(signature.payload());
+            proof.put("status", "PS_RELEASE_SNAPSHOT_MATCHED_OFFLINE");
+            proof.put("processSnapshot", Map.of("sha256", snapshotSha, "releaseVersion", published.releaseVersion(),
+                    "manifestSha256", published.manifestSha256()));
+            return proof;
+        } catch (PlatformReleaseArtifactValidator.ValidationFailure failure) {
+            throw failure.exitCode() == 66 ? new SignatureFailure(66, SNAPSHOT_IO_UNAVAILABLE)
+                    : new SignatureFailure(65, SNAPSHOT_INVALID);
+        } catch (DateTimeException | IllegalArgumentException malformed) {
+            throw new SignatureFailure(65, SNAPSHOT_INVALID);
+        } catch (IOException | UnsupportedOperationException | SecurityException unavailable) {
+            throw new SignatureFailure(66, SNAPSHOT_IO_UNAVAILABLE);
+        }
+    }
+
+    private static List<ProcessModelDTO> models(JsonNode models, String digestName) {
+        if (!models.isArray() || models.isEmpty() || models.size() > 16) {
+            throw new SignatureFailure(65, SNAPSHOT_INVALID);
+        }
+        var result = new ArrayList<ProcessModelDTO>(models.size());
+        for (var model : models) {
+            shape(model, "type", "definitionKey", digestName, "inputs");
+            var inputs = model.get("inputs");
+            if (!inputs.isObject() || inputs.size() > 16) throw new SignatureFailure(65, SNAPSHOT_INVALID);
+            var schema = new HashMap<String, ProcessValueTypeEnum>();
+            for (String name : inputs.propertyNames()) {
+                schema.put(name, ProcessValueTypeEnum.valueOf(field(inputs, name)));
+            }
+            result.add(new ProcessModelDTO(ProcessModelTypeEnum.valueOf(field(model, "type")),
+                    field(model, "definitionKey"), field(model, digestName), schema));
+        }
+        return result;
+    }
+
+    private static Instant snapshotCreatedAt(JsonNode snapshot) {
+        String text = field(snapshot, "createdAt");
+        if (!text.matches(SNAPSHOT_UTC)) throw new SignatureFailure(65, SNAPSHOT_INVALID);
+        var timestamp = LocalDateTime.parse(text.substring(0, text.length() - 1));
+        if (timestamp.getYear() < 1) throw new SignatureFailure(65, SNAPSHOT_INVALID);
+        return timestamp.toInstant(ZoneOffset.UTC);
     }
 
     private static void validateCandidate(JsonNode candidate) {
@@ -381,6 +453,8 @@ final class PlatformReleaseSignatureVerifier {
     private static SignatureFailure unavailable() {
         return new SignatureFailure(66, IO_UNAVAILABLE);
     }
+
+    record ProcessSnapshotInputDTO(String path, String expectedSha) { }
 
     private record ReleaseSignatureClaimsDTO(Map<String, String> scope, String candidateSha, String envelopeSha,
                                              Instant issuedAt, Instant expiresAt, String canonicalClaims) { }

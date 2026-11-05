@@ -2,8 +2,13 @@ package top.egon.cola.platform.tianji.process.server.release;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ArrayNode;
 import tools.jackson.databind.node.ObjectNode;
 
 import java.io.ByteArrayOutputStream;
@@ -410,6 +415,157 @@ final class PlatformReleaseSignatureVerifierTest {
         }
         Files.writeString(root.resolve("release-trust.json"), TRUST);
         Files.writeString(root.resolve("candidate.sig.json"), SIDECAR);
+    }
+
+    @Test
+    void comparesSignedCandidateWithPinnedPublicProcessSnapshot() throws IOException {
+        var root = stage("snapshot-match", SIDECAR);
+        String snapshot = fixture(processSnapshot());
+        var arguments = snapshotArgs(root, "published.json", writeSnapshot(root, snapshot));
+        var first = run(arguments);
+        assertEquals(0, first.status());
+        assertEquals("", first.stderr());
+        var proof = JSON.readTree(first.stdout());
+        var expected = (ObjectNode) JSON.readTree(EXPECTED_PROOF);
+        expected.put("status", "PS_RELEASE_SNAPSHOT_MATCHED_OFFLINE");
+        expected.set("processSnapshot", JSON.valueToTree(Map.of("sha256", sha(snapshot), "releaseVersion", "expense-v1",
+                "manifestSha256", processSnapshot().get("manifestSha256").asString())));
+        assertEquals(expected, proof);
+        assertArrayEquals(first.stdout(), run(arguments).stdout());
+        assertArrayEquals(EXPECTED_PROOF.getBytes(StandardCharsets.UTF_8), run(args(root, CANDIDATE_PIN, TRUST_PIN)).stdout());
+
+        var equivalent = processSnapshot();
+        equivalent.put("createdAt", "2026-11-05T11:00:00Z");
+        ((ArrayNode) equivalent.get("models")).add(((ArrayNode) equivalent.get("models")).remove(0));
+        String reformatted = JSON.writerWithDefaultPrettyPrinter().writeValueAsString(equivalent);
+        String reformattedSha = writeSnapshot(root, reformatted);
+        assertRefused(run(arguments), 65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_DIGEST_MISMATCH");
+        var second = run(snapshotArgs(root, "published.json", reformattedSha));
+        assertEquals(0, second.status());
+        ((ObjectNode) expected.get("processSnapshot")).put("sha256", sha(reformatted));
+        assertEquals(expected, JSON.readTree(second.stdout()));
+    }
+
+    @Test
+    void refusesReleaseManifestModelAndEffectiveInputDrift() throws IOException {
+        var root = stage("snapshot-drift", SIDECAR);
+        var published = processSnapshot();
+        published.put("releaseVersion", "other-release");
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        // Same named release with the role-rendered artifact's different manifest.
+        published.put("manifestSha256", "77b76704ba1d7d63e62c8764457253637a2cab0bfcf5fa2e5f01b45069352075");
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        ((ObjectNode) published.get("models").get(1)).put("contentSha256", WRONG_PIN);
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        ((ObjectNode) published.get("models").get(1)).put("definitionKey", "differentProcess");
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        ((ObjectNode) published.get("models").get(1).get("inputs")).put("amount", "STRING");
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        ((ArrayNode) published.get("models")).remove(0);
+        assertSnapshotMismatch(root, published);
+
+        published = processSnapshot();
+        var models = (ArrayNode) published.get("models");
+        models.add(((ObjectNode) models.get(1)).deepCopy().put("definitionKey", "extraModel"));
+        assertSnapshotMismatch(root, published);
+    }
+
+    @Test
+    void refusesMalformedPublicSnapshotAndUnauthorizedFields() throws IOException {
+        var root = stage("snapshot-invalid", SIDECAR);
+        var published = processSnapshot();
+        assertInvalidSnapshot(root, fixture(published.deepCopy().put("tenantId", "20")));
+        assertInvalidSnapshot(root, fixture(published.deepCopy().put("createdAt", "2026-11-05T24:00:00Z")));
+        assertInvalidSnapshot(root, fixture(published.deepCopy().put("createdAt", "2026-11-05T23:59:60Z")));
+        assertInvalidSnapshot(root, fixture(published.deepCopy().put("createdAt", "2026-11-05T10:00:00+08:00")));
+        assertInvalidSnapshot(root, fixture(published.deepCopy().put("createdAt", 1770000000)));
+        assertInvalidSnapshot(root, fixture(published) + "{}");
+        assertInvalidSnapshot(root, fixture(published).replaceFirst("\\{", "{\"releaseVersion\":\"expense-v1\","));
+
+        var models = (ArrayNode) published.get("models");
+        models.add(models.get(1).deepCopy());
+        assertInvalidSnapshot(root, fixture(published));
+
+        published = processSnapshot();
+        var model = (ObjectNode) published.get("models").get(1);
+        model.set("modelSha256", model.remove("contentSha256"));
+        assertInvalidSnapshot(root, fixture(published));
+    }
+
+    @Test
+    void verifiesSignatureBeforeReadingDistinctBoundedSnapshotFile() throws IOException {
+        var root = stage("snapshot-files", WRONG_KEY_SIDECAR);
+        assertRefused(run(snapshotArgs(root, "absent.json", WRONG_PIN)), 65, MISMATCH);
+        Files.writeString(root.resolve("candidate.sig.json"), SIDECAR);
+
+        assertRefused(run(snapshotArgs(root, "absent.json", WRONG_PIN)), 66, "TIANJI_RELEASE_PROCESS_SNAPSHOT_IO_UNAVAILABLE");
+        assertRefused(run(snapshotArgs(root, "../published.json", WRONG_PIN)), 65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+        assertRefused(run(snapshotArgs(root, "candidate.json", sha(CANDIDATE))), 65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+        Files.createLink(root.resolve("candidate-link.json"), root.resolve("candidate.json"));
+        assertRefused(run(snapshotArgs(root, "candidate-link.json", sha(CANDIDATE))), 65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+        Files.createSymbolicLink(root.resolve("candidate-symlink.json"), Path.of("candidate.json"));
+        assertRefused(run(snapshotArgs(root, "candidate-symlink.json", sha(CANDIDATE))), 65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+
+        String oversized = "x".repeat(65_537);
+        assertRefused(run(snapshotArgs(root, "published.json", writeSnapshot(root, oversized))),
+                65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+        assertRefused(run(snapshotArgs(root, "published.json", "invalid")), 64, "TIANJI_RELEASE_PROCESS_SNAPSHOT_USAGE");
+        var incomplete = snapshotArgs(root, "published.json", WRONG_PIN);
+        assertRefused(run(Arrays.copyOf(incomplete, incomplete.length - 2)), 64, "TIANJI_RELEASE_PROCESS_SNAPSHOT_USAGE");
+        incomplete[0] = "verify-signature";
+        assertRefused(run(incomplete), 64, USAGE);
+    }
+
+    private static ObjectNode processSnapshot() {
+        var bpmn = new ProcessModelDTO(ProcessModelTypeEnum.BPMN, "expenseReview",
+                "5957151c2760507749f0b68763863dde4e42466261e63de10627e1d48ed1c1b6",
+                Map.of("amount", ProcessValueTypeEnum.INTEGER, "operationId", ProcessValueTypeEnum.STRING));
+        var cmmn = new ProcessModelDTO(ProcessModelTypeEnum.CMMN, "expenseException",
+                "c2bc0015fcc709b1bd568b635737b4fc7feff80fe343622a9efdc1c9a02f49c1", Map.of());
+        var dmn = new ProcessModelDTO(ProcessModelTypeEnum.DMN, "expenseRouting",
+                "94cbd131a086c5e2a87240e99e0c7c88b267d946c184e5c7c1f3bfd694feba74",
+                Map.of("amount", ProcessValueTypeEnum.INTEGER));
+        return JSON.valueToTree(new ProcessReleaseDTO("expense-v1",
+                "f65fc8ac24ff2683ab3c3645e4fb60f7003666380767014df51bea10d96b24f5",
+                Instant.parse("2026-11-05T10:00:00.123456Z"), List.of(dmn, bpmn, cmmn)));
+    }
+
+    private static void assertSnapshotMismatch(Path root, ObjectNode document) throws IOException {
+        assertRefused(run(snapshotArgs(root, "published.json", writeSnapshot(root, fixture(document)))),
+                65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_MISMATCH");
+    }
+
+    private static void assertInvalidSnapshot(Path root, String document) throws IOException {
+        assertRefused(run(snapshotArgs(root, "published.json", writeSnapshot(root, document))),
+                65, "TIANJI_RELEASE_PROCESS_SNAPSHOT_INVALID");
+    }
+
+    private static String writeSnapshot(Path root, String document) throws IOException {
+        var file = root.resolve("published.json");
+        if (Files.exists(file)) Files.writeString(file, document);
+        else writePrivate(file, document);
+        return sha(document);
+    }
+
+    private static String[] snapshotArgs(Path root, String snapshot, String pin) {
+        var signature = args(root, CANDIDATE_PIN, TRUST_PIN);
+        var result = Arrays.copyOf(signature, signature.length + 4);
+        result[0] = "compare-process-snapshot";
+        result[signature.length] = "--process-snapshot";
+        result[signature.length + 1] = snapshot;
+        result[signature.length + 2] = "--expect-process-snapshot-sha256";
+        result[signature.length + 3] = pin;
+        return result;
     }
 
     private static String claim(String name, String value) {
