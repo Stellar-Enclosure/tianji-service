@@ -15,6 +15,8 @@ import java.net.http.HttpClient;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -32,6 +34,7 @@ public final class TianjiFixedBpmnStartReceiptReader implements FixedBpmnStartRe
     private static final Duration MAXIMUM_WINDOW = Duration.ofSeconds(10);
     private final TianjiFixedBpmnStartToolBindings bindings;
     private final TianjiProcessToolCredentialVerifier readVerifier;
+    private final Map<String, TianjiProcessToolCredentialVerifier.TargetVO> readTargets;
     private final HttpClient http;
     private final Clock clock;
     private final LongSupplier nanoTime;
@@ -42,8 +45,22 @@ public final class TianjiFixedBpmnStartReceiptReader implements FixedBpmnStartRe
         this(bindings, readVerifier, http, concurrency, Clock.systemUTC(), System::nanoTime);
     }
 
+    /** Explicit READ registrations for all retained START backends. Historical binding digests remain unchanged. */
+    public TianjiFixedBpmnStartReceiptReader(TianjiFixedBpmnStartToolBindings bindings,
+            TianjiProcessToolCredentialVerifier readVerifier, HttpClient http, int concurrency,
+            Map<String, String> readRegistrationByBackendSha256) {
+        this(bindings, readVerifier, http, concurrency, Clock.systemUTC(), System::nanoTime,
+                Objects.requireNonNull(readRegistrationByBackendSha256));
+    }
+
     TianjiFixedBpmnStartReceiptReader(TianjiFixedBpmnStartToolBindings bindings,
             TianjiProcessToolCredentialVerifier readVerifier, HttpClient http, int concurrency, Clock clock, LongSupplier nanoTime) {
+        this(bindings, readVerifier, http, concurrency, clock, nanoTime, null);
+    }
+
+    TianjiFixedBpmnStartReceiptReader(TianjiFixedBpmnStartToolBindings bindings,
+            TianjiProcessToolCredentialVerifier readVerifier, HttpClient http, int concurrency, Clock clock, LongSupplier nanoTime,
+            Map<String, String> readRegistrationByBackendSha256) {
         this.bindings = Objects.requireNonNull(bindings);
         this.readVerifier = Objects.requireNonNull(readVerifier);
         this.http = Objects.requireNonNull(http);
@@ -52,6 +69,8 @@ public final class TianjiFixedBpmnStartReceiptReader implements FixedBpmnStartRe
         if (concurrency < 1 || concurrency > 8 || http.followRedirects() != HttpClient.Redirect.NEVER) {
             throw new IllegalArgumentException("Fixed BPMN START receipt reader configuration is invalid");
         }
+        readTargets = readRegistrationByBackendSha256 == null ? Map.of()
+                : configureReadTargets(bindings, readVerifier, readRegistrationByBackendSha256);
         calls = new ThreadPoolExecutor(0, concurrency, 30, TimeUnit.SECONDS, new SynchronousQueue<>(),
                 Thread.ofVirtual().inheritInheritableThreadLocals(false).name("tianji-start-receipt-", 0).factory(),
                 new ThreadPoolExecutor.AbortPolicy());
@@ -107,9 +126,8 @@ public final class TianjiFixedBpmnStartReceiptReader implements FixedBpmnStartRe
 
     private Optional<ObservationVO> getReceipt(MaterialVO material, TrustedAgentActor executor, ReadWindow window) {
         var backend = material.backend();
-        var target = new TianjiProcessToolCredentialVerifier.TargetVO(backend.tenantId(), backend.processIssuer(), backend.processResourceUri(),
-                backend.registrationId(), backend.expectedClientId(), backend.expectedAppId(), backend.expectedSourceBiz(),
-                backend.expectedSourceApp(), backend.expectedEnvironment(), Set.of(ProcessStartReceiptClient.READ_SCOPE));
+        var target = readTargets.isEmpty() ? readTarget(backend, backend.registrationId())
+                : Objects.requireNonNull(readTargets.get(backend.bindingSha256()));
         var credential = readVerifier.credentials(target, window.deadline, () -> window.remaining(window.deadline),
                 window::publishBearer, () -> window.bearer(window.deadline));
         if (credential == null || !executor.equals(credential.actor())) throw unavailable();
@@ -129,6 +147,41 @@ public final class TianjiFixedBpmnStartReceiptReader implements FixedBpmnStartRe
             if (failure.httpStatus() == 404 && "TIANJI_RESOURCE_NOT_FOUND".equals(failure.code())) return Optional.empty();
             throw unavailable();
         }
+    }
+
+    private static Map<String, TianjiProcessToolCredentialVerifier.TargetVO> configureReadTargets(
+            TianjiFixedBpmnStartToolBindings bindings, TianjiProcessToolCredentialVerifier verifier,
+            Map<String, String> readRegistrationByBackendSha256) {
+        try {
+            var registrations = Map.copyOf(readRegistrationByBackendSha256);
+            var startRegistrations = new HashSet<String>();
+            var backends = new HashMap<String, BackendVO>();
+            for (var binding : bindings.bindings()) {
+                var backend = binding.backend();
+                startRegistrations.add(backend.registrationId());
+                backends.putIfAbsent(backend.bindingSha256(), backend);
+            }
+            if (backends.isEmpty() || !backends.keySet().equals(registrations.keySet())
+                    || registrations.values().stream().anyMatch(id -> id.isBlank() || id.length() > 128
+                            || !id.equals(id.trim()) || id.chars().anyMatch(Character::isISOControl)
+                            || startRegistrations.contains(id))) throw unavailable();
+            var targets = new HashMap<String, TianjiProcessToolCredentialVerifier.TargetVO>();
+            backends.forEach((sha256, backend) -> {
+                var target = readTarget(backend, registrations.get(sha256));
+                verifier.requireConfigured(target);
+                targets.put(sha256, target);
+            });
+            return Map.copyOf(targets);
+        } catch (RuntimeException privateConfiguration) {
+            throw unavailable();
+        }
+    }
+
+    private static TianjiProcessToolCredentialVerifier.TargetVO readTarget(BackendVO backend, String registrationId) {
+        return new TianjiProcessToolCredentialVerifier.TargetVO(backend.tenantId(), backend.processIssuer(),
+                backend.processResourceUri(), registrationId, backend.expectedClientId(), backend.expectedAppId(),
+                backend.expectedSourceBiz(), backend.expectedSourceApp(), backend.expectedEnvironment(),
+                Set.of(ProcessStartReceiptClient.READ_SCOPE));
     }
 
     private void requireAvailable() {

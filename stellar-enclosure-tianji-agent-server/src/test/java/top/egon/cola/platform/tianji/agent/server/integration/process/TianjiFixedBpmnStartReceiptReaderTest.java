@@ -55,6 +55,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -114,6 +115,52 @@ class TianjiFixedBpmnStartReceiptReaderTest {
             assertEquals("no-store", http.headers().firstValue("Cache-Control").orElseThrow());
             assertEquals(0L, http.bodyPublisher().orElseThrow().contentLength());
             assertEquals(Duration.ofSeconds(2), http.timeout().orElseThrow());
+        }
+    }
+
+    @Test
+    void aliased_receipt_read_preserves_the_historical_target_and_uses_only_the_read_registration() {
+        try (var fixture = new Fixture();
+             var reader = fixture.withReadRegistrations(Map.of(fixture.backend.bindingSha256(), "tool-receipt-reader"))) {
+            var request = fixture.request();
+            var target = reader.bind(request);
+            assertEquals(fixture.reader.bind(request), target);
+            var readTarget = new TianjiProcessToolCredentialVerifier.TargetVO(20, ISSUER, RESOURCE, "tool-receipt-reader",
+                    CLIENT, APP, "business", "agent", "test", Set.of(ProcessStartReceiptClient.READ_SCOPE));
+            verify(fixture.verifier).requireConfigured(readTarget);
+            verify(fixture.verifier, never()).credentials(any(), any(), any(), any(), any());
+
+            var observed = reader.read(request, target, NOW.plusSeconds(4)).orElseThrow();
+            assertEquals(EXECUTOR, observed.executor());
+            assertEquals(target, observed.target());
+            fixture.assertSingleGet();
+            verify(fixture.verifier).credentials(eq(readTarget), eq(NOW.plusSeconds(4)), any(), any(), any());
+            verify(fixture.verifier, times(2)).requireCurrent(eq(readTarget), any());
+        }
+    }
+
+    @Test
+    void alias_map_must_cover_only_the_exact_retained_backends_and_never_use_a_start_registration() {
+        try (var fixture = new Fixture()) {
+            var sha = fixture.backend.bindingSha256();
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of()));
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of(sha, "read", "a".repeat(64), "extra")));
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of("a".repeat(64), "read")));
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of(sha, fixture.backend.registrationId())));
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of(sha, " read")));
+            verifyNoInteractions(fixture.verifier);
+            assertEquals(0, fixture.sent.get());
+        }
+    }
+
+    @Test
+    void rejected_registration_preflight_cannot_acquire_a_token_or_call_process() {
+        try (var fixture = new Fixture()) {
+            org.mockito.Mockito.doThrow(new IllegalArgumentException(TOKEN))
+                    .when(fixture.verifier).requireConfigured(any());
+            assertUnavailable(() -> fixture.withReadRegistrations(Map.of(fixture.backend.bindingSha256(), "read")));
+            verify(fixture.verifier, never()).credentials(any(), any(), any(), any(), any());
+            assertEquals(0, fixture.sent.get());
         }
     }
 
@@ -230,6 +277,8 @@ class TianjiFixedBpmnStartReceiptReaderTest {
         private final AtomicReference<HttpRequest> lastHttp = new AtomicReference<>();
         private final TianjiFixedBpmnStartToolBindings.BackendVO backend;
         private final ToolDescriptor descriptor;
+        private final TianjiFixedBpmnStartToolBindings bindings;
+        private final Clock clock;
         private final TianjiFixedBpmnStartReceiptReader reader;
         private volatile int status = 200;
         private volatile String body = POSITIVE;
@@ -246,7 +295,7 @@ class TianjiFixedBpmnStartReceiptReaderTest {
                             backend.bindingSha256(), null));
             var binding = new TianjiFixedBpmnStartToolBindings.BindingVO(20, OWNER.issuerFingerprint(), OWNER.subjectType(),
                     "assistant", 1, DEFINITION_SHA, descriptor.reference(), backend);
-            var bindings = new TianjiFixedBpmnStartToolBindings(List.of(descriptor), List.of(binding));
+            bindings = new TianjiFixedBpmnStartToolBindings(List.of(descriptor), List.of(binding));
             when(verifier.credentials(any(), any(), any(), any(), any())).thenAnswer(call -> {
                 call.<LongSupplier>getArgument(2).getAsLong();
                 beforeBearer.run();
@@ -257,12 +306,16 @@ class TianjiFixedBpmnStartReceiptReaderTest {
             when(http.followRedirects()).thenReturn(HttpClient.Redirect.NEVER);
             when(http.sendAsync(any(HttpRequest.class), org.mockito.ArgumentMatchers.<HttpResponse.BodyHandler<byte[]>>any()))
                     .thenAnswer(call -> send(call.getArgument(0), call.getArgument(1)));
-            var clock = new Clock() {
+            clock = new Clock() {
                 @Override public ZoneId getZone() { return ZoneOffset.UTC; }
                 @Override public Clock withZone(ZoneId zone) { return this; }
                 @Override public Instant instant() { return wall.get(); }
             };
             reader = new TianjiFixedBpmnStartReceiptReader(bindings, verifier, http, 1, clock, nano::get);
+        }
+
+        private TianjiFixedBpmnStartReceiptReader withReadRegistrations(Map<String, String> aliases) {
+            return new TianjiFixedBpmnStartReceiptReader(bindings, verifier, http, 1, clock, nano::get, aliases);
         }
 
         private Request request() {

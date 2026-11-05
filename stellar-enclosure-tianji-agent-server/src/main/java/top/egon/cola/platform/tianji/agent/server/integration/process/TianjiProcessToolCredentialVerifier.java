@@ -38,7 +38,7 @@ public final class TianjiProcessToolCredentialVerifier {
 
     public CredentialVO credentials(TargetVO target, Instant deadlineAt, LongSupplier remainingNanos, Consumer<String> publishBearer, Supplier<String> currentBearer) {
         remainingNanos.getAsLong();
-        var request = new IdpServiceTokenRequest(target.registrationId(), target.expectedAppId(), target.resource(), ServiceTokenContext.TENANT, Long.toString(target.tenantId()), target.scopes());
+        var request = tokenRequest(target);
         var trust = trust(target); var key = oauth.authorizationKey(request); requireKey(key, request, target); remainingNanos.getAsLong();
         var token = oauth.authorizeBounded(request, target.issuer().toASCIIString(), Duration.ofNanos(remainingNanos.getAsLong()));
         remainingNanos.getAsLong();
@@ -61,6 +61,18 @@ public final class TianjiProcessToolCredentialVerifier {
         Instant expiry = earlier(earlier(token.getExpiresAt(), principal.expiresAt()), deadlineAt);
         var actor = TrustedAgentActor.verified(target.tenantId(), TrustedAgentActor.SubjectType.SERVICE, principal.clientId(), proof.getTrustedIssuer().issuer().toASCIIString());
         return new CredentialVO(request, key, trust, actor, expiry);
+    }
+
+    /** Preflights the exact configured registration without acquiring a token. */
+    void requireConfigured(TargetVO target) {
+        trust(target);
+        var request = tokenRequest(target);
+        requireKey(oauth.authorizationKey(request), request, target);
+    }
+
+    private static IdpServiceTokenRequest tokenRequest(TargetVO target) {
+        return new IdpServiceTokenRequest(target.registrationId(), target.expectedAppId(), target.resource(),
+                ServiceTokenContext.TENANT, Long.toString(target.tenantId()), target.scopes());
     }
 
     public void requireCurrent(TargetVO target, CredentialVO credential) {
