@@ -16,7 +16,10 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.CorrelationReceipt;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
@@ -175,6 +178,65 @@ class ProcessCorrelationLookupTest {
         }
     }
 
+    @Test
+    void reads_one_applied_start_on_the_same_primary_and_exact_owner_and_request_digest() throws Exception {
+        try (var fixture = new Fixture()) {
+            fixture.startRecordedAt = OffsetDateTime.ofInstant(SUBMITTED, ZoneOffset.ofHours(8));
+            fixture.startInstanceId = "instance-1";
+            var exact = new GetProcessStartReceiptQuery("intent:1", "c".repeat(64));
+            assertEquals(new ProcessStartReceiptDTO("instance-1", ProcessStartReceiptDTO.StatusEnum.APPLIED, SUBMITTED),
+                    assertDoesNotThrow(() -> fixture.service.getStartReceipt(OWNER, exact)));
+            assertEquals(4, fixture.calls.size());
+            assertEquals("SET TRANSACTION READ ONLY", fixture.calls.get(0).sql());
+            assertEquals("SET LOCAL statement_timeout = '2s'", fixture.calls.get(1).sql());
+            assertTrue(fixture.calls.get(2).sql().contains("NOT pg_catalog.pg_is_in_recovery()"));
+            var read = fixture.calls.getLast();
+            assertEquals(List.of(20L, "USER", OWNER.issuerFingerprint(), OWNER.subjectId(), exact.commandId(), exact.requestSha256()),
+                    read.parameters());
+            assertEquals("SELECT resource_id, created_at FROM \"tianji_process\".tianji_process_command_receipt"
+                    + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
+                    + " AND command_type='START' AND command_id=? AND request_sha256 COLLATE \"C\"=? AND state='APPLIED' LIMIT 2", read.sql());
+            for (var other : List.of(new ProcessActor(21, OWNER.subjectType(), OWNER.subjectId(), OWNER.issuerFingerprint()),
+                    new ProcessActor(20, ProcessActor.SubjectType.SERVICE, OWNER.subjectId(), OWNER.issuerFingerprint()),
+                    new ProcessActor(20, OWNER.subjectType(), "different-owner", OWNER.issuerFingerprint()),
+                    new ProcessActor(20, OWNER.subjectType(), OWNER.subjectId(), "b".repeat(64)))) {
+                assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.getStartReceipt(other, exact));
+            }
+            assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.getStartReceipt(OWNER,
+                    new GetProcessStartReceiptQuery("intent:1", "b".repeat(64))));
+            assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.getStartReceipt(OWNER,
+                    new GetProcessStartReceiptQuery("intent:2", "c".repeat(64))));
+            fixture.startApplied = false;
+            assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.getStartReceipt(OWNER, exact));
+            verify(fixture.connection, never()).setReadOnly(true);
+            verifyNoInteractions(fixture.runtime, fixture.history, fixture.repository);
+        }
+    }
+
+    @Test
+    void refuses_unverified_ambient_duplicate_and_corrupt_start_receipt_sources() throws Exception {
+        try (var fixture = new Fixture()) {
+            var query = new GetProcessStartReceiptQuery("intent:1", "c".repeat(64));
+            assertThrows(AccessDeniedException.class, () -> fixture.service.getStartReceipt(
+                    new ProcessActor(20, OWNER.subjectType(), OWNER.subjectId()), query));
+            new TransactionTemplate(fixture.manager).executeWithoutResult(status -> assertThrows(IllegalStateException.class,
+                    () -> fixture.service.getStartReceipt(OWNER, query)));
+            assertTrue(fixture.calls.isEmpty());
+            fixture.available = false;
+            assertThrows(IllegalStateException.class, () -> fixture.service.getStartReceipt(OWNER, query));
+            fixture.assertReadOnlyPrefix(3);
+            fixture.available = true;
+            fixture.startInstanceId = "instance-1";
+            assertThrows(IllegalStateException.class, () -> fixture.service.getStartReceipt(OWNER, query));
+            fixture.startRecordedAt = OffsetDateTime.ofInstant(SUBMITTED, ZoneOffset.UTC);
+            fixture.startInstanceId = "..";
+            assertThrows(IllegalStateException.class, () -> fixture.service.getStartReceipt(OWNER, query));
+            fixture.startInstanceId = "instance-1";
+            fixture.startDuplicate = true;
+            assertThrows(IllegalStateException.class, () -> fixture.service.getStartReceipt(OWNER, query));
+        }
+    }
+
     private static ListProcessInstancesByCorrelationQuery query(String cursor) {
         return new ListProcessInstancesByCorrelationQuery(CORRELATION, FROM, UNTIL, cursor);
     }
@@ -206,6 +268,10 @@ class ProcessCorrelationLookupTest {
         final ProcessExecutionService service;
         boolean available = true;
         boolean anchorPresent = true;
+        boolean startApplied = true;
+        boolean startDuplicate;
+        String startInstanceId;
+        OffsetDateTime startRecordedAt;
 
         Fixture() throws Exception {
             when(source.getConnection()).thenReturn(connection);
@@ -262,6 +328,15 @@ class ProcessCorrelationLookupTest {
                     yield anchorPresent;
                 }
                 case "query" -> {
+                    if (statement.startsWith("SELECT resource_id, created_at FROM ")) {
+                        if (!startApplied || !parameters.equals(List.of(20L, "USER", OWNER.issuerFingerprint(), OWNER.subjectId(),
+                                "intent:1", "c".repeat(64)))) yield List.of();
+                        var rs = mock(ResultSet.class);
+                        when(rs.getString("resource_id")).thenReturn(startInstanceId);
+                        when(rs.getObject("created_at", OffsetDateTime.class)).thenReturn(startRecordedAt);
+                        var result = ((RowMapper<?>) raw[1]).mapRow(rs, 0);
+                        yield startDuplicate ? List.of(result, result) : List.of(result);
+                    }
                     assertTrue(statement.startsWith("SELECT resource_id, release_key, created_at FROM "));
                     @SuppressWarnings("unchecked")
                     var mapper = (RowMapper<CorrelationReceipt>) raw[1];

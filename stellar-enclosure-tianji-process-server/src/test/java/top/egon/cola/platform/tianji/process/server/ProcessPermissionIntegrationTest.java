@@ -17,13 +17,16 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.servlet.config.annotation.EnableWebMvc;
 import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessRequestBodyAdvice;
 import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxController;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
@@ -216,11 +219,15 @@ class ProcessPermissionIntegrationTest {
         when(processes.get(actor, "instance-1")).thenReturn(new ProcessExecutionService.Snapshot("instance-1", "v1", "invoice",
                 "order", "trace", ProcessExecutionService.State.ACTIVE, NOW, null));
         var lookupEnd = NOW.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        var receiptQuery = new GetProcessStartReceiptQuery("intent:1", DIGEST);
+        when(processes.getStartReceipt(actor, receiptQuery)).thenReturn(new ProcessStartReceiptDTO(
+                "instance-1", ProcessStartReceiptDTO.StatusEnum.APPLIED, lookupEnd));
         var lookup = new ListProcessInstancesByCorrelationQuery("trace", lookupEnd.minusSeconds(60), lookupEnd, null);
         when(processes.listByCorrelation(actor, lookup)).thenReturn(new ProcessInstanceCorrelationPageDTO("trace", lookupEnd,
                 List.of(new ProcessInstanceCorrelationPageDTO.ReceiptDTO("instance-1", "v1", lookupEnd.minusSeconds(30))), null));
         new WebApplicationContextRunner().withUserConfiguration(TestWeb.class)
                 .withPropertyValues("stellar.tianji.process.api.enabled=true",
+                        "stellar.tianji.process.api.start-receipt-read-enabled=true",
                         "egon.cola.platform.tianquan.shoubing.register-filter=false",
                         "egon.cola.platform.tianquan.jianshen.register-filter=false")
                 .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
@@ -236,6 +243,13 @@ class ProcessPermissionIntegrationTest {
                             .apply(springSecurity()).build();
                     mvc.perform(get("/api/tianji/v1/process-instances/instance-1")).andExpect(status().isUnauthorized());
                     mvc.perform(correlationRequest()).andExpect(status().isUnauthorized());
+                    mvc.perform(startReceiptRequest()).andExpect(status().isUnauthorized());
+                    mvc.perform(startReceiptRequest().header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.instanceId").value("instance-1"));
+                    mvc.perform(startReceiptRequest().header("Authorization", "Bearer without-scope"))
+                            .andExpect(status().isForbidden());
+                    mvc.perform(post("/api/tianji/v1/process-start-receipts").header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
                     mvc.perform(correlationRequest().header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].instanceId").value("instance-1"));
                     mvc.perform(correlationRequest().header("Authorization", "Bearer without-scope"))
@@ -250,6 +264,8 @@ class ProcessPermissionIntegrationTest {
                                     .header("Authorization", "Bearer verified-test-token").header("X-Egon-Tianji-Tenant", "21"))
                             .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_TENANT_CONTEXT_CHANGED"));
                     granted.set(Set.of());
+                    mvc.perform(startReceiptRequest().header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isForbidden());
                     mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
                                     .header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isForbidden());
@@ -265,7 +281,12 @@ class ProcessPermissionIntegrationTest {
                             .andExpect(status().isForbidden());
                     verify(processes, times(1)).get(actor, "instance-1");
                     verify(processes, times(1)).listByCorrelation(actor, lookup);
+                    verify(processes, times(1)).getStartReceipt(actor, receiptQuery);
                 }));
+    }
+
+    private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder startReceiptRequest() {
+        return get("/api/tianji/v1/process-start-receipts").param("commandId", "intent:1").param("requestSha256", DIGEST);
     }
 
     private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder correlationRequest() {
@@ -288,11 +309,15 @@ class ProcessPermissionIntegrationTest {
                 new TianjiProcessAccess(guard(), CLOCK).require(TianjiProcessPermissions.GET_API));
         var access = new TianjiProcessAccess(guard(), CLOCK);
         assertEquals(ProcessActor.SubjectType.SERVICE, access.require(TianjiProcessPermissions.CORRELATION_LIST_API).subjectType());
+        assertEquals(ProcessActor.SubjectType.SERVICE, access.require(TianjiProcessPermissions.START_RECEIPT_GET_API).subjectType());
         var withoutCorrelation = new java.util.HashSet<>(resources());
+        withoutCorrelation.remove(TianjiProcessPermissions.START_RECEIPT_GET_API);
         withoutCorrelation.remove(TianjiProcessPermissions.CORRELATION_LIST_API);
         serviceGranted.set(Set.copyOf(withoutCorrelation));
         assertThrows(org.springframework.security.access.AccessDeniedException.class,
                 () -> access.require(TianjiProcessPermissions.CORRELATION_LIST_API));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class,
+                () -> access.require(TianjiProcessPermissions.START_RECEIPT_GET_API));
         assertEquals(ProcessActor.SubjectType.SERVICE, access.require(TianjiProcessPermissions.GET_API).subjectType());
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal));
         assertThrows(org.springframework.security.authentication.AuthenticationCredentialsNotFoundException.class,
@@ -653,6 +678,8 @@ class ProcessPermissionIntegrationTest {
                         new PermissionManifest.I18nReference("tianji.process.permissions", "api.case.actPlanItem"), DefinitionLifecycle.ACTIVE),
                 resource(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
                         "GET", "/api/tianji/v1/process-instances/{instanceId}", "api.process.get"),
+                resource(TianjiProcessPermissions.START_RECEIPT_GET_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
+                        "GET", "/api/tianji/v1/process-start-receipts", "api.process.startReceipt"),
                 resource(TianjiProcessPermissions.CORRELATION_LIST_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
                         "GET", "/api/tianji/v1/process-instance-correlations", "api.process.correlations"),
                 controlResource(TianjiProcessPermissions.CONTROL_API, "GET",
@@ -728,7 +755,7 @@ class ProcessPermissionIntegrationTest {
 
     private static Set<String> resources() {
         return Set.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API,
-                TianjiProcessPermissions.GET_API, TianjiProcessPermissions.CORRELATION_LIST_API,
+                TianjiProcessPermissions.GET_API, TianjiProcessPermissions.CORRELATION_LIST_API, TianjiProcessPermissions.START_RECEIPT_GET_API,
                 TianjiProcessPermissions.CONTROL_API, TianjiProcessPermissions.CANCEL_API,
                 TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
                 TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API,
@@ -754,6 +781,7 @@ class ProcessPermissionIntegrationTest {
     @Configuration(proxyBeanMethods = false)
     @EnableWebMvc
     @EnableWebSecurity
-    @Import({ProcessSecurityConfiguration.class, ProcessController.class, WorkerController.class, AgentResultInboxController.class, ProcessApiErrors.class, ProcessRequestBodyAdvice.class})
+    @Import({ProcessSecurityConfiguration.class, ProcessController.class, ProcessStartReceiptController.class, WorkerController.class,
+        AgentResultInboxController.class, ProcessApiErrors.class, ProcessRequestBodyAdvice.class})
     static class TestWeb { }
 }

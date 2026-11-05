@@ -18,6 +18,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
         excludeAutoConfiguration = UserDetailsServiceAutoConfiguration.class)
 @Import({ProcessSecurityConfiguration.class, ProcessSecurityConfigurationTest.Probe.class})
 class ProcessSecurityConfigurationTest {
+    @Test
+    void classifies_exact_start_receipt_get_as_mixed_principal() {
+        var endpoint = new org.springframework.mock.web.MockHttpServletRequest("GET", "/api/tianji/v1/process-start-receipts");
+        assertEquals(top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE,
+                new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy().requirement(endpoint));
+    }
+
     @Autowired
     private MockMvc mvc;
 

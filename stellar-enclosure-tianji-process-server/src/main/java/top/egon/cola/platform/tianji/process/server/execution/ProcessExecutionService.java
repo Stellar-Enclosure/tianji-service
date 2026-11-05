@@ -13,9 +13,11 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO.ReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.CorrelationReceipt;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
@@ -48,7 +50,7 @@ public final class ProcessExecutionService {
     private final ProcessCommandReceiptStore receipts;
     private final TransactionTemplate write;
     private final TransactionTemplate read;
-    private final TransactionTemplate correlationRead;
+    private final TransactionTemplate receiptRead;
 
     public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                    ProcessModelValidator validator) {
@@ -66,11 +68,11 @@ public final class ProcessExecutionService {
         this.read = new TransactionTemplate(manager);
         this.read.setReadOnly(true);
         this.read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
-        this.correlationRead = new TransactionTemplate(manager);
+        this.receiptRead = new TransactionTemplate(manager);
         // Read-only is enforced on the primary by the receipt store, not a replica routing hint.
-        this.correlationRead.setReadOnly(false);
-        this.correlationRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
-        this.correlationRead.setTimeout(2);
+        this.receiptRead.setReadOnly(false);
+        this.receiptRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        this.receiptRead.setTimeout(2);
     }
 
     public Snapshot start(ProcessActor actor, StartCommand command) {
@@ -85,6 +87,37 @@ public final class ProcessExecutionService {
         return Objects.requireNonNull(read.execute(status -> snapshot(actor, receipts.startByInstance(actor, instanceId))));
     }
 
+    public ProcessStartReceiptDTO getStartReceipt(ProcessActor actor, GetProcessStartReceiptQuery query) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AccessDeniedException("Verified Process owner is required");
+        }
+        if (query == null) throw invalid();
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive() || Thread.currentThread().isInterrupted()) {
+            throw startReceiptUnavailable();
+        }
+        try {
+            return Objects.requireNonNull(receiptRead.execute(status -> {
+                receipts.beginReceiptObservation();
+                var row = receipts.findAppliedStart(actor, query.commandId(), query.requestSha256())
+                        .orElseThrow(ProcessResourceNotFoundException::new);
+                if (row.recordedAt() == null || Thread.currentThread().isInterrupted()) throw startReceiptUnavailable();
+                try {
+                    return new ProcessStartReceiptDTO(row.instanceId(), ProcessStartReceiptDTO.StatusEnum.APPLIED,
+                            row.recordedAt().toInstant());
+                } catch (IllegalArgumentException corruptSource) {
+                    throw startReceiptUnavailable();
+                }
+            }));
+        } catch (DataAccessException | TransactionException failure) {
+            throw startReceiptUnavailable();
+        }
+    }
+
+    private static IllegalStateException startReceiptUnavailable() {
+        return new IllegalStateException("Process START receipt evidence is unavailable");
+    }
+
     public ProcessInstanceCorrelationPageDTO listByCorrelation(ProcessActor actor, ListProcessInstancesByCorrelationQuery query) {
         if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
             throw new AccessDeniedException("Verified Process owner is required");
@@ -96,7 +129,7 @@ public final class ProcessExecutionService {
         }
         CorrelationCursor cursor = query.cursor() == null ? null : decodeCorrelationCursor(actor, query);
         try {
-            return Objects.requireNonNull(correlationRead.execute(status -> correlationPage(actor, query, cursor)));
+            return Objects.requireNonNull(receiptRead.execute(status -> correlationPage(actor, query, cursor)));
         } catch (DataAccessException | TransactionException failure) {
             throw correlationUnavailable();
         }
@@ -104,7 +137,7 @@ public final class ProcessExecutionService {
 
     private ProcessInstanceCorrelationPageDTO correlationPage(ProcessActor actor, ListProcessInstancesByCorrelationQuery query,
                                                               CorrelationCursor cursor) {
-        Instant observedAt = receipts.beginCorrelationObservation();
+        Instant observedAt = receipts.beginReceiptObservation();
         if (query.toExclusive().isAfter(observedAt)) throw invalid();
         if (cursor != null && !receipts.hasCorrelationAnchor(actor, query.correlationId(), query.fromInclusive(),
                 query.toExclusive(), cursor.submittedAt(), cursor.instanceId())) throw invalid();

@@ -48,6 +48,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Read a process release"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.start", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Start a process instance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.startReceipt", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an owned Process START receipt"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read a process instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.agent.outcomes", defaultLocale = "en-US",
@@ -170,6 +172,7 @@ public final class TianjiProcessPermissions {
     public static final String AGENT_OUTCOMES_API = "tianji.api.process.agent.outcomes";
     public static final String CORRELATION_LIST_API = "tianji.api.process.instance.correlations";
     public static final String GET_API = "tianji.api.process.instance.get";
+    public static final String START_RECEIPT_GET_API = "tianji.api.process.startReceipt.get";
     public static final String CONTROL_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CONTROL_RESOURCE_KEY;
     public static final String CANCEL_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CANCEL_RESOURCE_KEY;
     public static final String WORKER_FAILURES_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessWorkerRecoveryClient.WORKER_FAILURES_RESOURCE_KEY;

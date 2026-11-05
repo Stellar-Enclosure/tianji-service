@@ -15,6 +15,27 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrchestrationContractTest {
     @Test
+    void start_receipt_contract_is_an_exact_non_authorizing_digest_and_three_output_fields() {
+        var command = new StartProcessCommand("expense", "v1", "order", "action:1", "trace", Map.of("amount", 7));
+        var same = new StartProcessCommand("expense", "v1", "order", "other-command", "trace", Map.of("amount", 7L));
+        String expected = OrchestrationRequestDigests.start(command);
+        assertEquals(expected, OrchestrationRequestDigests.start(same));
+        assertEquals("action:1", new GetProcessStartReceiptQuery(command.commandId(), expected).commandId());
+        assertThrows(IllegalArgumentException.class, () -> new GetProcessStartReceiptQuery(" action:1", expected));
+        assertThrows(IllegalArgumentException.class, () -> new GetProcessStartReceiptQuery("action:1", expected.toUpperCase(java.util.Locale.ROOT)));
+        assertThrows(IllegalArgumentException.class, () -> new GetProcessStartReceiptQuery("action:1", "a".repeat(63)));
+        var at = Instant.parse("2026-11-05T10:20:30.123456Z");
+        var receipt = new ProcessStartReceiptDTO("instance-1", ProcessStartReceiptDTO.StatusEnum.APPLIED, at);
+        assertEquals(at, receipt.recordedAt());
+        assertEquals(List.of("instanceId", "status", "recordedAt"), java.util.Arrays.stream(receipt.getClass().getRecordComponents())
+                .map(java.lang.reflect.RecordComponent::getName).toList());
+        assertThrows(IllegalArgumentException.class,
+                () -> new ProcessStartReceiptDTO("..", ProcessStartReceiptDTO.StatusEnum.APPLIED, at));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ProcessStartReceiptDTO("instance", ProcessStartReceiptDTO.StatusEnum.APPLIED, at.plusNanos(1)));
+    }
+
+    @Test
     void exposes_only_bounded_process_local_agent_outcome_evidence() {
         var recorded = Instant.parse("2026-11-05T12:00:00Z");
         var received = recorded.plusSeconds(1);

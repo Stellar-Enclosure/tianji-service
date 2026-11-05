@@ -66,7 +66,18 @@ public final class ProcessCommandReceiptStore {
         return one(rows);
     }
 
-    Instant beginCorrelationObservation() {
+    Optional<StartReceiptObservation> findAppliedStart(ProcessActor actor, String commandId, String requestSha256) {
+        var rows = jdbc.query("SELECT resource_id, created_at FROM " + table
+                        + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
+                        + " AND command_type='START' AND command_id=? AND request_sha256 COLLATE \"C\"=? AND state='APPLIED' LIMIT 2",
+                (rs, row) -> new StartReceiptObservation(rs.getString("resource_id"),
+                        rs.getObject("created_at", OffsetDateTime.class)),
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId, requestSha256);
+        if (rows.size() > 1) throw new IllegalStateException("Process START receipt evidence is unavailable");
+        return rows.stream().findFirst();
+    }
+
+    Instant beginReceiptObservation() {
         if (!TransactionSynchronizationManager.isActualTransactionActive()
                 || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())
                 || Thread.currentThread().isInterrupted()) throw correlationUnavailable();
@@ -189,6 +200,8 @@ public final class ProcessCommandReceiptStore {
     }
 
     record CorrelationReceipt(String instanceId, String releaseVersion, Instant submittedAt) { }
+
+    record StartReceiptObservation(String instanceId, OffsetDateTime recordedAt) { }
 
     public record Receipt(String requestHash, String releaseKey, String correlationId, String state,
                           String resourceId, Instant createdAt, String decisionResult) { }
