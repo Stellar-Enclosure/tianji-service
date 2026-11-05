@@ -9,6 +9,7 @@ import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.beans.factory.config.YamlMapFactoryBean;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.context.ApplicationContext;
@@ -16,11 +17,16 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.web.filter.RequestContextFilter;
 import org.springframework.web.context.WebApplicationContext;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
@@ -35,7 +41,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 
 class ProcessStorageConfigurationTest {
     @Test
@@ -237,9 +246,7 @@ class ProcessStorageConfigurationTest {
 
     @Test
     void recovery_security_transport_normalizes_only_the_two_exact_operations() throws Exception {
-        var filter = assertInstanceOf(Filter.class, assertDoesNotThrow(() -> Class.forName(
-                ProcessSecurityConfiguration.class.getName() + "$WorkerRecoverySecurityErrors")
-                .getDeclaredConstructor().newInstance()));
+        var filter = new ProcessSecurityConfiguration.ClosedProcessSecurityErrors(false, false, true);
         String base = "/api/tianji/v1/process-instances/p-1";
         String failures = base + "/worker-failures";
         String recoveries = base + "/worker-recoveries";
@@ -299,6 +306,112 @@ class ProcessStorageConfigurationTest {
         assertEquals(200, success.getStatus());
         assertEquals("no-store", success.getHeader(HttpHeaders.CACHE_CONTROL));
         assertEquals("{\"instanceId\":\"p-1\"}", success.getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void installs_the_closed_filter_for_enabled_process_api_even_with_worker_recovery_disabled() throws Exception {
+        var beans = new StaticListableBeanFactory(Map.of(
+                "identity", mock(IdpBearerAuthenticationFilter.class),
+                "authorization", mock(Rbac3BearerAuthenticationFilter.class),
+                "guard", mock(PermissionExecutionGuard.class)));
+        var http = mock(HttpSecurity.class, RETURNS_SELF);
+        new ProcessSecurityConfiguration().processSecurityFilterChain(http,
+                new MockEnvironment().withProperty("stellar.tianji.process.api.enabled", "true")
+                        .withProperty("egon.cola.platform.tianquan.shoubing.register-filter", "false")
+                        .withProperty("egon.cola.platform.tianquan.jianshen.register-filter", "false"),
+                beans.getBeanProvider(IdpBearerAuthenticationFilter.class),
+                beans.getBeanProvider(Rbac3BearerAuthenticationFilter.class),
+                beans.getBeanProvider(PermissionExecutionGuard.class));
+
+        var filter = org.mockito.ArgumentCaptor.forClass(Filter.class);
+        verify(http).addFilterBefore(filter.capture(), eq(RequestContextFilter.class));
+        var selected = assertInstanceOf(ProcessSecurityConfiguration.ClosedProcessSecurityErrors.class, filter.getValue());
+        assertFalse(selected.shouldNotFilter(recoveryRequest("GET", "/api/tianji/v1/process-instance-correlations")));
+        assertTrue(selected.shouldNotFilter(recoveryRequest("GET", "/api/tianji/v1/process-instances/p-1/worker-failures")));
+    }
+
+    @Test
+    void owner_read_gets_emit_the_exact_closed_security_envelope() throws Exception {
+        var filter = new ProcessSecurityConfiguration.ClosedProcessSecurityErrors(true, true, false);
+        for (String path : ownerReadPaths()) {
+            for (var error : Map.of(401, "TIANJI_UNAUTHENTICATED", 403, "TIANJI_PERMISSION_DENIED",
+                    503, "TIANJI_DEPENDENCY_UNAVAILABLE").entrySet()) {
+                int status = error.getKey();
+                var request = new MockHttpServletRequest("GET", "/edge" + path);
+                request.setContextPath("/edge");
+                request.setServletPath(path);
+                var response = new MockHttpServletResponse();
+                filter.doFilter(request, response, (ignored, downstream) -> {
+                    var http = (HttpServletResponse) downstream;
+                    http.setStatus(status);
+                    http.setContentType("application/problem+json");
+                    http.setHeader(HttpHeaders.WWW_AUTHENTICATE, "Bearer realm=process");
+                    http.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, "https://console.example");
+                    http.getWriter().write("{\"code\":\"private-detail\"}");
+                });
+
+                assertEquals(status, response.getStatus());
+                assertEquals("no-store", response.getHeader(HttpHeaders.CACHE_CONTROL), path);
+                assertEquals("Bearer realm=process", response.getHeader(HttpHeaders.WWW_AUTHENTICATE));
+                assertEquals("https://console.example", response.getHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN));
+                assertTrue(MediaType.APPLICATION_JSON.isCompatibleWith(MediaType.parseMediaType(response.getContentType())));
+                assertEquals("{\"code\":\"" + error.getValue() + "\",\"correlationId\":null}",
+                        response.getContentAsString(StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    void owner_read_heads_emit_get_error_metadata_without_a_body() throws Exception {
+        var filter = new ProcessSecurityConfiguration.ClosedProcessSecurityErrors(true, true, false);
+        for (String path : ownerReadPaths()) {
+            var response = new MockHttpServletResponse();
+            filter.doFilter(recoveryRequest("HEAD", path), response, (ignored, downstream) -> {
+                var http = (HttpServletResponse) downstream;
+                http.setStatus(401);
+                http.getWriter().write("{\"code\":\"TIANJI_UNAUTHENTICATED\"}");
+            });
+            assertEquals(401, response.getStatus());
+            assertEquals("no-store", response.getHeader(HttpHeaders.CACHE_CONTROL), path);
+            assertTrue(MediaType.APPLICATION_JSON.isCompatibleWith(MediaType.parseMediaType(response.getContentType())));
+            assertEquals("{\"code\":\"TIANJI_UNAUTHENTICATED\",\"correlationId\":null}".length(), response.getContentLength());
+            assertEquals(0, response.getContentAsByteArray().length);
+        }
+    }
+
+    @Test
+    void owner_read_envelope_preserves_disabled_paths_unrelated_methods_and_other_statuses() throws Exception {
+        var disabled = new ProcessSecurityConfiguration.ClosedProcessSecurityErrors(false, false, false);
+        assertTrue(disabled.shouldNotFilter(recoveryRequest("GET", "/api/tianji/v1/process-start-receipts")));
+        assertTrue(disabled.shouldNotFilter(recoveryRequest("HEAD", "/api/tianji/v1/process-instances/p-1/agent-outcomes")));
+        assertFalse(disabled.shouldNotFilter(recoveryRequest("GET", "/api/tianji/v1/process-instance-correlations")));
+
+        var all = new ProcessSecurityConfiguration.ClosedProcessSecurityErrors(true, true, true);
+        for (String path : ownerReadPaths()) {
+            assertTrue(all.shouldNotFilter(recoveryRequest("POST", path)), path);
+            assertTrue(all.shouldNotFilter(recoveryRequest("GET", path + "/extra")), path);
+        }
+        assertTrue(all.shouldNotFilter(recoveryRequest("HEAD", "/api/tianji/v1/process-instances/p-1/worker-failures")));
+        assertTrue(all.shouldNotFilter(recoveryRequest("GET", "/api/tianji/v1/process-instances/p-1/control")));
+
+        for (int status : List.of(200, 404, 409)) {
+            var response = new MockHttpServletResponse();
+            all.doFilter(recoveryRequest("GET", "/api/tianji/v1/process-instances/p-1/agent-outcomes"), response,
+                    (ignored, downstream) -> {
+                        var http = (HttpServletResponse) downstream;
+                        http.setStatus(status);
+                        http.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                        http.getWriter().write("{\"original\":true}");
+                    });
+            assertEquals(status, response.getStatus());
+            assertEquals("{\"original\":true}", response.getContentAsString(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static List<String> ownerReadPaths() {
+        return List.of("/api/tianji/v1/process-instance-correlations",
+                "/api/tianji/v1/process-instances/p-1/agent-outcomes",
+                "/api/tianji/v1/process-start-receipts");
     }
 
     private static MockHttpServletRequest recoveryRequest(String method, String path) {

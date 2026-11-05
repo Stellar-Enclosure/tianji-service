@@ -23,6 +23,7 @@ import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
+import org.springframework.security.web.util.matcher.RequestMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.filter.RequestContextFilter;
 import org.springframework.web.util.ContentCachingResponseWrapper;
@@ -94,8 +95,9 @@ import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
-import java.util.function.BooleanSupplier;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.function.BooleanSupplier;
 
 /** The process API is opt-in and requires both identity and authorization filters. */
 @Configuration(proxyBeanMethods = false)
@@ -174,23 +176,40 @@ public class ProcessSecurityConfiguration {
             http.addFilterBefore(new RequestContextFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(new VerifiedProcessIssuerFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(authorization, VerifiedProcessIssuerFilter.class);
-            if (workerEnabled && workerRecoveryEnabled) {
-                http.addFilterBefore(new WorkerRecoverySecurityErrors(), RequestContextFilter.class);
-            }
+            http.addFilterBefore(new ClosedProcessSecurityErrors(startReceiptReadEnabled, ownerOutcomesEnabled,
+                    workerEnabled && workerRecoveryEnabled), RequestContextFilter.class);
         }
         return http.build();
     }
 
-    /** Keep the recovery envelope consistent when either IAM filter short-circuits MVC. */
-    static final class WorkerRecoverySecurityErrors extends OncePerRequestFilter {
-        private static final PathPatternRequestMatcher FAILURES = PathPatternRequestMatcher.withDefaults()
-                .matcher(HttpMethod.GET, ProcessWorkerRecoveryClient.WORKER_FAILURES_PATH);
-        private static final PathPatternRequestMatcher RECOVERIES = PathPatternRequestMatcher.withDefaults()
-                .matcher(HttpMethod.POST, ProcessWorkerRecoveryClient.WORKER_RECOVERIES_PATH);
+    /** Keeps the closed wire envelope when IAM short-circuits the selected Process operations. */
+    static final class ClosedProcessSecurityErrors extends OncePerRequestFilter {
+        private static final String CORRELATION = "/api/tianji/v1" + ProcessController.CORRELATION_PATH;
+        private static final String OUTCOMES = "/api/tianji/v1/process-instances/{instanceId}/agent-outcomes";
+        private static final PathPatternRequestMatcher.Builder MATCHER = PathPatternRequestMatcher.withDefaults();
+
+        private final List<RequestMatcher> routes;
+
+        ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled) {
+            var selected = new ArrayList<RequestMatcher>();
+            addRead(selected, CORRELATION);
+            if (startReceiptReadEnabled) addRead(selected, ProcessStartReceiptController.PATH);
+            if (ownerOutcomesEnabled) addRead(selected, OUTCOMES);
+            if (workerRecoveryEnabled) {
+                selected.add(MATCHER.matcher(HttpMethod.GET, ProcessWorkerRecoveryClient.WORKER_FAILURES_PATH));
+                selected.add(MATCHER.matcher(HttpMethod.POST, ProcessWorkerRecoveryClient.WORKER_RECOVERIES_PATH));
+            }
+            routes = List.copyOf(selected);
+        }
+
+        private static void addRead(List<RequestMatcher> selected, String path) {
+            selected.add(MATCHER.matcher(HttpMethod.GET, path));
+            selected.add(MATCHER.matcher(HttpMethod.HEAD, path));
+        }
 
         @Override
         protected boolean shouldNotFilter(HttpServletRequest request) {
-            return !FAILURES.matches(request) && !RECOVERIES.matches(request);
+            return routes.stream().noneMatch(route -> route.matches(request));
         }
 
         @Override
@@ -212,8 +231,12 @@ public class ProcessSecurityConfiguration {
                 cached.setContentType(MediaType.APPLICATION_JSON_VALUE);
                 cached.setCharacterEncoding(StandardCharsets.UTF_8.name());
                 cached.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-                cached.setContentLength(body.length);
-                cached.getOutputStream().write(body);
+                if (HttpMethod.HEAD.matches(request.getMethod())) {
+                    response.setContentLength(body.length);
+                } else {
+                    cached.setContentLength(body.length);
+                    cached.getOutputStream().write(body);
+                }
             }
             cached.copyBodyToResponse();
         }
