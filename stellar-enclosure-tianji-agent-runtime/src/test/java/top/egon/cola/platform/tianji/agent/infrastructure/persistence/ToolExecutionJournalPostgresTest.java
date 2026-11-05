@@ -12,6 +12,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartReceiptRead;
+import top.egon.cola.platform.tianji.agent.application.tool.HistoricalToolReceiptAuthorization;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -41,6 +43,9 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
+import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
@@ -53,12 +58,14 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
@@ -81,15 +88,9 @@ class ToolExecutionJournalPostgresTest {
             "decision-tool-service", "https://process-idp.example/20");
 
     @Test void opt_in_tool_journal_contract_and_atomicity() throws Exception {
-        String url = System.getProperty("tianji.tool.journal.postgres.test.url");
-        if (url == null || !url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) throw new IllegalArgumentException("Tool journal tests require an explicit empty loopback tianji_it_ database");
-        String vectorVersion = System.getProperty("tianji.tool.journal.postgres.vector.version");
-        if (vectorVersion == null || !vectorVersion.matches("[0-9]+\\.[0-9]+\\.[0-9]+")) throw new IllegalArgumentException("Tool journal tests require an explicitly pinned preinstalled vector patch");
-        var source = new DriverManagerDataSource(url); var properties = new Properties();
-        properties.setProperty("connectTimeout", "5"); properties.setProperty("socketTimeout", "15"); source.setConnectionProperties(properties);
-        var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
-        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='tianji_agent'", Integer.class));
-        assertEquals(vectorVersion, jdbc.queryForObject("SELECT extversion FROM pg_extension WHERE extname='vector'", String.class));
+        var disposable = disposableDatabase();
+        var source = disposable.source();
+        var jdbc = disposable.jdbc();
         var previous = flyway(source, "12"); assertEquals(12, previous.migrate().migrationsExecuted); previous.validate();
         var history = jdbc.queryForList("SELECT version,type,script,checksum FROM tianji_agent.flyway_schema_history WHERE version IS NOT NULL ORDER BY installed_rank");
         assertThrows(AgentLedgerException.class, () -> new ToolExecutionStorageVerifier(source).verify());
@@ -134,6 +135,213 @@ class ToolExecutionJournalPostgresTest {
         approvedWriteJournal(source, jdbc, ledger, capabilities);
         approvedStartRecording(source, jdbc, ledger, capabilities);
     }
+
+    @Test
+    @EnabledIfSystemProperty(named = "tianji.tool.journal.postgres.historical.start.receipt", matches = "true")
+    void historical_start_receipts_append_positive_evidence_for_unknown_and_dispatched_actions() throws Exception {
+        var disposable = disposableDatabase();
+        var source = disposable.source();
+        var jdbc = disposable.jdbc();
+        var migrations = flyway(source, "13");
+        assertEquals(13, migrations.migrate().migrationsExecuted);
+        migrations.validate();
+        var ledger = new AgentLedgerService(source);
+        var capabilities = new ToolCapabilityStore(source, ledger);
+        capabilities.verifyStorage();
+        var fixture = new WriteFixture(source, jdbc, ledger, capabilities);
+
+        for (int index = 0; index < 2; index++) {
+            var request = fixture.request(index, fixture.action("historical-start-"));
+            var action = request.action();
+            var id = UUID.fromString(action.intentId());
+            var run = request.binding().run();
+            var prepared = fixture.store.prepareOrLoadIdempotentWrite(request).invocation();
+            var attempt = fixture.begin(request, prepared);
+            assertTrue(attempt.result().started());
+            String priorState = index == 0 ? "UNKNOWN" : "DISPATCHING";
+            if ("UNKNOWN".equals(priorState)) {
+                var unknown = new ToolExecutionOutcome(ToolExecutionOutcome.Status.UNKNOWN, Map.of(), null, "OUTCOME_UNKNOWN", null);
+                assertEquals("UNKNOWN", fixture.store.completeIdempotentWrite(request, attempt.result().attempt(),
+                        attempt.nonce(), unknown).invocation().state());
+            }
+            assertEquals(priorState, invocationState(jdbc, request));
+            assertEquals(priorState, writeActionFacts(jdbc, action).get("state"));
+
+            var current = ledger.get(ACTOR, new GetAgentRunQuery(run.runId()));
+            ledger.finish(ACTOR, request.lease(), current.revision(), new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED,
+                    Map.of(), null, null, null, null, "UNKNOWN"));
+            assertEquals("UNKNOWN", startBudgetState(jdbc, request));
+            var process = new ControlledHistoricalReceipt(jdbc, request);
+            var authorityChecks = new AtomicInteger();
+            var allow = new AtomicBoolean(true);
+            var service = new ToolStartReceiptReconciliationService(source, ledger, authorization -> {
+                assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+                assertEquals(ACTOR, authorization.owner());
+                assertEquals(run.runId(), authorization.dispatchRunId());
+                assertEquals(id, authorization.intentId());
+                assertEquals(EXECUTOR, authorization.executor());
+                assertEquals(priorState, authorization.priorState());
+                authorityChecks.incrementAndGet();
+                return allow.get() ? Optional.of(new HistoricalToolReceiptAuthorization.Permit(UUID.randomUUID(),
+                        authorization.bindingSha256(), 1, Instant.now(), authorization.deadlineAt())) : Optional.empty();
+            }, process);
+
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                    () -> service.observe(ACTOR, run.runId(), id)).code());
+            assertEquals(0, authorityChecks.get());
+            assertEquals(0, process.reads.get());
+            // Only shorten the fixture's already-issued dispatch window. Keep its recorded dispatch and outcome intact.
+            assertEquals(1, jdbc.update("""
+                    UPDATE ONLY tianji_agent.agent_tool_invocation SET dispatch_not_after=dispatched_at+interval '1 microsecond'
+                    WHERE tenant_id=? AND run_id=? AND invocation_id=? AND intent_id=? AND state=? AND dispatched_at IS NOT NULL
+                      AND dispatched_at+interval '1 microsecond'<clock_timestamp()
+                    """, ACTOR.tenantId(), run.runId(), request.invocationId(), id, priorState));
+            var sourceBefore = historicalSourceRows(jdbc, request);
+            var ownerMismatch = TrustedAgentActor.verified(ACTOR.tenantId(), ACTOR.subjectType(), ACTOR.subjectId(), "https://other-idp.example/20");
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                    () -> service.observe(ownerMismatch, run.runId(), id)).code());
+            assertEquals(0, authorityChecks.get());
+            allow.set(false);
+            assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class,
+                    () -> service.observe(ACTOR, run.runId(), id)).code());
+            assertEquals(0, process.reads.get());
+            allow.set(true);
+            assertEquals(AgentErrorCodeEnum.TIANJI_SIDE_EFFECT_UNKNOWN, assertThrows(AgentLedgerException.class,
+                    () -> service.observe(ACTOR, run.runId(), id)).code());
+            assertEquals(1, process.reads.get());
+            assertTrue(historicalReceipts(jdbc, id).isEmpty());
+            assertEquals(sourceBefore, historicalSourceRows(jdbc, request));
+
+            process.applied = true;
+            var receipt = index == 0 ? service.observe(ACTOR, run.runId(), id)
+                    : overlapHistoricalReceiptCommands(service, process, run.runId(), id);
+            assertEquals(id, receipt.intentId());
+            assertEquals(run.runId(), receipt.dispatchRunId());
+            assertEquals("controlled-historical-instance", receipt.instanceId());
+            assertEquals(process.processRecordedAt, receipt.recordedAt());
+            var rows = historicalReceipts(jdbc, id);
+            assertEquals(1, rows.size());
+            var stored = rows.getFirst();
+            assertEquals(run.runId(), stored.get("run_id"));
+            assertEquals("APPLIED_OBSERVED", stored.get("status"));
+            assertEquals(priorState, stored.get("prior_state"));
+            assertEquals(process.target.query().requestSha256(), stored.get("process_hash"));
+            assertEquals(receipt.observedAt(), ((Timestamp) stored.get("created_at")).toInstant());
+            assertEquals(receipt, service.observe(ACTOR, run.runId(), id));
+            assertEquals(index == 0 ? 6 : 8, authorityChecks.get());
+            assertEquals(index == 0 ? 3 : 4, process.reads.get());
+            process.instanceId = "conflicting-historical-instance";
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> service.observe(ACTOR, run.runId(), id)).code());
+            assertEquals(rows, historicalReceipts(jdbc, id));
+            assertEquals(sourceBefore, historicalSourceRows(jdbc, request));
+        }
+    }
+
+    private static ToolStartReceiptReconciliationService.ReceiptVO overlapHistoricalReceiptCommands(
+            ToolStartReceiptReconciliationService service, ControlledHistoricalReceipt process, String runId, UUID intent) throws Exception {
+        process.overlap = new CountDownLatch(2);
+        try (var pool = Executors.newFixedThreadPool(2)) {
+            var first = pool.submit(() -> service.observe(ACTOR, runId, intent));
+            var second = pool.submit(() -> service.observe(ACTOR, runId, intent));
+            var winner = first.get(12, TimeUnit.SECONDS);
+            assertEquals(winner, second.get(12, TimeUnit.SECONDS));
+            return winner;
+        } finally {
+            process.overlap = null;
+        }
+    }
+
+    private static List<Map<String, Object>> historicalReceipts(JdbcTemplate jdbc, UUID intent) {
+        return jdbc.queryForList("""
+                SELECT r.run_id,r.created_at,r.request_hash,r.result::text AS exact_result,
+                       r.result->>'status' AS status,r.result->'source'->>'priorState' AS prior_state,
+                       r.result->'process'->>'requestSha256' AS process_hash
+                FROM ONLY tianji_agent.agent_run_command_receipt r
+                WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                  AND r.operation='TOOL_START_RECEIPT_RECONCILE' AND r.command_id=?
+                """, ACTOR.tenantId(), ACTOR.subjectType().name(), ACTOR.issuerFingerprint(), ACTOR.subjectId(), intent + ":1");
+    }
+
+    private static Map<String, Object> historicalSourceRows(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO request) {
+        return jdbc.queryForMap("""
+                SELECT to_jsonb(a)::text AS action,to_jsonb(i)::text AS invocation,to_jsonb(d)::text AS run,
+                       to_jsonb(b)::text AS budget,to_jsonb(c)::text AS capability
+                FROM ONLY tianji_agent.agent_tool_action_intent a
+                JOIN ONLY tianji_agent.agent_tool_invocation i
+                  ON i.tenant_id=a.tenant_id AND i.run_id=a.dispatch_run_id AND i.invocation_id=a.dispatch_invocation_id
+                JOIN ONLY tianji_agent.agent_run d ON d.tenant_id=i.tenant_id AND d.run_id=i.run_id
+                JOIN ONLY tianji_agent.agent_budget_reservation b
+                  ON b.tenant_id=i.tenant_id AND b.run_id=i.run_id AND b.reservation_id=i.reservation_id
+                JOIN ONLY tianji_agent.agent_tool_capability c
+                  ON c.tenant_id=i.tenant_id AND c.run_id=i.run_id AND c.capability_id=i.capability_id
+                WHERE a.tenant_id=? AND a.intent_id=? AND i.run_id=? AND i.invocation_id=?
+                """, ACTOR.tenantId(), UUID.fromString(request.action().intentId()), request.binding().run().runId(), request.invocationId());
+    }
+
+    private static final class ControlledHistoricalReceipt implements FixedBpmnStartReceiptRead {
+        final ToolInvocationStore.PreparationRequestVO expected;
+        final TargetVO target;
+        final Instant processRecordedAt;
+        final AtomicInteger reads = new AtomicInteger();
+        boolean applied;
+        CountDownLatch overlap;
+        String instanceId = "controlled-historical-instance";
+
+        ControlledHistoricalReceipt(JdbcTemplate jdbc, ToolInvocationStore.PreparationRequestVO expected) {
+            this.expected = expected;
+            var action = expected.action();
+            var command = new StartProcessCommand("controlled-definition", "controlled-release",
+                    action.businessKey(), action.intentId(), action.intentId(), action.arguments());
+            target = new TargetVO("c".repeat(64), new GetProcessStartReceiptQuery(command.commandId(), OrchestrationRequestDigests.start(command)));
+            processRecordedAt = now(jdbc);
+        }
+
+        @Override public TargetVO bind(Request request) {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals(expected.binding().run(), request.run());
+            assertEquals(expected.action().requestSha256(), request.action().requestSha256());
+            assertEquals(expected.descriptor(), request.descriptor());
+            assertEquals(EXECUTOR, request.executor());
+            return target;
+        }
+
+        @Override public Optional<ObservationVO> read(Request request, TargetVO expectedTarget, Instant deadlineAt) {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals(target, expectedTarget);
+            assertEquals(EXECUTOR, request.executor());
+            assertTrue(deadlineAt.isAfter(Instant.now()));
+            reads.incrementAndGet();
+            var rendezvous = overlap;
+            if (rendezvous != null) {
+                rendezvous.countDown();
+                try {
+                    assertTrue(rendezvous.await(4, TimeUnit.SECONDS));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Controlled historical receipt rendezvous interrupted");
+                }
+            }
+            return applied ? Optional.of(new ObservationVO(target, EXECUTOR,
+                    new ProcessStartReceiptDTO(instanceId, ProcessStartReceiptDTO.StatusEnum.APPLIED, processRecordedAt),
+                    "tianji:ps-start:v1:" + "d".repeat(64), deadlineAt)) : Optional.empty();
+        }
+    }
+
+    private static DisposableDatabase disposableDatabase() {
+        String url = System.getProperty("tianji.tool.journal.postgres.test.url");
+        if (url == null || !url.matches("jdbc:postgresql://127\\.0\\.0\\.1:[0-9]{1,5}/tianji_it_[a-z0-9_]{1,40}")) throw new IllegalArgumentException("Tool journal tests require an explicit empty loopback tianji_it_ database");
+        String vectorVersion = System.getProperty("tianji.tool.journal.postgres.vector.version");
+        if (vectorVersion == null || !vectorVersion.matches("[0-9]+\\.[0-9]+\\.[0-9]+")) throw new IllegalArgumentException("Tool journal tests require an explicitly pinned preinstalled vector patch");
+        var source = new DriverManagerDataSource(url); var properties = new Properties();
+        properties.setProperty("connectTimeout", "5"); properties.setProperty("socketTimeout", "15"); source.setConnectionProperties(properties);
+        var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname='tianji_agent'", Integer.class));
+        assertEquals(vectorVersion, jdbc.queryForObject("SELECT extversion FROM pg_extension WHERE extname='vector'", String.class));
+        return new DisposableDatabase(source, jdbc);
+    }
+
+    private record DisposableDatabase(DriverManagerDataSource source, JdbcTemplate jdbc) { }
 
     /** Controlled ports prove Recorder composition over the real journal; no IAM or Process HTTP call is made. */
     private static void approvedStartRecording(DriverManagerDataSource source, JdbcTemplate jdbc, AgentLedgerService ledger,
