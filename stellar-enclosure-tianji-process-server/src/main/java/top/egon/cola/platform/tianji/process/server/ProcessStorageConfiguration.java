@@ -58,6 +58,12 @@ public class ProcessStorageConfiguration {
     @Bean
     SmartInitializingSingleton workerWebBoundaryGuard(Environment environment, ApplicationContext context) {
         return () -> {
+            if (environment.getProperty("stellar.tianji.process.worker-recovery.enabled", Boolean.class, false)
+                    && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false)
+                    || !environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false)
+                    || !(context instanceof WebApplicationContext))) {
+                throw new IllegalStateException("Process Worker recovery requires the enabled servlet Process Worker API");
+            }
             if (environment.getProperty("stellar.tianji.process.cancellation.enabled", Boolean.class, false)
                     && (!environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false) || !(context instanceof WebApplicationContext))) {
                 throw new IllegalStateException("Process cancellation requires an enabled servlet Process API");

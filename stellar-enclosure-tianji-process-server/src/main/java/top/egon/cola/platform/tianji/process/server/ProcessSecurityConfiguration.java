@@ -1,5 +1,10 @@
 package top.egon.cola.platform.tianji.process.server;
 
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
@@ -8,12 +13,19 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
+import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
+import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.filter.RequestContextFilter;
+import org.springframework.web.util.ContentCachingResponseWrapper;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.flowable.cmmn.engine.CmmnEngine;
@@ -27,6 +39,9 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionSe
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCancellationReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryService;
 import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
 import top.egon.cola.platform.tianji.process.server.execution.CasePlanItemReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
@@ -42,6 +57,7 @@ import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationPro
 import top.egon.cola.platform.tianji.process.server.task.ApprovalVerificationService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiApprovalVerificationAccess;
 import top.egon.cola.platform.tianji.contract.orchestration.ApprovalClient;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessWorkerRecoveryClient;
 import top.egon.cola.platform.tianji.process.server.security.VerifiedProcessIssuerFilter;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
@@ -68,6 +84,8 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthen
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
 
 import javax.sql.DataSource;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.function.BooleanSupplier;
 import java.util.List;
@@ -84,6 +102,7 @@ public class ProcessSecurityConfiguration {
             ObjectProvider<PermissionExecutionGuard> policies) throws Exception {
         boolean enabled = environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
+        boolean workerRecoveryEnabled = environment.getProperty("stellar.tianji.process.worker-recovery.enabled", Boolean.class, false);
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
         boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
         boolean taskPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
@@ -139,8 +158,49 @@ public class ProcessSecurityConfiguration {
             http.addFilterBefore(new RequestContextFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(new VerifiedProcessIssuerFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(authorization, VerifiedProcessIssuerFilter.class);
+            if (workerEnabled && workerRecoveryEnabled) {
+                http.addFilterBefore(new WorkerRecoverySecurityErrors(), RequestContextFilter.class);
+            }
         }
         return http.build();
+    }
+
+    /** Keep the recovery envelope consistent when either IAM filter short-circuits MVC. */
+    static final class WorkerRecoverySecurityErrors extends OncePerRequestFilter {
+        private static final PathPatternRequestMatcher FAILURES = PathPatternRequestMatcher.withDefaults()
+                .matcher(HttpMethod.GET, ProcessWorkerRecoveryClient.WORKER_FAILURES_PATH);
+        private static final PathPatternRequestMatcher RECOVERIES = PathPatternRequestMatcher.withDefaults()
+                .matcher(HttpMethod.POST, ProcessWorkerRecoveryClient.WORKER_RECOVERIES_PATH);
+
+        @Override
+        protected boolean shouldNotFilter(HttpServletRequest request) {
+            return !FAILURES.matches(request) && !RECOVERIES.matches(request);
+        }
+
+        @Override
+        protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+                throws ServletException, IOException {
+            var cached = new ContentCachingResponseWrapper(response);
+            chain.doFilter(request, cached);
+            if (response.isCommitted()) return;
+
+            String code = switch (cached.getStatus()) {
+                case HttpServletResponse.SC_UNAUTHORIZED -> "TIANJI_UNAUTHENTICATED";
+                case HttpServletResponse.SC_FORBIDDEN -> "TIANJI_PERMISSION_DENIED";
+                case HttpServletResponse.SC_SERVICE_UNAVAILABLE -> "TIANJI_DEPENDENCY_UNAVAILABLE";
+                default -> null;
+            };
+            if (code != null) {
+                byte[] body = ("{\"code\":\"" + code + "\",\"correlationId\":null}").getBytes(StandardCharsets.UTF_8);
+                cached.resetBuffer();
+                cached.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                cached.setCharacterEncoding(StandardCharsets.UTF_8.name());
+                cached.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                cached.setContentLength(body.length);
+                cached.getOutputStream().write(body);
+            }
+            cached.copyBodyToResponse();
+        }
     }
 
     @Bean
@@ -459,6 +519,27 @@ public class ProcessSecurityConfiguration {
             if (selected == null) selected = new AgentDispatchStore(source, manager, schema);
             selected.requireStorage(source, manager, schema);
             return new ProcessControlService(configuration, decisionConfiguration(dmn), validator, releases, nativeAccess, cancellations, selected);
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process",
+            name = {"api.enabled", "worker.enabled", "worker-recovery.enabled"}, havingValue = "true")
+    static class WorkerRecoveryConfiguration {
+        @Bean("processWorkerRecoveryService")
+        ProcessWorkerRecoveryService processWorkerRecoveryService(ProcessEngine process,
+                @Qualifier("processReleaseService") ProcessReleaseService releases,
+                @Qualifier("flowableWorkerService") FlowableWorkerService workers) {
+            var configuration = processConfiguration(process);
+            DataSource source = caseDataSource(configuration);
+            String schema = configuration.getDatabaseSchema();
+            var nativeAccess = new ProcessControlNativeAccess(source, configuration);
+            var jdbc = new JdbcTemplate(source);
+            jdbc.setQueryTimeout(5);
+            var commands = new ProcessCommandReceiptStore(jdbc, schema);
+            var audit = new ProcessWorkerRecoveryReceiptStore(source, schema);
+            audit.verifyStorage();
+            return new ProcessWorkerRecoveryService(configuration, releases, commands, nativeAccess, audit, workers);
         }
     }
 

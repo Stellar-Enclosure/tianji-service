@@ -25,6 +25,7 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessTenantChangedEx
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessCancellationBlockedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessWorkerRecoveryBlockedException;
 
 @RestControllerAdvice(basePackageClasses = ProcessController.class)
 @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
@@ -41,6 +42,9 @@ public final class ProcessApiErrors {
 
     @ExceptionHandler(ProcessCancellationBlockedException.class)
     ResponseEntity<OrchestrationErrorDTO> cancellationBlocked() { return error(HttpStatus.CONFLICT, "TIANJI_PROCESS_CANCEL_BLOCKED"); }
+
+    @ExceptionHandler(ProcessWorkerRecoveryBlockedException.class)
+    ResponseEntity<OrchestrationErrorDTO> recoveryBlocked() { return error(HttpStatus.CONFLICT, "TIANJI_PROCESS_WORKER_RECOVERY_BLOCKED"); }
 
     @ExceptionHandler(WorkerLeaseLostException.class)
     ResponseEntity<OrchestrationErrorDTO> workerLeaseLost() { return error(HttpStatus.CONFLICT, "TIANJI_WORKER_LEASE_LOST"); }

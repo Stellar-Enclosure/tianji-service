@@ -1,18 +1,34 @@
 package top.egon.cola.platform.tianji.process.server;
 
+import jakarta.servlet.Filter;
+import jakarta.servlet.http.HttpServletResponse;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.beans.factory.config.YamlMapFactoryBean;
 import org.springframework.context.ApplicationContext;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.web.context.WebApplicationContext;
+import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 
 import javax.sql.DataSource;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 class ProcessStorageConfigurationTest {
@@ -142,6 +158,129 @@ class ProcessStorageConfigurationTest {
         assertThrows(IllegalStateException.class, () -> configuration.workerWebBoundaryGuard(enabled, mock(ApplicationContext.class)).afterSingletonsInstantiated());
         assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(enabled, mock(WebApplicationContext.class)).afterSingletonsInstantiated());
         assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(new MockEnvironment(), mock(ApplicationContext.class)).afterSingletonsInstantiated());
+    }
+
+    @Test
+    void worker_recovery_requires_api_worker_and_servlet() {
+        var configuration = new ProcessStorageConfiguration();
+        var servlet = mock(WebApplicationContext.class);
+        var nonServlet = mock(ApplicationContext.class);
+        var enabled = new MockEnvironment().withProperty("stellar.tianji.process.worker-recovery.enabled", "true")
+                .withProperty("stellar.tianji.process.api.enabled", "true");
+
+        assertThrows(IllegalStateException.class,
+                () -> configuration.workerWebBoundaryGuard(enabled, servlet).afterSingletonsInstantiated());
+        enabled.setProperty("stellar.tianji.process.worker.enabled", "false");
+        assertThrows(IllegalStateException.class,
+                () -> configuration.workerWebBoundaryGuard(enabled, servlet).afterSingletonsInstantiated());
+        enabled.setProperty("stellar.tianji.process.worker.enabled", "true");
+        assertThrows(IllegalStateException.class,
+                () -> configuration.workerWebBoundaryGuard(enabled, nonServlet).afterSingletonsInstantiated());
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(enabled, servlet).afterSingletonsInstantiated());
+        enabled.setProperty("stellar.tianji.process.api.enabled", "false");
+        assertThrows(IllegalStateException.class,
+                () -> configuration.workerWebBoundaryGuard(enabled, servlet).afterSingletonsInstantiated());
+
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(new MockEnvironment(), nonServlet)
+                .afterSingletonsInstantiated());
+        var disabled = new MockEnvironment().withProperty("stellar.tianji.process.worker-recovery.enabled", "false");
+        assertDoesNotThrow(() -> configuration.workerWebBoundaryGuard(disabled, nonServlet).afterSingletonsInstantiated());
+    }
+
+    @Test
+    void worker_recovery_defaults_off_and_declares_only_the_exact_user_scope() {
+        var yaml = new YamlMapFactoryBean();
+        yaml.setResources(new ClassPathResource("application.yml"));
+        var properties = yaml.getObject();
+        var process = section(properties, "stellar", "tianji", "process");
+        assertEquals(Boolean.FALSE, section(process, "worker-recovery").get("enabled"));
+        assertEquals(Boolean.FALSE, section(process, "cancellation").get("enabled"));
+
+        var scopes = section(properties, "egon", "cola", "platform", "tianquan", "jianshen",
+                "user-scope-policy", "permission-scopes");
+        assertEquals(List.of("tianji:process:worker-recover"), scopes.get("TIANJI_PROCESS_WORKER_RECOVER"));
+        assertEquals(List.of("tianji:process:read"), scopes.get("TIANJI_PROCESS_READ"));
+        assertEquals(List.of("tianji:process:cancel"), scopes.get("TIANJI_PROCESS_CANCEL"));
+    }
+
+    @Test
+    void recovery_security_transport_normalizes_only_the_two_exact_operations() throws Exception {
+        var filter = assertInstanceOf(Filter.class, assertDoesNotThrow(() -> Class.forName(
+                ProcessSecurityConfiguration.class.getName() + "$WorkerRecoverySecurityErrors")
+                .getDeclaredConstructor().newInstance()));
+        String base = "/api/tianji/v1/process-instances/p-1";
+        String failures = base + "/worker-failures";
+        String recoveries = base + "/worker-recoveries";
+        String challenge = "Bearer realm=process";
+        String origin = "https://console.example";
+        var errors = Map.of(401, "TIANJI_UNAUTHENTICATED", 403, "TIANJI_PERMISSION_DENIED",
+                503, "TIANJI_DEPENDENCY_UNAVAILABLE");
+        var json = JsonMapper.builder().build();
+        for (var error : errors.entrySet()) {
+            int status = error.getKey();
+            var response = new MockHttpServletResponse();
+            var request = recoveryRequest(status == 401 ? "GET" : "POST", status == 401 ? failures : recoveries);
+            filter.doFilter(request, response, (ignored, downstream) -> {
+                var http = (HttpServletResponse) downstream;
+                http.setStatus(status);
+                http.setContentType("application/problem+json");
+                http.setHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                if (status == 401) {
+                    http.setHeader(HttpHeaders.WWW_AUTHENTICATE, challenge);
+                    http.getWriter().write("{\"diagnostic\":\"private-challenge\"}");
+                } else {
+                    http.getOutputStream().write("private-transport".getBytes(StandardCharsets.UTF_8));
+                }
+            });
+            assertEquals(status, response.getStatus());
+            assertEquals("no-store", response.getHeader(HttpHeaders.CACHE_CONTROL));
+            assertEquals(origin, response.getHeader(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN));
+            if (status == 401) assertEquals(challenge, response.getHeader(HttpHeaders.WWW_AUTHENTICATE));
+            assertTrue(MediaType.APPLICATION_JSON.isCompatibleWith(MediaType.parseMediaType(response.getContentType())));
+            var body = json.readTree(response.getContentAsByteArray());
+            assertEquals(Set.of("code", "correlationId"), Set.copyOf(body.propertyNames()));
+            assertEquals(error.getValue(), body.get("code").asString());
+            assertTrue(body.get("correlationId").isNull());
+        }
+
+        for (var request : List.of(recoveryRequest("POST", failures), recoveryRequest("GET", recoveries),
+                recoveryRequest("GET", base + "/control"), recoveryRequest("GET", failures + "/extra"))) {
+            var response = new MockHttpServletResponse();
+            filter.doFilter(request, response, (ignored, downstream) -> {
+                var http = (HttpServletResponse) downstream;
+                http.setStatus(403);
+                http.setContentType(MediaType.TEXT_PLAIN_VALUE);
+                http.getOutputStream().write("original-error".getBytes(StandardCharsets.UTF_8));
+            });
+            assertEquals(403, response.getStatus());
+            assertEquals(MediaType.TEXT_PLAIN_VALUE, response.getContentType());
+            assertEquals("original-error", response.getContentAsString(StandardCharsets.UTF_8));
+        }
+
+        var success = new MockHttpServletResponse();
+        filter.doFilter(recoveryRequest("GET", failures), success, (ignored, downstream) -> {
+            var http = (HttpServletResponse) downstream;
+            http.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+            http.setContentType(MediaType.APPLICATION_JSON_VALUE);
+            http.getOutputStream().write("{\"instanceId\":\"p-1\"}".getBytes(StandardCharsets.UTF_8));
+        });
+        assertEquals(200, success.getStatus());
+        assertEquals("no-store", success.getHeader(HttpHeaders.CACHE_CONTROL));
+        assertEquals("{\"instanceId\":\"p-1\"}", success.getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    private static MockHttpServletRequest recoveryRequest(String method, String path) {
+        var request = new MockHttpServletRequest(method, path);
+        request.setServletPath(path);
+        return request;
+    }
+
+    private static Map<?, ?> section(Map<?, ?> source, String... path) {
+        Map<?, ?> section = source;
+        for (String key : path) {
+            section = assertInstanceOf(Map.class, section.get(key), "Missing YAML section " + key);
+        }
+        return section;
     }
 
     private static void guard(MockEnvironment environment) {

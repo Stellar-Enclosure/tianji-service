@@ -23,11 +23,15 @@ import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCo
 import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorkerCommand;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Type;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.util.Set;
 
 /** Applies the same bound to fixed-length and streamed JSON command bodies. */
@@ -38,6 +42,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_WORKER_BYTES = 256 * 1024;
     static final int MAX_AGENT_RESULT_BYTES = 64 * 1024;
     static final int MAX_PROCESS_CANCEL_BYTES = 4096;
+    static final int MAX_PROCESS_WORKER_RECOVERY_BYTES = 8192;
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
@@ -56,13 +61,15 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     @Override
     public boolean supports(MethodParameter parameter, Type type, Class<? extends HttpMessageConverter<?>> converter) {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
-                || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class;
+                || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
+                || type == RecoverProcessWorkerCommand.class;
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
-        int maxBytes = type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
+        int maxBytes = type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
+                : type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
                 : type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
         if (input.getHeaders().getContentLength() > maxBytes) throw new TooLarge();
         byte[] body = input.getBody().readNBytes(maxBytes + 1);
@@ -70,6 +77,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (workerCommand(type)) validateWorkerBody(body, type);
         if (type == AgentTerminalEvent.class) validateAgentResult(body);
         if (type == CancelProcessCommand.class) validateProcessCancel(body);
+        if (type == RecoverProcessWorkerCommand.class) validateProcessWorkerRecovery(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -131,11 +139,30 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         }
     }
 
+    private static void validateProcessWorkerRecovery(byte[] body) {
+        Set<String> fields = Set.of("instanceId", "jobId", "commandId", "expectedVersion", "reason");
+        try {
+            String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var root = STRICT_PROCESS_CANCEL_JSON.readTree(json);
+            if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(fields)) {
+                throw invalidProcessWorkerRecovery();
+            }
+            strings(root, fields);
+            STRICT_PROCESS_CANCEL_JSON.readValue(json, RecoverProcessWorkerCommand.class);
+        } catch (CharacterCodingException | RuntimeException invalid) {
+            throw invalidProcessWorkerRecovery();
+        }
+    }
+
     private static void strings(JsonNode node, Set<String> names) {
         for (String name : names) if (node.get(name) == null || !node.get(name).isString()) throw invalidAgentResult();
     }
     private static IllegalArgumentException invalidAgentResult() { return new IllegalArgumentException("Agent result event is invalid"); }
     private static IllegalArgumentException invalidProcessCancel() { return new IllegalArgumentException("Process cancellation request is invalid"); }
+
+    private static IllegalArgumentException invalidProcessWorkerRecovery() {
+        return new IllegalArgumentException("Process Worker recovery request is invalid");
+    }
 
     static final class TooLarge extends RuntimeException { }
 }
