@@ -93,6 +93,11 @@ public final class ExpenseAgentAcceptanceMain {
                         .asSubclass(org.springframework.context.ApplicationContextInitializer.class)
                         .getDeclaredConstructor().newInstance();
                 app.initializers(initializer);
+            } else if ("true".equals(settings.getProperty(FIXTURE + "s12-metrics"))) {
+                var initializer = Class.forName("top.egon.cola.platform.tianji.acceptance.S12MetricsInitializer")
+                        .asSubclass(org.springframework.context.ApplicationContextInitializer.class)
+                        .getDeclaredConstructor().newInstance();
+                app.initializers(initializer);
             }
             app.run(args);
         } catch (Exception failure) {

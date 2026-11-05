@@ -161,6 +161,7 @@ class BusinessProcessAgentAcceptanceIT {
             String property = switch (suite) {
                 case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
+                case S12_METRICS -> "tianji.s12.metrics.manifest";
                 default -> "tianji.expense.e2e.manifest";
             };
             var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty(property));
@@ -247,6 +248,10 @@ class BusinessProcessAgentAcceptanceIT {
         ExpenseAcceptanceHarness harness() { return harness; }
         ExpenseAcceptanceManifestDTO receiveLinkManifest() {
             require(manifest.suite().observesReceiveLinks(), "Exact receive-link fixture suite");
+            return manifest;
+        }
+        ExpenseAcceptanceManifestDTO metricsManifest() {
+            require(manifest.suite() == Suite.S12_METRICS, "Exact metrics fixture suite");
             return manifest;
         }
         Duration relayBudget() { return Duration.ofSeconds(Math.min(manifest.limits().recoverySeconds(), 60)); }
@@ -899,8 +904,10 @@ class BusinessProcessAgentAcceptanceIT {
             put(config, "spring.datasource.username", store.runtimeRole());
             put(config, "spring.datasource.password", value(dbCredentials, "runtime.password"));
             put(config, "spring.datasource.hikari.schema", store.schema());
-            put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
-            put(config, "management.tracing.sampling.probability", "1.0");
+            if (manifest.suite() != Suite.S12_METRICS) {
+                put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
+                put(config, "management.tracing.sampling.probability", "1.0");
+            }
             put(config, "egon.cola.component.transactional-outbox.enabled", "true");
             put(config, "egon.cola.component.transactional-outbox.storage.type", "JDBC");
             put(config, "egon.cola.component.transactional-outbox.storage.jdbc.schema", store.schema());
@@ -915,6 +922,11 @@ class BusinessProcessAgentAcceptanceIT {
                 } else {
                     put(config, "stellar.tianji.process.agent-results.receive-span-links-enabled", "true");
                 }
+            } else if (manifest.suite() == Suite.S12_METRICS) {
+                String flag = role == ChildRole.AGENT
+                        ? "stellar.tianji.agent.run-observation.initial-claim-metrics-enabled"
+                        : "stellar.tianji.process.agent-results.lag-metrics-enabled";
+                put(config, flag, "true");
             }
             return Map.copyOf(config);
         }
@@ -954,7 +966,7 @@ class BusinessProcessAgentAcceptanceIT {
                 var delivery = prefix + "result-delivery.destinations[" + index + "].";
                 put(config, delivery + "id", destination(tenant));
                 put(config, delivery + "tenant-id", Long.toString(tenant.tenantId()));
-                put(config, delivery + "base-uri", manifest.suite() == Suite.RECEIVE_LINK
+                put(config, delivery + "base-uri", manifest.suite() == Suite.RECEIVE_LINK || manifest.suite() == Suite.S12_METRICS
                         ? manifest.endpoints().process() : manifest.endpoints().resultRelay());
                 put(config, delivery + "resource-uri", tenant.processResource());
                 put(config, delivery + "issuer", tenant.issuer());

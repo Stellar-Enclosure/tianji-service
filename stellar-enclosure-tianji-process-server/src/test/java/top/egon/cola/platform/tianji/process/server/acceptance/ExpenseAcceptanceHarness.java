@@ -4,6 +4,7 @@ import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.MapperFeature;
 import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.acceptance.S12MetricsTelemetry;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -117,6 +118,17 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     static ExpenseAcceptanceHarness open(ExpenseAcceptanceManifestDTO manifest, SourcePreflight preflight,
                                           ChildLauncher launcher, LongSupplier nanoTime, Clock clock, Sleeper sleeper) {
         validateManifest(manifest);
+        if (manifest.suite() == Suite.S12_METRICS) {
+            try {
+                if (manifest.agent().testClasses().indexOf(',') >= 0 || manifest.process().testClasses().indexOf(',') >= 0
+                        || manifest.privateRoot().indexOf(',') >= 0) throw invalid();
+                S12MetricsTelemetry.requireEndpoint(URI.create(manifest.endpoints().collector()));
+                if (S12MetricsCollectorEvidence.readAvailable(
+                        absolute(manifest.privateRoot()).resolve(S12MetricsCollectorEvidence.METRICS_FILE)).length != 0) throw invalid();
+            } catch (IOException | RuntimeException failure) {
+                throw invalid();
+            }
+        }
         Objects.requireNonNull(preflight);
         try {
             var witness = preflight.verify(manifest);
@@ -439,6 +451,9 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
         values.setProperty(prefix + "run-authorized", "true");
         if (manifest.suite().observesReceiveLinks()) {
             values.setProperty(prefix + "s12-receive-link", "true");
+        } else if (manifest.suite() == Suite.S12_METRICS) {
+            values.setProperty(prefix + "s12-metrics", "true");
+            values.setProperty(prefix + "s12-metrics-endpoint", manifest.endpoints().collector());
         }
         values.setProperty(prefix + "role", role.name());
         values.setProperty(prefix + "trust-store", manifest.tls().trustStore());
@@ -461,22 +476,24 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private ChildLaunchDTO launchCommand(ChildRole role, ArtifactLockDTO artifact, Path configuration) throws IOException {
         String java = Path.of(System.getProperty("java.home")).toRealPath().resolve("bin/java").toString();
         String loaderPath = artifact.testClasses();
-        if (manifest.suite().observesReceiveLinks()) {
-            if (role == ChildRole.AGENT) {
-                verifyArtifact(absolute(manifest.checkoutRoot()), ChildRole.PROCESS, manifest.process());
-                loaderPath += "," + manifest.process().testClasses();
-            } else {
-                if (s12Libraries.size() != S12ReceiveLinkCollectorEvidence.TRACE_LIBRARIES.size()) throw invalid();
-                for (var library : s12Libraries.entrySet()) {
-                    if (!library.getValue().equals(sha256(library.getKey()))) throw invalid();
-                    loaderPath += "," + library.getKey();
-                }
+        if (role == ChildRole.AGENT && (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS)) {
+            verifyArtifact(absolute(manifest.checkoutRoot()), ChildRole.PROCESS, manifest.process());
+            loaderPath += "," + manifest.process().testClasses();
+        } else if (manifest.suite().observesReceiveLinks()) {
+            if (s12Libraries.size() != S12ReceiveLinkCollectorEvidence.TRACE_LIBRARIES.size()) throw invalid();
+            for (var library : s12Libraries.entrySet()) {
+                if (!library.getValue().equals(sha256(library.getKey()))) throw invalid();
+                loaderPath += "," + library.getKey();
             }
         }
+        var environment = manifest.suite() == Suite.S12_METRICS
+                ? Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false", "OTEL_TRACES_EXPORTER", "none",
+                        "OTEL_METRICS_EXPORTER", "none", "OTEL_LOGS_EXPORTER", "none")
+                : Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false");
         return new ChildLaunchDTO(role, List.of(java, "-Dloader.main=" + childMain(role), "-Dloader.path=" + loaderPath,
                 "-cp", artifact.execJar(), "org.springframework.boot.loader.launch.PropertiesLauncher",
                 "--spring.main.web-application-type=servlet", "--spring.config.additional-location=" + configuration.toUri().toASCIIString()),
-                Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false"), absolute(manifest.privateRoot()));
+                environment, absolute(manifest.privateRoot()));
     }
 
     private static String childMain(ChildRole role) {
@@ -593,7 +610,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
-        if (manifest.suite().observesReceiveLinks()) throw invalid();
+        if (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
         Path destination = output.resolve("expense-" + manifest.runId() + ".json");
@@ -768,7 +785,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
     enum Suite {
-        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY;
+        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS;
 
         boolean observesReceiveLinks() {
             return this == RECEIVE_LINK || this == RECEIVE_LINK_REPLAY;

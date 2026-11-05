@@ -39,6 +39,8 @@ public final class ExpenseProcessAcceptanceMain {
             var app = new SpringApplicationBuilder(TianjiProcessServerApplication.class).web(WebApplicationType.SERVLET);
             if ("true".equals(settings.getProperty(FIXTURE + "s12-receive-link"))) {
                 app.initializers(new top.egon.cola.platform.tianji.acceptance.S12ReceiveLinkInitializer());
+            } else if ("true".equals(settings.getProperty(FIXTURE + "s12-metrics"))) {
+                app.initializers(new top.egon.cola.platform.tianji.acceptance.S12MetricsInitializer());
             }
             app.run(args);
         } catch (Exception failure) {
