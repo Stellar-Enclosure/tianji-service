@@ -73,6 +73,7 @@ import java.time.DateTimeException;
  */
 public final class AgentLedgerService {
     private static final Logger log = LoggerFactory.getLogger(AgentLedgerService.class);
+    static final int QUEUED_BACKLOG_CAP = 257;
     private static final int CORRELATION_PAGE_SIZE = 20;
     private final DataSource dataSource;
     private final JdbcAgentLedgerRepository repository;
@@ -1156,6 +1157,36 @@ public final class AgentLedgerService {
             }
         }
         return reconciled;
+    }
+
+    /** A technical, bounded count of unexpired and uncancelled queued runs on the owning primary. */
+    public int sampleQueuedBacklog() {
+        if (Thread.currentThread().isInterrupted() || TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw queuedBacklogUnavailable();
+        }
+        var sample = new TransactionTemplate(transaction.getTransactionManager());
+        // Bind the primary before PostgreSQL sets physical read-only mode.
+        sample.setReadOnly(false);
+        sample.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        sample.setTimeout(1);
+        try {
+            return sample.execute(status -> {
+                if (!TransactionSynchronizationManager.isActualTransactionActive()
+                        || !TransactionSynchronizationManager.hasResource(dataSource)) throw queuedBacklogUnavailable();
+                Integer count = repository.sampleQueuedBacklog();
+                if (count == null || count < 0 || count > QUEUED_BACKLOG_CAP) throw queuedBacklogUnavailable();
+                return count;
+            });
+        } catch (org.springframework.dao.DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw queuedBacklogUnavailable();
+        }
+    }
+
+    private static AgentLedgerException queuedBacklogUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Agent queued backlog observation is unavailable");
     }
 
     /** Internal queue discovery; the returned owner comes from the committed run record. */

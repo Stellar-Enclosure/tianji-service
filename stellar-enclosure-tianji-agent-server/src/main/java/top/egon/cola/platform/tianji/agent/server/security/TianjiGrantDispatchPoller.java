@@ -26,6 +26,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
     private final Duration shutdownTimeout;
     private final Semaphore slots;
     private final boolean includeService;
+    private final AgentQueuedBacklogObservation backlog;
     private final Set<GrantReadyAgentRun> inFlight = ConcurrentHashMap.newKeySet();
     private final Object monitor = new Object();
     private final java.util.concurrent.atomic.AtomicBoolean discoveryFailureLogged = new java.util.concurrent.atomic.AtomicBoolean();
@@ -39,6 +40,12 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
     public TianjiGrantDispatchPoller(AgentLedgerService ledger, AgentRunDispatcher dispatcher,
             TianjiExecutionGrantAuthorizer authorizer, TaskScheduler scheduler, int batchSize, int maxInFlight,
             Duration interval, Duration shutdownTimeout) {
+        this(ledger, dispatcher, authorizer, scheduler, batchSize, maxInFlight, interval, shutdownTimeout, null);
+    }
+
+    TianjiGrantDispatchPoller(AgentLedgerService ledger, AgentRunDispatcher dispatcher,
+            TianjiExecutionGrantAuthorizer authorizer, TaskScheduler scheduler, int batchSize, int maxInFlight,
+            Duration interval, Duration shutdownTimeout, AgentQueuedBacklogObservation backlog) {
         this.ledger = Objects.requireNonNull(ledger, "ledger"); this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
         if (authorizer == null || !dispatcher.usesAuthorization(authorizer)) {
@@ -56,6 +63,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
         this.batchSize = batchSize; this.interval = interval; this.shutdownTimeout = shutdownTimeout;
         this.includeService = authorizer.supportsService();
         this.slots = new Semaphore(maxInFlight);
+        this.backlog = backlog;
     }
 
     @Override public void start() {
@@ -74,8 +82,10 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
             if (!running || generation != expected || activePoll != null) return;
             activePoll = Thread.currentThread(); position = cursor;
         }
+        boolean discovered = false;
         try {
             var candidates = includeService ? ledger.grantReadyRuns(position, batchSize, true) : ledger.grantReadyRuns(position, batchSize);
+            discovered = true;
             discoveryFailureLogged.set(false);
             if (candidates.isEmpty()) {
                 synchronized (monitor) { if (running && generation == expected) cursor = null; }
@@ -100,11 +110,16 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
                 synchronized (monitor) { if (running && generation == expected) cursor = candidate.cursor(); }
             }
         } catch (RuntimeException failed) {
+            if (!discovered && backlog != null) backlog.invalidate();
             if (discoveryFailureLogged.compareAndSet(false, true)) {
                 log.warn("Agent dispatch discovery failed failureType={}", failed.getClass().getSimpleName());
             }
         } finally {
-            synchronized (monitor) { activePoll = null; monitor.notifyAll(); }
+            try {
+                if (discovered && backlog != null) backlog.sampleIfDue();
+            } finally {
+                synchronized (monitor) { activePoll = null; monitor.notifyAll(); }
+            }
         }
     }
 
@@ -114,6 +129,7 @@ public final class TianjiGrantDispatchPoller implements SmartLifecycle, AutoClos
         synchronized (monitor) {
             if (closed) return;
             closed = true; running = false; generation++; future = scheduled; scheduled = null;
+            if (backlog != null) backlog.close();
         }
         if (future != null) {
             try { future.cancel(false); }

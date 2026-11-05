@@ -527,6 +527,22 @@ final class JdbcAgentLedgerRepository {
                 rs.getString("run_id"), rs.getLong("revision"), rs.getBoolean("deadline_expired")), limit);
     }
 
+    Integer sampleQueuedBacklog() {
+        jdbc.execute("SET TRANSACTION READ ONLY");
+        jdbc.execute("SET LOCAL statement_timeout = '100ms'");
+        return jdbc.queryForObject("""
+                SELECT CASE WHEN NOT pg_catalog.pg_is_in_recovery()
+                      AND pg_catalog.current_setting('transaction_read_only') = 'on' THEN (
+                    SELECT count(*)::integer FROM (
+                        SELECT 1 FROM tianji_agent.agent_run
+                        WHERE status = 'QUEUED' AND cancel_requested_at IS NULL
+                          AND deadline_at > pg_catalog.statement_timestamp()
+                        LIMIT ?
+                    ) AS bounded_queue
+                ) END
+                """, Integer.class, AgentLedgerService.QUEUED_BACKLOG_CAP);
+    }
+
     List<PendingAgentRun> queuedRuns(int limit) {
         return jdbc.query("""
                 SELECT tenant_id, subject_type, subject_issuer, subject_id, run_id

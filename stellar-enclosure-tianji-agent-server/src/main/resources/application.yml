@@ -46,6 +46,7 @@ stellar:
         cross-process-span-links-enabled: false
       run-observation:
         initial-claim-metrics-enabled: false
+        queued-backlog-metrics-enabled: false
       storage:
         model-usage-enabled: false
         model-usage-cumulative-route-refs: []
