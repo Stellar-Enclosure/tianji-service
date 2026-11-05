@@ -1,9 +1,12 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
@@ -59,6 +62,8 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.UUID;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.nio.charset.StandardCharsets;
 import java.time.DateTimeException;
 
@@ -67,6 +72,7 @@ import java.time.DateTimeException;
  * this service is not an HTTP entry point and is not automatically enabled.
  */
 public final class AgentLedgerService {
+    private static final Logger log = LoggerFactory.getLogger(AgentLedgerService.class);
     private static final int CORRELATION_PAGE_SIZE = 20;
     private final DataSource dataSource;
     private final JdbcAgentLedgerRepository repository;
@@ -76,19 +82,22 @@ public final class AgentLedgerService {
     private final AgentTerminalEventPublisher terminalPublisher;
     private final String terminalProducerId;
     private final List<String> modelUsageRoutes;
+    private final Consumer<Duration> initialClaimTiming;
+    private final AtomicBoolean initialClaimTimingFailureReported = new AtomicBoolean();
 
     public AgentLedgerService(DataSource dataSource) {
         this(dataSource, (AgentTerminalEventPublisher) null);
     }
 
     private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher) {
-        this(dataSource, terminalPublisher, List.of());
+        this(dataSource, terminalPublisher, List.of(), null);
     }
 
     private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher,
-                               List<String> modelUsageRoutes) {
+                               List<String> modelUsageRoutes, Consumer<Duration> initialClaimTiming) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
         this.modelUsageRoutes = List.copyOf(modelUsageRoutes);
+        this.initialClaimTiming = initialClaimTiming;
         String producerId = terminalPublisher == null ? null : terminalPublisher.producerId();
         if (terminalPublisher != null && (!terminalPublisher.usesDataSource(dataSource) || producerId == null
                 || !producerId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))) {
@@ -105,6 +114,11 @@ public final class AgentLedgerService {
     /** Trusted host opt-in. Original construction paths continue without any V15 check. */
     public static AgentLedgerService withModelUsage(DataSource dataSource, AgentTerminalEventPublisher publisher,
                                                      List<String> exactRouteRefs) {
+        return withModelUsage(dataSource, publisher, exactRouteRefs, null);
+    }
+
+    public static AgentLedgerService withModelUsage(DataSource dataSource, AgentTerminalEventPublisher publisher,
+                                                     List<String> exactRouteRefs, Consumer<Duration> initialClaimTiming) {
         if (exactRouteRefs == null || exactRouteRefs.isEmpty() || exactRouteRefs.size() > 32) {
             throw invalid("Agent model usage routes are invalid");
         }
@@ -119,9 +133,16 @@ public final class AgentLedgerService {
             }
         }
         // Validate an optional publisher's exact source in the unchanged constructor before catalog access.
-        var ledger = new AgentLedgerService(dataSource, publisher, routes);
+        var ledger = new AgentLedgerService(dataSource, publisher, routes, initialClaimTiming);
         new AgentStorageVerifier(dataSource).verifyModelUsage();
         return ledger;
+    }
+
+    /** Trusted host opt-in for elapsed time on the first committed QUEUED-to-RUNNING claim. */
+    public static AgentLedgerService withInitialClaimTiming(DataSource dataSource, AgentTerminalEventPublisher publisher,
+                                                            Consumer<Duration> initialClaimTiming) {
+        return new AgentLedgerService(dataSource, publisher, List.of(),
+                Objects.requireNonNull(initialClaimTiming, "initialClaimTiming"));
     }
 
     public static AgentLedgerService withTerminalEvents(DataSource dataSource, AgentTerminalEventPublisher publisher) {
@@ -929,10 +950,51 @@ public final class AgentLedgerService {
             JdbcAgentLedgerRepository.StoredRun claimed = repository.claim(actor, query.runId(), expectedRevision,
                     normalizedOwner, leaseMillis).orElseThrow(() -> new AgentLedgerException(
                             AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent run cannot be claimed"));
-            appendStatusEvent(actor, previous, claimed, AgentRunStatusEnum.QUEUED, AgentRunStatusEnum.RUNNING, null);
-            return new ClaimedAgentRun(claimed.run(), new AgentRunLease(query.runId(), normalizedOwner,
+            Instant claimRecordedAt = appendStatusEvent(actor, previous, claimed, AgentRunStatusEnum.QUEUED,
+                    AgentRunStatusEnum.RUNNING, null);
+            var response = new ClaimedAgentRun(claimed.run(), new AgentRunLease(query.runId(), normalizedOwner,
                     claimed.leaseEpoch(), claimed.leaseExpiresAt()));
+            observeInitialClaim(previous.run(), claimed.run(), claimRecordedAt);
+            return response;
         });
+    }
+
+    private void observeInitialClaim(AgentRunDTO previous, AgentRunDTO claimed, Instant claimRecordedAt) {
+        if (initialClaimTiming == null || previous.status() != AgentRunStatusEnum.QUEUED
+                || claimed.status() != AgentRunStatusEnum.RUNNING || previous.attempt() != 0 || claimed.attempt() != 1
+                || !previous.createdAt().equals(claimed.createdAt()) || claimRecordedAt.isBefore(previous.createdAt())
+                || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.isSynchronizationActive()
+                || !TransactionSynchronizationManager.hasResource(dataSource)) return;
+
+        Duration elapsed = Duration.between(previous.createdAt(), claimRecordedAt);
+        try {
+            elapsed.toNanos(); // The metrics backend represents the recorded duration in nanoseconds.
+        } catch (ArithmeticException unrepresentable) {
+            return;
+        }
+        try {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status == STATUS_COMMITTED) {
+                        try {
+                            initialClaimTiming.accept(elapsed);
+                        } catch (RuntimeException unavailable) {
+                            reportInitialClaimTimingUnavailable();
+                        }
+                    }
+                }
+            });
+        } catch (RuntimeException unavailable) {
+            reportInitialClaimTimingUnavailable();
+        }
+    }
+
+    private void reportInitialClaimTimingUnavailable() {
+        if (initialClaimTimingFailureReported.compareAndSet(false, true)) {
+            log.warn("Agent initial claim timing observation unavailable");
+        }
     }
 
     public LeaseHeartbeat heartbeat(TrustedAgentActor actor, AgentRunLease lease, Duration leaseDuration) {
@@ -1182,19 +1244,21 @@ public final class AgentLedgerService {
                 "unfenced Agent run transitions are unavailable");
     }
 
-    private void appendStatusEvent(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun previous,
-                                   JdbcAgentLedgerRepository.StoredRun updated, AgentRunStatusEnum from,
-                                   AgentRunStatusEnum to, String reason) {
+    private Instant appendStatusEvent(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun previous,
+                                      JdbcAgentLedgerRepository.StoredRun updated, AgentRunStatusEnum from,
+                                      AgentRunStatusEnum to, String reason) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("from", from.name());
         payload.put("status", to.name());
         if (reason != null) {
             payload.put("reason", reason);
         }
-        repository.insertEvent(actor.tenantId(), new AgentEventDTO(UUID.randomUUID().toString(),
+        var event = new AgentEventDTO(UUID.randomUUID().toString(),
                 updated.run().runId(), updated.run().lastEventSequence(), "RUN_STATUS_CHANGED", null, null,
-                null, now(), previous.correlationId(), "1", payload));
+                null, now(), previous.correlationId(), "1", payload);
+        repository.insertEvent(actor.tenantId(), event);
         if (terminalPublisher != null && AgentRunTransitions.terminal(to)) terminalReference(actor, updated).ifPresent(terminalPublisher::publish);
+        return event.occurredAt();
     }
 
     private Optional<AgentTerminalEvent> terminalReference(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {

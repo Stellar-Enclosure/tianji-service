@@ -1,6 +1,11 @@
 package top.egon.cola.platform.tianji.agent.server;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+
 import javax.sql.DataSource;
+import java.time.Duration;
+import java.util.function.Consumer;
 import java.util.List;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.ObjectProvider;
@@ -26,6 +31,8 @@ import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 @Import(TianjiAgentStorageConfiguration.StorageDataSourceImport.class)
 public class TianjiAgentStorageConfiguration {
     private static final String STORAGE = "stellar.tianji.agent.storage";
+    private static final String INITIAL_CLAIM_METRICS = "stellar.tianji.agent.run-observation.initial-claim-metrics-enabled";
+    private static final String INITIAL_CLAIM_DELAY = "tianji.agent.run.initial.claim.delay";
 
     @Configuration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = STORAGE, name = "enabled", havingValue = "true")
@@ -46,10 +53,22 @@ public class TianjiAgentStorageConfiguration {
     @ConditionalOnProperty(prefix = STORAGE, name = "enabled", havingValue = "true")
     @ConditionalOnMissingBean(AgentLedgerService.class)
     AgentLedgerService tianjiAgentServerLedgerService(DataSource dataSource, ObjectProvider<AgentTerminalEventPublisher> publishers,
-                                                      Environment environment) {
+                                                      Environment environment, ObjectProvider<MeterRegistry> registries) {
         AgentTerminalEventPublisher publisher = publishers.getIfAvailable();
+        Consumer<Duration> initialClaimTiming = environment.getProperty(INITIAL_CLAIM_METRICS, Boolean.class, false)
+                ? elapsed -> {
+                    MeterRegistry registry = registries.getIfUnique();
+                    if (registry != null) {
+                        Timer.builder(INITIAL_CLAIM_DELAY)
+                                .description("Agent run creation to first recorded claim for committed claims")
+                                .register(registry).record(elapsed);
+                    }
+                } : null;
         if (modelUsageEnabled(environment)) {
-            return AgentLedgerService.withModelUsage(dataSource, publisher, reviewedRoutes(environment));
+            return AgentLedgerService.withModelUsage(dataSource, publisher, reviewedRoutes(environment), initialClaimTiming);
+        }
+        if (initialClaimTiming != null) {
+            return AgentLedgerService.withInitialClaimTiming(dataSource, publisher, initialClaimTiming);
         }
         return publisher == null ? new AgentLedgerService(dataSource) : AgentLedgerService.withTerminalEvents(dataSource, publisher);
     }

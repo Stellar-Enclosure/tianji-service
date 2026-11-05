@@ -44,6 +44,8 @@ stellar:
         span-links-enabled: false
       result-delivery:
         cross-process-span-links-enabled: false
+      run-observation:
+        initial-claim-metrics-enabled: false
       storage:
         model-usage-enabled: false
         model-usage-cumulative-route-refs: []

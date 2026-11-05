@@ -1,11 +1,15 @@
 package top.egon.cola.platform.tianji.agent.server;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.beans.factory.config.YamlMapFactoryBean;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.core.annotation.AnnotatedElementUtils;
 import org.springframework.core.io.ClassPathResource;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.web.bind.annotation.RequestMapping;
 import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
@@ -21,10 +25,14 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
 import javax.sql.DataSource;
 import java.lang.reflect.Modifier;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -45,6 +53,7 @@ import static org.mockito.Mockito.when;
 class AgentModelUsageDiagnosticsTest {
     private static final String PREFIX = "stellar.tianji.agent.";
     private static final String STORAGE = PREFIX + "storage.enabled=true";
+    private static final String CLAIM_METRICS = PREFIX + "run-observation.initial-claim-metrics-enabled";
     private static final String USAGE = PREFIX + "storage.model-usage-enabled=true";
     private static final String ROUTE = "expense@1";
     private static final String ROUTES = PREFIX + "storage.model-usage-cumulative-route-refs[0]=" + ROUTE;
@@ -137,7 +146,7 @@ class AgentModelUsageDiagnosticsTest {
 
         try (var verifiers = mockConstruction(AgentStorageVerifier.class)) {
             new WebApplicationContextRunner().withUserConfiguration(TianjiAgentStorageConfiguration.class)
-                    .withPropertyValues(STORAGE, USAGE, ROUTES, API, PREFIX + "runtime.enabled=false")
+                    .withPropertyValues(STORAGE, USAGE, ROUTES, API, CLAIM_METRICS + "=true", PREFIX + "runtime.enabled=false")
                     .withBean(DataSource.class, () -> source).withBean(AgentTerminalEventPublisher.class, () -> publisher)
                     .withBean(TianjiAgentAccess.class, () -> access).run(ctx -> {
                         assertThat(ctx).hasNotFailed().hasSingleBean(AgentModelUsageDiagnostics.class);
@@ -160,6 +169,49 @@ class AgentModelUsageDiagnosticsTest {
                     .run(ctx -> assertThat(ctx).hasNotFailed().doesNotHaveBean(AgentModelUsageDiagnostics.class));
         }
         verifyNoInteractions(source, access);
+    }
+
+    @Test
+    void initialClaimTimingIsDefaultOffAndUsesOneFixedMeter() {
+        context.withPropertyValues(CLAIM_METRICS + "=true")
+                .run(ctx -> assertThat(ctx).hasNotFailed().doesNotHaveBean(AgentLedgerService.class));
+        var yaml = new YamlMapFactoryBean();
+        yaml.setResources(new ClassPathResource("application.yml"));
+        Map<?, ?> defaults = yaml.getObject();
+        var stellar = (Map<?, ?>) defaults.get("stellar");
+        var tianji = (Map<?, ?>) stellar.get("tianji");
+        var agent = (Map<?, ?>) tianji.get("agent");
+        assertEquals(Boolean.FALSE, ((Map<?, ?>) agent.get("run-observation")).get("initial-claim-metrics-enabled"));
+
+        var registry = new SimpleMeterRegistry();
+        var factory = new TianjiAgentStorageConfiguration();
+        var beans = new StaticListableBeanFactory();
+        beans.addBean("meterRegistry", registry);
+        var publishers = beans.getBeanProvider(AgentTerminalEventPublisher.class);
+        var registries = beans.getBeanProvider(MeterRegistry.class);
+        var source = mock(DataSource.class);
+        var args = new ArrayList<List<?>>();
+        try (var ledgers = mockConstruction(AgentLedgerService.class, (ledger, created) -> args.add(created.arguments()))) {
+            factory.tianjiAgentServerLedgerService(source, publishers, new MockEnvironment(), registries);
+            factory.tianjiAgentServerLedgerService(source, publishers,
+                    new MockEnvironment().withProperty(CLAIM_METRICS, "false"), registries);
+            factory.tianjiAgentServerLedgerService(source, publishers,
+                    new MockEnvironment().withProperty(CLAIM_METRICS, "true"), registries);
+            assertEquals(3, ledgers.constructed().size());
+            assertEquals(List.of(source), args.get(0));
+            assertEquals(List.of(source), args.get(1));
+            assertSame(source, args.get(2).getFirst());
+            assertEquals(List.of(), args.get(2).get(2));
+            assertTrue(registry.getMeters().isEmpty());
+            @SuppressWarnings("unchecked")
+            var observer = (Consumer<Duration>) assertInstanceOf(Consumer.class, args.get(2).getLast());
+            observer.accept(Duration.ofNanos(1_500));
+            assertEquals(1, registry.getMeters().size());
+            var timer = registry.get("tianji.agent.run.initial.claim.delay").timer();
+            assertEquals(1, timer.count());
+            assertEquals(1_500, timer.totalTime(TimeUnit.NANOSECONDS));
+            assertTrue(timer.getId().getTags().isEmpty());
+        }
     }
 
     @Test
