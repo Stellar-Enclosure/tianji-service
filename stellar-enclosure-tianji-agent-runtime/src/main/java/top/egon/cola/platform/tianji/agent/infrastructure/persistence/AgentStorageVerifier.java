@@ -5,18 +5,23 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32;
 import javax.sql.DataSource;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -45,6 +50,9 @@ public final class AgentStorageVerifier {
             Map.entry("agent_run_execution_grant", "tenant_id, run_id, binding_sha256, issue_epoch, grant_id, ciphertext, expires_at, updated_at"));
     private static final List<String> SESSION_OWNER = List.of("tenant_id", "subject_type", "subject_issuer", "subject_id", "app_name", "session_id");
     private static final List<String> RUN_KEY = List.of("tenant_id", "run_id");
+    private static final String MODEL_USAGE_FILE = "V15__add_agent_model_usage.sql";
+    private static final String MODEL_USAGE_SHA256 = "f5b414af7c1b422697b7ab98823d78fbff0f6327e858a1f5bf816e6b75a74238";
+    private static final List<String> MODEL_USAGE_KEY = List.of("tenant_id", "run_id", "reservation_id");
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
 
@@ -179,6 +187,227 @@ public final class AgentStorageVerifier {
             });
         } catch (DataAccessException failure) { throw invalid(); }
     }
+
+    /** Checks the optional V15 store on the owning primary, without installing or repairing it. */
+    public void verifyModelUsage() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
+        String migration = modelUsageMigration();
+        verify();
+        try {
+            transaction.executeWithoutResult(status -> {
+                if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                        SELECT NOT pg_is_in_recovery() AND current_setting('transaction_read_only')='off'
+                          AND current_setting('server_encoding')='UTF8'
+                          AND current_setting('session_replication_role')='origin'
+                        """, Boolean.class))) throw invalid();
+                int expectedChecksum = checksum(MODEL_USAGE_FILE);
+                var history = jdbc.query("""
+                        SELECT type,script,success,checksum FROM tianji_agent.flyway_schema_history
+                        WHERE version='15'
+                        """, (rs, row) -> "SQL".equals(rs.getString("type"))
+                        && MODEL_USAGE_FILE.equals(rs.getString("script")) && rs.getBoolean("success")
+                        && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+                if (history.size() != 1 || !history.getFirst()) throw invalid();
+                verifyModelUsageColumns();
+                verifyModelUsageKeys();
+                verifyModelUsageChecks(migration);
+                verifyModelUsageRole();
+            });
+        } catch (DataAccessException failure) {
+            throw invalid();
+        }
+    }
+
+    private void verifyModelUsageColumns() {
+        Map<String, UsageColumn> expected = Map.ofEntries(
+                usageColumn("tenant_id", "bigint", true, false),
+                usageColumn("run_id", "character varying(64)", true, false),
+                usageColumn("reservation_id", "character varying(128)", true, true),
+                usageColumn("lease_epoch", "bigint", true, false),
+                usageColumn("model_route_ref", "character varying(256)", true, true),
+                usageColumn("model_name", "character varying(512)", true, true),
+                usageColumn("price_version_ref", "character(64)", false, true),
+                usageColumn("currency", "character(3)", false, true),
+                usageColumn("input_rate_per_million", "numeric(32,8)", false, false),
+                usageColumn("output_rate_per_million", "numeric(32,8)", false, false),
+                Map.entry("state", new UsageColumn("character varying(16)", true, true, "'PENDING'")),
+                usageColumn("actual_input_tokens", "bigint", false, false),
+                usageColumn("actual_output_tokens", "bigint", false, false),
+                usageColumn("actual_cost", "numeric(24,8)", false, false),
+                usageColumn("safe_reason", "character varying(32)", false, true),
+                usageColumn("final_sha256", "character(64)", false, true),
+                usageColumn("created_at", "timestamp(6) with time zone", true, false),
+                usageColumn("measured_at", "timestamp(6) with time zone", false, false));
+        Map<String, UsageColumn> actual = new HashMap<>();
+        jdbc.query("""
+                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,a.attidentity,a.attgenerated,
+                       co.collname,cn.nspname AS collation_schema,pg_get_expr(d.adbin,d.adrelid) AS default_value
+                FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
+                LEFT JOIN pg_collation co ON co.oid=a.attcollation
+                LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace
+                LEFT JOIN pg_attrdef d ON d.adrelid=t.oid AND d.adnum=a.attnum
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_model_usage' AND t.relkind='r'
+                """, rs -> {
+            String collation = rs.getString("collname");
+            String defaultValue = rs.getString("default_value");
+            if (!"".equals(rs.getString("attidentity")) || !"".equals(rs.getString("attgenerated"))
+                    || "C".equals(collation) && !"pg_catalog".equals(rs.getString("collation_schema"))
+                    || collation != null && !"C".equals(collation) && !"default".equals(collation)) throw invalid();
+            var entry = new UsageColumn(rs.getString("type"), rs.getBoolean("attnotnull"),
+                    "C".equals(collation), defaultValue == null ? null : normalizedCheck(defaultValue));
+            if (actual.put(rs.getString("attname"), entry) != null) throw invalid();
+        });
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private void verifyModelUsageKeys() {
+        Set<String> seen = new HashSet<>();
+        jdbc.query("""
+                SELECT c.conname,c.contype,c.convalidated,c.condeferrable,c.condeferred,
+                       c.confupdtype,c.confdeltype,c.confmatchtype,rn.nspname AS ref_schema,rt.relname AS ref_table,
+                       i.indisprimary,i.indisunique,i.indisvalid,i.indisready,i.indislive,i.indimmediate,
+                       i.indnkeyatts,i.indnatts,x.relname AS index_name,am.amname,
+                       i.indpred IS NULL AND i.indexprs IS NULL AS plain_index,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indoption::smallint[]) v(options) WHERE options<>0) AS ascending,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indclass::oid[]) k(oid)
+                                    JOIN pg_opclass op ON op.oid=k.oid WHERE NOT op.opcdefault) AS default_classes,
+                       NOT EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY co(oid,pos)
+                                    JOIN unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,pos) USING(pos)
+                                    JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num
+                                    WHERE co.oid<>a.attcollation) AS column_collations,
+                       (SELECT count(*) FROM pg_index j WHERE j.indrelid=t.oid) AS index_count,
+                       ARRAY(SELECT a.attname::text FROM unnest(c.conkey) WITH ORDINALITY k(num,pos)
+                             JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num ORDER BY k.pos) AS columns,
+                       ARRAY(SELECT a.attname::text FROM unnest(c.confkey) WITH ORDINALITY k(num,pos)
+                             JOIN pg_attribute a ON a.attrelid=c.confrelid AND a.attnum=k.num ORDER BY k.pos) AS ref_columns
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                LEFT JOIN pg_class rt ON rt.oid=c.confrelid LEFT JOIN pg_namespace rn ON rn.oid=rt.relnamespace
+                LEFT JOIN pg_index i ON i.indexrelid=c.conindid LEFT JOIN pg_class x ON x.oid=i.indexrelid
+                LEFT JOIN pg_am am ON am.oid=x.relam
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_model_usage' AND c.contype<>'c'
+                  AND c.contype<>'n'
+                """, rs -> {
+            String name = rs.getString("conname");
+            if (!seen.add(name) || !rs.getBoolean("convalidated") || rs.getBoolean("condeferrable")
+                    || rs.getBoolean("condeferred") || !MODEL_USAGE_KEY.equals(array(rs.getArray("columns")))) throw invalid();
+            switch (name) {
+                case "agent_model_usage_pkey" -> {
+                    if (!"p".equals(rs.getString("contype")) || !name.equals(rs.getString("index_name"))
+                            || !rs.getBoolean("indisprimary") || !rs.getBoolean("indisunique")
+                            || !rs.getBoolean("indisvalid") || !rs.getBoolean("indisready") || !rs.getBoolean("indislive")
+                            || !rs.getBoolean("indimmediate") || !"btree".equals(rs.getString("amname"))
+                            || rs.getInt("indnkeyatts") != 3 || rs.getInt("indnatts") != 3
+                            || !rs.getBoolean("plain_index") || !rs.getBoolean("ascending")
+                            || !rs.getBoolean("default_classes") || !rs.getBoolean("column_collations")
+                            || rs.getInt("index_count") != 1) throw invalid();
+                }
+                case "agent_model_usage_budget_fkey" -> {
+                    if (!"f".equals(rs.getString("contype")) || !"tianji_agent".equals(rs.getString("ref_schema"))
+                            || !"agent_budget_reservation".equals(rs.getString("ref_table"))
+                            || !MODEL_USAGE_KEY.equals(array(rs.getArray("ref_columns")))
+                            || !"a".equals(rs.getString("confupdtype")) || !"a".equals(rs.getString("confdeltype"))
+                            || !"s".equals(rs.getString("confmatchtype"))) throw invalid();
+                }
+                default -> throw invalid();
+            }
+        });
+        if (!seen.equals(Set.of("agent_model_usage_pkey", "agent_model_usage_budget_fkey"))) throw invalid();
+    }
+
+    private void verifyModelUsageChecks(String migration) {
+        var expected = modelUsageChecks(migration);
+        var actual = new HashMap<String, String>();
+        jdbc.query("""
+                SELECT c.conname,c.convalidated,c.connoinherit,pg_get_constraintdef(c.oid) AS definition
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+                JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='tianji_agent' AND t.relname='agent_model_usage' AND c.contype='c'
+                """, rs -> {
+            if (!rs.getBoolean("convalidated") || rs.getBoolean("connoinherit")
+                    || actual.put(rs.getString("conname"), modelUsageCheckSignature(rs.getString("definition"))) != null) {
+                throw invalid();
+            }
+        });
+        if (!expected.equals(actual)) throw invalid();
+    }
+
+    private static Map<String, String> modelUsageChecks(String migration) {
+        var checks = new HashMap<String, String>();
+        var clauses = Pattern.compile("CONSTRAINT (agent_model_usage_[a-z_]+) CHECK\\s*\\(").matcher(migration);
+        while (clauses.find()) {
+            int open = clauses.end() - 1;
+            int end = modelUsageCheckEnd(migration, open);
+            if (checks.put(clauses.group(1), modelUsageCheckSignature("CHECK " + migration.substring(open, end + 1))) != null) {
+                throw invalid();
+            }
+        }
+        if (checks.size() != 8) throw invalid();
+        return checks;
+    }
+
+    private static int modelUsageCheckEnd(String sql, int open) {
+        int depth = 0;
+        boolean quoted = false;
+        for (int index = open; index < sql.length(); index++) {
+            char value = sql.charAt(index);
+            if (value == '\'') {
+                if (quoted && index + 1 < sql.length() && sql.charAt(index + 1) == '\'') index++;
+                else quoted = !quoted;
+            } else if (!quoted && value == '(') depth++;
+            else if (!quoted && value == ')' && --depth == 0) return index;
+        }
+        throw invalid();
+    }
+
+    private static String modelUsageCheckSignature(String definition) {
+        // The pinned V15 CASE branches never mix AND and OR in one condition.
+        return normalizedCheck(definition)
+                .replace(">=0::numeric", ">=0").replace(">='0'::numeric", ">=0")
+                .replace("<=9223372036854775807::numeric", "<='9223372036854775807'::numeric")
+                .replace("][]", "]");
+    }
+
+    private void verifyModelUsageRole() {
+        Boolean permitted = jdbc.queryForObject("""
+                SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                  AND has_schema_privilege(n.oid,'USAGE') AND NOT has_schema_privilege(n.oid,'CREATE')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user AND (r.rolsuper OR r.rolbypassrls))
+                  AND NOT pg_has_role(c.relowner,'MEMBER') AND NOT pg_has_role(n.nspowner,'MEMBER')
+                  AND has_table_privilege(c.oid,'SELECT') AND has_table_privilege(c.oid,'INSERT')
+                  AND NOT has_table_privilege(c.oid,'UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES')
+                  AND NOT has_any_column_privilege(c.oid,'REFERENCES')
+                  AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
+                    AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
+                  AND NOT EXISTS (SELECT 1 FROM pg_rewrite rule WHERE rule.ev_class=c.oid)
+                  AND ARRAY(SELECT a.attname::text FROM pg_attribute a
+                    WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                      AND has_column_privilege(c.oid,a.attnum,'UPDATE') ORDER BY a.attname::text COLLATE "C")
+                    = ARRAY['actual_cost','actual_input_tokens','actual_output_tokens','final_sha256','measured_at','safe_reason','state']
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent' AND c.relname='agent_model_usage' AND c.relkind='r'
+                """, Boolean.class);
+        if (!Boolean.TRUE.equals(permitted)) throw invalid();
+    }
+
+    private static String modelUsageMigration() {
+        try (InputStream input = AgentStorageVerifier.class.getClassLoader()
+                .getResourceAsStream("db/tianji-agent/" + MODEL_USAGE_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readNBytes(8193);
+            if (bytes.length > 8192 || !MODEL_USAGE_SHA256.equals(HexFormat.of()
+                    .formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw invalid();
+        }
+    }
+
+    private static Map.Entry<String, UsageColumn> usageColumn(String name, String type, boolean required, boolean cCollation) {
+        return Map.entry(name, new UsageColumn(type, required, cCollation, null));
+    }
+
+    private record UsageColumn(String type, boolean required, boolean cCollation, String defaultValue) { }
 
     private void verifyContextColumns() {
         Map<String, Column> expected = Map.ofEntries(column("tenant_id", "bigint", true, false), column("run_id", "character varying(64)", true, false),

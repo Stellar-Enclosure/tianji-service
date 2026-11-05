@@ -80,8 +80,13 @@ public final class AgentLedgerService {
     }
 
     private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher) {
+        this(dataSource, terminalPublisher, List.of());
+    }
+
+    private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher,
+                               List<String> modelUsageRoutes) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
-        this.modelUsageRoutes = List.of();
+        this.modelUsageRoutes = List.copyOf(modelUsageRoutes);
         String producerId = terminalPublisher == null ? null : terminalPublisher.producerId();
         if (terminalPublisher != null && (!terminalPublisher.usesDataSource(dataSource) || producerId == null
                 || !producerId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))) {
@@ -93,6 +98,28 @@ public final class AgentLedgerService {
         this.transaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         this.transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         this.budgetService = new AgentBudgetService(this, repository, transaction);
+    }
+
+    /** Trusted host opt-in. Original construction paths continue without any V15 check. */
+    public static AgentLedgerService withModelUsage(DataSource dataSource, AgentTerminalEventPublisher publisher,
+                                                     List<String> exactRouteRefs) {
+        if (exactRouteRefs == null || exactRouteRefs.isEmpty() || exactRouteRefs.size() > 32) {
+            throw invalid("Agent model usage routes are invalid");
+        }
+        var routes = new java.util.ArrayList<>(exactRouteRefs);
+        var distinct = new java.util.HashSet<String>();
+        for (String route : routes) {
+            if (route == null || route.isBlank() || route.length() > 256 || !route.equals(route.trim())
+                    || route.indexOf('*') >= 0 || route.indexOf('?') >= 0
+                    || route.chars().anyMatch(Character::isISOControl)
+                    || !StandardCharsets.UTF_8.newEncoder().canEncode(route) || !distinct.add(route)) {
+                throw invalid("Agent model usage routes are invalid");
+            }
+        }
+        // Validate an optional publisher's exact source in the unchanged constructor before catalog access.
+        var ledger = new AgentLedgerService(dataSource, publisher, routes);
+        new AgentStorageVerifier(dataSource).verifyModelUsage();
+        return ledger;
     }
 
     public static AgentLedgerService withTerminalEvents(DataSource dataSource, AgentTerminalEventPublisher publisher) {
@@ -414,10 +441,7 @@ public final class AgentLedgerService {
 
     private AgentModelUsageRunDTO projectModelUsage(TrustedAgentActor actor, JdbcAgentLedgerRepository.ModelUsageRunRow run,
                                                   Instant observedAt, String afterReservationId, int limit) {
-        if (!modelUsageText(run.runId(), 64) || run.createdAt() == null
-                || run.correlationId() != null && !modelUsageText(run.correlationId(), 128)) {
-            throw modelUsageUnavailable();
-        }
+        if (!modelUsageText(run.runId(), 64) || run.createdAt() == null) throw modelUsageUnavailable();
         var rows = repository.modelUsageSlots(actor, run.runId(), afterReservationId, limit + 1);
         if (rows.size() > limit + 1) throw modelUsageUnavailable();
         var items = rows.stream().limit(limit).map(slot -> projectModelUsageSlot(run, slot, observedAt)).toList();
