@@ -14,6 +14,7 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
@@ -93,6 +94,7 @@ public final class ExpenseAgentAcceptanceMain {
     }
 
     @TestConfiguration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "tianji.expense.fixture", name = "run-authorized", havingValue = "true")
     static class FixtureConfiguration {
         @Bean(MODEL_BEAN)
         ChatModel expenseFixtureModel() {
