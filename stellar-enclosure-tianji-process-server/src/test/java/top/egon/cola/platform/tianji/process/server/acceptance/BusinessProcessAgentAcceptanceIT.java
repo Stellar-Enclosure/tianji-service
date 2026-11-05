@@ -155,13 +155,20 @@ class BusinessProcessAgentAcceptanceIT {
         private final Map<String, CompleteWorkerTaskCommand> dropped = new ConcurrentHashMap<>();
         private final Map<String, ChildIdentityDTO> outboxDropAgent = new ConcurrentHashMap<>();
         private final RenderedRelease release;
+        private final S12ChildLogPrivacy logs;
         private ExpenseAcceptanceFaultRelay relay;
 
         static Driver open(Suite suite) throws Exception {
+            return open(suite, null);
+        }
+
+        static Driver open(Suite suite, S12ChildLogPrivacy logs) throws Exception {
+            require(logs == null || suite == Suite.S12_METRICS, "S12 metrics child privacy capture scope");
             String property = switch (suite) {
                 case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
-                case S12_METRICS -> "tianji.s12.metrics.manifest";
+                case S12_METRICS -> logs == null
+                        ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
             };
             var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty(property));
@@ -172,17 +179,18 @@ class BusinessProcessAgentAcceptanceIT {
             for (var tenant : manifest.tenants()) tenantSettings.put(tenant.tenantId(), privateProperties(tenant.credentialFile()));
             var stores = sourceAccess(manifest);
             var harness = ExpenseAcceptanceHarness.open(manifest, lock -> verifySources(lock, stores),
-                    ExpenseAcceptanceHarness.processBuilderLauncher(), System::nanoTime, Clock.systemUTC(),
+                    ExpenseAcceptanceHarness.processBuilderLauncher(logs), System::nanoTime, Clock.systemUTC(),
                     duration -> Thread.sleep(duration));
             Driver driver = null;
             try {
                 char[] password = tlsPassword(manifest.tls().credentialFile());
                 try {
+                    if (logs != null) logs.secret(S12ChildLogPrivacy.Credential.TLS, java.nio.CharBuffer.wrap(password));
                     var trust = ssl(manifest.tls().trustStore(), null, password);
                     var listener = ssl(manifest.tls().trustStore(), manifest.tls().relayKeyStore(), password);
                     var http = HttpClient.newBuilder().sslContext(trust).connectTimeout(NETWORK)
                             .followRedirects(HttpClient.Redirect.NEVER).build();
-                    driver = new Driver(manifest, harness, stores, tenantSettings, http, renderRelease(manifest));
+                    driver = new Driver(manifest, harness, stores, tenantSettings, http, renderRelease(manifest), logs);
                     driver.boot(listener, trust, password);
                     return driver;
                 } finally {
@@ -196,7 +204,8 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private Driver(ExpenseAcceptanceManifestDTO manifest, ExpenseAcceptanceHarness harness, Map<StoreOwner, StoreAccess> stores,
-                       Map<Long, Properties> tenantSettings, HttpClient http, RenderedRelease release) {
+                       Map<Long, Properties> tenantSettings, HttpClient http, RenderedRelease release, S12ChildLogPrivacy logs) {
+            this.logs = logs;
             this.manifest = manifest;
             this.harness = harness;
             this.stores = Map.copyOf(stores);
@@ -819,7 +828,11 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private Supplier<String> token(TenantBindingDTO tenant, String key) {
-            return () -> value(privateProperties(tenant.credentialFile()), key);
+            return () -> {
+                String bearer = value(privateProperties(tenant.credentialFile()), key);
+                if (logs != null) logs.secret(S12ChildLogPrivacy.Credential.HTTP_BEARER, bearer);
+                return bearer;
+            };
         }
 
         private TenantClients clients(TenantBindingDTO tenant) { return Objects.requireNonNull(clients.get(tenant.tenantId())); }
@@ -902,7 +915,10 @@ class BusinessProcessAgentAcceptanceIT {
             put(config, "spring.sql.init.mode", "never");
             put(config, "spring.datasource.url", store.jdbcUrl());
             put(config, "spring.datasource.username", store.runtimeRole());
-            put(config, "spring.datasource.password", value(dbCredentials, "runtime.password"));
+            String runtimePassword = value(dbCredentials, "runtime.password");
+            if (logs != null) logs.secret(role == ChildRole.AGENT
+                    ? S12ChildLogPrivacy.Credential.AGENT_DB : S12ChildLogPrivacy.Credential.PROCESS_DB, runtimePassword);
+            put(config, "spring.datasource.password", runtimePassword);
             put(config, "spring.datasource.hikari.schema", store.schema());
             if (manifest.suite() != Suite.S12_METRICS) {
                 put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());

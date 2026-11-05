@@ -503,13 +503,23 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     static ChildLauncher processBuilderLauncher() {
+        return processBuilderLauncher(null);
+    }
+
+    static ChildLauncher processBuilderLauncher(S12ChildLogPrivacy logs) {
         return launch -> {
-            var builder = new ProcessBuilder(launch.arguments()).directory(launch.workingDirectory().toFile())
-                    .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
+            var builder = new ProcessBuilder(launch.arguments()).directory(launch.workingDirectory().toFile());
+            if (logs == null) {
+                builder.redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
+            } else {
+                builder.redirectErrorStream(true);
+            }
             builder.environment().clear();
             builder.environment().putAll(launch.environment());
+            if (logs != null) builder.environment().put(
+                    top.egon.cola.platform.tianji.acceptance.S12MetricsInitializer.LOG_PRIVACY_ENV, "true");
             Process process = builder.start();
-            return new OwnedChild() {
+            var handle = new OwnedChild() {
                 public long pid() { return process.pid(); }
                 public Instant startedAt() { return process.info().startInstant().orElseThrow(ExpenseAcceptanceHarness::unavailable); }
                 public boolean alive() { return process.isAlive(); }
@@ -520,6 +530,15 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
                 }
                 public int exitCode() { return process.exitValue(); }
             };
+            if (logs != null) {
+                try {
+                    logs.attach(launch.role(), process.getInputStream());
+                } catch (RuntimeException | Error failure) {
+                    stopHandle(handle);
+                    throw failure;
+                }
+            }
+            return handle;
         };
     }
 
