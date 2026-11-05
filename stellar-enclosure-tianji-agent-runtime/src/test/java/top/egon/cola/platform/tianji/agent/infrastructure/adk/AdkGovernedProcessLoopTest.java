@@ -7,11 +7,14 @@ import com.google.adk.tools.ToolContext;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import io.reactivex.rxjava3.schedulers.Schedulers;
+import org.junit.jupiter.api.DynamicTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestFactory;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.metadata.ChatGenerationMetadata;
 import org.springframework.ai.chat.metadata.ChatResponseMetadata;
 import org.springframework.ai.chat.metadata.DefaultUsage;
@@ -70,10 +73,19 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 
+import tools.jackson.core.StreamReadFeature;
+import tools.jackson.core.json.JsonFactory;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
 import java.math.BigDecimal;
 import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -89,6 +101,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -106,6 +119,140 @@ class AdkGovernedProcessLoopTest {
             new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
             new ToolSchema(Map.of("instanceId", ToolSchema.ValueType.STRING), Set.of("instanceId")),
             new ToolPolicy(ToolPolicy.Risk.APPROVAL_REQUIRED, "fixed.approved.action", ProcessClient.START_RESOURCE_KEY, HASH, "approval-v1"));
+
+    @Test void governed_process_injection_corpus_is_present() {
+        assertNotNull(getClass().getResource("/evaluation/governed-process-injection-v1.json"));
+    }
+
+    @TestFactory
+    Stream<DynamicTest> governed_process_injection_corpus() throws Exception {
+        var mapper = JsonMapper.builder(JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
+                .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
+        JsonNode corpus;
+        try (var resource = getClass().getResourceAsStream("/evaluation/governed-process-injection-v1.json")) {
+            assertNotNull(resource);
+            corpus = mapper.readTree(resource);
+        }
+        assertEquals(Set.of("schemaVersion", "fixture", "cases"), Set.copyOf(corpus.propertyNames()));
+        assertTrue(corpus.required("schemaVersion").isIntegralNumber());
+        assertEquals(1, corpus.required("schemaVersion").intValue());
+        var fixture = corpus.required("fixture");
+        assertEquals(Set.of("definitionKey", "definitionVersion", "inputSchemaVersion", "outputSchemaVersion", "model",
+                "route", "policy", "businessKey", "businessVersion", "trustedTenant", "tools"), Set.copyOf(fixture.propertyNames()));
+        assertEquals(Set.of("normal", "approvalRequired"), Set.copyOf(fixture.required("tools").propertyNames()));
+        var cases = corpus.required("cases");
+        assertTrue(cases.isArray());
+        assertEquals(6, cases.size());
+        var tests = new ArrayList<DynamicTest>();
+        var ids = new HashSet<String>();
+        for (var item : cases) {
+            assertEquals(Set.of("id", "requiresApproval", "inputText", "taskData", "modelArguments", "expected"),
+                    Set.copyOf(item.propertyNames()));
+            var id = item.required("id").textValue();
+            assertTrue(id != null && id.matches("[a-z-]{1,48}") && ids.add(id));
+            tests.add(DynamicTest.dynamicTest(id, () -> evaluateInjectionCase(mapper, fixture, item)));
+        }
+        assertEquals(Set.of("trusted-control", "untrusted-text-keeps-trusted-host", "model-forges-tenant",
+                "model-forges-release", "model-forges-approval", "text-approval-cannot-dispatch"), ids);
+        return tests.stream();
+    }
+
+    private static void evaluateInjectionCase(JsonMapper mapper, JsonNode fixture, JsonNode item) {
+        var expected = item.required("expected");
+        assertEquals(Set.of("status", "errorCode", "sideEffectOutcome", "writes", "delegates", "receiptSelections",
+                "modelStreams", "reply", "toolEvents"), Set.copyOf(expected.propertyNames()));
+        assertTrue(item.required("requiresApproval").isBoolean());
+        for (String key : List.of("writes", "delegates", "receiptSelections", "modelStreams", "toolEvents")) {
+            assertTrue(expected.required(key).isIntegralNumber());
+        }
+        for (String key : List.of("errorCode", "reply")) {
+            assertTrue(expected.required(key).isString() || expected.required(key).isNull());
+        }
+        var task = item.required("taskData");
+        var arguments = item.required("modelArguments");
+        assertTrue(task.isObject() && arguments.isObject());
+        var inputText = item.required("inputText").textValue();
+        assertNotNull(inputText);
+        try (var rig = new Rig("SINGLE", 2, item.required("requiresApproval").booleanValue())) {
+            rig.input = new AgentInputDTO(inputText, List.of(), mapper.convertValue(task, new TypeReference<Map<String, Object>>() { }));
+            rig.model.scriptArguments.put("writer", List.of(mapper.writeValueAsString(arguments)));
+            rig.model.scripts.put("writer", List.of(rig.writeTool.name()));
+            var definition = rig.material().snapshot().definition();
+            assertEquals(fixture.required("definitionKey").textValue(), definition.definitionKey());
+            assertEquals(fixture.required("definitionVersion").longValue(), definition.version());
+            assertEquals(fixture.required("inputSchemaVersion").textValue(), definition.inputSchemaVersion());
+            assertEquals(fixture.required("outputSchemaVersion").textValue(), definition.outputSchemaVersion());
+            assertEquals(fixture.required("model").textValue(), definition.configuration().get("modelName"));
+            assertEquals(fixture.required("route").textValue(), definition.dependencies().modelRouteRef());
+            assertEquals(fixture.required("policy").textValue(), definition.dependencies().policyVersionRef());
+            assertEquals(fixture.required("trustedTenant").longValue(), rig.actor.tenantId());
+            var expectedTool = fixture.required("tools").required(rig.approved ? "approvalRequired" : "normal");
+            assertEquals(Set.of("name", "key", "version", "contentSha256", "risk"), Set.copyOf(expectedTool.propertyNames()));
+            var toolRef = rig.writeTool.reference();
+            assertEquals(expectedTool.required("name").textValue(), rig.writeTool.name());
+            assertEquals(expectedTool.required("key").textValue(), toolRef.key());
+            assertEquals(expectedTool.required("version").longValue(), toolRef.version());
+            assertEquals(expectedTool.required("contentSha256").textValue(), toolRef.contentSha256());
+            assertEquals(expectedTool.required("risk").textValue(), rig.writeTool.policy().risk().name());
+            assertTrue(definition.dependencies().tools().contains(toolRef));
+
+            var run = rig.executor().executeQueued(rig.actor, rig.query);
+            assertEquals(AgentRunStatusEnum.valueOf(expected.required("status").textValue()), run.status());
+            var result = rig.finished.get();
+            assertNotNull(result);
+            assertEquals(expected.required("errorCode").textValue(), result.errorCode());
+            assertEquals(expected.required("sideEffectOutcome").textValue(), result.sideEffectOutcome());
+            assertEquals(expected.required("writes").intValue(), rig.writes.get());
+            assertEquals(expected.required("delegates").intValue(), rig.delegates.get());
+            assertEquals(expected.required("receiptSelections").intValue(), rig.receiptSelections.get());
+            assertEquals(expected.required("modelStreams").intValue(), rig.model.streams.get());
+            assertEquals(0, rig.reads.get());
+            assertEquals(0, rig.mcpDelegates.get());
+            assertEquals(0, rig.accesses.get());
+            assertEquals(0, rig.approvalCalls.get());
+            assertEquals(expected.required("toolEvents").longValue(), rig.events.stream()
+                    .filter(event -> event.type().startsWith("TOOL_")).count());
+            assertTrue(rig.scopeClosed.get());
+
+            var visible = rig.model.prompts.getFirst().getInstructions();
+            assertTrue(visible.stream().filter(UserMessage.class::isInstance).anyMatch(message -> message.getText().contains(inputText)));
+            for (var key : task.propertyNames()) {
+                String untrusted = task.required(key).textValue();
+                assertNotNull(untrusted);
+                assertTrue(visible.stream().filter(UserMessage.class::isInstance).anyMatch(message -> message.getText().contains(untrusted)));
+                assertTrue(visible.stream().filter(SystemMessage.class::isInstance).noneMatch(message -> message.getText().contains(untrusted)));
+            }
+            if (inputText.contains("fixture-")) {
+                assertTrue(visible.stream().filter(SystemMessage.class::isInstance).noneMatch(message -> message.getText().contains(inputText)));
+            }
+
+            String reply = expected.required("reply").textValue();
+            if (reply == null) {
+                assertTrue(result.output().isEmpty());
+                assertTrue(rig.preparations.isEmpty());
+            } else {
+                assertEquals(Map.of("agents", Map.of("writer", "Done writer"), "text", "Done writer"), result.output());
+                var action = rig.preparations.getFirst().action();
+                assertEquals(rig.actor, action.owner());
+                assertEquals(fixture.required("businessKey").textValue(), action.businessKey());
+                assertEquals(fixture.required("businessVersion").textValue(), action.businessVersion());
+                assertEquals(rig.writeTool.reference(), action.tool());
+                assertEquals(Map.of("amount", 7L), action.arguments());
+                var response = rig.model.prompts.getLast().getInstructions().stream().filter(ToolResponseMessage.class::isInstance)
+                        .map(ToolResponseMessage.class::cast).reduce((first, second) -> second).orElseThrow();
+                var json = mapper.readTree(response.getResponses().getLast().responseData());
+                var safe = reply.equals("SUCCEEDED") ? Map.of("status", reply, "output", Map.of("instanceId", INSTANCE))
+                        : Map.of("status", reply);
+                assertEquals(mapper.valueToTree(safe), json);
+            }
+            for (var event : rig.events) if (event.type().startsWith("TOOL_")) {
+                String detail = event.payload().toString();
+                for (var privateValue : List.of("canary", "fixture-fake-approval", "foreign-release", "tenantId", RECEIPT)) {
+                    assertFalse(detail.contains(privateValue));
+                }
+            }
+        }
+    }
 
     @Test void native_streaming_loop_uses_one_union_and_returns_only_the_authorized_instance() {
         try (var rig = new Rig("SINGLE", 2)) {
@@ -577,6 +724,7 @@ class AdkGovernedProcessLoopTest {
         final AtomicReference<ToolCommittedFactObserver> lateObserver = new AtomicReference<>();
         final CountDownLatch writeEntered = new CountDownLatch(1), releaseWrite = new CountDownLatch(1), lateFact = new CountDownLatch(1);
         final FakeChatModel model = new FakeChatModel();
+        AgentInputDTO input = new AgentInputDTO("Use the reviewed tools", null, null);
         final FixedBpmnStartToolTransport start;
         final AdkGovernedProcessToolBridge bridge;
         final String workflow; final int maxEntries; final boolean approved; final ToolDescriptor writeTool; final boolean mcpEnabled; final List<ToolDescriptor> descriptors;
@@ -757,7 +905,7 @@ class AdkGovernedProcessLoopTest {
                     "agents", agents, "workflows", workflow.equals("SINGLE") ? List.of() : List.of(Map.of("name", "root", "type", workflow, "subAgentNames", List.of("writer", "reviewer"))));
             var definition = new AgentDefinitionSpecDTO("assistant", 1, "CONFIG", null, "1", "1",
                     new DefinitionDependenciesDTO(List.of(), List.of(), tools ? descriptors.stream().map(ToolDescriptor::reference).toList() : List.of(), "route-v1", "policy-v1"), policy, config);
-            var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, new AgentInputDTO("Use the reviewed tools", null, null), "invoice-1");
+            var snapshot = new AgentExecutionSnapshot(definition, HASH, policy, input, "invoice-1");
             var authorization = new AgentRunAuthorization.Request(actor, query.runId(), "assistant", 1, HASH, "c".repeat(64), "d".repeat(64), "policy-v1", false, deadline);
             return new AgentLedgerService.ExecutionMaterial(run(AgentRunStatusEnum.QUEUED, 0, 0), snapshot, authorization);
         }
@@ -793,6 +941,7 @@ class AdkGovernedProcessLoopTest {
         final AtomicInteger calls = new AtomicInteger(), streams = new AtomicInteger();
         final List<Prompt> prompts = new CopyOnWriteArrayList<>();
         final Map<String, List<String>> scripts = new ConcurrentHashMap<>();
+        final Map<String, List<String>> scriptArguments = new ConcurrentHashMap<>();
         final Map<String, AtomicInteger> rounds = new ConcurrentHashMap<>();
         volatile boolean neverAfterTools, failAfterTools;
         volatile CountDownLatch failReviewerAfter;
@@ -805,8 +954,13 @@ class AdkGovernedProcessLoopTest {
             if (leaf.equals("reviewer") && failReviewerAfter != null) { awaitIgnoringInterrupt(failReviewerAfter); return Flux.error(new IllegalStateException("controlled sibling failure")); }
             int round = rounds.computeIfAbsent(leaf, ignored -> new AtomicInteger()).incrementAndGet(); var script = scripts.getOrDefault(leaf, List.of());
             if (round > 5) throw new AssertionError("native loop bound exceeded");
-            if (round <= script.size()) return Flux.just(response(AssistantMessage.builder().content("").toolCalls(List.of(
-                    new AssistantMessage.ToolCall("private-native-" + leaf + "-" + round, "function", script.get(round - 1), "{\"amount\":7}"))).build(), "tool_calls"));
+            if (round <= script.size()) {
+                var arguments = scriptArguments.get(leaf);
+                String json = arguments == null ? "{\"amount\":7}" : arguments.get(round - 1);
+                return Flux.just(response(AssistantMessage.builder().content("").toolCalls(List.of(
+                        new AssistantMessage.ToolCall("private-native-" + leaf + "-" + round, "function",
+                                script.get(round - 1), json))).build(), "tool_calls"));
+            }
             if (neverAfterTools) return Flux.never(); if (failAfterTools) return Flux.error(new IllegalStateException("private model failure"));
             return Flux.just(response(new AssistantMessage("Done " + leaf), "stop"));
         }
