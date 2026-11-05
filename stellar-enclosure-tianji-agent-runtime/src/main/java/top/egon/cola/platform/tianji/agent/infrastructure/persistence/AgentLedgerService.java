@@ -28,6 +28,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentUsageDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentUsageKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -71,6 +73,7 @@ public final class AgentLedgerService {
     private final AgentBudgetService budgetService;
     private final AgentTerminalEventPublisher terminalPublisher;
     private final String terminalProducerId;
+    private final List<String> modelUsageRoutes;
 
     public AgentLedgerService(DataSource dataSource) {
         this(dataSource, (AgentTerminalEventPublisher) null);
@@ -78,6 +81,7 @@ public final class AgentLedgerService {
 
     private AgentLedgerService(DataSource dataSource, AgentTerminalEventPublisher terminalPublisher) {
         this.dataSource = Objects.requireNonNull(dataSource, "dataSource");
+        this.modelUsageRoutes = List.of();
         String producerId = terminalPublisher == null ? null : terminalPublisher.producerId();
         if (terminalPublisher != null && (!terminalPublisher.usesDataSource(dataSource) || producerId == null
                 || !producerId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}"))) {
@@ -327,6 +331,224 @@ public final class AgentLedgerService {
     }
 
     private record RunCursor(Instant createdAt, String runId) { }
+
+    public boolean modelUsageEnabled() {
+        return !modelUsageRoutes.isEmpty();
+    }
+
+    public boolean acceptsModelUsage(String executionMode, String routeRef) {
+        return "CONFIG".equals(executionMode) && routeRef != null && modelUsageRoutes.contains(routeRef);
+    }
+
+    public boolean usesModelUsageRoutes(List<String> exactRouteRefs) {
+        return modelUsageEnabled() && modelUsageRoutes.equals(exactRouteRefs);
+    }
+
+    public AgentModelUsageRunDTO getModelUsage(TrustedAgentActor actor, GetAgentRunQuery query, String afterReservationId) {
+        requireModelUsageReader(actor);
+        if (query == null || !modelUsageText(query.runId(), 64)
+                || afterReservationId != null && !modelUsageText(afterReservationId, 128)) {
+            throw invalid("Agent model usage query is invalid");
+        }
+        return modelUsageRead(() -> {
+            Instant observedAt = now();
+            var owned = repository.modelUsageRun(actor, query.runId()).orElseThrow(AgentLedgerService::notFound);
+            if (!query.runId().equals(owned.runId())) throw modelUsageUnavailable();
+            return projectModelUsage(actor, owned, observedAt, afterReservationId, 100);
+        });
+    }
+
+    public AgentModelUsagePageDTO listModelUsageByCorrelation(TrustedAgentActor actor, AgentModelUsageCorrelationQuery query) {
+        requireModelUsageReader(actor);
+        if (query == null) throw invalid("Agent model usage query is invalid");
+        String binding = json.resultHash("TIANJI_AGENT_MODEL_USAGE_CURSOR_V1:"
+                + json.write(List.of(actor.identityFingerprint(), query.correlationId(), query.fromInclusive().toString(),
+                query.toExclusive().toString()), 4_096));
+        var cursor = query.cursor();
+        if (cursor != null && (!binding.equals(cursor.bindingSha256()) || cursor.createdAt().isBefore(query.fromInclusive())
+                || !cursor.createdAt().isBefore(query.toExclusive()))) {
+            throw invalid("Agent model usage cursor is invalid");
+        }
+        return modelUsageRead(() -> {
+            Instant observedAt = now();
+            if (query.toExclusive().isAfter(observedAt)) throw invalid("Agent model usage window exceeds the source clock");
+            var rows = repository.modelUsageRuns(actor, query.correlationId(), query.fromInclusive(), query.toExclusive(),
+                    cursor == null ? null : cursor.createdAt(), cursor == null ? null : cursor.runId(), 21);
+            if (rows.size() > 21) throw modelUsageUnavailable();
+            var accepted = rows.subList(0, Math.min(rows.size(), 20));
+            var results = accepted.stream().map(row -> {
+                if (!query.correlationId().equals(row.correlationId()) || row.createdAt() == null
+                        || row.createdAt().isBefore(query.fromInclusive()) || !row.createdAt().isBefore(query.toExclusive())) {
+                    throw modelUsageUnavailable();
+                }
+                return projectModelUsage(actor, row, observedAt, null, 5);
+            }).toList();
+            var next = rows.size() > 20
+                    ? new AgentModelUsageCursorDTO(accepted.getLast().createdAt(), accepted.getLast().runId(), binding) : null;
+            return new AgentModelUsagePageDTO(results, next, observedAt);
+        });
+    }
+
+    private void requireModelUsageReader(TrustedAgentActor actor) {
+        if (!modelUsageEnabled()) throw modelUsageDisabled();
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Verified Agent owner is required");
+        }
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Agent model usage must own its snapshot transaction");
+        }
+    }
+
+    private <T> T modelUsageRead(java.util.function.Supplier<T> operation) {
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        // As in terminalReference, this is a SELECT-only path pinned to the owning primary.
+        read.setReadOnly(false);
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        read.setTimeout(2);
+        try {
+            return Objects.requireNonNull(read.execute(status -> operation.get()));
+        } catch (org.springframework.dao.DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw modelUsageUnavailable();
+        }
+    }
+
+    private AgentModelUsageRunDTO projectModelUsage(TrustedAgentActor actor, JdbcAgentLedgerRepository.ModelUsageRunRow run,
+                                                  Instant observedAt, String afterReservationId, int limit) {
+        if (!modelUsageText(run.runId(), 64) || run.createdAt() == null
+                || run.correlationId() != null && !modelUsageText(run.correlationId(), 128)) {
+            throw modelUsageUnavailable();
+        }
+        var rows = repository.modelUsageSlots(actor, run.runId(), afterReservationId, limit + 1);
+        if (rows.size() > limit + 1) throw modelUsageUnavailable();
+        var items = rows.stream().limit(limit).map(slot -> projectModelUsageSlot(run, slot, observedAt)).toList();
+        String next = rows.size() > limit ? items.getLast().reservationId() : null;
+        return new AgentModelUsageRunDTO(run.runId(), run.correlationId(), run.createdAt(), observedAt, items, next);
+    }
+
+    static AgentModelUsageSlotDTO projectModelUsageSlot(JdbcAgentLedgerRepository.ModelUsageRunRow run,
+                                                        JdbcAgentLedgerRepository.ModelUsageSlotRow slot, Instant observedAt) {
+        if (!modelUsageText(slot.reservationId(), 128) || slot.reservationEpoch() < 1 || slot.reservedAt() == null) {
+            throw modelUsageUnavailable();
+        }
+        if (!slot.tracked()) {
+            return new AgentModelUsageSlotDTO(slot.reservationId(), null, null, AgentModelUsageStateEnum.NOT_INSTRUMENTED,
+                    null, null, slot.reservedAt(), null);
+        }
+        if (slot.usageEpoch() == null || slot.usageEpoch() != slot.reservationEpoch() || slot.createdAt() == null
+                || !modelUsageText(slot.modelRouteRef(), 256) || !modelUsageText(slot.modelName(), 512)) throw modelUsageUnavailable();
+
+        AgentModelUsageStateEnum state;
+        try {
+            state = AgentModelUsageStateEnum.valueOf(slot.state());
+        } catch (IllegalArgumentException | NullPointerException invalid) {
+            throw modelUsageUnavailable();
+        }
+        String reason = slot.safeReason();
+        AgentUsageDTO actual = null;
+        switch (state) {
+            case NOT_INSTRUMENTED -> throw modelUsageUnavailable();
+            case PENDING -> {
+                requireNoActualUsage(slot);
+                if (reason != null) throw modelUsageUnavailable();
+                if (!"RESERVED".equals(slot.budgetState()) || !"RUNNING".equals(run.status())
+                        || run.leaseEpoch() != slot.reservationEpoch() || !run.hasLeaseOwner() || run.leaseExpiresAt() == null
+                        || !run.leaseExpiresAt().isAfter(observedAt)) {
+                    state = AgentModelUsageStateEnum.UNKNOWN;
+                    reason = "RESERVATION_ENDED";
+                }
+            }
+            case UNKNOWN -> {
+                requireNoActualUsage(slot);
+                if (reason == null || !Set.of("MISSING_USAGE", "INVALID_USAGE", "MODEL_ERROR").contains(reason)) {
+                    throw modelUsageUnavailable();
+                }
+            }
+            case PRICED, UNPRICED -> actual = projectActualModelUsage(state, slot);
+        }
+        return new AgentModelUsageSlotDTO(slot.reservationId(), slot.modelRouteRef(), slot.modelName(), state, actual,
+                reason, slot.createdAt(), slot.measuredAt());
+    }
+
+    private static void requireNoActualUsage(JdbcAgentLedgerRepository.ModelUsageSlotRow slot) {
+        if (slot.inputTokens() != null || slot.outputTokens() != null || slot.actualCost() != null || slot.measuredAt() != null) {
+            throw modelUsageUnavailable();
+        }
+    }
+
+    private static AgentUsageDTO projectActualModelUsage(AgentModelUsageStateEnum state,
+                                                        JdbcAgentLedgerRepository.ModelUsageSlotRow slot) {
+        Long input = slot.inputTokens(), output = slot.outputTokens();
+        if (input == null || output == null || input < 0 || output < 0 || Long.MAX_VALUE - input < output
+                || slot.measuredAt() == null || slot.measuredAt().isBefore(slot.createdAt())) throw modelUsageUnavailable();
+        boolean hasPrice = slot.currency() != null && slot.currency().matches("[A-Z]{3}")
+                && slot.priceVersionRef() != null && slot.priceVersionRef().matches("[0-9a-f]{64}");
+        if (state == AgentModelUsageStateEnum.PRICED) {
+            if (!hasPrice || slot.safeReason() != null || slot.actualCost() == null || slot.actualCost().signum() < 0) {
+                throw modelUsageUnavailable();
+            }
+        } else {
+            boolean missing = "PRICE_MISSING".equals(slot.safeReason()) && slot.currency() == null && slot.priceVersionRef() == null;
+            boolean overflow = "PRICE_OVERFLOW".equals(slot.safeReason()) && hasPrice;
+            if ((!missing && !overflow) || slot.actualCost() != null) throw modelUsageUnavailable();
+        }
+        return new AgentUsageDTO(AgentUsageKindEnum.ACTUAL, input, output, input + output, slot.actualCost(),
+                slot.currency(), slot.priceVersionRef());
+    }
+
+    private static boolean modelUsageText(String value, int limit) {
+        return value != null && !value.isBlank() && value.length() <= limit && value.equals(value.trim())
+                && value.codePoints().noneMatch(c -> c < 32 || c == 127
+                || c >= Character.MIN_SURROGATE && c <= Character.MAX_SURROGATE);
+    }
+
+    private static boolean modelUsageTime(Instant value) {
+        return value != null && !value.isBefore(Instant.EPOCH)
+                && !value.isAfter(Instant.parse("9999-12-31T23:59:59.999999Z"))
+                && value.equals(value.truncatedTo(ChronoUnit.MICROS));
+    }
+
+    private static AgentLedgerException modelUsageDisabled() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Agent model usage is not enabled");
+    }
+
+    private static AgentLedgerException modelUsageUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent model usage is unavailable");
+    }
+
+    public record AgentModelUsageCorrelationQuery(String correlationId, Instant fromInclusive, Instant toExclusive,
+                                                  AgentModelUsageCursorDTO cursor) {
+        public AgentModelUsageCorrelationQuery {
+            if (!modelUsageText(correlationId, 128) || !modelUsageTime(fromInclusive) || !modelUsageTime(toExclusive)
+                    || !fromInclusive.isBefore(toExclusive) || Duration.between(fromInclusive, toExclusive).compareTo(Duration.ofDays(31)) > 0) {
+                throw invalid("Agent model usage correlation query is invalid");
+            }
+        }
+    }
+
+    public record AgentModelUsageCursorDTO(Instant createdAt, String runId, String bindingSha256) {
+        public AgentModelUsageCursorDTO {
+            if (!modelUsageTime(createdAt) || !modelUsageText(runId, 64)
+                    || bindingSha256 == null || !bindingSha256.matches("[0-9a-f]{64}")) {
+                throw invalid("Agent model usage cursor is invalid");
+            }
+        }
+    }
+
+    public enum AgentModelUsageStateEnum { NOT_INSTRUMENTED, PENDING, UNKNOWN, UNPRICED, PRICED }
+
+    public record AgentModelUsageSlotDTO(String reservationId, String modelRouteRef, String modelName,
+                                        AgentModelUsageStateEnum state, AgentUsageDTO usage, String safeReason,
+                                        Instant createdAt, Instant measuredAt) { }
+
+    public record AgentModelUsageRunDTO(String runId, String correlationId, Instant createdAt, Instant observedAt,
+                                       List<AgentModelUsageSlotDTO> slots, String nextReservationId) {
+        public AgentModelUsageRunDTO { slots = List.copyOf(slots); }
+    }
+
+    public record AgentModelUsagePageDTO(List<AgentModelUsageRunDTO> runs, AgentModelUsageCursorDTO nextCursor,
+                                        Instant observedAt) {
+        public AgentModelUsagePageDTO { runs = List.copyOf(runs); }
+    }
 
     public Optional<AgentExecutionResult> getResult(TrustedAgentActor actor, GetAgentRunQuery query) {
         String result = requireRun(actor, query).resultJson();

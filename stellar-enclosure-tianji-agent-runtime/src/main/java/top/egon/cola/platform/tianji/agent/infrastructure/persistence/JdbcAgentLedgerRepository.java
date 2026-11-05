@@ -31,6 +31,9 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 final class JdbcAgentLedgerRepository {
     private static final String RUN_COLUMNS = "run_id, definition_key, definition_version, session_id, status, wait_reason, "
             + "cancel_requested_at, attempt, revision, last_event_sequence, deadline_at, created_at, finished_at";
+    private static final String USAGE_RUN_COLUMNS = "run_id, correlation_id, created_at, status, lease_epoch, "
+            + "lease_owner IS NOT NULL AS has_lease_owner, lease_expires_at";
+    private static final String USAGE_OWNER = "tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?";
     private final JdbcTemplate jdbc;
     private final AgentJsonCodec json;
     private final AgentContextJsonCodec contexts = new AgentContextJsonCodec();
@@ -129,6 +132,80 @@ final class JdbcAgentLedgerRepository {
                 (rs, row) -> mapRun(rs), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 Timestamp.from(beforeCreatedAt), beforeRunId, limit);
     }
+
+    Optional<ModelUsageRunRow> modelUsageRun(TrustedAgentActor actor, String runId) {
+        return jdbc.query("SELECT " + USAGE_RUN_COLUMNS + " FROM tianji_agent.agent_run WHERE "
+                        + USAGE_OWNER + " AND run_id=?", JdbcAgentLedgerRepository::modelUsageRunRow,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId)
+                .stream().findFirst();
+    }
+
+    List<ModelUsageRunRow> modelUsageRuns(TrustedAgentActor actor, String correlationId, Instant fromInclusive,
+                                        Instant toExclusive, Instant beforeCreatedAt, String beforeRunId, int limit) {
+        String query = "SELECT " + USAGE_RUN_COLUMNS + " FROM tianji_agent.agent_run WHERE " + USAGE_OWNER
+                + " AND correlation_id COLLATE \"C\"=? AND created_at>=? AND created_at<?";
+        String order = " ORDER BY created_at DESC, run_id DESC LIMIT ?";
+        if (beforeCreatedAt == null) {
+            return jdbc.query(query + order, JdbcAgentLedgerRepository::modelUsageRunRow,
+                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    correlationId, Timestamp.from(fromInclusive), Timestamp.from(toExclusive), limit);
+        }
+        return jdbc.query(query + " AND (created_at,run_id)<(?,?)" + order, JdbcAgentLedgerRepository::modelUsageRunRow,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                correlationId, Timestamp.from(fromInclusive), Timestamp.from(toExclusive),
+                Timestamp.from(beforeCreatedAt), beforeRunId, limit);
+    }
+
+    List<ModelUsageSlotRow> modelUsageSlots(TrustedAgentActor actor, String runId, String afterReservationId, int limit) {
+        String query = """
+                SELECT b.reservation_id,b.lease_epoch,b.state AS budget_state,b.created_at AS reserved_at,
+                    u.reservation_id IS NOT NULL AS tracked,u.lease_epoch AS usage_epoch,u.state AS usage_state,
+                    u.model_route_ref,u.model_name,u.price_version_ref,u.currency,u.actual_input_tokens,
+                    u.actual_output_tokens,u.actual_cost,u.safe_reason,u.created_at AS usage_created_at,u.measured_at
+                FROM tianji_agent.agent_run r
+                JOIN tianji_agent.agent_budget_reservation b ON b.tenant_id=r.tenant_id AND b.run_id=r.run_id
+                LEFT JOIN tianji_agent.agent_model_usage u ON u.tenant_id=b.tenant_id AND u.run_id=b.run_id
+                    AND u.reservation_id=b.reservation_id
+                WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=? AND r.run_id=?
+                    AND b.kind='MODEL'
+                """;
+        String order = " ORDER BY b.reservation_id COLLATE \"C\" LIMIT ?";
+        if (afterReservationId == null) {
+            return jdbc.query(query + order, JdbcAgentLedgerRepository::modelUsageSlotRow,
+                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), runId, limit);
+        }
+        return jdbc.query(query + " AND b.reservation_id COLLATE \"C\">?" + order,
+                JdbcAgentLedgerRepository::modelUsageSlotRow, actor.tenantId(), actor.subjectType().name(),
+                actor.issuerFingerprint(), actor.subjectId(), runId, afterReservationId, limit);
+    }
+
+    private static ModelUsageRunRow modelUsageRunRow(ResultSet rs, int index) throws SQLException {
+        return new ModelUsageRunRow(rs.getString("run_id"), rs.getString("correlation_id"),
+                rs.getTimestamp("created_at").toInstant(), rs.getString("status"), rs.getLong("lease_epoch"),
+                rs.getBoolean("has_lease_owner"), optionalInstant(rs, "lease_expires_at"));
+    }
+
+    private static ModelUsageSlotRow modelUsageSlotRow(ResultSet rs, int index) throws SQLException {
+        return new ModelUsageSlotRow(rs.getString("reservation_id"), rs.getLong("lease_epoch"), rs.getString("budget_state"),
+                rs.getTimestamp("reserved_at").toInstant(), rs.getBoolean("tracked"), rs.getObject("usage_epoch", Long.class),
+                rs.getString("usage_state"), rs.getString("model_route_ref"), rs.getString("model_name"),
+                rs.getString("price_version_ref"), rs.getString("currency"), rs.getObject("actual_input_tokens", Long.class),
+                rs.getObject("actual_output_tokens", Long.class), rs.getBigDecimal("actual_cost"), rs.getString("safe_reason"),
+                optionalInstant(rs, "usage_created_at"), optionalInstant(rs, "measured_at"));
+    }
+
+    private static Instant optionalInstant(ResultSet rs, String name) throws SQLException {
+        Timestamp time = rs.getTimestamp(name);
+        return time == null ? null : time.toInstant();
+    }
+
+    record ModelUsageRunRow(String runId, String correlationId, Instant createdAt, String status, long leaseEpoch,
+                            boolean hasLeaseOwner, Instant leaseExpiresAt) { }
+
+    record ModelUsageSlotRow(String reservationId, long reservationEpoch, String budgetState, Instant reservedAt,
+                             boolean tracked, Long usageEpoch, String state, String modelRouteRef, String modelName,
+                             String priceVersionRef, String currency, Long inputTokens, Long outputTokens,
+                             BigDecimal actualCost, String safeReason, Instant createdAt, Instant measuredAt) { }
 
     int insertRun(TrustedAgentActor actor, String runId, String definitionKey, long definitionVersion,
                   String idempotencyKey, String requestHash, String sessionId, String correlationId,
