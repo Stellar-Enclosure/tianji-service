@@ -1,0 +1,120 @@
+name: Tianji release tooling
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-tooling:
+    name: Release tooling self-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fetch the exact Tianji Service commit
+        id: fetch
+        shell: bash
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch ||
+                "$GITHUB_SERVER_URL" != https://github.com ||
+                "$GITHUB_REPOSITORY" != Stellar-Enclosure/tianji-service ||
+                ! "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ||
+                -z "${CHECKOUT_TOKEN:-}" ]]; then
+            printf '%s\n' TIANJI_TOOLING_CHECKOUT_CONTEXT_REJECTED >&2
+            exit 1
+          fi
+
+          work="$(mktemp -d "$RUNNER_TEMP/tianji-release-tooling.XXXXXXXX")"
+          export PATH=/usr/bin:/bin
+          for name in "${!GIT_@}"; do unset "$name"; done
+          unset GITHUB_TOKEN GH_TOKEN GIT_CURL_VERBOSE
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=https
+          git init --quiet --template='' "$work/repository"
+
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+          unset CHECKOUT_TOKEN
+          printf '::add-mask::%s\n' "$authorization"
+          if ! GIT_CONFIG_COUNT=2 \
+               GIT_CONFIG_KEY_0=http.followRedirects GIT_CONFIG_VALUE_0=false \
+               GIT_CONFIG_KEY_1=http.https://github.com/.extraheader \
+               GIT_CONFIG_VALUE_1="AUTHORIZATION: basic $authorization" \
+               git -C "$work/repository" fetch --quiet --no-tags --no-recurse-submodules --depth=1 \
+                 https://github.com/Stellar-Enclosure/tianji-service.git "$GITHUB_SHA" >/dev/null 2>&1; then
+            printf '%s\n' TIANJI_TOOLING_FETCH_FAILED >&2
+            exit 1
+          fi
+          unset authorization
+          test "$(git -C "$work/repository" rev-parse --verify 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA"
+          printf 'root=%s\n' "$work" >> "$GITHUB_OUTPUT"
+          printf 'Verified Tianji Service commit %s\n' "$GITHUB_SHA"
+
+      - name: Materialize five files from the verified Git tree
+        id: archive
+        shell: bash
+        env:
+          TOOLING_ROOT: ${{ steps.fetch.outputs.root }}
+        run: |
+          set -euo pipefail
+          test -d "$TOOLING_ROOT/repository/.git"
+          export PATH=/usr/bin:/bin
+          for name in "${!GIT_@}"; do unset "$name"; done
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          files=(
+            scripts/release-evidence-policy-v1.json
+            scripts/verify-release-evidence.py
+            scripts/verify-local-release-u.py
+            scripts/test_verify_release_evidence.py
+            scripts/test_verify_local_release_u.py
+          )
+          for file in "${files[@]}"; do
+            read -r mode type oid tracked <<< "$(git -C "$TOOLING_ROOT/repository" ls-tree "$GITHUB_SHA" -- "$file")"
+            if [[ "$type" != blob || "$tracked" != "$file" ||
+                  ( "$mode" != 100644 && "$mode" != 100755 ) ||
+                  ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              printf '%s\n' TIANJI_TOOLING_ARCHIVE_INPUT_REJECTED >&2
+              exit 1
+            fi
+          done
+          mkdir "$TOOLING_ROOT/source"
+          git -C "$TOOLING_ROOT/repository" archive --format=tar "$GITHUB_SHA" -- "${files[@]}" |
+            tar -xf - -C "$TOOLING_ROOT/source"
+          for file in "${files[@]}"; do
+            archived="$TOOLING_ROOT/source/$file"
+            test -f "$archived"
+            test ! -L "$archived"
+            test "$(git hash-object --no-filters "$archived")" = \
+              "$(git -C "$TOOLING_ROOT/repository" rev-parse --verify "$GITHUB_SHA:$file")"
+          done
+          printf 'source=%s\n' "$TOOLING_ROOT/source" >> "$GITHUB_OUTPUT"
+
+      - name: Run the 13 isolated Python tooling tests
+        shell: bash
+        env:
+          TOOLING_SOURCE: ${{ steps.archive.outputs.source }}
+        run: |
+          set -euo pipefail
+          cd "$TOOLING_SOURCE"
+          env -i PATH=/usr/bin:/bin LC_ALL=C /usr/bin/python3 -I -B - <<'PY'
+          import sys
+          import unittest
+
+          if sys.version_info < (3, 10):
+              raise SystemExit("TIANJI_TOOLING_PYTHON_UNSUPPORTED")
+
+          suites = (("test_verify_release_evidence.py", 7), ("test_verify_local_release_u.py", 6))
+          for filename, expected in suites:
+              loader = unittest.TestLoader()
+              suite = loader.discover("scripts", pattern=filename)
+              if suite.countTestCases() != expected or loader.errors:
+                  raise SystemExit("TIANJI_TOOLING_TEST_DISCOVERY_FAILED")
+              result = unittest.TextTestRunner(verbosity=1).run(suite)
+              if (result.testsRun != expected or not result.wasSuccessful() or result.skipped
+                      or result.expectedFailures):
+                  raise SystemExit("TIANJI_TOOLING_TESTS_FAILED")
+          print("Tianji release tooling self-tests passed: 13")
+          PY
