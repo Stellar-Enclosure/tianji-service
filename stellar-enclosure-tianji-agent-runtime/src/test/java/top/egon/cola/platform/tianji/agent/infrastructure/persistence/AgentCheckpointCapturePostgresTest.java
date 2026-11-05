@@ -26,11 +26,14 @@ import top.egon.cola.component.common.core.validation.ValidationUtils;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointObservationService;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointObservationService.Observation;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -63,6 +66,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -161,7 +165,28 @@ class AgentCheckpointCapturePostgresTest {
     @Timeout(150)
     @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture.fork", matches = "true")
     void forced_process_exit_preserves_checkpoint_and_reconciles_expired_run_without_execution() throws Exception {
-        var database = provision();
+        verifyProductCheckpointForks(provision(), (fixture, cut) -> { });
+    }
+
+    @Test
+    @Timeout(150)
+    @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.observation", matches = "true")
+    void observes_only_exact_owned_product_checkpoint_after_reconciliation_and_rejects_evidence_drift() throws Exception {
+        String readerRole = System.getProperty("tianji.postgres.checkpoint.observation.reader-role", "");
+        if (!readerRole.matches("tianji_it_checkpoint_observer_[a-z0-9_]{1,24}")) {
+            throw new IllegalArgumentException("checkpoint observation requires an exact disposable reader role");
+        }
+        var database = provision(readerRole);
+        var readSource = dataSource(database.setup().getUrl(), readerRole);
+        var readerJdbc = new JdbcTemplate(readSource);
+        assertCheckpointReaderPrivileges(readerJdbc);
+        var service = new AgentCheckpointObservationService(readSource);
+        verifyProductCheckpointForks(database, (fixture, cut) ->
+                fixture.assertCheckpointObservation(cut, service, readerJdbc, '"' + readerRole + '"'));
+    }
+
+    private static void verifyProductCheckpointForks(Database database, BiConsumer<RunFixture, ForkCut> afterReconcile)
+            throws Exception {
         var setupLedger = new AgentLedgerService(database.setup());
         String setupRole = database.observer().queryForObject("SELECT current_user", String.class);
         String runtimeRole = database.runtime().getUsername();
@@ -211,6 +236,7 @@ class AgentCheckpointCapturePostgresTest {
                     reapForkChild(replacement);
                 }
                 fixture.assertReconciled(cut);
+                afterReconcile.accept(fixture, cut);
             } finally {
                 Files.deleteIfExists(reconcileMarker);
                 Files.deleteIfExists(captureMarker);
@@ -395,7 +421,8 @@ class AgentCheckpointCapturePostgresTest {
         }
     }
 
-    private record ForkCut(String sha256, long epoch, long revision, long sequence, String leaseOwner) {
+    private record ForkCut(String sha256, long epoch, long revision, long sequence, String leaseOwner,
+                           long sessionEpoch, String sessionLeaseOwner) {
         @Override public String toString() { return "ForkCut[redacted]"; }
     }
 
@@ -410,13 +437,17 @@ class AgentCheckpointCapturePostgresTest {
     }
 
     private static Database provision() {
+        return provision(null);
+    }
+
+    private static Database provision(String readerRole) {
         String url = System.getProperty("tianji.postgres.checkpoint.capture.url", "");
         String role = System.getProperty("tianji.postgres.checkpoint.capture.runtime-role", "");
         String vectorVersion = System.getProperty("tianji.postgres.checkpoint.capture.vector.version", "");
         var match = URL.matcher(url);
         if (!Boolean.getBoolean("tianji.postgres.checkpoint.capture") || !match.matches()
                 || Integer.parseInt(match.group(1)) > 65_535 || !role.matches("tianji_it_checkpoint_[a-z0-9_]{1,32}")
-                || !vectorVersion.matches("[0-9]+\\.[0-9]+\\.[0-9]+")) {
+                || !vectorVersion.matches("[0-9]+\\.[0-9]+\\.[0-9]+") || role.equals(readerRole)) {
             throw new IllegalArgumentException("checkpoint probe requires explicit disposable loopback database, runtime role and vector patch");
         }
         var setup = dataSource(url, null);
@@ -432,12 +463,15 @@ class AgentCheckpointCapturePostgresTest {
                 SELECT e.extversion FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace
                 WHERE e.extname='vector' AND n.nspname='public'
                 """, String.class));
-        assertTrue(Boolean.TRUE.equals(observer.queryForObject("""
-                SELECT current_user<>? AND EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=?
-                    AND r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolbypassrls AND NOT r.rolcreatedb
-                    AND NOT r.rolcreaterole AND NOT r.rolreplication
-                    AND NOT EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member=r.oid))
-                """, Boolean.class, role, role)));
+        assertLimitedLogin(observer, role);
+        if (readerRole != null) {
+            assertLimitedLogin(observer, readerRole);
+            var reader = new JdbcTemplate(dataSource(url, readerRole));
+            assertTrue(Boolean.TRUE.equals(reader.queryForObject("""
+                    SELECT current_database()=? AND current_user=? AND inet_server_addr()=inet '127.0.0.1'
+                      AND NOT pg_is_in_recovery()
+                    """, Boolean.class, match.group(2), readerRole)));
+        }
 
         var previous = flyway(setup, "15");
         assertEquals(15, previous.migrate().migrationsExecuted);
@@ -472,10 +506,48 @@ class AgentCheckpointCapturePostgresTest {
                 GRANT INSERT, UPDATE ON tianji_agent.agent_budget_reservation,tianji_agent.agent_session_lease TO
                 """ + quotedRole);
         observer.execute("GRANT INSERT ON " + CHECKPOINT + " TO " + quotedRole);
+        if (readerRole != null) grantCheckpointReader(observer, readerRole);
         var runtime = dataSource(url, role);
         assertTrue(new JdbcTemplate(runtime).queryForObject("SELECT current_user=?", Boolean.class, role));
         assertDoesNotThrow(new AgentStorageVerifier(runtime)::verifyCheckpointCapture);
         return new Database(setup, runtime, observer, quotedRole);
+    }
+
+    private static void assertLimitedLogin(JdbcTemplate observer, String role) {
+        assertTrue(Boolean.TRUE.equals(observer.queryForObject("""
+                SELECT current_user<>? AND EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=?
+                    AND r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolbypassrls AND NOT r.rolcreatedb
+                    AND NOT r.rolcreaterole AND NOT r.rolreplication
+                    AND NOT EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member=r.oid))
+                """, Boolean.class, role, role)));
+    }
+
+    private static void grantCheckpointReader(JdbcTemplate observer, String readerRole) {
+        String quotedReader = '"' + readerRole + '"';
+        observer.execute("GRANT USAGE ON SCHEMA tianji_agent TO " + quotedReader);
+        observer.execute("""
+                GRANT SELECT ON tianji_agent.flyway_schema_history,tianji_agent.agent_definition_version,
+                  tianji_agent.agent_run,tianji_agent.agent_event,tianji_agent.agent_budget_reservation,
+                  tianji_agent.agent_session,tianji_agent.agent_session_event,tianji_agent.agent_session_scope_state,
+                  tianji_agent.agent_session_lease,tianji_agent.agent_checkpoint TO
+                """ + quotedReader);
+        observer.execute("GRANT SELECT (tenant_id,run_id) ON tianji_agent.agent_tool_invocation TO " + quotedReader);
+        observer.execute("GRANT SELECT (tenant_id,origin_run_id) ON tianji_agent.agent_tool_action_intent TO " + quotedReader);
+    }
+
+    private static void assertCheckpointReaderPrivileges(JdbcTemplate reader) {
+        assertTrue(Boolean.TRUE.equals(reader.queryForObject("""
+                SELECT NOT has_schema_privilege('tianji_agent','CREATE')
+                  AND NOT has_table_privilege('tianji_agent.agent_tool_invocation','SELECT')
+                  AND NOT has_table_privilege('tianji_agent.agent_tool_action_intent','SELECT')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+                      WHERE n.nspname='tianji_agent' AND c.relkind='r'
+                        AND (pg_has_role(c.relowner,'MEMBER')
+                             OR has_table_privilege(c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')
+                             OR has_any_column_privilege(c.oid,'INSERT,UPDATE,REFERENCES,SELECT WITH GRANT OPTION'))
+                  )
+                """, Boolean.class)));
     }
 
     private static DriverManagerDataSource dataSource(String url, String username) {
@@ -592,7 +664,8 @@ class AgentCheckpointCapturePostgresTest {
                     SELECT jsonb_build_array(to_jsonb(c)-'captured_at',extract(epoch FROM c.captured_at),
                              s.session_state,s.state_codec_version,s.revision,s.last_event_sequence,
                              to_jsonb(e),l.lease_epoch,l.lease_owner)::text AS cut,
-                           r.lease_epoch,r.revision,r.last_event_sequence,r.lease_owner
+                           r.lease_epoch,r.revision,r.last_event_sequence,r.lease_owner,
+                           l.lease_epoch AS session_lease_epoch,l.lease_owner AS session_lease_owner
                     FROM tianji_agent.agent_checkpoint c
                     JOIN tianji_agent.agent_run r ON
                       (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
@@ -610,7 +683,8 @@ class AgentCheckpointCapturePostgresTest {
                       AND c.app_name=? AND c.session_id=? AND c.checkpoint_no=1 AND c.attempt=1
                       AND c.native_event_id=e.native_event_id AND l.lease_owner IS NOT NULL
                     """, (row, index) -> new ForkCut(forkDigest(row.getString("cut")), row.getLong("lease_epoch"),
-                    row.getLong("revision"), row.getLong("last_event_sequence"), row.getString("lease_owner")),
+                    row.getLong("revision"), row.getLong("last_event_sequence"), row.getString("lease_owner"),
+                    row.getLong("session_lease_epoch"), row.getString("session_lease_owner")),
                     actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), APP, SESSION);
         }
 
@@ -678,6 +752,60 @@ class AgentCheckpointCapturePostgresTest {
             assertEquals(1, database.observer().queryForObject(
                     "SELECT count(*) FROM tianji_agent.agent_session_event " + SESSION_SCOPE, Integer.class, scope()));
             assertNoExecutionEvidence();
+        }
+
+        void assertCheckpointObservation(ForkCut cut, AgentCheckpointObservationService service,
+                                         JdbcTemplate reader, String quotedReader) {
+            assertNotNull(cut.sessionLeaseOwner());
+            assertEquals(1, database.observer().update("""
+                    UPDATE tianji_agent.agent_session_lease l SET lease_expires_at=clock_timestamp()-interval '1 second'
+                    FROM tianji_agent.agent_checkpoint c JOIN tianji_agent.agent_run r
+                      ON (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
+                         (c.tenant_id,c.run_id,c.subject_type,c.subject_issuer,c.subject_id,c.session_id)
+                    WHERE (l.tenant_id,l.subject_type,l.subject_issuer,l.subject_id,l.app_name,l.session_id)=
+                          (c.tenant_id,c.subject_type,c.subject_issuer,c.subject_id,c.app_name,c.session_id)
+                      AND c.tenant_id=? AND c.run_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
+                      AND c.app_name=? AND c.session_id=? AND c.attempt=1 AND c.checkpoint_no=1
+                      AND r.status='SUSPENDED' AND r.wait_reason='LEASE_EXPIRED' AND r.lease_epoch=? AND r.revision=?
+                      AND l.lease_epoch=c.session_lease_epoch AND l.lease_epoch=? AND l.lease_owner=?
+                      AND l.lease_expires_at IS NOT NULL
+                    """, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    APP, SESSION, cut.epoch() + 1, cut.revision() + 1, cut.sessionEpoch(), cut.sessionLeaseOwner()));
+            assertEquals(Observation.BOUNDARY_OBSERVED, service.observe(actor, query));
+
+            var otherOwner = TrustedAgentActor.verified(actor.tenantId(), TrustedAgentActor.SubjectType.USER,
+                    "checkpoint-other-owner", "https://checkpoint-fixture.example");
+            var hidden = assertThrows(AgentLedgerException.class, () -> service.observe(otherOwner, query));
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, hidden.code());
+
+            database.observer().execute("REVOKE SELECT (run_id) ON tianji_agent.agent_tool_invocation FROM " + quotedReader);
+            try {
+                assertEquals(Boolean.FALSE, reader.queryForObject("""
+                        SELECT has_column_privilege('tianji_agent.agent_tool_invocation','run_id','SELECT')
+                        """, Boolean.class));
+                assertEquals(Observation.TOOL_EVIDENCE_UNAVAILABLE, service.observe(actor, query));
+            } finally {
+                database.observer().execute("GRANT SELECT (run_id) ON tianji_agent.agent_tool_invocation TO " + quotedReader);
+            }
+            assertEquals(Observation.BOUNDARY_OBSERVED, service.observe(actor, query));
+
+            changeObservationSessionRevision(1, 2);
+            try {
+                assertEquals(Observation.NOT_AT_CAPTURE_FENCE, service.observe(actor, query));
+            } finally {
+                changeObservationSessionRevision(2, 1);
+            }
+            assertEquals(Observation.BOUNDARY_OBSERVED, service.observe(actor, query));
+            assertReconciled(cut);
+        }
+
+        private void changeObservationSessionRevision(long previous, long replacement) {
+            assertEquals(1, database.observer().update("""
+                    UPDATE tianji_agent.agent_session SET revision=?
+                    WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND app_name=? AND session_id=?
+                      AND revision=? AND last_event_sequence=1
+                    """, replacement, actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    APP, SESSION, previous));
         }
 
         void assertCommittedCut() {
