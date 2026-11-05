@@ -68,11 +68,12 @@ public class TianjiAgentRuntimeAutoConfiguration {
         boolean snapshots = environment.getProperty("stellar.tianji.agent.context.snapshots.enabled", Boolean.class, false);
         boolean trimming = environment.getProperty("stellar.tianji.agent.context.trimming.enabled", Boolean.class, false);
         var contextOptions = new AgentContextRuntimeOptions(snapshots, trimming);
-        if (!snapshots) new AgentStorageVerifier(dataSource).verify();
+        boolean checkpointCapture = environment.getProperty("stellar.tianji.agent.recovery.checkpoint-capture.enabled", Boolean.class, false);
+        if (!snapshots && !checkpointCapture) new AgentStorageVerifier(dataSource).verify();
         boolean typedWrites = environment.getProperty("stellar.tianji.agent.runtime.typed-session-writes", Boolean.class, false);
-        return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
+        return AdkAgentRunExecutor.forRuntime(ledger, flowFactory, flowValidator, chatModels, factories, control, estimator,
                 dataSource, typedWrites, authorizer, contexts.getIfAvailable(DefaultContextAssembler::new), contextOptions,
-                governedProcessToolsEnabled ? governedProcessTools::getObject : readOnlyTools ? tools::getObject : null);
+                governedProcessToolsEnabled ? governedProcessTools::getObject : readOnlyTools ? tools::getObject : null, checkpointCapture);
     }
 
     @Bean(destroyMethod = "close")

@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk.session;
 
 import com.google.adk.events.Event;
+import com.google.adk.events.EventActions;
 import com.google.adk.sessions.BaseSessionService;
 import com.google.adk.sessions.GetSessionConfig;
 import com.google.adk.sessions.ListEventsResponse;
@@ -9,6 +10,8 @@ import com.google.adk.sessions.Session;
 import com.google.adk.sessions.SessionException;
 import com.google.adk.sessions.SessionNotFoundException;
 import com.google.adk.sessions.State;
+import com.google.genai.types.Content;
+import com.google.genai.types.Part;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
@@ -17,9 +20,12 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 
 import javax.sql.DataSource;
 import java.time.Duration;
@@ -30,6 +36,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.WeakHashMap;
@@ -38,6 +45,7 @@ import java.util.function.Function;
 
 /** ADK's native session SPI, bound to an authenticated tenant/subject by trusted host code. */
 public final class PostgresAdkSessionService implements BaseSessionService {
+    private static final EventActions EMPTY_EVENT_ACTIONS = EventActions.builder().build();
     private static final int MAX_SESSIONS = 500;
     private static final int MAX_EVENTS = 1_000;
     private static final long MAX_HISTORY_BYTES = 8L * 1_048_576;
@@ -56,6 +64,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     private final AdkSessionStateCodec stateCodec;
     private final Map<Session, Long> revisions;
     private final SessionLease lease;
+    private final FirstInputCheckpointBO firstInputCheckpoint;
 
     /** App-wide state writes are disabled unless the trusted host explicitly enables them. */
     public PostgresAdkSessionService(DataSource dataSource, TrustedAgentActor actor, String appName) {
@@ -84,9 +93,11 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         this.stateCodec = new AdkSessionStateCodec(typedWrites);
         this.revisions = Collections.synchronizedMap(new WeakHashMap<>());
         this.lease = null;
+        this.firstInputCheckpoint = null;
     }
 
-    private PostgresAdkSessionService(PostgresAdkSessionService source, SessionLease lease) {
+    private PostgresAdkSessionService(PostgresAdkSessionService source, SessionLease lease,
+                                      FirstInputCheckpointBO firstInputCheckpoint) {
         this.actor = source.actor;
         this.appName = source.appName;
         this.userId = source.userId;
@@ -98,6 +109,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         this.stateCodec = source.stateCodec;
         this.revisions = source.revisions;
         this.lease = lease;
+        this.firstInputCheckpoint = firstInputCheckpoint;
     }
 
     /** The ADK user identifier is a local namespace; the database additionally binds tenant and principal type. */
@@ -152,7 +164,16 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     /** Returns a run-bound adapter; every durable append checks both database leases. */
     public PostgresAdkSessionService withLease(SessionLease existing) {
         requireLeaseScope(existing);
-        return new PostgresAdkSessionService(this, existing);
+        return new PostgresAdkSessionService(this, existing, null);
+    }
+
+    public PostgresAdkSessionService withLease(SessionLease existing, FirstInputCheckpointBO checkpoint) {
+        requireLeaseScope(existing);
+        Objects.requireNonNull(checkpoint, "checkpoint");
+        if (!actor.equals(checkpoint.request().actor()) || !"tianji".equals(appName)
+                || !existing.sessionId.equals(checkpoint.claimed().sessionId())
+                || !existing.runLease.runId().equals(checkpoint.request().runId())) throw invalid();
+        return new PostgresAdkSessionService(this, existing, checkpoint);
     }
 
     @Override
@@ -254,7 +275,9 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             synchronized (session) {
                 Long revision = revisions.get(session);
                 if (revision == null) throw revisionConflict();
-                AppendResult result = write.execute(status -> append(id, revision, durable, payload));
+                boolean emptyLoadedSession = firstInputCheckpoint != null && session.state().isEmpty()
+                        && session.immutableEvents().isEmpty();
+                AppendResult result = write.execute(status -> append(id, revision, event, durable, payload, emptyLoadedSession));
                 if (result.applyToSession()) {
                     BaseSessionService.super.appendEvent(session, durable).blockingGet();
                 }
@@ -265,7 +288,8 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         });
     }
 
-    private AppendResult append(String id, long expectedRevision, Event event, String payload) {
+    private AppendResult append(String id, long expectedRevision, Event original, Event event, String payload,
+                                boolean emptyLoadedSession) {
         requireRunFence(id, lease.runLease);
         JdbcAdkSessionRepository.SessionRow row = repository.session(id, true).orElseThrow(PostgresAdkSessionService::notFound);
         requireSessionFence(id, lease);
@@ -283,6 +307,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         }
         if (row.revision() != expectedRevision || row.lastEventSequence() == Long.MAX_VALUE) throw revisionConflict();
         Map<String, Object> local = localState(row);
+        boolean capture = firstInputCheckpoint != null && canCaptureFirstInput(row, local, emptyLoadedSession, original, event);
         Map<String, Object> delta = event.actions().stateDelta();
         applyLocalState(local, delta);
         applyScopedState(delta);
@@ -290,8 +315,34 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         repository.insertEvent(id, sequence, event.id(), event.timestamp(), payload);
         JdbcAdkSessionRepository.SessionRow updated = repository.updateSession(id, row.revision(), sequence,
                 stateCodec.encode(local), stateCodec.writeVersion());
+        if (capture) repository.insertFirstInputCheckpoint(firstInputCheckpoint, lease.runLease, lease.epoch, row, updated, event);
         requireLiveFences(id, lease);
         return new AppendResult(updated, true);
+    }
+
+    private boolean canCaptureFirstInput(JdbcAdkSessionRepository.SessionRow row, Map<String, Object> local,
+                                         boolean emptyLoadedSession, Event event, Event durable) {
+        if (!emptyLoadedSession || row.revision() != 0 || row.lastEventSequence() != 0 || !local.isEmpty()
+                || !matchesFirstInput(event, firstInputCheckpoint.userInput())
+                || !matchesFirstInput(durable, firstInputCheckpoint.userInput())
+                || !repository.tryLockScopeForCheckpoint()) return false;
+        var bounds = repository.scopeBounds();
+        return bounds.appCount() == 0 && bounds.userCount() == 0;
+    }
+
+    static boolean matchesFirstInput(Event event, Content input) {
+        return "user".equals(event.author()) && checkpointId(event.id()) && checkpointId(event.invocationId())
+                && event.timestamp() > 0 && event.content().filter(input::equals).isPresent()
+                && EMPTY_EVENT_ACTIONS.equals(event.actions()) && event.branch().isEmpty()
+                && !event.partial().orElse(false) && !event.turnComplete().orElse(false)
+                && !event.interrupted().orElse(false) && event.errorCode().isEmpty() && event.errorMessage().isEmpty()
+                && event.finishReason().isEmpty() && event.usageMetadata().isEmpty() && event.output().isEmpty()
+                && event.longRunningToolIds().orElse(Set.of()).isEmpty();
+    }
+
+    private static boolean checkpointId(String id) {
+        return id != null && !id.isBlank() && id.length() <= 128
+                && id.chars().allMatch(value -> value >= 33 && value <= 126);
     }
 
     private <T> T readableSession(String id, Function<JdbcAdkSessionRepository.SessionRow, T> reader) {
@@ -486,6 +537,31 @@ public final class PostgresAdkSessionService implements BaseSessionService {
 
     private record SessionView(Session session, long revision) { }
     private record AppendResult(JdbcAdkSessionRepository.SessionRow row, boolean applyToSession) { }
+
+    /** Immutable in-process evidence from the claimed Run, with transient input confined to the native Session adapter. */
+    public record FirstInputCheckpointBO(AgentRunAuthorization.Request request, AgentRunDTO claimed,
+                                         Content userInput, String engineVersion) {
+        public FirstInputCheckpointBO {
+            Objects.requireNonNull(request, "request");
+            Objects.requireNonNull(claimed, "claimed");
+            Objects.requireNonNull(userInput, "userInput");
+            var parts = userInput.parts().orElse(List.of());
+            if (!request.sessionRequired() || request.actor().subjectType() != TrustedAgentActor.SubjectType.USER
+                    || "LEGACY".equals(request.actor().issuerFingerprint())
+                    || !request.runId().equals(claimed.runId()) || claimed.sessionId() == null
+                    || claimed.status() != AgentRunStatusEnum.RUNNING || claimed.attempt() != 1
+                    || claimed.revision() <= 0 || claimed.lastEventSequence() <= 0 || !"1.13.0".equals(engineVersion)
+                    || parts.size() != 1 || parts.getFirst().text().filter(text -> !text.isBlank()).isEmpty()
+                    || !userInput.equals(Content.fromParts(Part.fromText(parts.getFirst().text().orElseThrow())))) {
+                throw invalid();
+            }
+        }
+
+        @Override
+        public String toString() {
+            return "FirstInputCheckpointBO[redacted]";
+        }
+    }
 
     /** Opaque capability; the owner token is never exposed or logged. */
     public static final class SessionLease {

@@ -50,6 +50,9 @@ stellar:
       storage:
         model-usage-enabled: false
         model-usage-cumulative-route-refs: []
+      recovery:
+        checkpoint-capture:
+          enabled: false
       recovery-diagnostics:
         enabled: false
       native-templates:

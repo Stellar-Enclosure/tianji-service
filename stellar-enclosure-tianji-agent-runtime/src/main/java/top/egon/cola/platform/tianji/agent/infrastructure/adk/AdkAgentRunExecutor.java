@@ -38,8 +38,10 @@ import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService.FirstInputCheckpointBO;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService.SessionLease;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
@@ -48,12 +50,15 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
 import javax.sql.DataSource;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -80,6 +85,7 @@ public final class AdkAgentRunExecutor {
     private final AgentRunAuthorization authorizer;
     private final DataSource sessionDataSource;
     private final boolean typedSessionWrites;
+    private final String checkpointEngineVersion;
     private final DefaultContextAssembler contextAssembler;
     private final AgentContextRuntimeOptions contextOptions;
     private final Supplier<? extends AdkGovernedToolBridge> governedToolSupplier;
@@ -162,6 +168,30 @@ public final class AdkAgentRunExecutor {
                                DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
                                DefaultContextAssembler contextAssembler, AgentContextRuntimeOptions contextOptions,
                                Supplier<? extends AdkGovernedToolBridge> governedTools) {
+        this(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories, controlExecutor, budgetEstimator,
+                sessionDataSource, typedSessionWrites, authorizer, contextAssembler, contextOptions, governedTools, false);
+    }
+
+    /** Trusted runtime assembly keeps the existing constructor contracts and disabled defaults. */
+    public static AdkAgentRunExecutor forRuntime(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+            AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+            Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+            ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+            DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
+            DefaultContextAssembler contextAssembler, AgentContextRuntimeOptions contextOptions,
+            Supplier<? extends AdkGovernedToolBridge> governedTools, boolean checkpointCaptureEnabled) {
+        return new AdkAgentRunExecutor(ledger, flowFactory, flowValidator, chatModels, codeFirstFactories,
+                controlExecutor, budgetEstimator, sessionDataSource, typedSessionWrites, authorizer, contextAssembler,
+                contextOptions, governedTools, checkpointCaptureEnabled);
+    }
+
+    private AdkAgentRunExecutor(AgentLedgerService ledger, AgentFlowFactory flowFactory,
+                               AgentFlowConfigValidator flowValidator, Map<String, ChatModel> chatModels,
+                               Map<String, Function<Scheduler, ? extends BaseAgent>> codeFirstFactories,
+                               ScheduledExecutorService controlExecutor, AgentModelBudgetEstimator budgetEstimator,
+                               DataSource sessionDataSource, boolean typedSessionWrites, AgentRunAuthorization authorizer,
+                               DefaultContextAssembler contextAssembler, AgentContextRuntimeOptions contextOptions,
+                               Supplier<? extends AdkGovernedToolBridge> governedTools, boolean checkpointCaptureEnabled) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.flowFactory = Objects.requireNonNull(flowFactory, "flowFactory");
         this.flowValidator = Objects.requireNonNull(flowValidator, "flowValidator");
@@ -178,6 +208,13 @@ public final class AdkAgentRunExecutor {
         }
         this.sessionDataSource = sessionDataSource;
         this.typedSessionWrites = typedSessionWrites;
+        if (checkpointCaptureEnabled) {
+            if (sessionDataSource == null) throw new IllegalArgumentException("Checkpoint capture requires durable Agent storage");
+            checkpointEngineVersion = checkpointEngineVersion();
+            new AgentStorageVerifier(sessionDataSource).verifyCheckpointCapture();
+        } else {
+            checkpointEngineVersion = null;
+        }
         if (contextOptions.snapshots()) ledger.verifyContextSnapshotStorage();
     }
 
@@ -298,6 +335,7 @@ public final class AdkAgentRunExecutor {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
             var input = contextAssembler.assemble(snapshot.input());
+            Content userInput = Content.fromParts(input.parts().stream().map(Part::fromText).toArray(Part[]::new));
             var dependencies = snapshot.definition().dependencies();
             NativeAgentCompilerStrategy nativeCompiler = nativeSelected
                     ? (NativeAgentCompilerStrategy) codeFirstFactories.get(snapshot.definition().codeRef()) : null;
@@ -333,7 +371,9 @@ public final class AdkAgentRunExecutor {
             } else {
                 sessions = new PostgresAdkSessionService(sessionDataSource, actor, "tianji", false, typedSessionWrites);
                 sessionLease = sessions.acquireSessionLease(running.sessionId(), lease, LEASE_DURATION);
-                runner = new AgentFlowSessionRunner(root, "tianji", sessions.withLease(sessionLease), List.of(budget));
+                var checkpoint = firstInputCheckpoint(material, running, root, userInput);
+                var boundSessions = checkpoint == null ? sessions.withLease(sessionLease) : sessions.withLease(sessionLease, checkpoint);
+                runner = new AgentFlowSessionRunner(root, "tianji", boundSessions, List.of(budget));
                 userId = sessions.adkUserId();
                 sessionId = running.sessionId();
             }
@@ -369,7 +409,7 @@ public final class AdkAgentRunExecutor {
             collectAgentNames(root, agentNames);
             NativeAgentGate activeNativeGate = nativeGate;
             invocationStarted = true;
-            runner.runAsync(userId, sessionId, Content.fromParts(input.parts().stream().map(Part::fromText).toArray(Part[]::new)), config)
+            runner.runAsync(userId, sessionId, userInput, config)
                     .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout(),
                             activeNativeGate == null ? Flowable.never() : activeNativeGate.failureSignal()))
                     .blockingForEach(event -> {
@@ -577,6 +617,54 @@ public final class AdkAgentRunExecutor {
         if (model.getOptions() instanceof ToolCallingChatOptions options && options.getToolCallbacks() != null
                 && !options.getToolCallbacks().isEmpty()) throw unsupportedAgentCallbacks();
         return spec;
+    }
+
+    private FirstInputCheckpointBO firstInputCheckpoint(AgentLedgerService.ExecutionMaterial material,
+                                                            AgentRunDTO running, BaseAgent root, Content userInput) {
+        if (checkpointEngineVersion == null || running.attempt() != 1 || contextAssembler.hasProviders()
+                || contextOptions.snapshots() || contextOptions.trimming()) return null;
+        var request = material.authorization();
+        var snapshot = material.snapshot();
+        var definition = snapshot.definition();
+        var dependencies = definition.dependencies();
+        var policy = snapshot.effectivePolicy();
+        if (request.actor().subjectType() != TrustedAgentActor.SubjectType.USER
+                || "LEGACY".equals(request.actor().issuerFingerprint()) || !request.sessionRequired()
+                || !"CONFIG".equals(definition.executionMode()) || !(root instanceof LlmAgent agent)
+                || !agent.subAgents().isEmpty() || agent.outputKey().isPresent()
+                || !dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty() || !dependencies.tools().isEmpty()
+                || policy.maxToolCalls() != 0 || !policy.allowedToolVersions().isEmpty()
+                || snapshot.processLink() != null || !snapshot.input().artifactRefs().isEmpty()
+                || !snapshot.input().taskData().isEmpty() || snapshot.input().text() == null
+                || snapshot.input().text().isBlank()) return null;
+        return new FirstInputCheckpointBO(request, running, userInput, checkpointEngineVersion);
+    }
+
+    private static String checkpointEngineVersion() {
+        try {
+            var resources = Runner.class.getClassLoader().getResources("META-INF/maven/com.google.adk/google-adk/pom.properties");
+            if (!resources.hasMoreElements()) throw checkpointEngineUnavailable();
+            var resource = resources.nextElement();
+            if (resources.hasMoreElements()) throw checkpointEngineUnavailable();
+            var properties = new Properties();
+            try (var stream = resource.openStream()) {
+                byte[] bytes = stream.readNBytes(4097);
+                if (bytes.length > 4096) throw checkpointEngineUnavailable();
+                properties.load(new ByteArrayInputStream(bytes));
+            }
+            String version = properties.getProperty("version");
+            if (!"com.google.adk".equals(properties.getProperty("groupId"))
+                    || !"google-adk".equals(properties.getProperty("artifactId")) || !"1.13.0".equals(version)) {
+                throw checkpointEngineUnavailable();
+            }
+            return version;
+        } catch (IOException | IllegalArgumentException failure) {
+            throw checkpointEngineUnavailable();
+        }
+    }
+
+    private static IllegalStateException checkpointEngineUnavailable() {
+        return new IllegalStateException("TIANJI_AGENT_CHECKPOINT_ENGINE_UNAVAILABLE");
     }
 
     private BaseAgent buildRoot(AgentDefinitionSpecDTO definition, List<BaseTool> tools) {

@@ -1,8 +1,13 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk.session;
 
+import com.google.adk.events.Event;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService.FirstInputCheckpointBO;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -228,7 +233,59 @@ final class JdbcAdkSessionRepository {
 
     void lockScope() {
         jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { },
-                "tianji:adk-session-scope:" + actor.tenantId() + ":" + app);
+                scopeLockKey());
+    }
+
+    boolean tryLockScopeForCheckpoint() {
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended(?, 0))", Boolean.class, scopeLockKey()));
+    }
+
+    private String scopeLockKey() {
+        return "tianji:adk-session-scope:" + actor.tenantId() + ":" + app;
+    }
+
+    void insertFirstInputCheckpoint(FirstInputCheckpointBO checkpoint, AgentRunLease run, long sessionEpoch,
+                                    SessionRow before, SessionRow after, Event event) {
+        var request = checkpoint.request();
+        var claimed = checkpoint.claimed();
+        try {
+            int inserted = jdbc.update("""
+                    INSERT INTO tianji_agent.agent_checkpoint
+                        (tenant_id, run_id, attempt, checkpoint_no, subject_type, subject_issuer, subject_id, app_name, session_id,
+                         run_lease_epoch, run_revision, run_event_sequence, session_lease_epoch, prior_session_revision,
+                         session_revision, prior_session_event_sequence, session_event_sequence, native_invocation_id,
+                         native_event_id, definition_key, definition_version, definition_sha256, request_sha256,
+                         snapshot_sha256, policy_version_ref, engine_version, safe_boundary, tool_receipts, captured_at)
+                    SELECT r.tenant_id,r.run_id,r.attempt,1,r.subject_type,r.subject_issuer,r.subject_id,?,r.session_id,
+                           r.lease_epoch,r.revision,r.last_event_sequence,?,?,?,?,?,?,?,r.definition_key,r.definition_version,
+                           d.content_sha256,r.request_hash,?,?,?,'FIRST_DURABLE_INPUT_V1','[]'::jsonb,clock_timestamp()
+                    FROM tianji_agent.agent_run r
+                    JOIN tianji_agent.agent_definition_version d
+                      ON d.tenant_id=r.tenant_id AND d.definition_key=r.definition_key AND d.version=r.definition_version
+                    WHERE r.tenant_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id COLLATE "C"=?
+                      AND r.run_id COLLATE "C"=? AND r.session_id COLLATE "C"=? AND r.lease_owner COLLATE "C"=?
+                      AND r.lease_epoch=? AND r.revision=? AND r.last_event_sequence=? AND r.attempt=1
+                      AND r.definition_key COLLATE "C"=? AND r.definition_version=? AND r.request_hash=? AND d.content_sha256=?
+                      AND r.status='RUNNING' AND r.cancel_requested_at IS NULL
+                      AND r.model_calls_reserved=0 AND r.tool_calls_reserved=0
+                      AND NOT EXISTS (SELECT 1 FROM tianji_agent.agent_budget_reservation b
+                                      WHERE b.tenant_id=r.tenant_id AND b.run_id=r.run_id)
+                    """, app, sessionEpoch, before.revision(), after.revision(), before.lastEventSequence(),
+                    after.lastEventSequence(), event.invocationId(), event.id(), request.snapshotSha256(),
+                    request.policyVersionRef(), checkpoint.engineVersion(), actor.tenantId(), type(),
+                    actor.issuerFingerprint(), actor.subjectId(), run.runId(), claimed.sessionId(), run.owner(),
+                    run.epoch(), claimed.revision(), claimed.lastEventSequence(), request.definitionKey(),
+                    request.definitionVersion(), request.requestSha256(), request.definitionSha256());
+            if (inserted != 1) throw checkpointUnavailable();
+        } catch (DataAccessException failure) {
+            throw checkpointUnavailable();
+        }
+    }
+
+    private static AgentLedgerException checkpointUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Agent checkpoint capture is unavailable");
     }
 
     ScopeBounds scopeBounds() {
