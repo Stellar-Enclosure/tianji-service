@@ -74,6 +74,7 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessConflictExcepti
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.compensation.WorkerCompensationFlowableScenarios;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
@@ -630,6 +631,9 @@ class ProcessServerPostgresTest {
                     .processInstanceId(processId).finished().singleResult());
             verifyNativeWorkerReset(app, workerProbe);
             verifyWorkerAdapter(app, jdbc);
+            if (System.getProperty("tianji.worker.business.postgres.test.url") != null) {
+                WorkerCompensationFlowableScenarios.verifyIfConfigured(app, jdbc, runtimeUser);
+            }
             verifyAgentDispatchAdapter(app, jdbc);
             verifyAgentInboxApplication(app, jdbc);
             HumanTaskFlowableScenarios.verify(app, jdbc);
