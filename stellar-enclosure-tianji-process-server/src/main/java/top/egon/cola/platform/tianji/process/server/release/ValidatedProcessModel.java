@@ -27,6 +27,7 @@ public final class ValidatedProcessModel {
     private final Map<String, CaseSource> caseSources;
     private final Map<String, Duration> timerWaits;
     private final Map<String, WorkerBusinessError> workerBusinessErrors;
+    private final Map<String, WorkerCompensationVO> workerCompensations;
 
     ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
                           Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds) {
@@ -79,6 +80,17 @@ public final class ValidatedProcessModel {
                           Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks,
                           Map<String, HumanTaskTimer> humanTaskTimers, Map<String, CaseSource> caseSources,
                           Map<String, Duration> timerWaits, Map<String, WorkerBusinessError> workerBusinessErrors) {
+        this(type, definitionKey, xml, inputs, outputs, ruleIds, decisionTasks, routeConditions, workerTasks,
+                messageWaits, humanTasks, humanTaskTimers, caseSources, timerWaits, workerBusinessErrors, Map.of());
+    }
+
+    ValidatedProcessModel(Type type, String definitionKey, byte[] xml,
+                          Map<String, ValueType> inputs, Map<String, ValueType> outputs, List<String> ruleIds,
+                          Map<String, String> decisionTasks, List<RouteCondition> routeConditions,
+                          Map<String, WorkerTask> workerTasks, Map<String, MessageWait> messageWaits, Map<String, HumanTask> humanTasks,
+                          Map<String, HumanTaskTimer> humanTaskTimers, Map<String, CaseSource> caseSources,
+                          Map<String, Duration> timerWaits, Map<String, WorkerBusinessError> workerBusinessErrors,
+                          Map<String, WorkerCompensationVO> workerCompensations) {
         this.type = type;
         this.definitionKey = definitionKey;
         this.xml = xml.clone();
@@ -94,6 +106,7 @@ public final class ValidatedProcessModel {
         this.caseSources = Map.copyOf(caseSources);
         this.timerWaits = Map.copyOf(timerWaits);
         this.workerBusinessErrors = Map.copyOf(workerBusinessErrors);
+        this.workerCompensations = Map.copyOf(workerCompensations);
     }
 
     public Type type() { return type; }
@@ -111,12 +124,17 @@ public final class ValidatedProcessModel {
     public Map<String, CaseSource> caseSources() { return caseSources; }
     public Map<String, Duration> timerWaits() { return timerWaits; }
     public Map<String, WorkerBusinessError> workerBusinessErrors() { return workerBusinessErrors; }
+    public Map<String, WorkerCompensationVO> workerCompensations() { return workerCompensations; }
 
     /** Released graph-derived metadata. Constructing it grants neither source identity nor native execution authority. */
     public record CaseSource(String caseDefinitionKey, String messageElementId, String messageName, String timerElementId, Duration timeout) { }
 
     /** Released model metadata fixes the only native BPMN Error route for one ordinary Worker. */
     public record WorkerBusinessError(String errorId, String errorCode, String boundaryEventId, String targetElementId) { }
+
+    /** Released graph metadata; construction grants no source, task or execution authority. */
+    public record WorkerCompensationVO(String originalWorkerId, String boundaryEventId, String associationId,
+                                       String compensationWorkerId, String throwEventId, String endEventId) { }
 
     public record HumanTaskField(String name, String target, ValueType type) { }
     public record HumanTaskTimer(String taskElementId, Duration duration) { }

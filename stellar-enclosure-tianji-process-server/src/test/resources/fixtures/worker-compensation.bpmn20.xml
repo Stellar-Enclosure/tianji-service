@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn"
+             xmlns:tianji="urn:stellar-enclosure:tianji:worker:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <error id="downstreamError" errorCode="RESERVATION_REJECTED"/>
+    <process id="workerCompensation" isExecutable="true">
+        <startEvent id="start"/>
+        <sequenceFlow id="toReserve" sourceRef="start" targetRef="reserve"/>
+        <serviceTask id="reserve" flowable:type="external-worker" flowable:topic="reserveBusiness:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="reserveBusiness"
+                     tianji:schemaVersion="1" tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <boundaryEvent id="reserveCompBoundary" attachedToRef="reserve" cancelActivity="false">
+            <compensateEventDefinition/>
+        </boundaryEvent>
+        <sequenceFlow id="reserveNormal" sourceRef="reserve" targetRef="downstream"/>
+        <serviceTask id="downstream" flowable:type="external-worker" flowable:topic="downstreamRejectable:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="downstreamRejectable"
+                     tianji:schemaVersion="1" tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <sequenceFlow id="downstreamNormal" sourceRef="downstream" targetRef="normalEnd"/>
+        <endEvent id="normalEnd"/>
+        <boundaryEvent id="downstreamRejected" attachedToRef="downstream" cancelActivity="true">
+            <errorEventDefinition errorRef="downstreamError"/>
+        </boundaryEvent>
+        <sequenceFlow id="toThrowUndo" sourceRef="downstreamRejected" targetRef="throwUndo"/>
+        <intermediateThrowEvent id="throwUndo">
+            <compensateEventDefinition activityRef="reserve" waitForCompletion="true"/>
+        </intermediateThrowEvent>
+        <sequenceFlow id="toCompEnd" sourceRef="throwUndo" targetRef="compEnd"/>
+        <endEvent id="compEnd"/>
+        <serviceTask id="undoReserve" isForCompensation="true" flowable:type="external-worker"
+                     flowable:topic="undoReservation:1" flowable:doNotIncludeVariables="true"
+                     tianji:topic="undoReservation" tianji:schemaVersion="1"
+                     tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <association id="reserveCompAssociation" sourceRef="reserveCompBoundary"
+                     targetRef="undoReserve" associationDirection="One"/>
+    </process>
+</definitions>

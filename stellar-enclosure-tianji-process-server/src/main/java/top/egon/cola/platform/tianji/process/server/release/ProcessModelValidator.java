@@ -15,6 +15,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskField;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.HumanTaskKind;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerBusinessError;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerCompensationVO;
 
 import javax.xml.XMLConstants;
 import java.time.Duration;
@@ -47,9 +48,11 @@ public final class ProcessModelValidator {
             + "|" + INTEGER + "|true|false)\\}");
     private static final Map<String, Set<String>> BPMN_CHILDREN = Map.ofEntries(
             Map.entry("definitions", Set.of("process", "message", "error")),
-            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent", "boundaryEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow")),
+            Map.entry("process", Set.of("startEvent", "endEvent", "userTask", "serviceTask", "intermediateCatchEvent",
+                    "intermediateThrowEvent", "boundaryEvent", "parallelGateway", "exclusiveGateway", "eventBasedGateway", "sequenceFlow", "association")),
             Map.entry("intermediateCatchEvent", Set.of("timerEventDefinition", "messageEventDefinition")),
-            Map.entry("boundaryEvent", Set.of("timerEventDefinition", "errorEventDefinition")),
+            Map.entry("intermediateThrowEvent", Set.of("compensateEventDefinition")),
+            Map.entry("boundaryEvent", Set.of("timerEventDefinition", "errorEventDefinition", "compensateEventDefinition")),
             Map.entry("timerEventDefinition", Set.of("timeDuration")),
             Map.entry("error", Set.of()), Map.entry("errorEventDefinition", Set.of()),
             Map.entry("serviceTask", Set.of("extensionElements")),
@@ -65,15 +68,18 @@ public final class ProcessModelValidator {
             Map.entry("userTask", Set.of("id", "name")), Map.entry("parallelGateway", Set.of("id", "name")),
             Map.entry("boundaryEvent", Set.of("id", "name", "attachedToRef", "cancelActivity")),
             Map.entry("eventBasedGateway", Set.of("id", "name")),
-            Map.entry("serviceTask", Set.of("id", "name")), Map.entry("extensionElements", Set.of()),
+            Map.entry("serviceTask", Set.of("id", "name", "isForCompensation")), Map.entry("extensionElements", Set.of()),
             Map.entry("field", Set.of("name")), Map.entry("string", Set.of()),
             Map.entry("externalWorkerInParameter", Set.of("source", "target")),
             Map.entry("externalWorkerOutParameter", Set.of("source", "target")),
             Map.entry("taskLane", Set.of("key", "roleIds")), Map.entry("taskField", Set.of("name", "target", "type")),
             Map.entry("exclusiveGateway", Set.of("id", "name", "default")), Map.entry("conditionExpression", Set.of()),
             Map.entry("intermediateCatchEvent", Set.of("id", "name")),
+            Map.entry("intermediateThrowEvent", Set.of("id")),
+            Map.entry("compensateEventDefinition", Set.of("activityRef", "waitForCompletion")),
             Map.entry("timerEventDefinition", Set.of("id")), Map.entry("timeDuration", Set.of("id")),
-            Map.entry("sequenceFlow", Set.of("id", "name", "sourceRef", "targetRef")));
+            Map.entry("sequenceFlow", Set.of("id", "name", "sourceRef", "targetRef")),
+            Map.entry("association", Set.of("id", "sourceRef", "targetRef", "associationDirection")));
     private static final Map<String, Set<String>> DMN_CHILDREN = Map.ofEntries(
             Map.entry("definitions", Set.of("decision")), Map.entry("decision", Set.of("decisionTable")),
             Map.entry("decisionTable", Set.of("input", "output", "rule")),
@@ -124,18 +130,30 @@ public final class ProcessModelValidator {
         Map<String, ValidatedProcessModel.HumanTaskTimer> humanTimers = new LinkedHashMap<>();
         Map<String, String> errorBoundaryRefs = new LinkedHashMap<>();
         Map<String, String> errorBoundaryAttachments = new LinkedHashMap<>();
+        Map<String, String> compensationBoundaryAttachments = new LinkedHashMap<>();
+        List<Element> associations = new ArrayList<>();
+        List<String> compensationWorkerIds = new ArrayList<>();
+        List<String> compensationThrowIds = new ArrayList<>();
         for (Element element : children(process)) {
             String kind = element.getLocalName();
             if ("sequenceFlow".equals(kind)) {
                 required(element, "id");
                 flows.add(element);
+            } else if ("association".equals(kind)) {
+                required(element, "id");
+                associations.add(element);
             } else {
                 String id = required(element, "id");
                 nodes.put(id, new FlowNode(kind, element));
+                if ("intermediateThrowEvent".equals(kind)) compensationThrowIds.add(id);
                 if ("userTask".equals(kind) && (element.hasAttributeNS(TIANJI_TASK, "kind") || element.hasAttributeNS(TIANJI_TASK, "initialLane")
                         || element.hasAttributeNS(TIANJI_TASK, "laneVariable") || element.hasAttributeNS(TIANJI_TASK, "approvalVariable") || !children(element).isEmpty())) humans.put(id, humanTask(element));
                 if ("serviceTask".equals(kind)) {
                     String taskType = element.getAttributeNS(FLOWABLE, "type");
+                    if (element.hasAttribute("isForCompensation")) {
+                        if (!"external-worker".equals(taskType) || !"true".equals(element.getAttribute("isForCompensation"))) throw invalid();
+                        compensationWorkerIds.add(id);
+                    }
                     if ("case".equals(taskType)) {
                         String caseKey = element.getAttributeNS(FLOWABLE, "caseDefinitionKey");
                         if (!IDENTIFIER.matcher(caseKey).matches() || !children(element).isEmpty()
@@ -179,8 +197,17 @@ public final class ProcessModelValidator {
                     }
                 }
                 if ("boundaryEvent".equals(kind)) {
-                    if (!"true".equals(element.getAttribute("cancelActivity")) || children(element).size() != 1) throw invalid();
+                    List<Element> definitions = children(element);
+                    if (definitions.size() != 1) throw invalid();
+                    Element definition = definitions.getFirst();
                     String attached = required(element, "attachedToRef");
+                    if ("compensateEventDefinition".equals(definition.getLocalName())) {
+                        if (!"false".equals(element.getAttribute("cancelActivity"))
+                                || definition.hasAttribute("activityRef") || definition.hasAttribute("waitForCompletion")) throw invalid();
+                        compensationBoundaryAttachments.put(id, attached);
+                        continue;
+                    }
+                    if (!"true".equals(element.getAttribute("cancelActivity"))) throw invalid();
                     if (!children(element, "timerEventDefinition").isEmpty()) {
                         var literal = only(only(element, "timerEventDefinition"), "timeDuration"); var duration = timerDuration(literal);
                         if (duration.getNano() != 0 || !duration.toString().equals(literal.getTextContent())) throw invalid();
@@ -203,15 +230,24 @@ public final class ProcessModelValidator {
             from.next.add(to);
             from.flows.add(flow);
             to.previous.add(from);
+            to.incomingEdges.add(new IncomingEdge(from, required(flow, "id")));
             to.incoming++;
         }
         if (decisions.size() > 1 || workers.size() > 16 || caseKeys.size() > 16 || humans.size() > 16 || humans.values().stream().anyMatch(task -> task.laneVariable() != null) && decisions.size() != 1
                 || (!decisions.isEmpty() || !workers.isEmpty()) && nodes.values().stream().anyMatch(n -> "parallelGateway".equals(n.kind))
                 || decisions.isEmpty() && messageRefs.isEmpty() && humans.isEmpty() && nodes.values().stream().anyMatch(n -> "exclusiveGateway".equals(n.kind))) throw invalid();
+        CompensationProfile profile = compensationProfile(nodes, workers, associations, compensationBoundaryAttachments,
+                compensationWorkerIds, compensationThrowIds, errorBoundaryAttachments, humanTimers);
+        Map<String, FlowNode> normalNodes = nodes;
+        if (profile != null) {
+            normalNodes = new LinkedHashMap<>(nodes);
+            normalNodes.remove(profile.metadata().boundaryEventId());
+            normalNodes.remove(profile.metadata().compensationWorkerId());
+        }
         FlowNode start = null;
         List<RouteCondition> routes = new ArrayList<>();
         int splits = 0;
-        for (FlowNode node : nodes.values()) {
+        for (FlowNode node : normalNodes.values()) {
             int outgoing = node.next.size();
             switch (node.kind) {
                 case "startEvent" -> {
@@ -219,7 +255,7 @@ public final class ProcessModelValidator {
                     start = node;
                 }
                 case "endEvent" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing != 0) throw invalid(); }
-                case "userTask", "serviceTask", "intermediateCatchEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
+                case "userTask", "serviceTask", "intermediateCatchEvent", "intermediateThrowEvent" -> { if (node.incoming != 1 || outgoing != 1) throw invalid(); }
                 case "boundaryEvent" -> { if (node.incoming != 0 || outgoing != 1) throw invalid(); }
                 case "parallelGateway" -> { if (node.incoming < 1 || node.incoming > 4 || outgoing < 1 || outgoing > 4) throw invalid(); }
                 case "eventBasedGateway" -> {
@@ -270,6 +306,8 @@ public final class ProcessModelValidator {
             }
         }
         if (!cases.keySet().equals(caseKeys.keySet())) throw invalid();
+        if (profile != null && (waitingWorkers.contains(profile.metadata().originalWorkerId())
+                || waitingWorkers.contains(profile.metadata().compensationWorkerId()))) throw invalid();
         var referencedErrors = new HashSet<String>();
         var workerErrors = new LinkedHashMap<String, WorkerBusinessError>();
         for (var entry : errorBoundaryRefs.entrySet()) {
@@ -283,6 +321,7 @@ public final class ProcessModelValidator {
             workerErrors.put(workerId, new WorkerBusinessError(errorId, errorCodes.get(errorId), boundaryId, targetId));
             // The native interrupting boundary is an implicit alternative edge from its attached Worker.
             worker.next.add(boundary); boundary.previous.add(worker); boundary.incoming++;
+            boundary.incomingEdges.add(new IncomingEdge(worker, null));
         }
         if (!referencedErrors.equals(errorCodes.keySet())) throw invalid();
         var timedTasks = new HashSet<String>();
@@ -290,11 +329,12 @@ public final class ProcessModelValidator {
             String attached = entry.getValue().taskElementId(); if (!humans.containsKey(attached) || !timedTasks.add(attached)) throw invalid();
             // The native boundary has an implicit edge from its attached task, not an incoming sequenceFlow.
             var task = nodes.get(attached); var boundary = nodes.get(entry.getKey()); task.next.add(boundary); boundary.previous.add(task); boundary.incoming++;
+            boundary.incomingEdges.add(new IncomingEdge(task, null));
         }
         if (start == null) throw invalid();
         ArrayDeque<FlowNode> ready = new ArrayDeque<>();
         start.paths = 1;
-        nodes.values().stream().filter(node -> node.incoming == 0).forEach(ready::add);
+        normalNodes.values().stream().filter(node -> node.incoming == 0).forEach(ready::add);
         int visited = 0;
         int traversals = 0;
         while (!ready.isEmpty()) {
@@ -303,6 +343,11 @@ public final class ProcessModelValidator {
             node.decisionBefore = decisions.containsKey(node.element.getAttribute("id")) || !node.previous.isEmpty() && node.previous.stream().allMatch(previous -> previous.decisionBefore);
             node.waitBefore = !node.previous.isEmpty() && node.previous.stream().allMatch(previous -> previous.waitBefore
                     || "userTask".equals(previous.kind) || "intermediateCatchEvent".equals(previous.kind) || workers.containsKey(previous.element.getAttribute("id")));
+            if (profile != null) {
+                // Only the original's explicit normal edge can establish success on a path.
+                node.originalNormalBefore = !node.incomingEdges.isEmpty() && node.incomingEdges.stream().allMatch(edge ->
+                        edge.previous().originalNormalBefore || profile.originalNormalFlowId().equals(edge.explicitSequenceFlowId()));
+            }
             if (caseKeys.containsKey(node.element.getAttribute("id")) && !node.waitBefore) throw invalid();
             var human = humans.get(node.element.getAttribute("id"));
             if (human != null && human.laneVariable() != null && !node.decisionBefore) throw invalid();
@@ -315,9 +360,61 @@ public final class ProcessModelValidator {
                 if (++next.visitedInputs == next.incoming) ready.add(next);
             }
         }
-        if (visited != nodes.size()) throw invalid();
+        if (visited != normalNodes.size()) throw invalid();
+        Map<String, WorkerCompensationVO> compensations = Map.of();
+        if (profile != null) {
+            WorkerCompensationVO compensation = profile.metadata();
+            if (!nodes.get(compensation.throwEventId()).originalNormalBefore) throw invalid();
+            compensations = Map.of(compensation.originalWorkerId(), compensation);
+        }
         return new ValidatedProcessModel(Type.BPMN, key, bytes, Map.of(), Map.of(), List.of(), decisions, routes,
-                workers, waits, humans, humanTimers, cases, Map.copyOf(timers), Map.copyOf(workerErrors));
+                workers, waits, humans, humanTimers, cases, Map.copyOf(timers), Map.copyOf(workerErrors), compensations);
+    }
+
+    private static CompensationProfile compensationProfile(Map<String, FlowNode> nodes, Map<String, WorkerTask> workers,
+                                                            List<Element> associations, Map<String, String> boundaryAttachments,
+                                                            List<String> handlerIds, List<String> throwIds,
+                                                            Map<String, String> errorBoundaryAttachments,
+                                                            Map<String, ValidatedProcessModel.HumanTaskTimer> humanTimers) {
+        if (associations.isEmpty() && boundaryAttachments.isEmpty() && handlerIds.isEmpty() && throwIds.isEmpty()) return null;
+        if (associations.size() != 1 || boundaryAttachments.size() != 1 || handlerIds.size() != 1 || throwIds.size() != 1) throw invalid();
+
+        var attachment = boundaryAttachments.entrySet().iterator().next();
+        String boundaryId = attachment.getKey();
+        String originalId = attachment.getValue();
+        String handlerId = handlerIds.getFirst();
+        Element association = associations.getFirst();
+        if (!"One".equals(association.getAttribute("associationDirection"))
+                || !boundaryId.equals(association.getAttribute("sourceRef")) || !handlerId.equals(association.getAttribute("targetRef"))
+                || originalId.equals(handlerId)) throw invalid();
+
+        WorkerTask originalWorker = workers.get(originalId);
+        WorkerTask handlerWorker = workers.get(handlerId);
+        var operationInput = List.of(new WorkerParameter("operationId", "operationId", ValueType.STRING));
+        if (originalWorker == null || handlerWorker == null
+                || !operationInput.equals(originalWorker.inputs()) || !originalWorker.outputs().isEmpty()
+                || !operationInput.equals(handlerWorker.inputs()) || !handlerWorker.outputs().isEmpty()
+                || errorBoundaryAttachments.containsValue(handlerId)
+                || humanTimers.values().stream().anyMatch(timer -> handlerId.equals(timer.taskElementId()))) throw invalid();
+
+        FlowNode boundary = nodes.get(boundaryId);
+        FlowNode handler = nodes.get(handlerId);
+        FlowNode original = nodes.get(originalId);
+        if (boundary.incoming != 0 || !boundary.next.isEmpty() || handler.incoming != 0 || !handler.next.isEmpty()
+                || original.incoming != 1 || original.flows.size() != 1) throw invalid();
+        String originalNormalFlowId = required(original.flows.getFirst(), "id");
+
+        String throwId = throwIds.getFirst();
+        FlowNode thrown = nodes.get(throwId);
+        Element definition = only(thrown.element, "compensateEventDefinition");
+        if (!originalId.equals(definition.getAttribute("activityRef"))
+                || !"true".equals(definition.getAttribute("waitForCompletion"))
+                || thrown.incoming != 1 || thrown.next.size() != 1) throw invalid();
+        FlowNode end = thrown.next.getFirst();
+        if (!"endEvent".equals(end.kind) || end.incoming != 1 || !end.next.isEmpty()) throw invalid();
+        var metadata = new WorkerCompensationVO(originalId, boundaryId, required(association, "id"), handlerId,
+                throwId, required(end.element, "id"));
+        return new CompensationProfile(metadata, originalNormalFlowId);
     }
 
     private static Duration timerDuration(Element duration) {
@@ -654,17 +751,23 @@ public final class ProcessModelValidator {
         return new IllegalArgumentException("Process model is invalid or not supported");
     }
 
+    private record IncomingEdge(FlowNode previous, String explicitSequenceFlowId) { }
+
+    private record CompensationProfile(WorkerCompensationVO metadata, String originalNormalFlowId) { }
+
     private static final class FlowNode {
         private final String kind;
         private final Element element;
         private final List<FlowNode> next = new ArrayList<>();
         private final List<FlowNode> previous = new ArrayList<>();
+        private final List<IncomingEdge> incomingEdges = new ArrayList<>();
         private final List<Element> flows = new ArrayList<>();
         private int incoming;
         private int visitedInputs;
         private int paths;
         private boolean decisionBefore;
         private boolean waitBefore;
+        private boolean originalNormalBefore;
 
         private FlowNode(String kind, Element element) { this.kind = kind; this.element = element; }
     }
