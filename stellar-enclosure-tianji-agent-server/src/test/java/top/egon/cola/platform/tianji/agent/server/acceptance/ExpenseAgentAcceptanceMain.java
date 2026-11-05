@@ -86,8 +86,15 @@ public final class ExpenseAgentAcceptanceMain {
             }
             if ("true".equals(settings.getProperty("stellar.tianji.agent.model-budgets.enabled"))) throw unavailable();
             installTrust(settings);
-            new SpringApplicationBuilder(TianjiAgentServerApplication.class, FixtureConfiguration.class)
-                    .web(WebApplicationType.SERVLET).run(args);
+            var app = new SpringApplicationBuilder(TianjiAgentServerApplication.class, FixtureConfiguration.class)
+                    .web(WebApplicationType.SERVLET);
+            if ("true".equals(settings.getProperty(FIXTURE + "s12-receive-link"))) {
+                var initializer = Class.forName("top.egon.cola.platform.tianji.acceptance.S12ReceiveLinkInitializer")
+                        .asSubclass(org.springframework.context.ApplicationContextInitializer.class)
+                        .getDeclaredConstructor().newInstance();
+                app.initializers(initializer);
+            }
+            app.run(args);
         } catch (Exception failure) {
             throw unavailable();
         }

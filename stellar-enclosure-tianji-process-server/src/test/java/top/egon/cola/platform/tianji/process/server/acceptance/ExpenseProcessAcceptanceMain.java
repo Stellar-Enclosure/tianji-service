@@ -36,7 +36,11 @@ public final class ExpenseProcessAcceptanceMain {
                 if (!"true".equals(settings.getProperty("stellar.tianji.process." + feature + ".enabled"))) throw unavailable();
             }
             installTrust(settings);
-            new SpringApplicationBuilder(TianjiProcessServerApplication.class).web(WebApplicationType.SERVLET).run(args);
+            var app = new SpringApplicationBuilder(TianjiProcessServerApplication.class).web(WebApplicationType.SERVLET);
+            if ("true".equals(settings.getProperty(FIXTURE + "s12-receive-link"))) {
+                app.initializers(new top.egon.cola.platform.tianji.acceptance.S12ReceiveLinkInitializer());
+            }
+            app.run(args);
         } catch (Exception failure) {
             throw unavailable();
         }

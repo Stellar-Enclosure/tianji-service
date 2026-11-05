@@ -158,7 +158,8 @@ class BusinessProcessAgentAcceptanceIT {
         private ExpenseAcceptanceFaultRelay relay;
 
         static Driver open(Suite suite) throws Exception {
-            var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty("tianji.expense.e2e.manifest"));
+            String property = suite == Suite.RECEIVE_LINK ? "tianji.s12.receive-link.manifest" : "tianji.expense.e2e.manifest";
+            var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty(property));
             assumeTrue(permit.isPresent(), "Explicit isolated expense acceptance manifest is required");
             var manifest = permit.orElseThrow();
             require(manifest.suite() == suite, "Expense acceptance manifest suite");
@@ -240,6 +241,10 @@ class BusinessProcessAgentAcceptanceIT {
 
         List<TenantBindingDTO> tenants() { return manifest.tenants(); }
         ExpenseAcceptanceHarness harness() { return harness; }
+        ExpenseAcceptanceManifestDTO receiveLinkManifest() {
+            require(manifest.suite() == Suite.RECEIVE_LINK, "Exact receive-link fixture suite");
+            return manifest;
+        }
         Duration relayBudget() { return Duration.ofSeconds(Math.min(manifest.limits().recoverySeconds(), 60)); }
         Duration linkedHoldBudget() { return Duration.ofSeconds(manifest.limits().linkedHoldSeconds()); }
         ExpenseAcceptanceFaultRelay relay() { return Objects.requireNonNull(relay); }
@@ -602,6 +607,15 @@ class BusinessProcessAgentAcceptanceIT {
                     """, (rs, row) -> new OutboxDTO(rs.getString(1), rs.getString(2), rs.getInt(3)), eventId, destination(run.tenant()));
         }
 
+        String committedReceiveLinkCarrier(RunDTO run) {
+            require(manifest.suite() == Suite.RECEIVE_LINK, "Exact receive-link fixture suite");
+            String eventId = inbox(run).filter(row -> "APPLIED".equals(row.state())).orElseThrow().eventId();
+            return one(db(StoreOwner.AGENT), """
+                    SELECT trace_id FROM tianji_agent.egon_cola_outbox_message
+                    WHERE message_id=? AND destination=? AND channel='tianji-agent-result' AND status='SUCCEEDED'
+                    """, (rs, row) -> rs.getString(1), eventId, destination(run.tenant())).orElseThrow();
+        }
+
         Optional<NativeWaitDTO> nativeWait(RunDTO run) {
             return one(db(StoreOwner.PROCESS), """
                     SELECT e.id_,j.id_,j.duedate_ FROM tianji_process.act_ru_event_subscr e
@@ -890,6 +904,14 @@ class BusinessProcessAgentAcceptanceIT {
             put(config, "egon.cola.component.transactional-outbox.polling.enabled", Boolean.toString(role == ChildRole.AGENT));
             if (role == ChildRole.AGENT) agentConfig(config);
             else processConfig(config);
+            if (manifest.suite() == Suite.RECEIVE_LINK) {
+                if (role == ChildRole.AGENT) {
+                    put(config, "stellar.tianji.agent.terminal-events.span-links-enabled", "true");
+                    put(config, "stellar.tianji.agent.result-delivery.cross-process-span-links-enabled", "true");
+                } else {
+                    put(config, "stellar.tianji.process.agent-results.receive-span-links-enabled", "true");
+                }
+            }
             return Map.copyOf(config);
         }
 
@@ -928,7 +950,8 @@ class BusinessProcessAgentAcceptanceIT {
                 var delivery = prefix + "result-delivery.destinations[" + index + "].";
                 put(config, delivery + "id", destination(tenant));
                 put(config, delivery + "tenant-id", Long.toString(tenant.tenantId()));
-                put(config, delivery + "base-uri", manifest.endpoints().resultRelay());
+                put(config, delivery + "base-uri", manifest.suite() == Suite.RECEIVE_LINK
+                        ? manifest.endpoints().process() : manifest.endpoints().resultRelay());
                 put(config, delivery + "resource-uri", tenant.processResource());
                 put(config, delivery + "issuer", tenant.issuer());
                 put(config, delivery + "registration-id", setting(tenant, "registration.result"));

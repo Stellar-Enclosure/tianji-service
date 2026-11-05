@@ -31,6 +31,7 @@ import java.util.HashSet;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
@@ -80,6 +81,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private final List<ChildIdentityDTO> children = new ArrayList<>();
     private final List<ChildExitDTO> exits = new ArrayList<>();
     private final Map<Path, String> writtenConfigurations = new HashMap<>();
+    private final Map<Path, String> s12Libraries = new LinkedHashMap<>();
     private boolean closed;
 
     private ExpenseAcceptanceHarness(ExpenseAcceptanceManifestDTO manifest, ChildLauncher launcher, LongSupplier nanoTime,
@@ -129,7 +131,15 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
         } catch (RuntimeException failure) {
             throw unavailable();
         }
-        return new ExpenseAcceptanceHarness(manifest, Objects.requireNonNull(launcher), nanoTime, clock, sleeper);
+        var harness = new ExpenseAcceptanceHarness(manifest, Objects.requireNonNull(launcher), nanoTime, clock, sleeper);
+        if (manifest.suite() == Suite.RECEIVE_LINK) {
+            try {
+                harness.s12Libraries.putAll(S12ReceiveLinkCollectorEvidence.prepare(manifest));
+            } catch (IOException failure) {
+                throw unavailable();
+            }
+        }
+        return harness;
     }
 
     private static boolean matchingStore(StoreBindingDTO locked, StoreWitnessDTO actual) {
@@ -427,6 +437,9 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private void addTrustedFixtureSettings(ChildRole role, Properties values) {
         String prefix = "tianji.expense.fixture.";
         values.setProperty(prefix + "run-authorized", "true");
+        if (manifest.suite() == Suite.RECEIVE_LINK) {
+            values.setProperty(prefix + "s12-receive-link", "true");
+        }
         values.setProperty(prefix + "role", role.name());
         values.setProperty(prefix + "trust-store", manifest.tls().trustStore());
         values.setProperty(prefix + "trust-password-file", manifest.tls().credentialFile());
@@ -447,7 +460,20 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     private ChildLaunchDTO launchCommand(ChildRole role, ArtifactLockDTO artifact, Path configuration) throws IOException {
         String java = Path.of(System.getProperty("java.home")).toRealPath().resolve("bin/java").toString();
-        return new ChildLaunchDTO(role, List.of(java, "-Dloader.main=" + childMain(role), "-Dloader.path=" + artifact.testClasses(),
+        String loaderPath = artifact.testClasses();
+        if (manifest.suite() == Suite.RECEIVE_LINK) {
+            if (role == ChildRole.AGENT) {
+                verifyArtifact(absolute(manifest.checkoutRoot()), ChildRole.PROCESS, manifest.process());
+                loaderPath += "," + manifest.process().testClasses();
+            } else {
+                if (s12Libraries.size() != S12ReceiveLinkCollectorEvidence.TRACE_LIBRARIES.size()) throw invalid();
+                for (var library : s12Libraries.entrySet()) {
+                    if (!library.getValue().equals(sha256(library.getKey()))) throw invalid();
+                    loaderPath += "," + library.getKey();
+                }
+            }
+        }
+        return new ChildLaunchDTO(role, List.of(java, "-Dloader.main=" + childMain(role), "-Dloader.path=" + loaderPath,
                 "-cp", artifact.execJar(), "org.springframework.boot.loader.launch.PropertiesLauncher",
                 "--spring.main.web-application-type=servlet", "--spring.config.additional-location=" + configuration.toUri().toASCIIString()),
                 Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false"), absolute(manifest.privateRoot()));
@@ -567,6 +593,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
+        if (manifest.suite() == Suite.RECEIVE_LINK) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
         Path destination = output.resolve("expense-" + manifest.runId() + ".json");
@@ -740,7 +767,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
-    enum Suite { BUSINESS, RECOVERY }
+    enum Suite { BUSINESS, RECOVERY, RECEIVE_LINK }
     enum ChildRole { AGENT, PROCESS }
     enum StoreOwner { AGENT, PROCESS, BUSINESS }
     enum Scenario { NORMAL, AGENT_FAILURE, MANUAL_CASE, RECOVERY }

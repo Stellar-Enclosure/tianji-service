@@ -1,0 +1,19 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+exporters:
+  file/receive_link:
+    path: ./s12-receive-link-traces.jsonl
+    format: json
+    append: false
+    flush_interval: 100ms
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file/receive_link]
