@@ -40,6 +40,11 @@ egon:
 stellar:
   tianji:
     agent:
+      native-templates:
+        enabled: false
+        model-bean-name: ""
+        model-name: ""
+        model-route-ref: ""
       tools:
         authority:
           enabled: false
