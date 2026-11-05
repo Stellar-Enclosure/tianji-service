@@ -168,6 +168,7 @@ class BusinessProcessAgentAcceptanceIT {
                 case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
                 case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
+                case S07_APPROVED_START -> "tianji.s07.approved-start.manifest";
                 case S12_METRICS -> logs == null
                         ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
@@ -191,7 +192,7 @@ class BusinessProcessAgentAcceptanceIT {
                     var listener = ssl(manifest.tls().trustStore(), manifest.tls().relayKeyStore(), password);
                     var http = HttpClient.newBuilder().sslContext(trust).connectTimeout(NETWORK)
                             .followRedirects(HttpClient.Redirect.NEVER).build();
-                    driver = new Driver(manifest, harness, stores, tenantSettings, http, suite == Suite.S07_GOVERNED_START ? null : renderRelease(manifest), logs);
+                    driver = new Driver(manifest, harness, stores, tenantSettings, http, suite.isS07() ? null : renderRelease(manifest), logs);
                     driver.boot(listener, trust, password);
                     return driver;
                 } finally {
@@ -228,7 +229,7 @@ class BusinessProcessAgentAcceptanceIT {
             StoreBindingDTO businessStore = binding(StoreOwner.BUSINESS);
             var access = stores.get(StoreOwner.BUSINESS);
             ExpenseBusinessWorkerFixture.prepareDisposableFixtureTables(access.setup(), businessStore.runtimeRole(), businessStore.observerRole());
-            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+            if (manifest.suite().isS07()) {
                 bootGovernedStart(password);
                 return;
             }
@@ -259,7 +260,16 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private void bootGovernedStart(char[] password) {
-            configs.put(ChildRole.PROCESS, childConfig(ChildRole.PROCESS, password));
+            boolean approved = manifest.suite() == Suite.S07_APPROVED_START;
+            var process = new TreeMap<>(childConfig(ChildRole.PROCESS, password));
+            if (approved) {
+                for (int index = 0; index < tenants().size(); index++) {
+                    var tenant = tenants().get(index);
+                    S07ApprovalFixture.processProperties(process, index, tenant,
+                            setting(tenant, "s07.approval-service-subject"));
+                }
+            }
+            configs.put(ChildRole.PROCESS, Map.copyOf(process));
             startChild(ChildRole.PROCESS);
             var agent = new TreeMap<>(childConfig(ChildRole.AGENT, password));
             var businessStore = binding(StoreOwner.BUSINESS);
@@ -270,6 +280,13 @@ class BusinessProcessAgentAcceptanceIT {
             put(agent, fixture + "observer-password", value(privateProperties(businessStore.credentialFile()), "observer.password"));
             put(agent, fixture + "bpmn-sha256", S07GovernedStartFixture.BPMN_SHA);
             put(agent, fixture + "dmn-sha256", S07GovernedStartFixture.DMN_SHA);
+            if (approved) {
+                var processStore = binding(StoreOwner.PROCESS);
+                put(agent, fixture + "approval-observer-url", processStore.jdbcUrl());
+                put(agent, fixture + "approval-observer-role", processStore.observerRole());
+                put(agent, fixture + "approval-observer-password",
+                        value(privateProperties(processStore.credentialFile()), "observer.password"));
+            }
             for (int index = 0; index < tenants().size(); index++) {
                 var tenant = tenants().get(index);
                 var publisher = clients(tenant).owner();
@@ -284,6 +301,19 @@ class BusinessProcessAgentAcceptanceIT {
                 put(agent, prefix + "business-key", businessKey);
                 put(agent, prefix + "process-resource", tenant.processResource());
                 put(agent, prefix + "manifest-sha256", published.manifestSha256());
+                if (approved) {
+                    String subject = setting(tenant, "s07.approval-service-subject");
+                    var approval = S07ApprovalFixture.registration(tenant, subject);
+                    var source = publisher.publish(S07ApprovalFixture.release(tenant));
+                    S07ApprovalFixture.verify(source, approval.definitionSha256());
+                    assertEquals(source, publisher.get(new GetProcessReleaseQuery(S07ApprovalFixture.RELEASE)));
+                    put(agent, prefix + "approval-policy-binding-sha256", approval.fingerprint());
+                    put(agent, prefix + "approval-model-sha256", approval.definitionSha256());
+                    for (String name : List.of("approval-service-subject", "approval-service-app", "approval-service-biz",
+                            "approval-service-source-app", "approval-service-environment", "approval-registration")) {
+                        put(agent, prefix + name, setting(tenant, "s07." + name));
+                    }
+                }
                 for (String name : List.of("service-subject", "service-app", "service-biz", "service-source-app",
                         "service-environment", "start-registration", "decision-registration", "start-authority-resource",
                         "decision-authority-resource")) {
@@ -345,6 +375,85 @@ class BusinessProcessAgentAcceptanceIT {
                     """));
         }
 
+        void verifyApprovedStart() {
+            require(manifest.suite() == Suite.S07_APPROVED_START, "Exact S07 approved suite");
+            for (var tenant : tenants()) {
+                long id = tenant.tenantId();
+                String issuer = issuerSha(tenant);
+                String businessKey = S07GovernedStartFixture.businessKey(id);
+                var users = clients(tenant);
+                var agent = new HttpAgentClient(URI.create(manifest.endpoints().agent()), http,
+                        token(tenant, "token.agent-owner"), NETWORK, 0, Duration.ZERO);
+                var waiting = startGovernedRun(agent, businessKey, "s07-approval-preparation");
+                assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, waiting.status());
+                var result = agent.getResult(new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(waiting.runId()));
+                assertEquals("s07-awaiting-approval", result.output().get("text"));
+                var action = one(db(StoreOwner.AGENT), """
+                        SELECT a.intent_id,a.request_sha256,a.business_version,a.tool_sha256
+                        FROM tianji_agent.agent_tool_action_intent a JOIN tianji_agent.agent_tool_invocation i
+                          ON i.tenant_id=a.tenant_id AND i.intent_id=a.intent_id AND i.run_id=a.origin_run_id
+                        WHERE a.tenant_id=? AND a.owner_type='USER' AND a.owner_issuer=? AND a.owner_id=?
+                          AND a.business_key=? AND a.origin_run_id=? AND a.risk='APPROVAL_REQUIRED'
+                          AND a.state='AWAITING_APPROVAL' AND a.dispatch_epoch=0 AND a.approval_receipt_id IS NULL
+                          AND i.state='AWAITING_APPROVAL' AND i.dispatch_epoch=0
+                        """, (rs, row) -> new ApprovalActionVO(rs.getObject("intent_id", UUID.class), rs.getString("request_sha256"),
+                        rs.getString("business_version"), rs.getString("tool_sha256")), id, issuer,
+                        tenant.ownerSubject(), businessKey, waiting.runId()).orElseThrow();
+                assertEquals(Long.toString(S07GovernedStartFixture.BUSINESS_VERSION), action.businessVersion());
+                assertEquals(0L, count(db(StoreOwner.PROCESS), """
+                        SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                        WHERE tenant_id=? AND command_type='START' AND release_key=?
+                        """, id, S07GovernedStartFixture.RELEASE));
+                String intent = action.intentId().toString();
+                var source = S07ApprovalFixture.sourceStart(businessKey, intent, action.requestSha256(),
+                        action.businessVersion(), action.toolSha256());
+                var scope = users.owner().start(source);
+                var task = harness.await(Phase.STANDARD_PATH, () -> task(users.first(), HumanTaskScopeTypeEnum.PROCESS,
+                        scope.instanceId(), S07ApprovalFixture.TASK, S07ApprovalFixture.RELEASE));
+                assertEquals(HumanTaskKindEnum.APPROVAL, task.kind());
+                rejectForeign(() -> users.owner().claimHumanTask(new ClaimHumanTaskCommand(
+                        "s07-requester-claim", task.taskId(), task.version())));
+                users.first().claimHumanTask(new ClaimHumanTaskCommand("s07-reviewer-claim", task.taskId(), task.version()));
+                var claimed = users.first().getHumanTask(new GetHumanTaskQuery(task.taskId()));
+                assertTrue(claimed.assignedToMe());
+                var approved = users.first().completeHumanTask(new CompleteHumanTaskCommand(
+                        "s07-reviewer-approval", task.taskId(), claimed.version(), Map.of("approved", true)));
+                assertNotNull(approved.approvalReceiptId());
+                assertEquals(Boolean.TRUE, approved.approved());
+                assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                        SELECT count(*) FROM tianji_process.tianji_human_task_receipt
+                        WHERE tenant_id=? AND subject_type='USER' AND subject_issuer=? AND subject_id=?
+                          AND requester_type='USER' AND requester_issuer=? AND requester_id=?
+                          AND command_type='TASK_COMPLETE' AND task_kind='APPROVAL' AND approved IS TRUE
+                          AND approval_receipt_id=? AND task_id=? AND process_instance_id=?
+                          AND start_command_id=? AND start_request_sha256=? AND authorized_role_id=?
+                        """, id, issuer, tenant.reviewerSubjects().getFirst(), issuer, tenant.ownerSubject(),
+                        approved.approvalReceiptId(), task.taskId(), scope.instanceId(), intent,
+                        OrchestrationRequestDigests.start(source), Long.parseLong(tenant.roleIds().getFirst())));
+                var dispatched = startGovernedRun(agent, businessKey, "s07-approved-dispatch");
+                assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, dispatched.status());
+                String instance = governedInstance(agent.getResult(
+                        new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(dispatched.runId())));
+                assertEquals(action.intentId(), governedAction(tenant, businessKey, waiting.runId(), dispatched.runId(), instance).intentId());
+                assertEquals(1L, count(db(StoreOwner.AGENT), """
+                        SELECT count(*) FROM tianji_agent.agent_tool_action_intent
+                        WHERE tenant_id=? AND intent_id=? AND state='APPLIED' AND risk='APPROVAL_REQUIRED'
+                          AND approval_receipt_id=? AND approval_approved IS TRUE AND approval_consumed_at IS NOT NULL
+                          AND approval_proof IS NOT NULL AND dispatch_epoch=1
+                        """, id, action.intentId(), approved.approvalReceiptId()));
+                assertEquals(1L, count(db(StoreOwner.AGENT), """
+                        SELECT count(*) FROM tianji_agent.agent_tool_invocation
+                        WHERE tenant_id=? AND intent_id=? AND dispatch_epoch>0
+                        """, id, action.intentId()));
+            }
+            assertEquals((long) tenants().size(), count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                    WHERE command_type='START' AND release_key=?
+                    """, S07GovernedStartFixture.RELEASE));
+        }
+
+        private record ApprovalActionVO(UUID intentId, String requestSha256, String businessVersion, String toolSha256) { }
+
         private top.egon.cola.platform.tianji.contract.agent.AgentRunDTO startGovernedRun(HttpAgentClient client,
                 String businessKey, String commandId) {
             var input = new top.egon.cola.platform.tianji.contract.agent.AgentInputDTO(null, List.of(),
@@ -369,6 +478,10 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private GovernedActionVO governedAction(TenantBindingDTO tenant, String businessKey, String runId, String instance) {
+            return governedAction(tenant, businessKey, runId, runId, instance);
+        }
+
+        private GovernedActionVO governedAction(TenantBindingDTO tenant, String businessKey, String originRun, String dispatchRun, String instance) {
             long id = tenant.tenantId();
             String issuer = issuerSha(tenant);
             String executor = setting(tenant, "s07.service-subject");
@@ -386,7 +499,7 @@ class BusinessProcessAgentAcceptanceIT {
                       AND b.state='SETTLED'
                     """, (rs, row) -> new GovernedActionVO(rs.getObject("intent_id", UUID.class), rs.getLong("revision")),
                     id, issuer, tenant.ownerSubject(), businessKey, Long.toString(S07GovernedStartFixture.BUSINESS_VERSION),
-                    runId, runId, issuer, executor).orElseThrow();
+                    originRun, dispatchRun, issuer, executor).orElseThrow();
             String commandId = action.intentId().toString();
             var command = new StartProcessCommand(S07GovernedStartFixture.BPMN, S07GovernedStartFixture.RELEASE, businessKey,
                     commandId, commandId, Map.of("amount", S07GovernedStartFixture.AMOUNT));
@@ -674,7 +787,12 @@ class BusinessProcessAgentAcceptanceIT {
 
         private static Optional<HumanTaskDTO> task(HttpProcessClient client, HumanTaskScopeTypeEnum scope,
                                                   String scopeId, String definitionKey) {
-            var page = client.humanTasks(new ListHumanTasksQuery(scope, HumanTaskSelectionEnum.CANDIDATE, RELEASE, scopeId,
+            return task(client, scope, scopeId, definitionKey, RELEASE);
+        }
+
+        private static Optional<HumanTaskDTO> task(HttpProcessClient client, HumanTaskScopeTypeEnum scope,
+                                                  String scopeId, String definitionKey, String release) {
+            var page = client.humanTasks(new ListHumanTasksQuery(scope, HumanTaskSelectionEnum.CANDIDATE, release, scopeId,
                     definitionKey, null, 16));
             require(page.nextAfterTaskId() == null && page.items().size() <= 1, "Unique scoped expense task");
             return page.items().stream().findFirst();
@@ -1073,7 +1191,7 @@ class BusinessProcessAgentAcceptanceIT {
                     ? S12ChildLogPrivacy.Credential.AGENT_DB : S12ChildLogPrivacy.Credential.PROCESS_DB, runtimePassword);
             put(config, "spring.datasource.password", runtimePassword);
             put(config, "spring.datasource.hikari.schema", store.schema());
-            if (manifest.suite() != Suite.S12_METRICS && manifest.suite() != Suite.S07_GOVERNED_START) {
+            if (manifest.suite() != Suite.S12_METRICS && !manifest.suite().isS07()) {
                 put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
                 put(config, "management.tracing.sampling.probability", "1.0");
             }
@@ -1102,7 +1220,7 @@ class BusinessProcessAgentAcceptanceIT {
 
         private void agentConfig(Map<String, String> config) {
             String prefix = "stellar.tianji.agent.";
-            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+            if (manifest.suite().isS07()) {
                 for (String flag : List.of("storage", "api", "runtime", "dispatch", "reconciliation", "execution-grants",
                         "execution-authorization")) put(config, prefix + flag + ".enabled", "true");
                 put(config, "egon.cola.component.agent-flow.enabled", "true");
@@ -1155,9 +1273,14 @@ class BusinessProcessAgentAcceptanceIT {
 
         private void processConfig(Map<String, String> config) {
             String prefix = "stellar.tianji.process.";
-            if (manifest.suite() == Suite.S07_GOVERNED_START) {
+            if (manifest.suite().isS07()) {
                 put(config, prefix + "api.enabled", "true");
                 put(config, prefix + "decision-tasks.enabled", "true");
+                if (manifest.suite() == Suite.S07_APPROVED_START) {
+                    put(config, prefix + "human-tasks.enabled", "true");
+                    put(config, prefix + "human-tasks.publish-enabled", "true");
+                    put(config, prefix + "approval-verification.enabled", "true");
+                }
                 put(config, "flowable.database-schema-update", "false");
                 put(config, "flowable.database-schema", "tianji_process");
                 put(config, "flowable.async-executor-activate", "false");

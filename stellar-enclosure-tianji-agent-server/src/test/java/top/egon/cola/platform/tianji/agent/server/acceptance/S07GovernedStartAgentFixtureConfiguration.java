@@ -26,9 +26,11 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolApprovalBinding;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextRequestVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextResolver;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextVO;
@@ -42,6 +44,7 @@ import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionClient;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
@@ -78,34 +81,41 @@ final class S07GovernedStartAgentFixtureConfiguration {
 
     static FixturePlan prepare(Properties settings) {
         if (!"true".equals(settings.getProperty(FIXTURE + "s07-governed-start"))) throw invalid();
-        String url = setting(settings, INPUT + "observer-url");
-        if (!url.matches("jdbc:postgresql://(?:127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}/tianji_it_[a-z0-9_]{1,51}")) throw invalid();
-        String user = setting(settings, INPUT + "observer-role");
-        if (!user.matches("tianji_it_[a-z0-9_]{1,50}") || user.equals(settings.getProperty("spring.datasource.username"))) throw invalid();
-        var source = new PGSimpleDataSource();
-        source.setUrl(url);
-        source.setUser(user);
-        source.setPassword(setting(settings, INPUT + "observer-password"));
-        source.setCurrentSchema("compensation_fixture");
-        source.setReadOnly(true);
-        source.setConnectTimeout(2);
-        source.setSocketTimeout(3);
-        var versions = new JdbcTemplate(source);
-        versions.setQueryTimeout(2);
+        var versions = observer(settings, INPUT + "observer-", "compensation_fixture");
+        boolean approved = "true".equals(settings.getProperty(FIXTURE + "s07-approved-start"));
+        var approvals = approved ? observer(settings, INPUT + "approval-observer-", "tianji_process") : null;
         var properties = new LinkedHashMap<String, Object>();
         properties.put(ROOT + "authority.enabled", "true");
         properties.put(ROOT + "governed-process.enabled", "true");
         properties.put(ROOT + "authority.timeout", "4s");
         properties.put(ROOT + "authority.concurrency", "2");
         properties.put(ROOT + "governed-process.concurrency", "2");
-        var profiles = List.of(profile(settings, properties, 0), profile(settings, properties, 1));
+        var profiles = List.of(profile(settings, properties, 0, approved), profile(settings, properties, 1, approved));
         if (profiles.getFirst().owner().tenantId() == profiles.getLast().owner().tenantId()
                 || profiles.getFirst().owner().issuerFingerprint().equals(profiles.getLast().owner().issuerFingerprint())
                 || profiles.getFirst().businessKey().equals(profiles.getLast().businessKey())) throw invalid();
-        return new FixturePlan(List.copyOf(profiles), Map.copyOf(properties), versions);
+        return new FixturePlan(List.copyOf(profiles), Map.copyOf(properties), versions, approvals);
     }
 
-    private static Profile profile(Properties settings, Map<String, Object> properties, int index) {
+    private static JdbcTemplate observer(Properties settings, String prefix, String schema) {
+        String url = setting(settings, prefix + "url");
+        if (!url.matches("jdbc:postgresql://(?:127\\.0\\.0\\.1|\\[::1\\]):[0-9]{1,5}/tianji_it_[a-z0-9_]{1,51}")) throw invalid();
+        String user = setting(settings, prefix + "role");
+        if (!user.matches("tianji_it_[a-z0-9_]{1,50}") || user.equals(settings.getProperty("spring.datasource.username"))) throw invalid();
+        var source = new PGSimpleDataSource();
+        source.setUrl(url);
+        source.setUser(user);
+        source.setPassword(setting(settings, prefix + "password"));
+        source.setCurrentSchema(schema);
+        source.setReadOnly(true);
+        source.setConnectTimeout(2);
+        source.setSocketTimeout(3);
+        var jdbc = new JdbcTemplate(source);
+        jdbc.setQueryTimeout(2);
+        return jdbc;
+    }
+
+    private static Profile profile(Properties settings, Map<String, Object> properties, int index, boolean approved) {
         String tenantKey = "tenant-" + (index + 1) + ".";
         String values = INPUT + tenantKey;
         String issuer = setting(settings, FIXTURE + tenantKey + "issuer");
@@ -130,14 +140,16 @@ final class S07GovernedStartAgentFixtureConfiguration {
         var decision = new TianjiFixedDecisionToolBindings.BackendVO(tenant, processIssuer, base, resource,
                 setting(settings, values + "decision-registration"), client, app, biz, sourceApp, environment,
                 release, manifest, "s07Decision", setting(settings, INPUT + "dmn-sha256"), inputs, TIMEOUT);
-        var startTool = descriptor("s07.start." + tenant, START_TOOL, "instanceId", ToolPolicy.Risk.IDEMPOTENT_WRITE,
-                ProcessClient.START_RESOURCE_KEY, start.bindingSha256());
+        String policyRef = approved ? "s07-start-approval" : null;
+        var startTool = descriptor("s07.start." + tenant, START_TOOL, "instanceId",
+                approved ? ToolPolicy.Risk.APPROVAL_REQUIRED : ToolPolicy.Risk.IDEMPOTENT_WRITE,
+                ProcessClient.START_RESOURCE_KEY, start.bindingSha256(), policyRef);
         var decisionTool = descriptor("s07.decision." + tenant, "s07_decision", "route", ToolPolicy.Risk.READ_ONLY,
-                DecisionClient.EXECUTE_RESOURCE_KEY, decision.bindingSha256());
+                DecisionClient.EXECUTE_RESOURCE_KEY, decision.bindingSha256(), null);
         var definition = new AgentDefinitionSpecDTO(DEFINITION, 1, "CONFIG", null, "1", "1",
                 new DefinitionDependenciesDTO(List.of(), List.of(), List.of(startTool.reference(), decisionTool.reference()), ROUTE, POLICY),
                 new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(15), Duration.ofSeconds(8), 3, 1, 16_384, 256,
-                        new BigDecimal("0.30"), "USD", 1, Set.of(startTool.versionKey(), decisionTool.versionKey()), null, null),
+                        new BigDecimal("0.30"), "USD", 1, Set.of(startTool.versionKey(), decisionTool.versionKey()), null, policyRef),
                 Map.of("chatModelBeanName", MODEL_BEAN, "modelName", MODEL, "rootAgentName", "s07Writer",
                         "agents", List.of(Map.of("name", "s07Writer", "instruction", INSTRUCTION))));
         String definitionHash = S07FixtureDefinitionHash.of(definition);
@@ -157,16 +169,18 @@ final class S07GovernedStartAgentFixtureConfiguration {
         properties.put(startPrefix + "backend.process-model-sha256", start.processModelSha256());
         properties.put(decisionPrefix + "backend.decision-key", decision.decisionKey());
         properties.put(decisionPrefix + "backend.decision-model-sha256", decision.decisionModelSha256());
+        var approval = approved ? approval(settings, properties, index, owner, issuer, base, resource,
+                definitionHash, startTool, policyRef, values) : null;
         return new Profile(owner, issuer, definition, definitionHash, startTool,
-                setting(settings, values + "source-id"), setting(settings, values + "business-key"));
+                setting(settings, values + "source-id"), setting(settings, values + "business-key"), approval);
     }
 
     private static ToolDescriptor descriptor(String key, String name, String output, ToolPolicy.Risk risk,
-                                             String resourceKey, String backendHash) {
+                                             String resourceKey, String backendHash, String approvalPolicyRef) {
         return new ToolDescriptor(key, 1, name, "Fixed isolated S07 tool",
                 new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")),
                 new ToolSchema(Map.of(output, ToolSchema.ValueType.STRING), Set.of(output)),
-                new ToolPolicy(risk, key, resourceKey, backendHash, null));
+                new ToolPolicy(risk, key, resourceKey, backendHash, approvalPolicyRef));
     }
 
     private static void toolAuthority(Map<String, Object> properties, int index, TrustedAgentActor owner,
@@ -185,6 +199,9 @@ final class S07GovernedStartAgentFixtureConfiguration {
         properties.put(descriptor + "policy.action-key", tool.policy().actionKey());
         properties.put(descriptor + "policy.execution-resource-key", tool.policy().executionResourceKey());
         properties.put(descriptor + "policy.binding-sha256", tool.policy().bindingSha256());
+        if (tool.policy().approvalPolicyRef() != null) {
+            properties.put(descriptor + "policy.approval-policy-ref", tool.policy().approvalPolicyRef());
+        }
         String binding = ROOT + "authority.bindings[" + index + "].";
         properties.put(binding + "tenant-id", owner.tenantId());
         properties.put(binding + "issuer-fingerprint", owner.issuerFingerprint());
@@ -233,6 +250,73 @@ final class S07GovernedStartAgentFixtureConfiguration {
         properties.put(prefix + "timeout", "4s");
     }
 
+    private static ToolApprovalBinding approval(Properties settings, Map<String, Object> properties, int index,
+            TrustedAgentActor owner, String issuer, URI base, URI resource, String definitionHash,
+            ToolDescriptor tool, String policy, String values) {
+        String subject = setting(settings, values + "approval-service-subject");
+        String registration = setting(settings, values + "approval-registration");
+        if (subject.equals(setting(settings, values + "service-subject"))
+                || registration.equals(setting(settings, values + "start-registration"))
+                || registration.equals(setting(settings, values + "decision-registration"))) throw invalid();
+        var consumer = TrustedAgentActor.verified(owner.tenantId(), TrustedAgentActor.SubjectType.SERVICE, subject, issuer);
+        var binding = new ToolApprovalBinding(consumer, policy, setting(settings, values + "approval-policy-binding-sha256"),
+                "s07-approval-source", "s07ApprovalSource", setting(settings, values + "approval-model-sha256"), "approveStart");
+        String prefix = ROOT + "governed-process.approval-bindings[" + index + "].";
+        slot(properties, prefix, owner, definitionHash, tool);
+        String a = prefix + "approval.";
+        properties.put(a + "consumer.tenant-id", owner.tenantId());
+        properties.put(a + "consumer.subject-type", "SERVICE");
+        properties.put(a + "consumer.subject-id", subject);
+        properties.put(a + "consumer.issuer-fingerprint", consumer.issuerFingerprint());
+        properties.put(a + "policy-ref", binding.policyRef());
+        properties.put(a + "policy-binding-sha256", binding.policyBindingSha256());
+        properties.put(a + "release-version", binding.releaseVersion());
+        properties.put(a + "definition-key", binding.definitionKey());
+        properties.put(a + "definition-sha256", binding.definitionSha256());
+        properties.put(a + "task-definition-key", binding.taskDefinitionKey());
+        String b = prefix + "backend.";
+        properties.put(b + "source-id", "s07-approval-source");
+        properties.put(b + "tenant-id", owner.tenantId());
+        properties.put(b + "process-issuer", issuer);
+        properties.put(b + "process-base-uri", base.toASCIIString());
+        properties.put(b + "process-resource-uri", resource.toASCIIString());
+        properties.put(b + "registration-id", registration);
+        properties.put(b + "expected-client-id", subject);
+        properties.put(b + "expected-app-id", setting(settings, values + "approval-service-app"));
+        properties.put(b + "expected-source-biz", setting(settings, values + "approval-service-biz"));
+        properties.put(b + "expected-source-app", setting(settings, values + "approval-service-source-app"));
+        properties.put(b + "expected-environment", setting(settings, values + "approval-service-environment"));
+        properties.put(b + "timeout", "3s");
+        return binding;
+    }
+
+    /** The observer selects an opaque native reference. The real verifier still authenticates and authorizes its own query. */
+    static String approvalReceipt(ApprovalReceiptRequestVO request, FixturePlan plan) {
+        var matches = plan.profiles().stream().filter(profile -> profile.owner().equals(request.run().actor())
+                && profile.definition().equals(request.snapshot().definition())
+                && profile.definitionHash().equals(request.run().definitionSha256())
+                && profile.businessKey().equals(request.action().businessKey())
+                && profile.startTool().equals(request.descriptor())).toList();
+        if (matches.size() != 1 || plan.approvals() == null || matches.getFirst().approval() == null) throw invalid();
+        var profile = matches.getFirst();
+        var current = resolve(new StartActionContextRequestVO(request.run(), request.snapshot(), request.descriptor()),
+                plan.profiles(), plan.versions());
+        if (!current.businessVersion().equals(request.action().businessVersion())) throw invalid();
+        var binding = profile.approval();
+        var source = binding.sourceStart(request.action());
+        var rows = plan.approvals().query("""
+                SELECT approval_receipt_id FROM ONLY tianji_process.tianji_human_task_receipt
+                WHERE tenant_id=? AND requester_type='USER' AND requester_issuer=? AND requester_id=?
+                  AND start_command_type='START' AND start_command_id=? AND start_request_sha256=?
+                  AND command_type='TASK_COMPLETE' AND task_kind='APPROVAL' AND release_key=?
+                  AND definition_key=? AND definition_sha256=? AND task_definition_key=? LIMIT 2
+                """, (rs, index) -> rs.getString("approval_receipt_id"), profile.owner().tenantId(), profile.owner().issuerFingerprint(),
+                profile.owner().subjectId(), source.commandId(), OrchestrationRequestDigests.start(source),
+                binding.releaseVersion(), binding.definitionKey(), binding.definitionSha256(), binding.taskDefinitionKey());
+        if (rows.size() > 1 || rows.size() == 1 && rows.getFirst() == null) throw invalid();
+        return rows.isEmpty() ? null : rows.getFirst();
+    }
+
     @Bean("s07FixtureDefinitionBootstrap")
     SmartInitializingSingleton bootstrap(AgentLedgerService ledger, TrustedIssuerRegistry issuers, FixturePlan plan) {
         return () -> {
@@ -269,19 +353,21 @@ final class S07GovernedStartAgentFixtureConfiguration {
     }
 
     @Bean(MODEL_BEAN)
-    ChatModel model() {
+    ChatModel model(FixturePlan plan) {
         return new ChatModel() {
             @Override public ChatResponse call(Prompt prompt) { throw invalid(); }
             @Override public ToolCallingChatOptions getOptions() {
                 return ToolCallingChatOptions.builder().model(MODEL).maxTokens(64).build();
             }
             @Override public Flux<ChatResponse> stream(Prompt prompt) {
-                return Flux.defer(() -> Flux.just(answer(prompt)));
+                return Flux.defer(() -> Flux.just(answer(prompt, plan.approvals() != null)));
             }
         };
     }
 
-    static ChatResponse answer(Prompt prompt) {
+    static ChatResponse answer(Prompt prompt) { return answer(prompt, false); }
+
+    static ChatResponse answer(Prompt prompt, boolean approved) {
         try {
             var messages = prompt.getInstructions();
             var user = messages.stream().filter(UserMessage.class::isInstance).toList();
@@ -304,6 +390,10 @@ final class S07GovernedStartAgentFixtureConfiguration {
             var response = tool.getFirst().getResponses().getFirst();
             if (!START_TOOL.equals(response.name()) || response.responseData().length() > 1024) throw invalid();
             var result = JSON.readTree(response.responseData());
+            if (approved && Set.copyOf(result.propertyNames()).equals(Set.of("status"))
+                    && "AWAITING_APPROVAL".equals(result.path("status").asString())) {
+                return reply(new AssistantMessage("s07-awaiting-approval"), "stop");
+            }
             if (!Set.copyOf(result.propertyNames()).equals(Set.of("status", "output"))
                     || !"SUCCEEDED".equals(result.path("status").asString())
                     || !Set.copyOf(result.path("output").propertyNames()).equals(Set.of("instanceId"))
@@ -356,12 +446,12 @@ final class S07GovernedStartAgentFixtureConfiguration {
         return value;
     }
 
-    record FixturePlan(List<Profile> profiles, Map<String, Object> properties, JdbcTemplate versions) {
+    record FixturePlan(List<Profile> profiles, Map<String, Object> properties, JdbcTemplate versions, JdbcTemplate approvals) {
         @Override public String toString() { return "S07 fixture plan"; }
     }
 
     record Profile(TrustedAgentActor owner, String issuer, AgentDefinitionSpecDTO definition, String definitionHash,
-                   ToolDescriptor startTool, String sourceId, String businessKey) {
+                   ToolDescriptor startTool, String sourceId, String businessKey, ToolApprovalBinding approval) {
         @Override public String toString() { return "S07 fixture profile"; }
     }
 

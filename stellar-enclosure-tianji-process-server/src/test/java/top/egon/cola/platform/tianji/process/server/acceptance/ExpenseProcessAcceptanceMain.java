@@ -41,6 +41,9 @@ public final class ExpenseProcessAcceptanceMain {
             for (String feature : required) {
                 if (!"true".equals(settings.getProperty("stellar.tianji.process." + feature + ".enabled"))) throw unavailable();
             }
+            if ("true".equals(settings.getProperty(FIXTURE + "s07-approved-start"))
+                    && (!s07 || !List.of("human-tasks.enabled", "human-tasks.publish-enabled", "approval-verification.enabled").stream()
+                    .allMatch(name -> "true".equals(settings.getProperty("stellar.tianji.process." + name))))) throw unavailable();
             installTrust(settings);
             var app = new SpringApplicationBuilder(TianjiProcessServerApplication.class).web(WebApplicationType.SERVLET);
             if ("true".equals(settings.getProperty(FIXTURE + "s12-receive-link"))) {

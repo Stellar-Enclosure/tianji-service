@@ -85,6 +85,7 @@ public final class ExpenseAgentAcceptanceMain {
         try {
             Properties settings = privateChildSettings(args, "AGENT");
             boolean s07 = "true".equals(settings.getProperty(FIXTURE + "s07-governed-start"));
+            if ("true".equals(settings.getProperty(FIXTURE + "s07-approved-start")) && !s07) throw unavailable();
             var required = s07 ? List.of("storage", "api", "runtime", "reconciliation", "dispatch", "execution-grants", "execution-authorization")
                     : List.of("storage", "api", "runtime", "reconciliation", "dispatch", "linked",
                     "service-execution", "terminal-events", "result-delivery");
@@ -105,6 +106,12 @@ public final class ExpenseAgentAcceptanceMain {
                                     "s07BoundToolFixture", plan.properties()));
                             ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
                                     "s07FixturePlan", S07GovernedStartAgentFixtureConfiguration.FixturePlan.class, () -> plan);
+                            if (plan.approvals() != null) {
+                                ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
+                                        "tianjiToolApprovalReceiptResolver",
+                                        top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.ApprovalReceiptResolver.class,
+                                        () -> request -> S07GovernedStartAgentFixtureConfiguration.approvalReceipt(request, plan));
+                            }
                         }).run(args);
                 return;
             }

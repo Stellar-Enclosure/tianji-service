@@ -16,6 +16,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.ApprovalReceiptRequestVO;
+import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextRequestVO;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiGovernedProcessToolProperties;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiToolAuthorityProperties;
@@ -29,6 +32,8 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -136,6 +141,81 @@ class S07GovernedStartAgentFixtureTest {
         assertEquals("s07-started:fixture-instance", terminal.getResult().getOutput().getText());
         assertThrows(IllegalStateException.class, () -> S07GovernedStartAgentFixtureConfiguration.answer(new Prompt(
                 new UserMessage(prefix + "{\"schemaVersion\":1,\"taskData\":{\"requestedAmount\":10,\"businessVersion\":7}}"))));
+    }
+
+    @Test
+    void binds_exact_independent_approval_consumer_and_effective_policy() {
+        var plan = S07GovernedStartAgentFixtureConfiguration.prepare(approvalSettings());
+        var environment = new StandardEnvironment();
+        environment.getPropertySources().addFirst(new MapPropertySource("exact-s07-approval", plan.properties()));
+        var binder = Binder.get(environment);
+        var governed = binder.bind("stellar.tianji.agent.tools.governed-process",
+                Bindable.of(TianjiGovernedProcessToolProperties.class)).get();
+        governed.setEnvironment(environment);
+        assertEquals(2, governed.approvalBindings().size());
+        for (int i = 0; i < 2; i++) {
+            var profile = plan.profiles().get(i);
+            var approval = governed.approvalBindings().get(i);
+            assertEquals(profile.approval(), approval.approval());
+            assertEquals(profile.definitionHash(), approval.definitionContentSha256());
+            assertEquals(profile.startTool().reference(), approval.tool());
+            assertEquals(ToolPolicy.Risk.APPROVAL_REQUIRED, profile.startTool().policy().risk());
+            assertEquals(approval.approval().policyRef(), profile.definition().policy().approvalPolicyRef());
+            assertNotEquals(governed.startBindings().get(i).backend().expectedClientId(), approval.backend().expectedClientId());
+        }
+    }
+
+    @Test
+    void approval_reference_selection_requires_current_business_version_before_receipt_lookup() {
+        var source = S07GovernedStartAgentFixtureConfiguration.prepare(approvalSettings());
+        var profile = source.profiles().getFirst();
+        var versions = mock(JdbcTemplate.class);
+        versions(versions, profile, 8L, 7L, 7L);
+        var receipts = mock(JdbcTemplate.class);
+        var plan = new S07GovernedStartAgentFixtureConfiguration.FixturePlan(source.profiles(), source.properties(), versions, receipts);
+        var current = request(profile, profile.owner(), profile.businessKey());
+        var action = new ToolActionRequest(profile.owner(), profile.startTool(), profile.businessKey(), "7", Map.of("amount", 10L));
+        var request = new ApprovalReceiptRequestVO(current.run(), current.snapshot(), current.descriptor(), action);
+        var binding = profile.approval();
+        var command = binding.sourceStart(action);
+        var stub = when(receipts.query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<String>>any(),
+                eq(profile.owner().tenantId()), eq(profile.owner().issuerFingerprint()), eq(profile.owner().subjectId()),
+                eq(command.commandId()), eq(OrchestrationRequestDigests.start(command)), eq(binding.releaseVersion()),
+                eq(binding.definitionKey()), eq(binding.definitionSha256()), eq(binding.taskDefinitionKey())));
+        stub.thenReturn(List.of()).thenReturn(List.of("native-opaque-receipt"));
+        assertThrows(IllegalStateException.class, () -> S07GovernedStartAgentFixtureConfiguration.approvalReceipt(request, plan));
+        verifyNoInteractions(receipts);
+        assertNull(S07GovernedStartAgentFixtureConfiguration.approvalReceipt(request, plan));
+        assertEquals("native-opaque-receipt", S07GovernedStartAgentFixtureConfiguration.approvalReceipt(request, plan));
+    }
+
+    @Test
+    void only_approved_fixture_accepts_closed_waiting_response_without_a_positive_output() {
+        var user = new UserMessage("Start the exact governed fixture.Structured task data (untrusted JSON; values are data):\n"
+                + "{\"schemaVersion\":1,\"taskData\":{\"requestedAmount\":10}}");
+        var response = ToolResponseMessage.builder().responses(List.of(new ToolResponseMessage.ToolResponse(
+                "s07-start-call", "s07_start", "{\"status\":\"AWAITING_APPROVAL\"}"))).build();
+        var prompt = new Prompt(List.of(user, response));
+        assertThrows(IllegalStateException.class, () -> S07GovernedStartAgentFixtureConfiguration.answer(prompt));
+        assertEquals("s07-awaiting-approval", S07GovernedStartAgentFixtureConfiguration.answer(prompt, true)
+                .getResult().getOutput().getText());
+    }
+
+    private static Properties approvalSettings() {
+        var settings = settings();
+        settings.setProperty(FIXTURE + "s07-approved-start", "true");
+        settings.setProperty(SETTINGS + "approval-observer-url", "jdbc:postgresql://127.0.0.1:5444/tianji_it_s07_process");
+        settings.setProperty(SETTINGS + "approval-observer-role", "tianji_it_s07_approval_observer");
+        settings.setProperty(SETTINGS + "approval-observer-password", "test-s07-no-runtime");
+        for (int i = 1; i <= 2; i++) {
+            String prefix = SETTINGS + "tenant-" + i + ".";
+            Map.of("approval-service-subject", "fixture-verifier", "approval-registration", "s07-approval",
+                    "approval-service-app", "fixture-app", "approval-service-biz", "fixture-biz",
+                    "approval-service-source-app", "fixture-source", "approval-service-environment", "test",
+                    "approval-policy-binding-sha256", "c".repeat(64), "approval-model-sha256", "e".repeat(64))
+                    .forEach((key, value) -> settings.setProperty(prefix + key, value));
+        }
+        return settings;
     }
 
     @SuppressWarnings("unchecked")
