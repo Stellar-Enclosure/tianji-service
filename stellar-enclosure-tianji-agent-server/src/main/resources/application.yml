@@ -45,6 +45,7 @@ stellar:
         model-bean-name: ""
         model-name: ""
         model-route-ref: ""
+        decomposition-enabled: false
       tools:
         authority:
           enabled: false

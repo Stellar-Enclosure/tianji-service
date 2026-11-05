@@ -1,16 +1,23 @@
 package top.egon.cola.platform.tianji.agent.server.agenttemplate;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 
 /** Host-owned model metadata, bound only while native templates are explicitly enabled. */
 @ConfigurationProperties(prefix = "stellar.tianji.agent.native-templates", ignoreUnknownFields = false)
 public record NativeAgentTemplateProperties(boolean enabled, String modelBeanName,
-                                            String modelName, String modelRouteRef) {
+                                            String modelName, String modelRouteRef, boolean decompositionEnabled) {
+    @ConstructorBinding
     public NativeAgentTemplateProperties {
         if (!enabled || !safe(modelBeanName, 64) || !safe(modelName, 128) || !safe(modelRouteRef, 256)
                 || !modelRouteRef.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}@[1-9][0-9]{0,18}#[0-9a-f]{64}")) {
             throw new IllegalArgumentException("TIANJI_NATIVE_TEMPLATE_CONFIGURATION_INVALID");
         }
+    }
+
+    public NativeAgentTemplateProperties(boolean enabled, String modelBeanName,
+                                         String modelName, String modelRouteRef) {
+        this(enabled, modelBeanName, modelName, modelRouteRef, false);
     }
 
     private static boolean safe(String value, int maximum) {

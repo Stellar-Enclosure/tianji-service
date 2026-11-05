@@ -10,6 +10,7 @@ import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -40,6 +41,12 @@ class TianjiNativeAgentTemplateConfigurationTest {
     }
 
     @Test
+    void decomposition_constructor_is_present() {
+        assertDoesNotThrow(() -> NativeAgentTemplateProperties.class.getDeclaredConstructor(
+                boolean.class, String.class, String.class, String.class, boolean.class));
+    }
+
+    @Test
     void native_template_configuration_is_present() {
         assertDoesNotThrow(() -> Class.forName(
                 "top.egon.cola.platform.tianji.agent.server.agenttemplate.TianjiNativeAgentTemplateConfiguration"));
@@ -52,7 +59,8 @@ class TianjiNativeAgentTemplateConfigurationTest {
                 () -> assertEquals(Boolean.FALSE, source.getProperty(PREFIX + "enabled")),
                 () -> assertEquals("", source.getProperty(PREFIX + "model-bean-name")),
                 () -> assertEquals("", source.getProperty(PREFIX + "model-name")),
-                () -> assertEquals("", source.getProperty(PREFIX + "model-route-ref")));
+                () -> assertEquals("", source.getProperty(PREFIX + "model-route-ref")),
+                () -> assertEquals(Boolean.FALSE, source.getProperty(PREFIX + "decomposition-enabled")));
     }
 
     @Test
@@ -144,6 +152,106 @@ class TianjiNativeAgentTemplateConfigurationTest {
         assertEquals(MODEL_BEAN, valid.modelBeanName());
         assertEquals(MODEL, valid.modelName());
         assertEquals(ROUTE, valid.modelRouteRef());
+    }
+
+    @Test
+    void fifth_constructor_is_the_binding_constructor_and_the_legacy_descriptor_defaults_false() {
+        var canonical = assertDoesNotThrow(() -> NativeAgentTemplateProperties.class.getDeclaredConstructor(
+                boolean.class, String.class, String.class, String.class, boolean.class));
+        var legacy = assertDoesNotThrow(() -> NativeAgentTemplateProperties.class.getDeclaredConstructor(
+                boolean.class, String.class, String.class, String.class));
+        assertAll(
+                () -> assertTrue(canonical.isAnnotationPresent(ConstructorBinding.class)),
+                () -> assertFalse(legacy.isAnnotationPresent(ConstructorBinding.class)),
+                () -> assertFalse(canonical.isAnnotationPresent(org.springframework.beans.factory.annotation.Autowired.class)),
+                () -> assertFalse(legacy.isAnnotationPresent(org.springframework.beans.factory.annotation.Autowired.class)));
+        var old = assertDoesNotThrow(() -> new NativeAgentTemplateProperties(true, MODEL_BEAN, MODEL, ROUTE));
+        var enabled = assertDoesNotThrow(() -> new NativeAgentTemplateProperties(true, MODEL_BEAN, MODEL, ROUTE, true));
+        assertFalse(old.decompositionEnabled());
+        assertTrue(enabled.decompositionEnabled());
+    }
+
+    @Test
+    void explicit_false_decomposition_preserves_the_exact_two_factory_map() {
+        ChatModel model = model(MODEL);
+        enabled(runner(Map.of(MODEL_BEAN, model))).withPropertyValues(PREFIX + "decomposition-enabled=false")
+                .withUserConfiguration(ConsumerConfiguration.class).run(context -> {
+                    assertNull(context.getStartupFailure());
+                    var properties = assertDoesNotThrow(() -> context.getBean(NativeAgentTemplateProperties.class));
+                    assertFalse(properties.decompositionEnabled());
+                    Map<?, ?> factories = assertDoesNotThrow(() -> context.getBean(FACTORIES, Map.class));
+                    assertEquals(Set.of("conditional-research-v1", "supervisor-research-v1"), factories.keySet());
+                    assertSame(factories, context.getBean("nativeFactoryConsumer"));
+                    assertThrows(UnsupportedOperationException.class, factories::clear);
+                });
+        verify(model, never()).call(any(Prompt.class));
+        verify(model, never()).stream(any(Prompt.class));
+    }
+
+    @Test
+    void both_flags_contribute_exactly_three_immutable_strategies_to_the_same_consumer() {
+        ChatModel model = model(MODEL);
+        enabled(runner(Map.of(MODEL_BEAN, model))).withPropertyValues(PREFIX + "decomposition-enabled=true")
+                .withUserConfiguration(ConsumerConfiguration.class).run(context -> {
+                    assertNull(context.getStartupFailure());
+                    var properties = assertDoesNotThrow(() -> context.getBean(NativeAgentTemplateProperties.class));
+                    assertTrue(properties.decompositionEnabled());
+                    Map<?, ?> factories = assertDoesNotThrow(() -> context.getBean(FACTORIES, Map.class));
+                    assertEquals(Set.of("conditional-research-v1", "supervisor-research-v1", "bounded-research-v1"), factories.keySet());
+                    assertTrue(factories.values().stream().allMatch(NativeAgentCompilerStrategy.class::isInstance));
+                    assertTrue(factories.values().stream().allMatch(Function.class::isInstance));
+                    assertSame(factories, context.getBean("nativeFactoryConsumer"));
+                    var bounded = assertInstanceOf(NativeAgentCompilerStrategy.class, factories.get("bounded-research-v1"));
+                    assertTrue(bounded.usesChatModel(model));
+                    var spec = assertDoesNotThrow(() -> bounded.templateSpec());
+                    assertNotNull(spec);
+                    assertEquals("1", spec.inputSchemaVersion());
+                    assertEquals("2", spec.outputSchemaVersion());
+                    assertThrows(UnsupportedOperationException.class, factories::clear);
+                });
+        verify(model, never()).call(any(Prompt.class));
+        verify(model, never()).stream(any(Prompt.class));
+    }
+
+    @Test
+    void native_disabled_ignores_decomposition_even_with_empty_or_invalid_metadata() {
+        for (String decomposition : List.of("true", "not-a-boolean")) {
+            runner(Map.of()).withPropertyValues(PREFIX + "enabled=false", PREFIX + "decomposition-enabled=" + decomposition,
+                    PREFIX + "model-bean-name=", PREFIX + "model-name=", PREFIX + "model-route-ref=").run(context -> {
+                assertNull(context.getStartupFailure());
+                assertFalse(context.containsBean(FACTORIES));
+                assertTrue(context.getBeansOfType(NativeAgentTemplateProperties.class).isEmpty());
+            });
+        }
+    }
+
+    @Test
+    void decomposition_enabled_does_not_bypass_existing_model_and_callback_guards() {
+        ChatModel mismatch = model("different-model");
+        enabled(runner(Map.of(MODEL_BEAN, mismatch))).withPropertyValues(PREFIX + "decomposition-enabled=true")
+                .run(context -> assertNotNull(context.getStartupFailure()));
+        var options = mock(ToolCallingChatOptions.class);
+        when(options.getModel()).thenReturn(MODEL);
+        when(options.getToolCallbacks()).thenReturn(List.of(mock(ToolCallback.class)));
+        ChatModel callbackModel = mock(ChatModel.class);
+        when(callbackModel.getOptions()).thenReturn(options);
+        enabled(runner(Map.of(MODEL_BEAN, callbackModel))).withPropertyValues(PREFIX + "decomposition-enabled=true")
+                .run(context -> assertNotNull(context.getStartupFailure()));
+        enabled(runner(Map.of(MODEL_BEAN, model(MODEL)))).withPropertyValues(PREFIX + "decomposition-enabled=not-a-boolean")
+                .run(context -> assertNotNull(context.getStartupFailure()));
+        verify(mismatch, never()).call(any(Prompt.class));
+        verify(mismatch, never()).stream(any(Prompt.class));
+        verify(callbackModel, never()).call(any(Prompt.class));
+        verify(callbackModel, never()).stream(any(Prompt.class));
+    }
+
+    @Test
+    void fifth_constructor_retains_the_same_strict_host_metadata_rules() {
+        assertAll(
+                () -> assertThrows(IllegalArgumentException.class, () -> new NativeAgentTemplateProperties(false, MODEL_BEAN, MODEL, ROUTE, true)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new NativeAgentTemplateProperties(true, " " + MODEL_BEAN, MODEL, ROUTE, true)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new NativeAgentTemplateProperties(true, MODEL_BEAN, "private\nmodel", ROUTE, true)),
+                () -> assertThrows(IllegalArgumentException.class, () -> new NativeAgentTemplateProperties(true, MODEL_BEAN, MODEL, "route-v1", true)));
     }
 
     private static ApplicationContextRunner runner(Map<String, ChatModel> models) {

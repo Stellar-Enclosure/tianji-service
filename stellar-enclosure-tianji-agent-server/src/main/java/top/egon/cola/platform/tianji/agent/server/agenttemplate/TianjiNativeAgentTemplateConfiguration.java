@@ -32,7 +32,12 @@ public class TianjiNativeAgentTemplateConfiguration {
                 && !tools.getToolCallbacks().isEmpty()) {
             throw new IllegalStateException("TIANJI_NATIVE_TEMPLATE_MODEL_BINDING_INVALID");
         }
+        if (!properties.decompositionEnabled()) {
+            return Map.of("conditional-research-v1", new ConditionalResearchAgentFactory(properties, model, adapter),
+                    "supervisor-research-v1", new SupervisorResearchAgentFactory(properties, model, adapter));
+        }
         return Map.of("conditional-research-v1", new ConditionalResearchAgentFactory(properties, model, adapter),
-                "supervisor-research-v1", new SupervisorResearchAgentFactory(properties, model, adapter));
+                "supervisor-research-v1", new SupervisorResearchAgentFactory(properties, model, adapter),
+                "bounded-research-v1", new BoundedResearchAgentFactory(properties, model, adapter));
     }
 }
