@@ -15,6 +15,7 @@ import top.egon.cola.platform.tianji.client.AgentClientException;
 import top.egon.cola.platform.tianji.client.HttpAgentClient;
 import top.egon.cola.platform.tianji.client.HttpProcessClient;
 import top.egon.cola.platform.tianji.client.ProcessClientException;
+import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.*;
 import top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceFaultRelay.FaultPhase;
@@ -43,6 +44,7 @@ import java.security.MessageDigest;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.Supplier;
@@ -126,6 +128,7 @@ class BusinessProcessAgentAcceptanceIT {
 
     record RunDTO(TenantBindingDTO tenant, Scenario scenario, String window, UUID operationId, ProcessInstanceDTO instance) { }
     record DispatchDTO(String occurrenceId, String runId, String state, String sourceId) { }
+    record OwnedAgentRunDTO(String status, Instant createdAt) { }
     record InboxDTO(String eventId, String fingerprint, String state) { }
     record OutboxDTO(String eventId, String status, int attempts) { }
     record NativeWaitDTO(String subscriptionId, String timerId, Instant deadline) { }
@@ -169,6 +172,7 @@ class BusinessProcessAgentAcceptanceIT {
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
                 case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
                 case S07_APPROVED_START -> "tianji.s07.approved-start.manifest";
+                case S12_OWNER_OBSERVATION -> "tianji.s12.owner-observation.manifest";
                 case S12_METRICS -> logs == null
                         ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
@@ -178,7 +182,18 @@ class BusinessProcessAgentAcceptanceIT {
             var manifest = permit.orElseThrow();
             require(manifest.suite() == suite, "Expense acceptance manifest suite");
             var tenantSettings = new HashMap<Long, Properties>();
-            for (var tenant : manifest.tenants()) tenantSettings.put(tenant.tenantId(), privateProperties(tenant.credentialFile()));
+            for (var tenant : manifest.tenants()) {
+                var settings = privateProperties(tenant.credentialFile());
+                if (suite == Suite.S12_OWNER_OBSERVATION) {
+                    var processRead = value(settings, S12OwnerObservationEvidence.PROCESS_TOKEN);
+                    var agentRead = value(settings, S12OwnerObservationEvidence.AGENT_TOKEN);
+                    S12OwnerObservationEvidence.requireReadToken(processRead, tenant, tenant.ownerSubject(),
+                            tenant.processResource(), "USER", ProcessControlClient.READ_SCOPE);
+                    S12OwnerObservationEvidence.requireReadToken(agentRead, tenant, value(settings, "identity.bridge-subject"),
+                            tenant.agentResource(), "SERVICE", "tianji:agent:read");
+                }
+                tenantSettings.put(tenant.tenantId(), settings);
+            }
             var stores = sourceAccess(manifest);
             var harness = ExpenseAcceptanceHarness.open(manifest, lock -> verifySources(lock, stores),
                     ExpenseAcceptanceHarness.processBuilderLauncher(logs), System::nanoTime, Clock.systemUTC(),
@@ -526,7 +541,7 @@ class BusinessProcessAgentAcceptanceIT {
             return manifest;
         }
         ExpenseAcceptanceManifestDTO metricsManifest() {
-            require(manifest.suite() == Suite.S12_METRICS, "Exact metrics fixture suite");
+            require(manifest.suite().collectsMetrics(), "Exact metrics fixture suite");
             return manifest;
         }
         Duration relayBudget() { return Duration.ofSeconds(Math.min(manifest.limits().recoverySeconds(), 60)); }
@@ -605,6 +620,7 @@ class BusinessProcessAgentAcceptanceIT {
             awaitEnd(run, "normalEnd");
             assertAgent(run, "COMPLETED", "APPLIED");
             assertEffects(run, 1, 0);
+            if (manifest.suite() == Suite.S12_OWNER_OBSERVATION) reconcile(run);
         }
 
         private void awaitEnd(RunDTO run, String endActivity) {
@@ -810,6 +826,36 @@ class BusinessProcessAgentAcceptanceIT {
             reject(404, () -> clients(second.tenant()).owner().get(new GetProcessInstanceQuery(first.instance().instanceId())));
         }
 
+        void verifyOwnerObservations(RunDTO first, RunDTO second) {
+            require(manifest.suite() == Suite.S12_OWNER_OBSERVATION, "Exact S12 owner observation fixture suite");
+            var processUntil = observerTime(StoreOwner.PROCESS);
+            var agentUntil = observerTime(StoreOwner.AGENT);
+            for (var own : List.of(first, second)) {
+                var foreign = own == first ? second : first;
+                var tenant = own.tenant();
+                var instance = own.instance();
+                var dispatch = dispatch(own).orElseThrow();
+                var ownedAgent = ownedAgentRun(own, dispatch.runId()).orElseThrow();
+                require("COMPLETED".equals(ownedAgent.status()), "Linked original AS owner run completed");
+                var process = new HttpProcessClient(URI.create(manifest.endpoints().process()), http,
+                        () -> setting(tenant, S12OwnerObservationEvidence.PROCESS_TOKEN), NETWORK);
+                var agent = new HttpAgentClient(URI.create(manifest.endpoints().agent()), http,
+                        () -> setting(tenant, S12OwnerObservationEvidence.AGENT_TOKEN), NETWORK, 0, Duration.ZERO);
+                var starts = process.listByCorrelation(new ListProcessInstancesByCorrelationQuery(instance.correlationId(),
+                        processUntil.minus(Duration.ofHours(1)), processUntil, null));
+                var outcome = process.getAgentOutcomes(new GetProcessAgentOutcomesQuery(instance.instanceId(), null));
+                var agents = agent.listByCorrelation(new ListAgentRunsByCorrelationQuery(instance.correlationId(),
+                        agentUntil.minus(Duration.ofHours(1)), agentUntil, null));
+                S12OwnerObservationEvidence.verify(instance, dispatch.runId(), ownedAgent.createdAt(), AGENT, starts, outcome, agents);
+                reject(404, () -> process.getAgentOutcomes(new GetProcessAgentOutcomesQuery(foreign.instance().instanceId(), null)));
+            }
+        }
+
+        private Instant observerTime(StoreOwner owner) {
+            return Objects.requireNonNull(db(owner).queryForObject("SELECT pg_catalog.clock_timestamp()", OffsetDateTime.class))
+                    .toInstant();
+        }
+
         ExpensePathResultDTO result(RunDTO run, Map<WitnessKind, WitnessDTO> additional) {
             reconcile(run);
             var dispatch = dispatch(run).orElseThrow();
@@ -957,14 +1003,18 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private Optional<String> agentStatus(RunDTO run, String agentRunId) {
+            return ownedAgentRun(run, agentRunId).map(OwnedAgentRunDTO::status);
+        }
+
+        private Optional<OwnedAgentRunDTO> ownedAgentRun(RunDTO run, String agentRunId) {
             return one(db(StoreOwner.AGENT), """
-                    SELECT r.status FROM tianji_agent.agent_run r JOIN tianji_agent.agent_process_dispatch d
+                    SELECT r.status,r.created_at FROM tianji_agent.agent_run r JOIN tianji_agent.agent_process_dispatch d
                       ON d.tenant_id=r.tenant_id AND d.run_id=r.run_id
                     WHERE r.tenant_id=? AND r.run_id=? AND r.subject_type='SERVICE' AND r.subject_id=? AND r.subject_issuer=?
                       AND r.definition_key='expenseAnalysis' AND r.definition_version=1 AND r.correlation_id=?
                       AND d.source_id=? AND d.scope_type='BPMN' AND d.scope_id=?
-                    """, (rs, row) -> rs.getString(1), run.tenant().tenantId(), agentRunId,
-                    setting(run.tenant(), "identity.bridge-subject"), issuerSha(run.tenant()), run.instance().correlationId(),
+                    """, (rs, row) -> new OwnedAgentRunDTO(rs.getString(1), rs.getObject(2, OffsetDateTime.class).toInstant()),
+                    run.tenant().tenantId(), agentRunId, setting(run.tenant(), "identity.bridge-subject"), issuerSha(run.tenant()), run.instance().correlationId(),
                     sourceId(run), run.instance().instanceId());
         }
 
@@ -1191,7 +1241,7 @@ class BusinessProcessAgentAcceptanceIT {
                     ? S12ChildLogPrivacy.Credential.AGENT_DB : S12ChildLogPrivacy.Credential.PROCESS_DB, runtimePassword);
             put(config, "spring.datasource.password", runtimePassword);
             put(config, "spring.datasource.hikari.schema", store.schema());
-            if (manifest.suite() != Suite.S12_METRICS && !manifest.suite().isS07()) {
+            if (!manifest.suite().collectsMetrics() && !manifest.suite().isS07()) {
                 put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
                 put(config, "management.tracing.sampling.probability", "1.0");
             }
@@ -1209,7 +1259,7 @@ class BusinessProcessAgentAcceptanceIT {
                 } else {
                     put(config, "stellar.tianji.process.agent-results.receive-span-links-enabled", "true");
                 }
-            } else if (manifest.suite() == Suite.S12_METRICS) {
+            } else if (manifest.suite().collectsMetrics()) {
                 String flag = role == ChildRole.AGENT
                         ? "stellar.tianji.agent.run-observation.initial-claim-metrics-enabled"
                         : "stellar.tianji.process.agent-results.lag-metrics-enabled";
@@ -1260,7 +1310,7 @@ class BusinessProcessAgentAcceptanceIT {
                 var delivery = prefix + "result-delivery.destinations[" + index + "].";
                 put(config, delivery + "id", destination(tenant));
                 put(config, delivery + "tenant-id", Long.toString(tenant.tenantId()));
-                put(config, delivery + "base-uri", manifest.suite() == Suite.RECEIVE_LINK || manifest.suite() == Suite.S12_METRICS
+                put(config, delivery + "base-uri", manifest.suite() == Suite.RECEIVE_LINK || manifest.suite().collectsMetrics()
                         ? manifest.endpoints().process() : manifest.endpoints().resultRelay());
                 put(config, delivery + "resource-uri", tenant.processResource());
                 put(config, delivery + "issuer", tenant.issuer());
@@ -1291,6 +1341,9 @@ class BusinessProcessAgentAcceptanceIT {
             }
             put(config, prefix + "human-tasks.publish-enabled", "true");
             put(config, prefix + "cases.new-starts-enabled", "true");
+            if (manifest.suite() == Suite.S12_OWNER_OBSERVATION) {
+                put(config, prefix + "agent-results.owner-outcomes-enabled", "true");
+            }
             put(config, "flowable.database-schema-update", "false");
             put(config, "flowable.database-schema", "tianji_process");
             put(config, "flowable.async-executor-activate", "true");

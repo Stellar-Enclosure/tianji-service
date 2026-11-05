@@ -23,9 +23,17 @@ class S12MetricsAcceptanceIT {
     }
 
     static void verifyMetrics(S12ChildLogPrivacy logs) throws Exception {
+        verifyMetrics(Suite.S12_METRICS, logs);
+    }
+
+    static void verifyOwnerObservations() throws Exception {
+        verifyMetrics(Suite.S12_OWNER_OBSERVATION, null);
+    }
+
+    private static void verifyMetrics(Suite suite, S12ChildLogPrivacy logs) throws Exception {
         var earliest = Instant.now();
         ExpenseAcceptanceManifestDTO manifest;
-        try (var driver = Driver.open(Suite.S12_METRICS, logs)) {
+        try (var driver = Driver.open(suite, logs)) {
             manifest = driver.metricsManifest();
             RunDTO prior = null;
             for (var tenant : driver.tenants()) {
@@ -33,7 +41,10 @@ class S12MetricsAcceptanceIT {
                 try {
                     driver.startWorker(run, false);
                     driver.assertNormalEnd(run);
-                    if (prior != null) driver.assertDisjoint(prior, run);
+                    if (prior != null) {
+                        driver.assertDisjoint(prior, run);
+                        if (suite == Suite.S12_OWNER_OBSERVATION) driver.verifyOwnerObservations(prior, run);
+                    }
                     prior = run;
                 } finally {
                     driver.stopWorker(run);
@@ -58,5 +69,8 @@ class S12MetricsAcceptanceIT {
                 digest, manifest.agent().execJarSha256(), manifest.process().execJarSha256(),
                 manifest.agent().testClassesSha256(), manifest.process().testClassesSha256());
         if (logs != null) System.out.println("S12_CHILD_LOG_PRIVACY_SUBSET roles=2 promptObservations=2");
+        if (suite == Suite.S12_OWNER_OBSERVATION) {
+            System.out.println("S12_OWNER_OBSERVATION_SUBSET tenants=2 protectedReads=6 foreignOutcomeDenials=2");
+        }
     }
 }

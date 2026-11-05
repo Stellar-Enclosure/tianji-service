@@ -118,7 +118,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     static ExpenseAcceptanceHarness open(ExpenseAcceptanceManifestDTO manifest, SourcePreflight preflight,
                                           ChildLauncher launcher, LongSupplier nanoTime, Clock clock, Sleeper sleeper) {
         validateManifest(manifest);
-        if (manifest.suite() == Suite.S12_METRICS) {
+        if (manifest.suite().collectsMetrics()) {
             try {
                 if (manifest.agent().testClasses().indexOf(',') >= 0 || manifest.process().testClasses().indexOf(',') >= 0
                         || manifest.privateRoot().indexOf(',') >= 0) throw invalid();
@@ -451,7 +451,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
         values.setProperty(prefix + "run-authorized", "true");
         if (manifest.suite().observesReceiveLinks()) {
             values.setProperty(prefix + "s12-receive-link", "true");
-        } else if (manifest.suite() == Suite.S12_METRICS) {
+        } else if (manifest.suite().collectsMetrics()) {
             values.setProperty(prefix + "s12-metrics", "true");
             values.setProperty(prefix + "s12-metrics-endpoint", manifest.endpoints().collector());
         } else if (manifest.suite().isS07()) {
@@ -479,7 +479,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private ChildLaunchDTO launchCommand(ChildRole role, ArtifactLockDTO artifact, Path configuration) throws IOException {
         String java = Path.of(System.getProperty("java.home")).toRealPath().resolve("bin/java").toString();
         String loaderPath = artifact.testClasses();
-        if (role == ChildRole.AGENT && (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS)) {
+        if (role == ChildRole.AGENT && (manifest.suite().observesReceiveLinks() || manifest.suite().collectsMetrics())) {
             verifyArtifact(absolute(manifest.checkoutRoot()), ChildRole.PROCESS, manifest.process());
             loaderPath += "," + manifest.process().testClasses();
         } else if (manifest.suite().observesReceiveLinks()) {
@@ -489,7 +489,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
                 loaderPath += "," + library.getKey();
             }
         }
-        var environment = manifest.suite() == Suite.S12_METRICS
+        var environment = manifest.suite().collectsMetrics()
                 ? Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false", "OTEL_TRACES_EXPORTER", "none",
                         "OTEL_METRICS_EXPORTER", "none", "OTEL_LOGS_EXPORTER", "none")
                 : Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false");
@@ -632,7 +632,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
-        if (manifest.suite().observesReceiveLinks() || manifest.suite() == Suite.S12_METRICS
+        if (manifest.suite().observesReceiveLinks() || manifest.suite().collectsMetrics()
                 || manifest.suite().isS07()) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
@@ -808,7 +808,10 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
     enum Suite {
-        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S07_GOVERNED_START, S07_APPROVED_START;
+        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S12_OWNER_OBSERVATION,
+        S07_GOVERNED_START, S07_APPROVED_START;
+
+        boolean collectsMetrics() { return this == S12_METRICS || this == S12_OWNER_OBSERVATION; }
 
         boolean isS07() { return this == S07_GOVERNED_START || this == S07_APPROVED_START; }
 
