@@ -35,6 +35,7 @@ import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
+import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
@@ -129,6 +130,8 @@ public class ProcessSecurityConfiguration {
                     if (enabled) authorize.requestMatchers("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                             "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                             "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**").authenticated();
+                    if (enabled) authorize.requestMatchers(HttpMethod.GET, "/api/tianji/v1" + ProcessController.CORRELATION_PATH).authenticated()
+                            .requestMatchers(HttpMethod.HEAD, "/api/tianji/v1" + ProcessController.CORRELATION_PATH).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
@@ -214,6 +217,7 @@ public class ProcessSecurityConfiguration {
                 List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
+                        "/api/tianji/v1" + ProcessController.CORRELATION_PATH,
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get"), true);
     }
 

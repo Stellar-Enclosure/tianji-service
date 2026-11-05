@@ -23,6 +23,8 @@ import top.egon.cola.platform.tianji.process.server.api.AgentResultInboxControll
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
@@ -213,6 +215,10 @@ class ProcessPermissionIntegrationTest {
         var actor = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "alice", "https://idp.example/tenants/20");
         when(processes.get(actor, "instance-1")).thenReturn(new ProcessExecutionService.Snapshot("instance-1", "v1", "invoice",
                 "order", "trace", ProcessExecutionService.State.ACTIVE, NOW, null));
+        var lookupEnd = NOW.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        var lookup = new ListProcessInstancesByCorrelationQuery("trace", lookupEnd.minusSeconds(60), lookupEnd, null);
+        when(processes.listByCorrelation(actor, lookup)).thenReturn(new ProcessInstanceCorrelationPageDTO("trace", lookupEnd,
+                List.of(new ProcessInstanceCorrelationPageDTO.ReceiptDTO("instance-1", "v1", lookupEnd.minusSeconds(30))), null));
         new WebApplicationContextRunner().withUserConfiguration(TestWeb.class)
                 .withPropertyValues("stellar.tianji.process.api.enabled=true",
                         "egon.cola.platform.tianquan.shoubing.register-filter=false",
@@ -229,6 +235,11 @@ class ProcessPermissionIntegrationTest {
                     var mvc = MockMvcBuilders.webAppContextSetup((WebApplicationContext) context.getSourceApplicationContext())
                             .apply(springSecurity()).build();
                     mvc.perform(get("/api/tianji/v1/process-instances/instance-1")).andExpect(status().isUnauthorized());
+                    mvc.perform(correlationRequest()).andExpect(status().isUnauthorized());
+                    mvc.perform(correlationRequest().header("Authorization", "Bearer verified-test-token"))
+                            .andExpect(status().isOk()).andExpect(jsonPath("$.items[0].instanceId").value("instance-1"));
+                    mvc.perform(correlationRequest().header("Authorization", "Bearer without-scope"))
+                            .andExpect(status().isForbidden());
                     var response = mvc.perform(get("/api/tianji/v1/process-instances/instance-1")
                                     .header("Authorization", "Bearer verified-test-token").header("X-Tenant-ID", "21"))
                             .andExpect(status().isOk()).andExpect(jsonPath("$.instanceId").value("instance-1")).andReturn();
@@ -253,7 +264,14 @@ class ProcessPermissionIntegrationTest {
                     mvc.perform(get("/unclassified").header("Authorization", "Bearer verified-test-token"))
                             .andExpect(status().isForbidden());
                     verify(processes, times(1)).get(actor, "instance-1");
+                    verify(processes, times(1)).listByCorrelation(actor, lookup);
                 }));
+    }
+
+    private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder correlationRequest() {
+        var end = NOW.truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        return get("/api/tianji/v1/process-instance-correlations").param("correlationId", "trace")
+                .param("fromInclusive", end.minusSeconds(60).toString()).param("toExclusive", end.toString());
     }
 
     @Test
@@ -268,6 +286,14 @@ class ProcessPermissionIntegrationTest {
                 URI.create("https://idp.example/tenants/20")));
         assertEquals(ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker", "https://idp.example/tenants/20"),
                 new TianjiProcessAccess(guard(), CLOCK).require(TianjiProcessPermissions.GET_API));
+        var access = new TianjiProcessAccess(guard(), CLOCK);
+        assertEquals(ProcessActor.SubjectType.SERVICE, access.require(TianjiProcessPermissions.CORRELATION_LIST_API).subjectType());
+        var withoutCorrelation = new java.util.HashSet<>(resources());
+        withoutCorrelation.remove(TianjiProcessPermissions.CORRELATION_LIST_API);
+        serviceGranted.set(Set.copyOf(withoutCorrelation));
+        assertThrows(org.springframework.security.access.AccessDeniedException.class,
+                () -> access.require(TianjiProcessPermissions.CORRELATION_LIST_API));
+        assertEquals(ProcessActor.SubjectType.SERVICE, access.require(TianjiProcessPermissions.GET_API).subjectType());
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal));
         assertThrows(org.springframework.security.authentication.AuthenticationCredentialsNotFoundException.class,
                 () -> new TianjiProcessAccess(guard(), CLOCK).require(TianjiProcessPermissions.GET_API));
@@ -452,6 +478,7 @@ class ProcessPermissionIntegrationTest {
                 TianjiProcessPermissions.RELEASE_GET_API, TianjiProcessPermissions.RELEASE_READ,
                 TianjiProcessPermissions.START_API, TianjiProcessPermissions.START,
                 TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ,
+                TianjiProcessPermissions.CORRELATION_LIST_API, TianjiProcessPermissions.READ,
                 TianjiProcessPermissions.DECISION_API, TianjiProcessPermissions.DECISION_EXECUTE);
         Set<String> all = Set.copyOf(required.values());
         granted.set(all);
@@ -626,6 +653,8 @@ class ProcessPermissionIntegrationTest {
                         new PermissionManifest.I18nReference("tianji.process.permissions", "api.case.actPlanItem"), DefinitionLifecycle.ACTIVE),
                 resource(TianjiProcessPermissions.GET_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
                         "GET", "/api/tianji/v1/process-instances/{instanceId}", "api.process.get"),
+                resource(TianjiProcessPermissions.CORRELATION_LIST_API, TianjiProcessPermissions.READ, TianjiProcessPermissions.READ_SCOPE,
+                        "GET", "/api/tianji/v1/process-instance-correlations", "api.process.correlations"),
                 controlResource(TianjiProcessPermissions.CONTROL_API, "GET",
                         "/api/tianji/v1/process-instances/{instanceId}/control", "api.process.control"),
                 controlResource(TianjiProcessPermissions.CANCEL_API, "POST",
@@ -699,7 +728,8 @@ class ProcessPermissionIntegrationTest {
 
     private static Set<String> resources() {
         return Set.of(TianjiProcessPermissions.CASE_START_API, TianjiProcessPermissions.CASE_GET_API, TianjiProcessPermissions.CASE_PLAN_ITEM_ACT_API,
-                TianjiProcessPermissions.GET_API, TianjiProcessPermissions.CONTROL_API, TianjiProcessPermissions.CANCEL_API,
+                TianjiProcessPermissions.GET_API, TianjiProcessPermissions.CORRELATION_LIST_API,
+                TianjiProcessPermissions.CONTROL_API, TianjiProcessPermissions.CANCEL_API,
                 TianjiProcessPermissions.START_API, TianjiProcessPermissions.RELEASE_GET_API,
                 TianjiProcessPermissions.RELEASE_PUBLISH_API, TianjiProcessPermissions.DECISION_API,
                 TianjiProcessPermissions.WORKER_ACQUIRE_API, TianjiProcessPermissions.WORKER_COMPLETE_API, TianjiProcessPermissions.WORKER_FAIL_API,

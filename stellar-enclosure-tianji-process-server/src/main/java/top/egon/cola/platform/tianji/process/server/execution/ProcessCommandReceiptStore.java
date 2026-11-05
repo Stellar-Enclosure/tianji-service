@@ -1,10 +1,14 @@
 package top.egon.cola.platform.tianji.process.server.execution;
 
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 
@@ -12,7 +16,11 @@ import java.util.Optional;
 public final class ProcessCommandReceiptStore {
     public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE, PROCESS_CANCEL, PROCESS_WORKER_RECOVER }
 
+    private static final String CORRELATION_SCOPE = " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
+            + " AND command_type='START' AND state='APPLIED' AND resource_id IS NOT NULL"
+            + " AND correlation_id COLLATE \"C\"=? AND created_at>=? AND created_at<?";
     private final JdbcTemplate jdbc;
+    private final String schema;
     private final String table;
 
     public ProcessCommandReceiptStore(JdbcTemplate jdbc, String schema) {
@@ -20,6 +28,7 @@ public final class ProcessCommandReceiptStore {
             throw new IllegalArgumentException("Process receipt storage is invalid");
         }
         this.jdbc = jdbc;
+        this.schema = schema;
         this.table = '"' + schema + "\".tianji_process_command_receipt";
     }
 
@@ -55,6 +64,74 @@ public final class ProcessCommandReceiptStore {
                         rs.getString("resource_id"), rs.getTimestamp("created_at").toInstant(), null), actor.tenantId(),
                 actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), instanceId);
         return one(rows);
+    }
+
+    Instant beginCorrelationObservation() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())
+                || Thread.currentThread().isInterrupted()) throw correlationUnavailable();
+        // Keep routing on the owning primary while making the physical transaction SELECT-only.
+        jdbc.execute("SET TRANSACTION READ ONLY");
+        jdbc.execute("SET LOCAL statement_timeout = '2s'");
+        var observed = jdbc.queryForObject("""
+                SELECT pg_catalog.clock_timestamp()
+                FROM pg_catalog.pg_namespace ns
+                JOIN pg_catalog.pg_class rel ON rel.relnamespace=ns.oid
+                WHERE ns.nspname=? AND rel.relname='tianji_process_command_receipt'
+                  AND pg_catalog.current_schema()=ns.nspname
+                  AND rel.relkind='r' AND rel.relpersistence='p' AND NOT rel.relispartition
+                  AND NOT rel.relrowsecurity AND NOT rel.relforcerowsecurity
+                  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits
+                                  WHERE inhrelid=rel.oid OR inhparent=rel.oid)
+                  AND pg_catalog.has_schema_privilege(ns.oid,'USAGE')
+                  AND pg_catalog.has_table_privilege(rel.oid,'SELECT')
+                  AND NOT pg_catalog.pg_is_in_recovery()
+                  AND pg_catalog.current_setting('server_encoding')='UTF8'
+                  AND pg_catalog.current_setting('session_replication_role')='origin'
+                  AND pg_catalog.current_setting('transaction_read_only')='on'
+                  AND pg_catalog.current_setting('transaction_isolation')='repeatable read'
+                """, OffsetDateTime.class, schema);
+        if (observed == null) throw correlationUnavailable();
+        return observed.toInstant();
+    }
+
+    boolean hasCorrelationAnchor(ProcessActor actor, String correlationId, Instant from, Instant until,
+                                 Instant submittedAt, String instanceId) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + table + CORRELATION_SCOPE
+                        + " AND created_at=? AND resource_id COLLATE \"C\"=?)", Boolean.class,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                correlationId, utc(from), utc(until), utc(submittedAt), instanceId));
+    }
+
+    List<CorrelationReceipt> listCorrelationReceipts(ProcessActor actor, String correlationId, Instant from, Instant until,
+                                                     Instant beforeSubmittedAt, String beforeInstanceId) {
+        String sql = "SELECT resource_id, release_key, created_at FROM " + table + CORRELATION_SCOPE;
+        String order = " ORDER BY created_at DESC, resource_id COLLATE \"C\" DESC LIMIT "
+                + (ProcessInstanceCorrelationPageDTO.PAGE_SIZE + 1);
+        var fromUtc = utc(from);
+        var untilUtc = utc(until);
+        if (beforeSubmittedAt == null) {
+            return jdbc.query(sql + order, ProcessCommandReceiptStore::readCorrelationReceipt,
+                    actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    correlationId, fromUtc, untilUtc);
+        }
+        return jdbc.query(sql + " AND (created_at,resource_id COLLATE \"C\") < (?,?)" + order,
+                ProcessCommandReceiptStore::readCorrelationReceipt, actor.tenantId(), actor.subjectType().name(),
+                actor.issuerFingerprint(), actor.subjectId(), correlationId, fromUtc, untilUtc, utc(beforeSubmittedAt), beforeInstanceId);
+    }
+
+    private static CorrelationReceipt readCorrelationReceipt(java.sql.ResultSet rs, int number) throws java.sql.SQLException {
+        var createdAt = rs.getObject("created_at", OffsetDateTime.class);
+        if (createdAt == null) throw correlationUnavailable();
+        return new CorrelationReceipt(rs.getString("resource_id"), rs.getString("release_key"), createdAt.toInstant());
+    }
+
+    private static OffsetDateTime utc(Instant instant) {
+        return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+    }
+
+    private static IllegalStateException correlationUnavailable() {
+        return new IllegalStateException("Process correlation evidence is unavailable");
     }
 
     public TaskOrigin readStartByInstance(ProcessActor actor, String instanceId) {
@@ -110,6 +187,8 @@ public final class ProcessCommandReceiptStore {
         if (rows.size() != 1) throw new ProcessResourceNotFoundException();
         return rows.getFirst();
     }
+
+    record CorrelationReceipt(String instanceId, String releaseVersion, Instant submittedAt) { }
 
     public record Receipt(String requestHash, String releaseKey, String correlationId, String state,
                           String resourceId, Instant createdAt, String decisionResult) { }

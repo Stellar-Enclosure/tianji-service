@@ -5,10 +5,18 @@ import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.history.HistoricProcessInstance;
 import org.flowable.engine.runtime.ProcessInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionException;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO.ReceiptDTO;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.CorrelationReceipt;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -19,20 +27,28 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /** Internal process entry point; the caller must authenticate and authorize the supplied actor. */
 public final class ProcessExecutionService {
+    private static final int CORRELATION_PAGE_SIZE = ProcessInstanceCorrelationPageDTO.PAGE_SIZE;
     private final SpringProcessEngineConfiguration engine;
     private final VerifiedProcessModels models;
     private final ProcessReleaseService releases;
     private final ProcessCommandReceiptStore receipts;
     private final TransactionTemplate write;
     private final TransactionTemplate read;
+    private final TransactionTemplate correlationRead;
 
     public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                    ProcessModelValidator validator) {
@@ -50,6 +66,11 @@ public final class ProcessExecutionService {
         this.read = new TransactionTemplate(manager);
         this.read.setReadOnly(true);
         this.read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        this.correlationRead = new TransactionTemplate(manager);
+        // Read-only is enforced on the primary by the receipt store, not a replica routing hint.
+        this.correlationRead.setReadOnly(false);
+        this.correlationRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        this.correlationRead.setTimeout(2);
     }
 
     public Snapshot start(ProcessActor actor, StartCommand command) {
@@ -63,6 +84,111 @@ public final class ProcessExecutionService {
         if (!validId(instanceId, 255)) throw invalid();
         return Objects.requireNonNull(read.execute(status -> snapshot(actor, receipts.startByInstance(actor, instanceId))));
     }
+
+    public ProcessInstanceCorrelationPageDTO listByCorrelation(ProcessActor actor, ListProcessInstancesByCorrelationQuery query) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AccessDeniedException("Verified Process owner is required");
+        }
+        if (query == null) throw invalid();
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive() || Thread.currentThread().isInterrupted()) {
+            throw correlationUnavailable();
+        }
+        CorrelationCursor cursor = query.cursor() == null ? null : decodeCorrelationCursor(actor, query);
+        try {
+            return Objects.requireNonNull(correlationRead.execute(status -> correlationPage(actor, query, cursor)));
+        } catch (DataAccessException | TransactionException failure) {
+            throw correlationUnavailable();
+        }
+    }
+
+    private ProcessInstanceCorrelationPageDTO correlationPage(ProcessActor actor, ListProcessInstancesByCorrelationQuery query,
+                                                              CorrelationCursor cursor) {
+        Instant observedAt = receipts.beginCorrelationObservation();
+        if (query.toExclusive().isAfter(observedAt)) throw invalid();
+        if (cursor != null && !receipts.hasCorrelationAnchor(actor, query.correlationId(), query.fromInclusive(),
+                query.toExclusive(), cursor.submittedAt(), cursor.instanceId())) throw invalid();
+
+        var rows = receipts.listCorrelationReceipts(actor, query.correlationId(), query.fromInclusive(), query.toExclusive(),
+                cursor == null ? null : cursor.submittedAt(), cursor == null ? null : cursor.instanceId());
+        validateCorrelationRows(rows, query, cursor);
+        var boundary = rows.size() > CORRELATION_PAGE_SIZE ? rows.get(CORRELATION_PAGE_SIZE - 1) : null;
+        String next = boundary == null ? null
+                : encodeCorrelationCursor(actor, query, boundary.submittedAt(), boundary.instanceId());
+        try {
+            var items = rows.stream().limit(CORRELATION_PAGE_SIZE)
+                    .map(row -> new ReceiptDTO(row.instanceId(), row.releaseVersion(), row.submittedAt())).toList();
+            return new ProcessInstanceCorrelationPageDTO(query.correlationId(), observedAt, items, next);
+        } catch (IllegalArgumentException corruptSource) {
+            throw correlationUnavailable();
+        }
+    }
+
+    private static void validateCorrelationRows(List<CorrelationReceipt> rows, ListProcessInstancesByCorrelationQuery query,
+                                                CorrelationCursor cursor) {
+        if (rows.size() > CORRELATION_PAGE_SIZE + 1 || Thread.currentThread().isInterrupted()) throw correlationUnavailable();
+        Instant previousTime = cursor == null ? null : cursor.submittedAt();
+        String previousId = cursor == null ? null : cursor.instanceId();
+        var identities = new HashSet<String>();
+        for (var row : rows) {
+            if (row == null || !validCorrelationInstanceId(row.instanceId()) || row.releaseVersion() == null
+                    || !row.releaseVersion().matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}") || row.submittedAt() == null
+                    || row.submittedAt().getNano() % 1_000 != 0 || row.submittedAt().isBefore(query.fromInclusive())
+                    || !row.submittedAt().isBefore(query.toExclusive()) || !identities.add(row.instanceId())) {
+                throw correlationUnavailable();
+            }
+            if (previousTime != null && (row.submittedAt().isAfter(previousTime)
+                    || row.submittedAt().equals(previousTime) && compareUtf8(row.instanceId(), previousId) >= 0)) {
+                throw correlationUnavailable();
+            }
+            previousTime = row.submittedAt();
+            previousId = row.instanceId();
+        }
+    }
+
+    private static boolean validCorrelationInstanceId(String value) {
+        return validId(value, 255) && !".".equals(value) && !"..".equals(value);
+    }
+
+    private static int compareUtf8(String left, String right) {
+        return Arrays.compareUnsigned(left.getBytes(StandardCharsets.UTF_8), right.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static CorrelationCursor decodeCorrelationCursor(ProcessActor actor, ListProcessInstancesByCorrelationQuery query) {
+        String token = query.cursor();
+        try {
+            var bytes = Base64.getUrlDecoder().decode(token.substring(3));
+            if (!token.equals("v1." + Base64.getUrlEncoder().withoutPadding().encodeToString(bytes))) throw invalid();
+            var text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString().split("\n", -1);
+            if (text.length != 3 || !validCorrelationInstanceId(text[1])) throw invalid();
+            Instant submittedAt = ListProcessInstancesByCorrelationQuery.parseUtc(text[0]);
+            if (!submittedAt.toString().equals(text[0]) || submittedAt.isBefore(query.fromInclusive())
+                    || !submittedAt.isBefore(query.toExclusive())
+                    || !correlationCursorHash(actor, query, submittedAt, text[1]).equals(text[2])) throw invalid();
+            return new CorrelationCursor(submittedAt, text[1]);
+        } catch (IllegalArgumentException | CharacterCodingException invalidCursor) {
+            throw invalid();
+        }
+    }
+
+    private static String encodeCorrelationCursor(ProcessActor actor, ListProcessInstancesByCorrelationQuery query,
+                                                  Instant submittedAt, String instanceId) {
+        var text = submittedAt + "\n" + instanceId + "\n" + correlationCursorHash(actor, query, submittedAt, instanceId);
+        return "v1." + Base64.getUrlEncoder().withoutPadding().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String correlationCursorHash(ProcessActor actor, ListProcessInstancesByCorrelationQuery query,
+                                                Instant submittedAt, String instanceId) {
+        return ProcessRequestDigest.hash(List.of("TIANJI_PROCESS_CORRELATION_CURSOR_V1", Long.toString(actor.tenantId()),
+                actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), query.correlationId(),
+                query.fromInclusive().toString(), query.toExclusive().toString(), submittedAt.toString(), instanceId), Map.of());
+    }
+
+    private static IllegalStateException correlationUnavailable() {
+        return new IllegalStateException("Process correlation evidence is unavailable");
+    }
+
+    private record CorrelationCursor(Instant submittedAt, String instanceId) { }
 
     private Snapshot startInTransaction(ProcessActor actor, StartCommand command) {
         Release release = releases.get(actor, command.releaseKey());

@@ -1,0 +1,297 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Owned Process Correlation Lookup",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/tianji/v1/process-instance-correlations": {
+      "get": {
+        "operationId": "listOwnedProcessStartsByCorrelation",
+        "summary": "Find owned process starts by exact correlation",
+        "description": "Returns up to 20 applied Process START receipts in descending submitted time and instance ID order. The requester is derived from verified identity and current authorization. The required UTC window is half-open and at most 31 days. An opaque cursor belongs to the same owner, correlation and window. Results contain Process receipt references.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:read"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_PROCESS_READ"
+        ],
+        "x-resource-key": "tianji.api.process.instance.correlations",
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "correlationId",
+            "in": "query",
+            "required": true,
+            "description": "Case-sensitive receipt correlation.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+            }
+          },
+          {
+            "name": "fromInclusive",
+            "in": "query",
+            "required": true,
+            "description": "Inclusive UTC lower bound.",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+            }
+          },
+          {
+            "name": "toExclusive",
+            "in": "query",
+            "required": true,
+            "description": "Exclusive UTC upper bound.",
+            "schema": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Opaque navigation cursor from the preceding page.",
+            "schema": {
+              "type": "string",
+              "maxLength": 1200,
+              "pattern": "^v1\\.[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Owned receipt page. Empty items means no owned matches.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CorrelationPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed query, time window or cursor.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current permission, scope or resource policy denied.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Tenant context changed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Process store unavailable.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Example URLs describe the existing user and service scopes. Deployments provide their own identity endpoints.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://identity.example/authorize",
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:process:read": "Read owned process instances"
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:process:read": "Read owned process instances"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CorrelationPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "correlationId",
+          "observedAt",
+          "items",
+          "nextCursor"
+        ],
+        "properties": {
+          "correlationId": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {
+              "$ref": "#/components/schemas/Receipt"
+            }
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1200,
+                "pattern": "^v1\\.[A-Za-z0-9_-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "Receipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "releaseVersion",
+          "submittedAt"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "releaseVersion": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]{1,6})?Z$"
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "correlationId"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^TIANJI_[A-Z_]+$"
+          },
+          "correlationId": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  }
+}

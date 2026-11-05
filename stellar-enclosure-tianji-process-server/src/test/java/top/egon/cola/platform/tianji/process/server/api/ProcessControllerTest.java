@@ -12,6 +12,8 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelResource;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
@@ -72,6 +74,50 @@ class ProcessControllerTest {
 
     @AfterEach
     void clear() { SecurityContextHolder.clearContext(); }
+
+    @Test
+    void lists_exact_owned_process_receipts_by_correlation() throws Exception {
+        var from = Instant.parse("2026-11-01T00:00:00Z");
+        var until = from.plusSeconds(86_400);
+        var input = new ListProcessInstancesByCorrelationQuery("trace-1", from, until, null);
+        var item = new ProcessInstanceCorrelationPageDTO.ReceiptDTO("instance-1", "v1", from);
+        when(processes.listByCorrelation(ACTOR, input)).thenReturn(
+                new ProcessInstanceCorrelationPageDTO("trace-1", until, List.of(item), null));
+
+        String body = mvc.perform(correlationRequest())
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.correlationId").value("trace-1"))
+                .andExpect(jsonPath("$.items[0].instanceId").value("instance-1"))
+                .andReturn().getResponse().getContentAsString();
+
+        assertEquals(Set.of("correlationId", "observedAt", "items", "nextCursor"),
+                Set.copyOf(mapper.readTree(body).propertyNames()));
+        assertEquals(Set.of("instanceId", "releaseVersion", "submittedAt"),
+                Set.copyOf(mapper.readTree(body).get("items").get(0).propertyNames()));
+        verify(guard).requireExecution(TianjiProcessPermissions.CORRELATION_LIST_API);
+        verify(processes).listByCorrelation(ACTOR, input);
+        verifyNoMoreInteractions(processes);
+    }
+
+    @Test
+    void rejects_malformed_or_unauthorized_correlation_lookups_before_storage() throws Exception {
+        for (var request : List.of(correlationRequest().param("correlationId", "another"),
+                correlationRequest().param("tenantId", "20"), correlationRequest().param("cursor", ""),
+                get("/api/tianji/v1/process-instance-correlations").param("correlationId", "trace-1"))) {
+            mvc.perform(request).andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.code").value("TIANJI_INVALID_COMMAND"));
+        }
+        doThrow(new AccessDeniedException("private authorization detail")).when(guard)
+                .requireExecution(TianjiProcessPermissions.CORRELATION_LIST_API);
+        mvc.perform(correlationRequest().param("tenantId", "20")).andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.code").value("TIANJI_PERMISSION_DENIED"));
+        verifyNoInteractions(processes);
+    }
+
+    private static org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder correlationRequest() {
+        return get("/api/tianji/v1/process-instance-correlations").param("correlationId", "trace-1")
+                .param("fromInclusive", "2026-11-01T00:00:00Z").param("toExclusive", "2026-11-02T00:00:00Z");
+    }
 
     @Test
     void maps_the_five_operations_to_the_verified_actor_without_engine_ids_in_responses() throws Exception {

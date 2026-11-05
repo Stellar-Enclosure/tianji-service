@@ -15,6 +15,46 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrchestrationContractTest {
     @Test
+    void rejects_invalid_process_correlation_queries() {
+        var start = Instant.parse("2026-11-01T00:00:00Z");
+        assertThrows(IllegalArgumentException.class,
+                () -> new ListProcessInstancesByCorrelationQuery("trace-1", start, start.plus(Duration.ofDays(31)).plusNanos(1_000), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ListProcessInstancesByCorrelationQuery("trace-1", start, start, null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ListProcessInstancesByCorrelationQuery("trace-1", start.plusNanos(1), start.plusSeconds(1), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ListProcessInstancesByCorrelationQuery("trace-1", start, start.plusSeconds(1), "v1.YQ="));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ListProcessInstancesByCorrelationQuery(" trace-1", start, start.plusSeconds(1), null));
+        assertEquals(start, ListProcessInstancesByCorrelationQuery.parseUtc("2026-11-01T00:00:00.000Z"));
+        for (var malformed : List.of("2026-11-01T00:00:00+00:00", "2026-11-01T00:00:60Z",
+                "2026-11-01T24:00:00Z", "2026-02-29T00:00:00Z", "2026-11-01T00:00:00.0000001Z")) {
+            assertThrows(IllegalArgumentException.class, () -> ListProcessInstancesByCorrelationQuery.parseUtc(malformed));
+        }
+        assertEquals(start.plus(Duration.ofDays(31)),
+                new ListProcessInstancesByCorrelationQuery("trace-1", start, start.plus(Duration.ofDays(31)), null).toExclusive());
+    }
+
+
+    @Test
+    void correlation_page_is_bounded_immutable_and_has_only_owned_receipt_fields() {
+        var now = Instant.parse("2026-11-01T00:00:00Z");
+        var item = new ProcessInstanceCorrelationPageDTO.ReceiptDTO("instance", "v1", now);
+        var source = new ArrayList<>(List.of(item));
+        var page = new ProcessInstanceCorrelationPageDTO("trace-1", now, source, null);
+        source.clear();
+        assertEquals(List.of(item), page.items());
+        assertThrows(UnsupportedOperationException.class, () -> page.items().clear());
+        assertThrows(IllegalArgumentException.class, () -> new ProcessInstanceCorrelationPageDTO("trace-1", now, List.of(item), "v1.YQ"));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessInstanceCorrelationPageDTO("trace-1", now, List.of(item, item), null));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessInstanceCorrelationPageDTO("trace-1", now.minusSeconds(1), List.of(item), null));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessInstanceCorrelationPageDTO.ReceiptDTO("..", "v1", now));
+        assertEquals(List.of("instanceId", "releaseVersion", "submittedAt"),
+                java.util.Arrays.stream(item.getClass().getRecordComponents()).map(component -> component.getName()).toList());
+    }
+
+    @Test
     void formal_case_models_have_their_own_named_release_type() {
         var cmmn = assertDoesNotThrow(() -> Enum.valueOf(ProcessModelTypeEnum.class, "CMMN"));
         assertEquals("CMMN", cmmn.name());

@@ -4,16 +4,20 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import top.egon.cola.platform.tianji.contract.orchestration.DecisionResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.EvaluateDecisionCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessReleaseQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstancesByCorrelationQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelDTO;
@@ -37,12 +41,16 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.R
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping(path = "/api/tianji/v1", produces = MediaType.APPLICATION_JSON_VALUE)
 @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
 public class ProcessController {
+    public static final String CORRELATION_PATH = "/process-instance-correlations";
+    private static final Set<String> CORRELATION_PARAMETERS = Set.of("correlationId", "fromInclusive", "toExclusive", "cursor");
+
     private final ProcessReleaseService releases;
     private final ProcessExecutionService processes;
     private final ProcessDecisionService decisions;
@@ -104,6 +112,25 @@ public class ProcessController {
     public ResponseEntity<ProcessInstanceDTO> instance(@PathVariable("instanceId") String instanceId) {
         var actor = access.require(TianjiProcessPermissions.GET_API);
         return noStore(instance(processes.get(actor, new GetProcessInstanceQuery(instanceId).instanceId())));
+    }
+
+    @PermissionResource(key = TianjiProcessPermissions.CORRELATION_LIST_API, type = ResourceType.API,
+            labelPage = "tianji.process.permissions", labelKey = "api.process.correlations",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = TianjiProcessPermissions.READ_SCOPE)
+    @RequiresPermissions(codes = TianjiProcessPermissions.READ)
+    @GetMapping(CORRELATION_PATH)
+    public ResponseEntity<ProcessInstanceCorrelationPageDTO> correlations(@RequestParam MultiValueMap<String, String> parameters) {
+        var actor = access.require(TianjiProcessPermissions.CORRELATION_LIST_API);
+        if (!CORRELATION_PARAMETERS.containsAll(parameters.keySet())
+                || parameters.values().stream().anyMatch(values -> values.size() != 1)) {
+            throw new IllegalArgumentException("Process correlation query is invalid");
+        }
+        var query = new ListProcessInstancesByCorrelationQuery(parameters.getFirst("correlationId"),
+                ListProcessInstancesByCorrelationQuery.parseUtc(parameters.getFirst("fromInclusive")),
+                ListProcessInstancesByCorrelationQuery.parseUtc(parameters.getFirst("toExclusive")),
+                parameters.getFirst("cursor"));
+        return noStore(processes.listByCorrelation(actor, query));
     }
 
     @PermissionResource(key = TianjiProcessPermissions.DECISION_API, type = ResourceType.API,
