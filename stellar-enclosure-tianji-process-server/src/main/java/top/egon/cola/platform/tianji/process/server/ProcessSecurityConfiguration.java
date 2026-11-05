@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.process.server;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -75,6 +76,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRe
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxLagObservation;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
 import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgePoller;
@@ -453,6 +455,8 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "agent-results.enabled"}, havingValue = "true")
     @EnableConfigurationProperties(AgentResultInboxProperties.class)
     static class AgentResultConfiguration {
+        private static final String LAG_METRICS_ENABLED = "stellar.tianji.process.agent-results.lag-metrics-enabled";
+
         @Bean
         @ConditionalOnMissingBean(AgentResultProducerRegistry.class)
         AgentResultProducerRegistry agentResultProducerRegistry(AgentResultInboxProperties properties) {
@@ -472,12 +476,17 @@ public class ProcessSecurityConfiguration {
         @Bean
         @ConditionalOnMissingBean(AgentResultInbox.class)
         AgentResultInbox agentResultInbox(ProcessEngine engine, AgentDispatchStore dispatches, AgentResultProducerRegistry producers,
-                                           AgentResultInboxProperties properties) {
+                                           AgentResultInboxProperties properties, Environment environment,
+                                           ObjectProvider<MeterRegistry> registries) {
             var configuration = processConfiguration(engine);
             if (!(configuration.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) {
                 throw new IllegalStateException("Agent result Inbox requires shared JDBC storage");
             }
-            return new AgentResultInbox(manager.getDataSource(), manager, configuration.getDatabaseSchema(), dispatches, producers, properties.pendingRetention());
+            var lag = environment.getProperty(LAG_METRICS_ENABLED, Boolean.class, false)
+                    ? AgentResultInboxLagObservation.enabled(registries::getIfUnique)
+                    : AgentResultInboxLagObservation.disabled();
+            return new AgentResultInbox(manager.getDataSource(), manager, configuration.getDatabaseSchema(),
+                    dispatches, producers, properties.pendingRetention(), lag);
         }
     }
 

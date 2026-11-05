@@ -86,5 +86,7 @@ stellar:
       human-tasks:
         enabled: false
         publish-enabled: false
+      agent-results:
+        lag-metrics-enabled: false
       agent-bridge:
         enabled: false

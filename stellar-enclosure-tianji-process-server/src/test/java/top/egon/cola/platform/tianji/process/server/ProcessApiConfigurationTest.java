@@ -1,6 +1,12 @@
 package top.egon.cola.platform.tianji.process.server;
 
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
+import org.springframework.boot.env.YamlPropertySourceLoader;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
@@ -25,6 +31,9 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 
 import javax.sql.DataSource;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxLagObservation;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
@@ -154,6 +163,48 @@ class ProcessApiConfigurationTest {
                     .withBean(FlowableHumanTaskService.class, () -> mock(FlowableHumanTaskService.class))
                     .withBean(ApprovalConsumerRegistry.class, () -> new ApprovalConsumerRegistry(java.util.List.of(approvalBinding())))
                     .run(context -> { assertThat(context).hasNotFailed(); assertThat(context).hasSingleBean(HumanTaskReceiptStore.class); assertThat(stores.constructed()).hasSize(1); verify(stores.constructed().getFirst()).verifyStorage(); });
+        }
+    }
+
+    @Test
+    void agentResultInboxLagObservationIsExplicitAndDoesNotChangePrerequisites() throws Exception {
+        String flag = "stellar.tianji.process.agent-results.lag-metrics-enabled";
+        runner.withPropertyValues(flag + "=true").run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context).doesNotHaveBean(AgentResultInbox.class);
+        });
+
+        var yaml = new YamlPropertySourceLoader().load("process-defaults", new ClassPathResource("application.yml"));
+        assertThat(yaml.getFirst().getProperty(flag)).isEqualTo(false);
+
+        var source = mock(DataSource.class);
+        var manager = new DataSourceTransactionManager(source);
+        var engine = mock(ProcessEngine.class);
+        var configuration = mock(SpringProcessEngineConfiguration.class);
+        when(engine.getProcessEngineConfiguration()).thenReturn(configuration);
+        when(configuration.getTransactionManager()).thenReturn(manager);
+        when(configuration.getDatabaseSchema()).thenReturn("tianji_process");
+        var dispatches = mock(AgentDispatchStore.class);
+        var producers = mock(AgentResultProducerRegistry.class);
+        var properties = new AgentResultInboxProperties(java.util.List.of(), null);
+        ObjectProvider<MeterRegistry> registries = new StaticListableBeanFactory().getBeanProvider(MeterRegistry.class);
+        var factory = new ProcessSecurityConfiguration.AgentResultConfiguration();
+        var arguments = new java.util.ArrayList<java.util.List<?>>();
+        try (var inboxes = mockConstruction(AgentResultInbox.class, (inbox, context) -> arguments.add(context.arguments()))) {
+            factory.agentResultInbox(engine, dispatches, producers, properties, new MockEnvironment(), registries);
+            factory.agentResultInbox(engine, dispatches, producers, properties,
+                    new MockEnvironment().withProperty(flag, "false"), registries);
+            factory.agentResultInbox(engine, dispatches, producers, properties,
+                    new MockEnvironment().withProperty(flag, "true"), registries);
+            assertThat(inboxes.constructed()).hasSize(3);
+            for (var invocation : arguments) {
+                assertThat(invocation.subList(0, 6)).isEqualTo(java.util.List.of(
+                        source, manager, "tianji_process", dispatches, producers, properties.pendingRetention()));
+            }
+            assertThat(arguments.get(0).getLast()).isSameAs(AgentResultInboxLagObservation.disabled());
+            assertThat(arguments.get(1).getLast()).isSameAs(AgentResultInboxLagObservation.disabled());
+            assertThat(arguments.get(2).getLast()).isInstanceOf(AgentResultInboxLagObservation.class)
+                    .isNotSameAs(AgentResultInboxLagObservation.disabled());
         }
     }
 

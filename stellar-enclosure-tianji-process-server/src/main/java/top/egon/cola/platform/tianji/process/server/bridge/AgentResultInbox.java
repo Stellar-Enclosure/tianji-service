@@ -42,9 +42,15 @@ public final class AgentResultInbox {
     private final DataSource source;
     private final DataSourceTransactionManager manager;
     private final String schema;
+    private final AgentResultInboxLagObservation lag;
 
     public AgentResultInbox(DataSource source, DataSourceTransactionManager manager, String schema, AgentDispatchStore dispatches,
                              AgentResultProducerRegistry producers, Duration pendingRetention) {
+        this(source, manager, schema, dispatches, producers, pendingRetention, AgentResultInboxLagObservation.disabled());
+    }
+
+    public AgentResultInbox(DataSource source, DataSourceTransactionManager manager, String schema, AgentDispatchStore dispatches,
+                             AgentResultProducerRegistry producers, Duration pendingRetention, AgentResultInboxLagObservation lag) {
         if (source == null || manager == null || manager.getDataSource() != source || schema == null
                 || !schema.matches("[a-z_][a-z0-9_]{0,62}") || pendingRetention == null
                 || pendingRetention.compareTo(Duration.ofMinutes(1)) < 0 || pendingRetention.compareTo(Duration.ofDays(30)) > 0
@@ -60,6 +66,7 @@ public final class AgentResultInbox {
         this.source = source;
         this.manager = manager;
         this.schema = schema;
+        this.lag = Objects.requireNonNull(lag, "lag");
     }
 
     /** RECEIVED means the exact payload is durable; this method never advances Flowable or claims an unknown run ID. */
@@ -163,7 +170,11 @@ public final class AgentResultInbox {
         if (jdbc.update("UPDATE " + table + " SET state=?,decided_at=clock_timestamp(),decision_code=?,attempt_count=? "
                         + "WHERE tenant_id=? AND event_id=? AND event_sha256=? AND state='PENDING'", state.name(), code, failures,
                 event.tenantId(), event.eventId(), event.fingerprint()) != 1) throw conflict();
-        return find(registration, event.eventId(), true).receipt();
+        var decided = find(registration, event.eventId(), true);
+        if (decided.receipt().state() == state) {
+            lag.recordOnCommit(state, decided.receipt().receivedAt(), decided.decidedAt());
+        }
+        return decided.receipt();
     }
 
     /** Normal wait observations retain the failure budget and the originally committed retry deadline. */
@@ -223,7 +234,7 @@ public final class AgentResultInbox {
                 : decided == null || code == null || !code.matches("[A-Z][A-Z0-9_]{0,63}"))) throw conflict();
         var receipt = new AgentResultReceipt(event.eventId(), event.fingerprint(), "PENDING".equals(state)
                 ? AgentResultReceiptStateEnum.RECEIVED : AgentResultReceiptStateEnum.valueOf(state), received);
-        return new Entry(actor, event, receipt, expires, attempts);
+        return new Entry(actor, event, receipt, expires, attempts, decided == null ? null : decided.toInstant());
     }
 
     private static String encode(AgentTerminalEvent event) {
@@ -240,7 +251,12 @@ public final class AgentResultInbox {
     }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Agent result Inbox configuration or payload is invalid"); }
     private static ProcessConflictException conflict() { return new ProcessConflictException(); }
-    record Entry(ProcessActor producer, AgentTerminalEvent event, AgentResultReceipt receipt, Instant retryNotAfter, int failures) {
+    record Entry(ProcessActor producer, AgentTerminalEvent event, AgentResultReceipt receipt, Instant retryNotAfter,
+                 int failures, Instant decidedAt) {
+        Entry(ProcessActor producer, AgentTerminalEvent event, AgentResultReceipt receipt, Instant retryNotAfter, int failures) {
+            this(producer, event, receipt, retryNotAfter, failures, null);
+        }
+
         @Override public String toString() { return "AgentResultInbox.Entry[state=" + receipt.state() + "]"; }
     }
 }
