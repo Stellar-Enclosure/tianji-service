@@ -4,6 +4,7 @@ import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier;
 import top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptanceHarness.ExpenseAcceptanceManifestDTO;
 
 import java.io.IOException;
@@ -35,6 +36,7 @@ final class S12ReceiveLinkCollectorEvidence {
     private static final String DELIVER = "tianji.agent.result.deliver";
     private static final String RECEIVE = "tianji.process.agent.result.receive";
     private static final int MAX_BYTES = 128 * 1024;
+    private static final int MAX_REPLAY_DELIVERIES = 8;
     private static final JsonMapper JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final Set<String> SPAN_FIELDS = Set.of("traceId", "spanId", "traceState", "parentSpanId", "flags", "name",
@@ -92,7 +94,70 @@ final class S12ReceiveLinkCollectorEvidence {
 
     static boolean linked(byte[] exported, List<String> expectedCarriers, Instant earliest) {
         require(exported != null && exported.length <= MAX_BYTES && expectedCarriers.size() == 2 && earliest != null);
-        if (exported.length == 0 || exported[exported.length - 1] != '\n') return false;
+        var bySpan = readSpans(exported, earliest, 6);
+        if (bySpan.size() < 6) return false;
+        var consumed = new HashSet<String>();
+        for (String carrier : expectedCarriers) {
+            require(carrier.matches("tianji-link-v1:00-[0-9a-f]{32}-[0-9a-f]{16}-01"));
+            String key = carrier.substring("tianji-link-v1:00-".length(), carrier.length() - 3);
+            var enqueue = bySpan.get(key);
+            require(enqueue != null && ENQUEUE.equals(enqueue.name()) && consumed.add(key));
+            var deliver = findLinked(bySpan, DELIVER, key);
+            var receive = findLinked(bySpan, RECEIVE, deliver.key());
+            require(consumed.add(deliver.key()) && consumed.add(receive.key())
+                    && !deliver.traceId().equals(enqueue.traceId()) && !receive.traceId().equals(deliver.traceId())
+                    && !receive.parentId().equals(deliver.spanId()));
+        }
+        require(consumed.size() == 6);
+        return true;
+    }
+
+    static boolean replayLinked(byte[] exported, String expectedEnqueue, String lostLink, String replayLink,
+                                Instant earliest, Instant replacementStartedAt) {
+        require(exported != null && exported.length <= MAX_BYTES && earliest != null && replacementStartedAt != null
+                && !replacementStartedAt.isBefore(earliest));
+        require(expectedEnqueue != null && expectedEnqueue.startsWith("tianji-link-v1:")
+                && AgentResultTraceLinkCarrier.isValid(expectedEnqueue.substring("tianji-link-v1:".length()))
+                && AgentResultTraceLinkCarrier.isValid(lostLink) && AgentResultTraceLinkCarrier.isValid(replayLink)
+                && !lostLink.equals(replayLink));
+        String enqueueKey = linkKey(expectedEnqueue.substring("tianji-link-v1:".length()));
+        String lostKey = linkKey(lostLink);
+        String replayKey = linkKey(replayLink);
+        var spans = readSpans(exported, earliest, 1 + MAX_REPLAY_DELIVERIES + 2);
+        int received = 0;
+        int deliveries = 0;
+        for (var span : spans.values()) {
+            switch (span.name()) {
+                case ENQUEUE -> require(enqueueKey.equals(span.key()));
+                case DELIVER -> {
+                    deliveries++;
+                    require(enqueueKey.equals(span.linked()) && deliveries <= MAX_REPLAY_DELIVERIES);
+                }
+                case RECEIVE -> {
+                    received++;
+                    require((lostKey.equals(span.linked()) || replayKey.equals(span.linked())) && received <= 2);
+                }
+                default -> throw new IllegalStateException("Invalid S12 receive-link collector evidence");
+            }
+        }
+        var lost = spans.get(lostKey);
+        var replay = spans.get(replayKey);
+        if (!spans.containsKey(enqueueKey) || lost == null || replay == null || received < 2) return false;
+        require(DELIVER.equals(lost.name()) && DELIVER.equals(replay.name())
+                && lost.startedAt().isBefore(replacementStartedAt)
+                && !replay.startedAt().isBefore(replacementStartedAt));
+        var lostReceive = findLinked(spans, RECEIVE, lostKey);
+        var replayReceive = findLinked(spans, RECEIVE, replayKey);
+        require(!lostReceive.parentId().equals(lost.spanId()) && !replayReceive.parentId().equals(replay.spanId()));
+        return true;
+    }
+
+    private static String linkKey(String wireCarrier) {
+        return wireCarrier.substring(3, wireCarrier.length() - 3);
+    }
+
+    private static Map<String, ObservedSpan> readSpans(byte[] exported, Instant earliest, int maximumSpans) {
+        if (exported.length == 0 || exported[exported.length - 1] != '\n') return Map.of();
         var bySpan = new HashMap<String, ObservedSpan>();
         var traceIds = new HashSet<String>();
         int lines = 0;
@@ -125,28 +190,14 @@ final class S12ReceiveLinkCollectorEvidence {
                     String scopeName = info.path("name").stringValue();
                     boolean agent = "tianji-s12-agent".equals(serviceName) && AGENT_SCOPE.equals(scopeName);
                     require(agent || "tianji-s12-process".equals(serviceName) && PROCESS_SCOPE.equals(scopeName));
-                    for (JsonNode span : array(scope.path("spans"), 6)) {
+                    for (JsonNode span : array(scope.path("spans"), maximumSpans)) {
                         var observed = span(span, agent, earliest);
-                        require(traceIds.add(observed.traceId()) && bySpan.putIfAbsent(observed.key(), observed) == null && bySpan.size() <= 6);
+                        require(traceIds.add(observed.traceId()) && bySpan.putIfAbsent(observed.key(), observed) == null && bySpan.size() <= maximumSpans);
                     }
                 }
             }
         }
-        if (bySpan.size() < 6) return false;
-        var consumed = new HashSet<String>();
-        for (String carrier : expectedCarriers) {
-            require(carrier.matches("tianji-link-v1:00-[0-9a-f]{32}-[0-9a-f]{16}-01"));
-            String key = carrier.substring("tianji-link-v1:00-".length(), carrier.length() - 3);
-            var enqueue = bySpan.get(key);
-            require(enqueue != null && ENQUEUE.equals(enqueue.name()) && consumed.add(key));
-            var deliver = findLinked(bySpan, DELIVER, key);
-            var receive = findLinked(bySpan, RECEIVE, deliver.key());
-            require(consumed.add(deliver.key()) && consumed.add(receive.key())
-                    && !deliver.traceId().equals(enqueue.traceId()) && !receive.traceId().equals(deliver.traceId())
-                    && !receive.parentId().equals(deliver.spanId()));
-        }
-        require(consumed.size() == 6);
-        return true;
+        return bySpan;
     }
 
     private static ObservedSpan span(JsonNode node, boolean agent, Instant earliest) {
@@ -178,7 +229,7 @@ final class S12ReceiveLinkCollectorEvidence {
             require(integer(link, "flags") == 769);
             linked = id(link, "traceId", 32) + "-" + id(link, "spanId", 16);
         }
-        return new ObservedSpan(name, id(node, "traceId", 32), id(node, "spanId", 16), parent, linked);
+        return new ObservedSpan(name, id(node, "traceId", 32), id(node, "spanId", 16), parent, linked, start);
     }
 
     private static ObservedSpan findLinked(Map<String, ObservedSpan> spans, String name, String target) {
@@ -230,7 +281,7 @@ final class S12ReceiveLinkCollectorEvidence {
         if (!condition) throw new IllegalStateException("S12 receive-link fixture evidence is invalid");
     }
 
-    private record ObservedSpan(String name, String traceId, String spanId, String parentId, String linked) {
+    private record ObservedSpan(String name, String traceId, String spanId, String parentId, String linked, Instant startedAt) {
         String key() { return traceId + "-" + spanId; }
     }
 }

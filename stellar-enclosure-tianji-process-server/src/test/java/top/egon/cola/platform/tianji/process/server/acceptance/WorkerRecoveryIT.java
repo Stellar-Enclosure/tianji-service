@@ -127,7 +127,7 @@ class WorkerRecoveryIT {
         }
     }
 
-    private static DeliveryWitnessDTO earlyResultAndAgentRestart(Driver driver, RunDTO run) {
+    static DeliveryWitnessDTO earlyResultAndAgentRestart(Driver driver, RunDTO run) {
         var relay = driver.relay();
         arm(driver, run, HOLD_LINKED_SUCCESS, null, null, null, null);
         arm(driver, run, DROP_COMMITTED_RESULT_202, null, null, null, null);

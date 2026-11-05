@@ -68,6 +68,48 @@ class S12ReceiveLinkCollectorEvidenceTest {
     }
 
     @Test
+    void replay_matches_one_exact_enqueue_two_receives_and_bounded_blocked_attempts() {
+        var replacement = Instant.now().minusSeconds(5);
+        var afterReplacement = afterReplacement(replacement);
+        var fixture = new ArrayList<>(List.of(span(ENQUEUE, 1, 0, Map.of()),
+                span(DELIVER, 2, 1, Map.of()), span(RECEIVE, 3, 2, Map.of()), span(DELIVER, 6, 1, Map.of()),
+                span(DELIVER, 4, 1, afterReplacement), span(RECEIVE, 5, 4, afterReplacement)));
+        assertTrue(S12ReceiveLinkCollectorEvidence.replayLinked(lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+        assertFalse(S12ReceiveLinkCollectorEvidence.replayLinked(lines(fixture.subList(0, 5)), carrier(1), wire(2), wire(4),
+                SINCE, replacement));
+        assertFalse(S12ReceiveLinkCollectorEvidence.replayLinked(new byte[0], carrier(1), wire(2), wire(4), SINCE, replacement));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(2), SINCE, replacement));
+
+        // A request from the original JVM cannot witness the replay even if it reached the relay late.
+        fixture.set(4, span(DELIVER, 4, 1, Map.of()));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+        fixture.set(4, span(DELIVER, 4, 1, afterReplacement));
+        fixture.set(5, span(RECEIVE, 5, 6, afterReplacement));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+        fixture.set(5, span(RECEIVE, 5, 4, Map.of("parentSpanId", id(4, 16))));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+        fixture.set(5, span(RECEIVE, 5, 4, afterReplacement));
+        fixture.add(span(ENQUEUE, 7, 0, Map.of()));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+        fixture.removeLast();
+        for (int value = 7; value < 13; value++) fixture.add(span(DELIVER, value, 1, Map.of()));
+        assertThrows(IllegalStateException.class, () -> S12ReceiveLinkCollectorEvidence.replayLinked(
+                lines(fixture), carrier(1), wire(2), wire(4), SINCE, replacement));
+    }
+
+    private static Map<String, Object> afterReplacement(Instant replacement) {
+        long startNanos = replacement.plusSeconds(1).getEpochSecond() * 1_000_000_000L;
+        return Map.of("startTimeUnixNano", Long.toString(startNanos), "endTimeUnixNano", Long.toString(startNanos + 1));
+    }
+
+    private static String wire(int value) { return carrier(value).substring("tianji-link-v1:".length()); }
+
+    @Test
     void initializer_requires_the_private_profile_before_registering_a_provider() {
         try (var context = new GenericApplicationContext()) {
             var initializer = new S12ReceiveLinkInitializer();

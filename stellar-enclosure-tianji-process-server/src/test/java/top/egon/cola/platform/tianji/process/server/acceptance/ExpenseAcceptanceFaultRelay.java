@@ -10,6 +10,7 @@ import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.MapperFeature;
 import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CompleteWorkerTaskCommand;
@@ -67,6 +68,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     private final LongSupplier nanoTime;
     private final Transport transport;
     private final Witnesses witnesses;
+    private final boolean resultLinkReplay;
     private final EnumMap<FaultPhase, Window> windows = new EnumMap<>(FaultPhase.class);
     private final List<HttpsServer> listeners = new ArrayList<>();
     private ThreadPoolExecutor listenerExecutor;
@@ -77,9 +79,15 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     private boolean closed;
 
     ExpenseAcceptanceFaultRelay(LongSupplier nanoTime, Transport transport, Witnesses witnesses) {
+        this(nanoTime, transport, witnesses, false);
+    }
+
+    ExpenseAcceptanceFaultRelay(LongSupplier nanoTime, Transport transport, Witnesses witnesses,
+                                boolean resultLinkReplay) {
         this.nanoTime = Objects.requireNonNull(nanoTime);
         this.transport = Objects.requireNonNull(transport);
         this.witnesses = Objects.requireNonNull(witnesses);
+        this.resultLinkReplay = resultLinkReplay;
     }
 
     static ExpenseAcceptanceFaultRelay open(ExpenseAcceptanceManifestDTO manifest, SSLContext listenerTls,
@@ -102,8 +110,10 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         var upstream = HttpClient.newBuilder().sslContext(upstreamTls).proxy(noProxy())
                 .followRedirects(HttpClient.Redirect.NEVER).connectTimeout(EXCHANGE_LIMIT)
                 .version(HttpClient.Version.HTTP_1_1).build();
+        boolean resultLinkReplay = manifest.suite() == ExpenseAcceptanceHarness.Suite.RECEIVE_LINK_REPLAY;
         var relay = new ExpenseAcceptanceFaultRelay(System::nanoTime, (request, timeout) ->
-                forward(upstream, request.direction() == Direction.LINKED ? agent : process, request, timeout), witnesses);
+                forward(upstream, request.direction() == Direction.LINKED ? agent : process, request, timeout,
+                        resultLinkReplay), witnesses, resultLinkReplay);
         relay.operatorHttpClient = upstream;
         relay.maximumOperatorWindow = operatorWindow;
         relay.maximumOperatorHold = operatorHold;
@@ -130,6 +140,10 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         bounded(definition.budget(), definition.phase() == FaultPhase.HOLD_LINKED_SUCCESS
                 ? maximumOperatorHold : maximumOperatorWindow);
         Direction direction = direction(definition.phase());
+        if (resultLinkReplay && direction == Direction.RESULT
+                && (definition.phase() != FaultPhase.DROP_COMMITTED_RESULT_202
+                    && definition.phase() != FaultPhase.OBSERVE_REPLACEMENT_RESEND
+                    || windows.containsKey(definition.phase()))) throw invalid();
         if (windows.values().stream().anyMatch(window -> direction(window.definition.phase()) == direction && !window.finished)) {
             throw unavailable();
         }
@@ -179,6 +193,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     ResponseDTO exchange(RequestDTO request) {
         Route route = route(request.direction(), request.method(), request.rawPath());
         validateRequest(request, route);
+        String traceLink = resultTraceLink(request, route, resultLinkReplay);
         var decoded = decode(route, request);
         var observed = decoded.observed();
         Window window;
@@ -187,7 +202,10 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
             window = matchingWindow(route, observed);
             if (window != null) requireRemaining(window, nanoTime.getAsLong());
         }
-        if (window == null) return forwardChecked(request, EXCHANGE_LIMIT, route);
+        if (window == null) {
+            if (resultLinkReplay && route == Route.RESULT) throw unavailable();
+            return forwardChecked(request, EXCHANGE_LIMIT, route);
+        }
         var candidate = withOccurrence(window.definition, observed.occurrenceId());
         if (!witnesses.owned(candidate, observed)) throw unavailable();
         bindVerifiedOccurrence(window, observed.occurrenceId());
@@ -201,8 +219,8 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
             }
             case HOLD_LINKED_SUCCESS -> holdLinked(window, candidate, request, route, observed);
             case DEFER_RESULT_UNTIL_TIMER_OR_RESTART -> deferResult(window, request, route, observed);
-            case DROP_COMMITTED_RESULT_202 -> dropCommittedResult(window, candidate, request, route, observed);
-            case OBSERVE_REPLACEMENT_RESEND -> observeResend(window, candidate, request, route, observed);
+            case DROP_COMMITTED_RESULT_202 -> dropCommittedResult(window, candidate, request, route, observed, traceLink);
+            case OBSERVE_REPLACEMENT_RESEND -> observeResend(window, candidate, request, route, observed, traceLink);
         };
     }
 
@@ -246,13 +264,13 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     }
 
     private ResponseDTO dropCommittedResult(Window window, FaultWindowDTO candidate, RequestDTO request, Route route,
-                                      ObservedExchangeDTO observed) {
+                                      ObservedExchangeDTO observed, String traceLink) {
         claim(window);
         try {
             var reply = forwardChecked(request, timeFor(window), route);
             requireActualReceipt(reply, observed);
             if (!witnesses.inboxCommitted(candidate, observed)) throw unavailable();
-            finish(window, observed);
+            finishResult(window, observed, traceLink);
         } catch (RuntimeException failure) {
             fail(window);
             throw failure;
@@ -261,14 +279,14 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
     }
 
     private ResponseDTO observeResend(Window window, FaultWindowDTO candidate, RequestDTO request, Route route,
-                                      ObservedExchangeDTO observed) {
+                                      ObservedExchangeDTO observed, String traceLink) {
         if (!witnesses.replacementReady(candidate, observed)) throw unavailable();
         claim(window);
         try {
             var reply = forwardChecked(request, timeFor(window), route);
             requireActualReceipt(reply, observed);
             if (!witnesses.inboxCommitted(candidate, observed)) throw unavailable();
-            finish(window, observed);
+            finishResult(window, observed, traceLink);
             return reply;
         } catch (RuntimeException failure) {
             fail(window);
@@ -303,6 +321,21 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         requireRemaining(window, nanoTime.getAsLong());
         if (window.claimed || window.finished) throw unavailable();
         window.claimed = true;
+    }
+
+    synchronized String committedResultLink(FaultPhase phase) {
+        requireOpen();
+        if (!resultLinkReplay || phase != FaultPhase.DROP_COMMITTED_RESULT_202
+                && phase != FaultPhase.OBSERVE_REPLACEMENT_RESEND) throw invalid();
+        var window = windows.get(phase);
+        if (window == null || !window.finished || window.observation == null
+                || window.committedResultLink == null) throw unavailable();
+        return window.committedResultLink;
+    }
+
+    private synchronized void finishResult(Window window, ObservedExchangeDTO exchange, String traceLink) {
+        finish(window, exchange);
+        window.committedResultLink = traceLink;
     }
 
     private synchronized void finish(Window window, ObservedExchangeDTO exchange) {
@@ -474,6 +507,13 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         for (String allowed : REQUEST_HEADERS) header(request.headers(), allowed);
     }
 
+    private static String resultTraceLink(RequestDTO request, Route route, boolean resultLinkReplay) {
+        if (!resultLinkReplay || route != Route.RESULT) return null;
+        String traceLink = header(request.headers(), AgentResultTraceLinkCarrier.HEADER);
+        if (!AgentResultTraceLinkCarrier.isValid(traceLink)) throw invalid();
+        return traceLink;
+    }
+
     private static String header(Map<String, List<String>> headers, String key) {
         String selected = null;
         for (var entry : headers.entrySet()) {
@@ -621,14 +661,23 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         }
     }
 
-    private static ResponseDTO forward(HttpClient client, URI origin, RequestDTO request, Duration timeout) {
+    static HttpRequest upstreamRequest(URI origin, RequestDTO request, Duration timeout, boolean resultLinkReplay) {
         var route = route(request.direction(), request.method(), request.rawPath());
-        var upstream = HttpRequest.newBuilder(origin.resolve(request.rawPath())).timeout(timeout);
+        String traceLink = resultTraceLink(request, route, resultLinkReplay);
+        URI exactOrigin = traceLink == null ? origin : localOrigin(origin.toASCIIString());
+        var upstream = HttpRequest.newBuilder(exactOrigin.resolve(request.rawPath())).timeout(timeout);
         for (String name : REQUEST_HEADERS) {
             String value = header(request.headers(), name);
             if (value != null) upstream.header(name, value);
         }
-        var pending = client.sendAsync(upstream.POST(HttpRequest.BodyPublishers.ofByteArray(request.body)).build(),
+        if (traceLink != null) upstream.header(AgentResultTraceLinkCarrier.HEADER, traceLink);
+        return upstream.POST(HttpRequest.BodyPublishers.ofByteArray(request.body)).build();
+    }
+
+    private static ResponseDTO forward(HttpClient client, URI origin, RequestDTO request, Duration timeout,
+                                       boolean resultLinkReplay) {
+        var route = route(request.direction(), request.method(), request.rawPath());
+        var pending = client.sendAsync(upstreamRequest(origin, request, timeout, resultLinkReplay),
                 ignored -> new BoundedResponse(route.responseLimit));
         try {
             var response = pending.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
@@ -748,6 +797,7 @@ final class ExpenseAcceptanceFaultRelay implements AutoCloseable {
         private final FaultWindowDTO definition;
         private final long started;
         private ObservationDTO observation;
+        private String committedResultLink;
         private String boundOccurrenceId;
         private boolean claimed;
         private boolean finished;

@@ -132,7 +132,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
             throw unavailable();
         }
         var harness = new ExpenseAcceptanceHarness(manifest, Objects.requireNonNull(launcher), nanoTime, clock, sleeper);
-        if (manifest.suite() == Suite.RECEIVE_LINK) {
+        if (manifest.suite().observesReceiveLinks()) {
             try {
                 harness.s12Libraries.putAll(S12ReceiveLinkCollectorEvidence.prepare(manifest));
             } catch (IOException failure) {
@@ -437,7 +437,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private void addTrustedFixtureSettings(ChildRole role, Properties values) {
         String prefix = "tianji.expense.fixture.";
         values.setProperty(prefix + "run-authorized", "true");
-        if (manifest.suite() == Suite.RECEIVE_LINK) {
+        if (manifest.suite().observesReceiveLinks()) {
             values.setProperty(prefix + "s12-receive-link", "true");
         }
         values.setProperty(prefix + "role", role.name());
@@ -461,7 +461,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private ChildLaunchDTO launchCommand(ChildRole role, ArtifactLockDTO artifact, Path configuration) throws IOException {
         String java = Path.of(System.getProperty("java.home")).toRealPath().resolve("bin/java").toString();
         String loaderPath = artifact.testClasses();
-        if (manifest.suite() == Suite.RECEIVE_LINK) {
+        if (manifest.suite().observesReceiveLinks()) {
             if (role == ChildRole.AGENT) {
                 verifyArtifact(absolute(manifest.checkoutRoot()), ChildRole.PROCESS, manifest.process());
                 loaderPath += "," + manifest.process().testClasses();
@@ -593,7 +593,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     }
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
-        if (manifest.suite() == Suite.RECEIVE_LINK) throw invalid();
+        if (manifest.suite().observesReceiveLinks()) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
         Path destination = output.resolve("expense-" + manifest.runId() + ".json");
@@ -767,7 +767,13 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
-    enum Suite { BUSINESS, RECOVERY, RECEIVE_LINK }
+    enum Suite {
+        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY;
+
+        boolean observesReceiveLinks() {
+            return this == RECEIVE_LINK || this == RECEIVE_LINK_REPLAY;
+        }
+    }
     enum ChildRole { AGENT, PROCESS }
     enum StoreOwner { AGENT, PROCESS, BUSINESS }
     enum Scenario { NORMAL, AGENT_FAILURE, MANUAL_CASE, RECOVERY }

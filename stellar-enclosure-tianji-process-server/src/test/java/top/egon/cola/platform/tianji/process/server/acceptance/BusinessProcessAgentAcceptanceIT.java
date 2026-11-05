@@ -158,7 +158,11 @@ class BusinessProcessAgentAcceptanceIT {
         private ExpenseAcceptanceFaultRelay relay;
 
         static Driver open(Suite suite) throws Exception {
-            String property = suite == Suite.RECEIVE_LINK ? "tianji.s12.receive-link.manifest" : "tianji.expense.e2e.manifest";
+            String property = switch (suite) {
+                case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
+                case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
+                default -> "tianji.expense.e2e.manifest";
+            };
             var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty(property));
             assumeTrue(permit.isPresent(), "Explicit isolated expense acceptance manifest is required");
             var manifest = permit.orElseThrow();
@@ -242,7 +246,7 @@ class BusinessProcessAgentAcceptanceIT {
         List<TenantBindingDTO> tenants() { return manifest.tenants(); }
         ExpenseAcceptanceHarness harness() { return harness; }
         ExpenseAcceptanceManifestDTO receiveLinkManifest() {
-            require(manifest.suite() == Suite.RECEIVE_LINK, "Exact receive-link fixture suite");
+            require(manifest.suite().observesReceiveLinks(), "Exact receive-link fixture suite");
             return manifest;
         }
         Duration relayBudget() { return Duration.ofSeconds(Math.min(manifest.limits().recoverySeconds(), 60)); }
@@ -608,7 +612,7 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         String committedReceiveLinkCarrier(RunDTO run) {
-            require(manifest.suite() == Suite.RECEIVE_LINK, "Exact receive-link fixture suite");
+            require(manifest.suite().observesReceiveLinks(), "Exact receive-link fixture suite");
             String eventId = inbox(run).filter(row -> "APPLIED".equals(row.state())).orElseThrow().eventId();
             return one(db(StoreOwner.AGENT), """
                     SELECT trace_id FROM tianji_agent.egon_cola_outbox_message
@@ -904,7 +908,7 @@ class BusinessProcessAgentAcceptanceIT {
             put(config, "egon.cola.component.transactional-outbox.polling.enabled", Boolean.toString(role == ChildRole.AGENT));
             if (role == ChildRole.AGENT) agentConfig(config);
             else processConfig(config);
-            if (manifest.suite() == Suite.RECEIVE_LINK) {
+            if (manifest.suite().observesReceiveLinks()) {
                 if (role == ChildRole.AGENT) {
                     put(config, "stellar.tianji.agent.terminal-events.span-links-enabled", "true");
                     put(config, "stellar.tianji.agent.result-delivery.cross-process-span-links-enabled", "true");

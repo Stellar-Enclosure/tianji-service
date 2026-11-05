@@ -434,6 +434,82 @@ class ExpenseAcceptanceHarnessTest {
     }
 
     @Test
+    void s12ReplayBuildsTheExactUpstreamResultHeaderWithoutOpeningATransport() {
+        String wire = replayWire('1', '2');
+        var result = withReplayLink(relayResultRequest(relayTerminalEvent("c")), List.of(wire));
+        var origin = URI.create("https://127.0.0.1:18443");
+        var timeout = Duration.ofSeconds(1);
+        var header = top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier.HEADER;
+        var built = ExpenseAcceptanceFaultRelay.upstreamRequest(origin, result, timeout, true);
+        assertEquals("POST", built.method());
+        assertEquals("https://127.0.0.1:18443/api/tianji/v1/agent-result-inbox", built.uri().toString());
+        assertEquals(List.of(wire), built.headers().allValues(header));
+        assertTrue(ExpenseAcceptanceFaultRelay.upstreamRequest(origin, result, timeout, false).headers().allValues(header).isEmpty());
+        var worker = withReplayLink(relayWorkerComplete("job", "occurrence"), List.of(wire));
+        assertTrue(ExpenseAcceptanceFaultRelay.upstreamRequest(origin, worker, timeout, true).headers().allValues(header).isEmpty());
+        assertThrows(IllegalArgumentException.class, () -> ExpenseAcceptanceFaultRelay.upstreamRequest(
+                URI.create("https://remote.invalid:18443"), result, timeout, true));
+        assertThrows(IllegalArgumentException.class, () -> ExpenseAcceptanceFaultRelay.upstreamRequest(origin,
+                withReplayLink(result, List.of(wire, wire)), timeout, true));
+        assertThrows(IllegalArgumentException.class, () -> ExpenseAcceptanceFaultRelay.upstreamRequest(origin,
+                withReplayLink(result, List.of("00-" + "0".repeat(32) + "-" + "2".repeat(16) + "-01")), timeout, true));
+    }
+
+    @Test
+    void s12ReplayBindsOnlyTwoCommittedForwardedLinksAndClosesTheWindowGap() {
+        var event = relayTerminalEvent("c");
+        var request = relayResultRequest(event);
+        String lostLink = replayWire('1', '2');
+        String replayLink = replayWire('3', '4');
+        var lost = withReplayLink(request, List.of(lostLink));
+        var replay = withReplayLink(request, List.of(replayLink));
+        var receipt = new top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt(event.eventId(),
+                event.fingerprint(), top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum.RECEIVED,
+                Instant.parse("2026-11-05T05:00:01Z"));
+        var forwards = new AtomicInteger();
+        var ready = new java.util.concurrent.atomic.AtomicBoolean();
+        var drop = ExpenseAcceptanceFaultRelay.FaultPhase.DROP_COMMITTED_RESULT_202;
+        var resend = ExpenseAcceptanceFaultRelay.FaultPhase.OBSERVE_REPLACEMENT_RESEND;
+        try (var relay = new ExpenseAcceptanceFaultRelay(System::nanoTime, (incoming, timeout) -> {
+            forwards.incrementAndGet();
+            assertArrayEquals(request.body(), incoming.body());
+            return new ExpenseAcceptanceFaultRelay.ResponseDTO(202, Map.of(),
+                    JsonMapper.builder().build().writeValueAsBytes(receipt));
+        }, relayWitnesses(new java.util.concurrent.atomic.AtomicBoolean(true), ready), true)) {
+            assertThrows(IllegalStateException.class, () -> relay.exchange(lost));
+            assertThrows(IllegalArgumentException.class, () -> relay.arm(relayUnresolvedWindow(
+                    ExpenseAcceptanceFaultRelay.FaultPhase.DEFER_RESULT_UNTIL_TIMER_OR_RESTART)));
+            relay.arm(relayUnresolvedWindow(drop));
+            assertThrows(IllegalArgumentException.class, () -> relay.exchange(request));
+            assertThrows(ExpenseAcceptanceFaultRelay.ConnectionDropped.class, () -> relay.exchange(lost));
+            assertEquals(lostLink, relay.committedResultLink(drop));
+            assertThrows(IllegalArgumentException.class, () -> relay.arm(relayUnresolvedWindow(drop)));
+            assertThrows(IllegalStateException.class, () -> relay.exchange(replay));
+            relay.arm(relayResultWindow(resend, event));
+            assertThrows(IllegalStateException.class, () -> relay.exchange(replay));
+            assertThrows(IllegalStateException.class, () -> relay.committedResultLink(resend));
+            assertEquals(1, forwards.get());
+            ready.set(true);
+            assertEquals(202, relay.exchange(replay).status());
+            assertEquals(replayLink, relay.committedResultLink(resend));
+            assertThrows(IllegalStateException.class, () -> relay.exchange(replay));
+            assertEquals(2, forwards.get());
+        }
+    }
+
+    private static String replayWire(char trace, char span) {
+        return "00-" + String.valueOf(trace).repeat(32) + "-" + String.valueOf(span).repeat(16) + "-01";
+    }
+
+    private static ExpenseAcceptanceFaultRelay.RequestDTO withReplayLink(ExpenseAcceptanceFaultRelay.RequestDTO request,
+                                                                         List<String> values) {
+        var headers = new java.util.HashMap<>(request.headers());
+        headers.put(top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier.HEADER, values);
+        return new ExpenseAcceptanceFaultRelay.RequestDTO(request.direction(), request.method(), request.rawPath(), headers,
+                request.body());
+    }
+
+    @Test
     void relayHoldsActualLinkedResponseWhileResultCanBeStored() throws Exception {
         var event = relayTerminalEvent("c");
         var json = JsonMapper.builder().build();
