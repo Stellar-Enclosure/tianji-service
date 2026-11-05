@@ -32,6 +32,11 @@ import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.CheckpointResumeAcknowledgement;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.CheckpointResumeCommand;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.HistoricalStartReceipt;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.HistoricalStartReceiptCommand;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunCorrelationClient;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunPageDTO;
@@ -68,7 +73,7 @@ import java.util.function.Supplier;
 import java.util.function.Function;
 
 /** JDK HTTP transport for the engine-neutral Agent contract. It does not initiate write retries. */
-public final class HttpAgentClient implements AgentClient, AgentSessionClient, MemoryClient, AgentRunCorrelationClient {
+public final class HttpAgentClient implements AgentClient, AgentSessionClient, MemoryClient, AgentRunCorrelationClient, AgentRecoveryCommandClient {
     private static final int MAX_JSON_BYTES = 2_097_152;
     private final URI baseUri;
     private final HttpClient http;
@@ -128,7 +133,26 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
         String suffix = OwnerObservationResponseCodec.windowQuery(
                 query.correlationId(), query.fromInclusive(), query.toExclusive(), query.cursor());
         return call("GET", URI.create(path("").toString() + suffix), null, AgentRunPageDTO.class, null,
-                bytes -> OwnerObservationResponseCodec.agentRuns(bytes, query), OwnerObservationResponseCodec.MAX_BYTES, true);
+                bytes -> OwnerObservationResponseCodec.agentRuns(bytes, query), MAX_JSON_BYTES, OwnerObservationResponseCodec.MAX_BYTES,
+                response -> OwnerObservationResponseCodec.failureCode(response, OwnerObservationResponseCodec.Route.AGENT_RUNS));
+    }
+
+    @Override
+    public CheckpointResumeAcknowledgement resumeCheckpoint(CheckpointResumeCommand command) {
+        Objects.requireNonNull(command, "command");
+        OwnerObservationResponseCodec.requireSecureBase(baseUri);
+        return call("POST", baseUri.resolve(CHECKPOINT_RESUME_PATH.substring(1)), command, CheckpointResumeAcknowledgement.class,
+                null, bytes -> AgentRecoveryCommandResponseCodec.acknowledgement(bytes, command), 4096, AgentRecoveryCommandResponseCodec.MAX_BYTES,
+                response -> AgentRecoveryCommandResponseCodec.failureCode(response, AgentRecoveryCommandResponseCodec.Route.RESUME));
+    }
+
+    @Override
+    public HistoricalStartReceipt reconcileHistoricalStart(HistoricalStartReceiptCommand command) {
+        Objects.requireNonNull(command, "command");
+        OwnerObservationResponseCodec.requireSecureBase(baseUri);
+        return call("POST", baseUri.resolve(HISTORICAL_START_RECEIPT_PATH.substring(1)), command, HistoricalStartReceipt.class,
+                null, bytes -> AgentRecoveryCommandResponseCodec.receipt(bytes, command), 512, AgentRecoveryCommandResponseCodec.MAX_BYTES,
+                response -> AgentRecoveryCommandResponseCodec.failureCode(response, AgentRecoveryCommandResponseCodec.Route.HISTORICAL));
     }
 
     @Override
@@ -335,17 +359,18 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
     }
 
     private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId, Function<byte[], T> decoder, int responseLimit) {
-        return call(method, uri, body, type, expectedSessionId, decoder, responseLimit, false);
+        return call(method, uri, body, type, expectedSessionId, decoder, MAX_JSON_BYTES, responseLimit, null);
     }
 
     private <T> T call(String method, URI uri, Object body, Class<T> type, String expectedSessionId,
-                       Function<byte[], T> decoder, int responseLimit, boolean ownerObservation) {
+                       Function<byte[], T> decoder, int requestLimit, int responseLimit,
+                       Function<HttpResponse<byte[]>, String> strictFailure) {
         byte[] bytes = body == null ? null : mapper.writeValueAsBytes(body);
-        if (bytes != null && bytes.length > MAX_JSON_BYTES) {
+        if (bytes != null && bytes.length > requestLimit) {
             throw new IllegalArgumentException("Agent request exceeds its size limit");
         }
         HttpRequest.Builder builder = request(uri).timeout(requestTimeout).header("Accept", "application/json");
-        if (ownerObservation) builder.header("Cache-Control", "no-store");
+        if (strictFailure != null) builder.header("Cache-Control", "no-store");
         HttpRequest request = body == null ? builder.method(method, HttpRequest.BodyPublishers.noBody()).build()
                 : builder.header("Content-Type", "application/json")
                         .method(method, HttpRequest.BodyPublishers.ofByteArray(bytes)).build();
@@ -353,13 +378,13 @@ public final class HttpAgentClient implements AgentClient, AgentSessionClient, M
         try {
             call = http.sendAsync(request, info -> new BoundedBodySubscriber(responseLimit));
         } catch (RuntimeException failure) {
-            if (!ownerObservation) throw failure;
+            if (strictFailure == null) throw failure;
             throw new AgentClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
         }
         try {
             HttpResponse<byte[]> response = call.get(requestTimeout.toNanos(), TimeUnit.NANOSECONDS);
-            if (ownerObservation) {
-                String code = OwnerObservationResponseCodec.failureCode(response, OwnerObservationResponseCodec.Route.AGENT_RUNS);
+            if (strictFailure != null) {
+                String code = strictFailure.apply(response);
                 if (code != null) throw new AgentClientException(response.statusCode(), code, null, null);
             }
             if (response.statusCode() < 200 || response.statusCode() >= 300) {

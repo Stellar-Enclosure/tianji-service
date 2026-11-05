@@ -1,6 +1,10 @@
 package top.egon.cola.platform.tianji.client;
 
 import org.junit.jupiter.api.Test;
+import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.CheckpointResumeCommand;
+import top.egon.cola.platform.tianji.contract.agent.AgentRecoveryCommandClient.HistoricalStartReceiptCommand;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunCorrelationClient;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
@@ -13,6 +17,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessOwnerObservat
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
+import java.io.ByteArrayOutputStream;
 import java.net.Authenticator;
 import java.net.CookieHandler;
 import java.net.ProxySelector;
@@ -28,6 +33,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Flow;
@@ -293,6 +300,142 @@ class OwnerObservationHttpTest {
         assertThrows(IllegalArgumentException.class, () -> agent(redirecting));
         assertThrows(IllegalArgumentException.class, () -> process(redirecting));
         assertEquals(0, redirecting.sent);
+    }
+
+    private static final UUID INTENT = UUID.fromString("5c837d15-109c-4969-b180-fb2e1aa2cd67");
+    private static final CheckpointResumeCommand RESUME = new CheckpointResumeCommand("run-one", "resume-one", 3);
+    private static final HistoricalStartReceiptCommand RECONCILE = new HistoricalStartReceiptCommand("run-one", INTENT);
+    private static final String RESUME_ACK = """
+            {"runId":"run-one","status":"RUNNING","attempt":1,"revision":5}
+            """;
+    private static final String HISTORY = """
+            {"intentId":"%s","dispatchRunId":"run-one","instanceId":"instance-one",
+             "recordedAt":"2026-11-06T02:00:00.001Z","observedAt":"2026-11-06T01:00:00Z"}
+            """.formatted(INTENT);
+
+    @Test
+    void sends_one_exact_resume_post_and_reads_the_original_durable_acknowledgement() {
+        var wire = reply(200, RESUME_ACK);
+        AgentRecoveryCommandClient client = agent(wire);
+        var ack = client.resumeCheckpoint(RESUME);
+        assertEquals("run-one", ack.runId());
+        assertEquals(AgentRunStatusEnum.RUNNING, ack.status());
+        assertEquals(1, ack.attempt());
+        assertEquals(5, ack.revision());
+        var body = assertCommand(wire, AgentRecoveryCommandClient.CHECKPOINT_RESUME_PATH);
+        assertEquals(Set.of("runId", "commandId", "expectedRevision"), body.propertyNames());
+        assertEquals(RESUME.runId(), body.get("runId").asString());
+        assertEquals(RESUME.commandId(), body.get("commandId").asString());
+        assertEquals(RESUME.expectedRevision(), body.get("expectedRevision").asLong());
+    }
+
+    @Test
+    void sends_one_exact_historical_post_and_retains_both_independent_clock_values() {
+        var wire = reply(200, HISTORY);
+        var receipt = agent(wire).reconcileHistoricalStart(RECONCILE);
+        assertEquals(INTENT, receipt.intentId());
+        assertEquals("run-one", receipt.dispatchRunId());
+        assertEquals("instance-one", receipt.instanceId());
+        assertEquals(Instant.parse("2026-11-06T02:00:00.001Z"), receipt.recordedAt());
+        assertEquals(Instant.parse("2026-11-06T01:00:00Z"), receipt.observedAt());
+        var body = assertCommand(wire, AgentRecoveryCommandClient.HISTORICAL_START_RECEIPT_PATH);
+        assertEquals(Set.of("runId", "intentId"), body.propertyNames());
+        assertEquals(RECONCILE.runId(), body.get("runId").asString());
+        assertEquals(INTENT.toString(), body.get("intentId").asString());
+    }
+
+    @Test
+    void rejects_an_acknowledgement_for_another_revision() {
+        var wire = reply(200, RESUME_ACK.replace("\"revision\":5", "\"revision\":6"));
+        assertRecoveryFailure(wire, false, 200, INVALID);
+    }
+
+    @Test
+    void rejects_mismatched_and_noncanonical_recovery_success_responses() {
+        for (String bad : List.of(RESUME_ACK.replace("run-one", "other-run"), RESUME_ACK.replace("RUNNING", "COMPLETED"),
+                RESUME_ACK.replace("\"attempt\":1", "\"attempt\":1.0"),
+                RESUME_ACK.replace("\"revision\":5", "\"revision\":5,\"revision\":5"))) {
+            assertRecoveryFailure(reply(200, bad), false, 200, INVALID);
+        }
+        for (String bad : List.of(HISTORY.replace("run-one", "other-run"), HISTORY.replace(INTENT.toString(), UUID.randomUUID().toString()),
+                HISTORY.replace("02:00:00.001Z", "02:00:00.001+00:00"), HISTORY.replace("02:00:00.001Z", "24:00:00Z"),
+                HISTORY.replace("\"instanceId\":\"instance-one\"", "\"instanceId\":\"instance-one\",\"extra\":true"))) {
+            assertRecoveryFailure(reply(200, bad), true, 200, INVALID);
+        }
+        assertRecoveryFailure(reply(202, RESUME_ACK), false, 202, INVALID);
+        assertRecoveryFailure(new FakeHttpClient(200, Map.of("Content-Type", List.of("application/json")),
+                HISTORY.getBytes(StandardCharsets.UTF_8)), true, 200, INVALID);
+    }
+
+    @Test
+    void retains_safe_denial_capacity_and_unknown_effect_without_replaying_a_post() {
+        assertRecoveryFailure(reply(403, "{\"code\":\"TIANJI_PERMISSION_DENIED\"}"), false, 403, "TIANJI_PERMISSION_DENIED");
+        assertRecoveryFailure(reply(429, error("TIANJI_CAPACITY_EXCEEDED")), false, 429, "TIANJI_CAPACITY_EXCEEDED");
+        assertRecoveryFailure(reply(409, error("TIANJI_SIDE_EFFECT_UNKNOWN")), true, 409, "TIANJI_SIDE_EFFECT_UNKNOWN");
+        assertRecoveryFailure(reply(409, error("TIANJI_SIDE_EFFECT_UNKNOWN")), false, 409, INVALID);
+        assertRecoveryFailure(reply(409, "{\"code\":\"TIANJI_SIDE_EFFECT_UNKNOWN\",\"extra\":\"" + TOKEN + "\"}"), true, 409, INVALID);
+    }
+
+    @Test
+    void caps_recovery_responses_and_refuses_plaintext_before_reading_credentials() {
+        var oversized = new FakeHttpClient(200, HEADERS, new byte[16_385]);
+        assertRecoveryFailure(oversized, true, 0, "TIANJI_RESPONSE_TOO_LARGE");
+        assertTrue(oversized.subscription.cancelled);
+        var blocked = reply(200, RESUME_ACK);
+        var credentials = new AtomicInteger();
+        var client = new HttpAgentClient(URI.create("http://owner.example/"), blocked,
+                () -> { credentials.incrementAndGet(); return TOKEN; }, TIMEOUT, 0, Duration.ZERO);
+        assertThrows(IllegalArgumentException.class, () -> client.resumeCheckpoint(RESUME));
+        assertThrows(IllegalArgumentException.class, () -> client.reconcileHistoricalStart(RECONCILE));
+        assertEquals(0, credentials.get());
+        assertEquals(0, blocked.sent);
+    }
+
+    @Test
+    void a_lost_acknowledgement_does_not_retry_the_command() {
+        var wire = reply(200, RESUME_ACK);
+        wire.stalled = new CompletableFuture<>();
+        var client = new HttpAgentClient(URI.create(BASE), wire, () -> TOKEN, Duration.ofMillis(5), 4, Duration.ZERO);
+        var failure = assertThrows(AgentClientException.class, () -> client.resumeCheckpoint(RESUME));
+        assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", failure.code());
+        assertEquals(1, wire.sent);
+        assertTrue(wire.stalled.isCancelled());
+    }
+
+    private static tools.jackson.databind.JsonNode assertCommand(FakeHttpClient wire, String path) {
+        assertEquals(1, wire.sent);
+        assertEquals("POST", wire.request.method());
+        assertEquals(URI.create(BASE).resolve(path.substring(1)), wire.request.uri());
+        assertEquals("Bearer " + TOKEN, wire.request.headers().firstValue("Authorization").orElseThrow());
+        assertEquals("application/json", wire.request.headers().firstValue("Content-Type").orElseThrow());
+        assertEquals("no-store", wire.request.headers().firstValue("Cache-Control").orElseThrow());
+        var body = new CompletableFuture<byte[]>();
+        wire.request.bodyPublisher().orElseThrow().subscribe(new Flow.Subscriber<ByteBuffer>() {
+            private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+
+            @Override public void onSubscribe(Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
+            @Override public void onNext(ByteBuffer item) {
+                byte[] bytes = new byte[item.remaining()];
+                item.get(bytes);
+                buffer.writeBytes(bytes);
+            }
+            @Override public void onError(Throwable failure) { body.completeExceptionally(failure); }
+            @Override public void onComplete() { body.complete(buffer.toByteArray()); }
+        });
+        return JsonMapper.builder().build().readTree(body.join());
+    }
+
+    private static void assertRecoveryFailure(FakeHttpClient wire, boolean historical, int status, String code) {
+        var failure = assertThrows(AgentClientException.class, () -> {
+            if (historical) agent(wire).reconcileHistoricalStart(RECONCILE);
+            else agent(wire).resumeCheckpoint(RESUME);
+        });
+        assertEquals(status, failure.httpStatus());
+        assertEquals(code, failure.code());
+        assertNull(failure.correlationId());
+        assertNull(failure.retryAfter());
+        assertFalse(failure.toString().contains(TOKEN));
+        assertEquals(1, wire.sent);
     }
 
     private static void assertRequest(FakeHttpClient wire, String suffix) {
