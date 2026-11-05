@@ -15,6 +15,30 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class OrchestrationContractTest {
     @Test
+    void exposes_only_bounded_process_local_agent_outcome_evidence() {
+        var recorded = Instant.parse("2026-11-05T12:00:00Z");
+        var received = recorded.plusSeconds(1);
+        var decided = received.plusSeconds(1);
+        var dispatch = ProcessAgentOutcomePageDTO.DispatchState.ACKNOWLEDGED;
+        var inbox = ProcessAgentOutcomePageDTO.InboxState.APPLIED;
+        var terminal = top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED;
+        var item = new ProcessAgentOutcomePageDTO.ItemDTO("review", dispatch, inbox, terminal, recorded, received, decided);
+        var items = new ArrayList<>(List.of(item));
+        var page = new ProcessAgentOutcomePageDTO("instance", decided, items, null);
+        items.clear();
+        assertEquals(List.of(item), page.items());
+        assertThrows(IllegalArgumentException.class, () -> new GetProcessAgentOutcomesQuery("..", null));
+        assertThrows(IllegalArgumentException.class, () -> new GetProcessAgentOutcomesQuery("instance", "occurrence-id"));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessAgentOutcomePageDTO("instance", recorded, List.of(item), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> new ProcessAgentOutcomePageDTO("instance", decided, List.of(item), "v1." + "a".repeat(64)));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessAgentOutcomePageDTO.ItemDTO(
+                "review", dispatch, inbox, null, recorded, received, decided));
+        assertThrows(IllegalArgumentException.class, () -> new ProcessAgentOutcomePageDTO.ItemDTO(
+                "review", dispatch, ProcessAgentOutcomePageDTO.InboxState.NOT_OBSERVED, terminal, recorded, null, null));
+    }
+
+    @Test
     void rejects_invalid_process_correlation_queries() {
         var start = Instant.parse("2026-11-01T00:00:00Z");
         assertThrows(IllegalArgumentException.class,

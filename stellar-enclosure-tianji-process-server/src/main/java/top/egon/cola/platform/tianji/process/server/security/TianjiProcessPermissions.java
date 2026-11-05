@@ -50,6 +50,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Start a process instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read a process instance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.agent.outcomes", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read owned process Agent outcomes"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.correlations", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Find owned process starts by correlation"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.control", defaultLocale = "en-US",
@@ -162,6 +164,7 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_PUBLISH_API = "tianji.api.process.release.publish";
     public static final String RELEASE_GET_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_RESOURCE_KEY;
     public static final String START_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_RESOURCE_KEY;
+    public static final String AGENT_OUTCOMES_API = "tianji.api.process.agent.outcomes";
     public static final String CORRELATION_LIST_API = "tianji.api.process.instance.correlations";
     public static final String GET_API = "tianji.api.process.instance.get";
     public static final String CONTROL_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CONTROL_RESOURCE_KEY;

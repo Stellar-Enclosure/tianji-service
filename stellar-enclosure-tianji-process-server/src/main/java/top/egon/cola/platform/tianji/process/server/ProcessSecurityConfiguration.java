@@ -82,6 +82,7 @@ import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxLagObservation;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
+import top.egon.cola.platform.tianji.process.server.bridge.ProcessLinkedAgentOutcomeQuery;
 import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgePoller;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
@@ -109,6 +110,7 @@ public class ProcessSecurityConfiguration {
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
         boolean workerRecoveryEnabled = environment.getProperty("stellar.tianji.process.worker-recovery.enabled", Boolean.class, false);
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
+        boolean ownerOutcomesEnabled = environment.getProperty("stellar.tianji.process.agent-results.owner-outcomes-enabled", Boolean.class, false);
         boolean tasksEnabled = environment.getProperty("stellar.tianji.process.human-tasks.enabled", Boolean.class, false);
         boolean taskPublicationEnabled = environment.getProperty("stellar.tianji.process.human-tasks.publish-enabled", Boolean.class, false);
         boolean approvalVerificationEnabled = environment.getProperty("stellar.tianji.process.approval-verification.enabled", Boolean.class, false);
@@ -118,6 +120,7 @@ public class ProcessSecurityConfiguration {
         if (cancellationEnabled && !enabled) throw new IllegalStateException("Process cancellation requires the Process API security boundary");
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
+        if (ownerOutcomesEnabled && !inboxEnabled) throw new IllegalStateException("Process Agent outcomes require the durable Agent result Inbox");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
         if (taskPublicationEnabled && !tasksEnabled) throw new IllegalStateException("Governed task publication requires the human task API");
         if (approvalVerificationEnabled && !enabled) throw new IllegalStateException("Approval verification requires the Process API security boundary");
@@ -485,6 +488,18 @@ public class ProcessSecurityConfiguration {
                 throw new IllegalStateException("Agent result Inbox requires shared JDBC storage");
             }
             return new AgentDispatchStore(manager.getDataSource(), manager, configuration.getDatabaseSchema());
+        }
+
+        @Bean("processLinkedAgentOutcomeQuery")
+        @ConditionalOnProperty(prefix = "stellar.tianji.process.agent-results", name = "owner-outcomes-enabled", havingValue = "true")
+        ProcessLinkedAgentOutcomeQuery processLinkedAgentOutcomeQuery(ProcessEngine engine, AgentDispatchStore dispatches,
+                AgentResultInbox inbox, AgentResultProducerRegistry producers, AgentResultInboxProperties properties) {
+            var configuration = processConfiguration(engine);
+            var source = caseDataSource(configuration);
+            var manager = (DataSourceTransactionManager) configuration.getTransactionManager();
+            String schema = configuration.getDatabaseSchema();
+            new ProcessApiSchemaVerifier(source, schema).verifyAgentResultInbox();
+            return new ProcessLinkedAgentOutcomeQuery(source, manager, schema, dispatches, inbox, producers, properties.registrations());
         }
 
         @Bean

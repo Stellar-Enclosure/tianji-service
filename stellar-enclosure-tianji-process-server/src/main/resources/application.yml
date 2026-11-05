@@ -91,6 +91,7 @@ stellar:
         completion-metrics-enabled: false
       agent-results:
         receive-span-links-enabled: false
+        owner-outcomes-enabled: false
         lag-metrics-enabled: false
       agent-bridge:
         enabled: false

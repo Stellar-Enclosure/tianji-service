@@ -235,6 +235,11 @@ public final class AgentDispatchStore {
     }
 
     private Instant now() { return jdbc.queryForObject("SELECT clock_timestamp()", (rs, row) -> rs.getTimestamp(1).toInstant()); }
+    static String idempotencyKey(Key key) {
+        return "ad-" + ProcessRequestDigest.hash(List.of("process-agent-occurrence-v1", Long.toString(key.actor().tenantId()),
+                key.actor().issuerFingerprint(), key.actor().subjectId(), key.sourceId(), key.instanceId(), key.occurrenceId()), Map.of());
+    }
+
     private static String where() { return "tenant_id=? AND subject_issuer=? AND subject_id=? AND source_id=? AND scope_type='BPMN' AND scope_id=? AND occurrence_id=?"; }
     private static Object[] args(Key key) {
         return new Object[] {key.actor().tenantId(), key.actor().issuerFingerprint(), key.actor().subjectId(), key.sourceId(), key.instanceId(), key.occurrenceId()};
@@ -326,8 +331,7 @@ public final class AgentDispatchStore {
         }
         public Key key() { return new Key(binding.actor(), binding.sourceId(), instanceId, occurrenceId); }
         public String idempotencyKey() {
-            return "ad-" + ProcessRequestDigest.hash(List.of("process-agent-occurrence-v1", Long.toString(binding.actor().tenantId()),
-                    binding.actor().issuerFingerprint(), binding.actor().subjectId(), binding.sourceId(), instanceId, occurrenceId), Map.of());
+            return AgentDispatchStore.idempotencyKey(key());
         }
         public String fingerprint() {
             return ProcessRequestDigest.hash(List.of("process-agent-dispatch-v1", idempotencyKey(), releaseKey, processDefinitionId,

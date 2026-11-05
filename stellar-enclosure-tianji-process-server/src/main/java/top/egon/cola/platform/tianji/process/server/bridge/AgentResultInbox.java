@@ -214,7 +214,7 @@ public final class AgentResultInbox {
                 || delay.toNanos() % 1_000_000 != 0) throw invalid();
     }
 
-    private static Entry read(ResultSet rs) throws SQLException {
+    static Entry read(ResultSet rs) throws SQLException {
         AgentTerminalEvent event = decode(rs.getString("event_payload"));
         if (event.tenantId() != rs.getLong("tenant_id") || !event.eventId().equals(rs.getString("event_id"))
                 || !event.producerId().equals(rs.getString("producer_id")) || !event.fingerprint().equals(rs.getString("event_sha256"))
