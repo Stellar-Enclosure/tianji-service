@@ -73,6 +73,7 @@ stellar:
         enabled: false
       migration-preflight:
         enabled: false
+        http-enabled: false
       worker-recovery:
         enabled: false
       cases:

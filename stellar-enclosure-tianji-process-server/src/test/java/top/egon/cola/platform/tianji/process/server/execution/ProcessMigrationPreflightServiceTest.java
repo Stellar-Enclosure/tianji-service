@@ -182,6 +182,24 @@ class ProcessMigrationPreflightServiceTest {
         }
     }
 
+    @Test
+    void denies_a_different_route_actor_before_opening_storage() throws Exception {
+        try (var fixture = new Fixture()) {
+            var mismatched = new ProcessActor(OWNER.tenantId(), OWNER.subjectType(), OWNER.subjectId(), "f".repeat(64));
+            assertThrows(AccessDeniedException.class, () -> fixture.service.inspectForResourceActor(mismatched, fixture.query()));
+            verify(fixture.access).require(TianjiProcessPermissions.GET_API);
+            verify(fixture.access).require(TianjiProcessPermissions.RELEASE_GET_API);
+            verifyNoInteractions(fixture.source, fixture.builder);
+        }
+        try (var fixture = new Fixture()) {
+            assertThrows(AccessDeniedException.class, () -> fixture.service.inspectForResourceActor(null, fixture.query()));
+            verifyNoInteractions(fixture.access, fixture.source, fixture.builder);
+        }
+        try (var fixture = new Fixture()) {
+            assertEquals(NATIVE_STRUCTURE_VALIDATED_ONLY, fixture.service.inspectForResourceActor(OWNER, fixture.query()).status());
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         private final TimeZone previous = TimeZone.getDefault();
         private final DataSource source = mock(DataSource.class);

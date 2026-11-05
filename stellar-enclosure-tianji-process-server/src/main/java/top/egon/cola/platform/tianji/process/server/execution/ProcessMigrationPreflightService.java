@@ -110,11 +110,23 @@ public final class ProcessMigrationPreflightService {
     }
 
     public ProcessMigrationPreflightDTO inspect(ValidateProcessMigrationQuery query) {
+        return inspectBoundOwner(query, null);
+    }
+
+    public ProcessMigrationPreflightDTO inspectForResourceActor(ProcessActor resourceActor, ValidateProcessMigrationQuery query) {
+        if (resourceActor == null || "LEGACY".equals(resourceActor.issuerFingerprint())) {
+            throw new AccessDeniedException("Verified Process owner is required");
+        }
+        return inspectBoundOwner(query, resourceActor);
+    }
+
+    private ProcessMigrationPreflightDTO inspectBoundOwner(ValidateProcessMigrationQuery query, ProcessActor resourceActor) {
         if (query == null) throw new IllegalArgumentException("Process migration preflight query is invalid");
         requireNoAmbientTransaction();
         ProcessActor actor = access.require(TianjiProcessPermissions.GET_API);
         ProcessActor releaseReader = access.require(TianjiProcessPermissions.RELEASE_GET_API);
-        if (actor == null || !actor.equals(releaseReader) || "LEGACY".equals(actor.issuerFingerprint())) {
+        if (actor == null || !actor.equals(releaseReader) || "LEGACY".equals(actor.issuerFingerprint())
+                || resourceActor != null && !actor.equals(resourceActor)) {
             throw new AccessDeniedException("Verified Process owner is required");
         }
         try {
