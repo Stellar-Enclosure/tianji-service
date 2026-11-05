@@ -1,6 +1,10 @@
 package top.egon.cola.platform.tianji.process.server.api;
 
+import io.opentelemetry.api.OpenTelemetry;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.core.env.Environment;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -28,10 +32,25 @@ import java.util.Objects;
 public class AgentResultInboxController {
     private final AgentResultInbox inbox;
     private final TianjiProcessAccess access;
+    private final AgentResultInboxReceiveObservation observation;
 
     public AgentResultInboxController(AgentResultInbox inbox, TianjiProcessAccess access) {
+        this(inbox, access, AgentResultInboxReceiveObservation.disabled());
+    }
+
+    @Autowired
+    public AgentResultInboxController(AgentResultInbox inbox, TianjiProcessAccess access, Environment environment,
+                                      ObjectProvider<OpenTelemetry> telemetry) {
+        this(inbox, access, environment.getProperty(AgentResultInboxReceiveObservation.FLAG, Boolean.class, false)
+                ? AgentResultInboxReceiveObservation.enabled(telemetry::getIfUnique)
+                : AgentResultInboxReceiveObservation.disabled());
+    }
+
+    AgentResultInboxController(AgentResultInbox inbox, TianjiProcessAccess access,
+                               AgentResultInboxReceiveObservation observation) {
         this.inbox = Objects.requireNonNull(inbox, "inbox");
         this.access = Objects.requireNonNull(access, "access");
+        this.observation = Objects.requireNonNull(observation, "observation");
     }
 
     @PermissionResource(key = TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API, type = ResourceType.API,
@@ -42,6 +61,8 @@ public class AgentResultInboxController {
     public ResponseEntity<AgentResultReceipt> receive(@RequestBody AgentTerminalEvent event) {
         ProcessActor producer = access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API);
         if (producer.subjectType() != ProcessActor.SubjectType.SERVICE) throw new AccessDeniedException("service identity required");
-        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(inbox.receive(producer, event));
+        var receipt = inbox.receive(producer, event);
+        observation.afterReceive();
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(receipt);
     }
 }

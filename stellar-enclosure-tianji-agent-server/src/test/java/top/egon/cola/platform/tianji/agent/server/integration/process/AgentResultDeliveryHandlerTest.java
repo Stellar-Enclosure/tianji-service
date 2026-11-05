@@ -1,5 +1,14 @@
 package top.egon.cola.platform.tianji.agent.server.integration.process;
 
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.trace.ReadWriteSpan;
+import io.opentelemetry.sdk.trace.ReadableSpan;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -30,6 +39,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -181,6 +191,70 @@ class AgentResultDeliveryHandlerTest {
         var agent = assertInstanceOf(Map.class, tianji.get("agent"));
         var terminal = assertInstanceOf(Map.class, agent.get("terminal-events"));
         assertEquals(Map.of("span-links-enabled", false), terminal);
+        var delivery = assertInstanceOf(Map.class, agent.get("result-delivery"));
+        assertEquals(Map.of("cross-process-span-links-enabled", false), delivery);
+    }
+
+    @Test
+    void crossProcessCarrierUsesTheActualDeliverySpanAndRetainsTheOldOffCall() {
+        var spans = new LocalSpans();
+        var savedOrigin = "tianji-link-v1:00-" + "a".repeat(32) + "-" + "b".repeat(16) + "-01";
+        var original = context();
+        var linked = new DeliveryContext(original.messageId(), original.channel(), original.destination(),
+                original.payload(), original.contentType(), original.schemaVersion(), original.headers(), savedOrigin,
+                original.attempt(), original.maxAttempts(), original.deadline());
+        var receipt = new AgentResultReceipt(event.eventId(), event.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+        when(client.receive(event)).thenReturn(receipt);
+        when(client.receive(eq(event), anyString())).thenReturn(receipt);
+        try (var provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn()).addSpanProcessor(spans).build()) {
+            var telemetry = OpenTelemetrySdk.builder().setTracerProvider(provider).build();
+            var observation = AgentResultSpanObservation.enabled(() -> telemetry, () -> null);
+            var route = new AgentResultDeliveryHandler.Route("process-one", "process-east", owner, client);
+            var local = new AgentResultDeliveryHandler(() -> ledger, List.of(route), Clock.fixed(NOW, ZoneOffset.UTC),
+                    observation, false);
+            var cross = new AgentResultDeliveryHandler(() -> ledger, List.of(route), Clock.fixed(NOW, ZoneOffset.UTC),
+                    observation, true);
+            var current = Context.current();
+            assertEquals(DeliveryResult.Kind.SUCCESS, local.deliver(linked).kind());
+            verify(client).receive(event);
+            verify(client, never()).receive(any(), anyString());
+            assertEquals(DeliveryResult.Kind.SUCCESS, cross.deliver(linked).kind());
+            assertSame(current, Context.current());
+            assertEquals(2, spans.completed.size());
+            var delivery = spans.completed.getLast();
+            assertEquals("tianji.agent.result.deliver", delivery.getName());
+            assertEquals("a".repeat(32), delivery.getLinks().getFirst().getSpanContext().getTraceId());
+            assertNotEquals("a".repeat(32), delivery.getTraceId());
+            assertTrue(delivery.getAttributes().isEmpty());
+            verify(client).receive(event, "00-" + delivery.getTraceId() + "-" + delivery.getSpanId() + "-01");
+        }
+    }
+
+    @Test
+    void crossProcessOptInWithoutRecordingProviderStillSendsOnlyTheLegacyRequest() {
+        var original = context();
+        var linked = new DeliveryContext(original.messageId(), original.channel(), original.destination(),
+                original.payload(), original.contentType(), original.schemaVersion(), original.headers(),
+                "tianji-link-v1:00-" + "a".repeat(32) + "-" + "b".repeat(16) + "-01",
+                original.attempt(), original.maxAttempts(), original.deadline());
+        when(client.receive(event)).thenReturn(new AgentResultReceipt(event.eventId(), event.fingerprint(),
+                AgentResultReceiptStateEnum.RECEIVED, NOW));
+        var noop = AgentResultSpanObservation.enabled(OpenTelemetry::noop, () -> null);
+        var cross = new AgentResultDeliveryHandler(() -> ledger, List.of(
+                new AgentResultDeliveryHandler.Route("process-one", "process-east", owner, client)),
+                Clock.fixed(NOW, ZoneOffset.UTC), noop, true);
+        assertEquals(DeliveryResult.Kind.SUCCESS, cross.deliver(linked).kind());
+        verify(client).receive(event);
+        verify(client, never()).receive(any(), anyString());
+    }
+
+    private static final class LocalSpans implements SpanProcessor {
+        private final List<SpanData> completed = new ArrayList<>();
+
+        @Override public void onStart(Context parent, ReadWriteSpan span) { }
+        @Override public boolean isStartRequired() { return false; }
+        @Override public void onEnd(ReadableSpan span) { completed.add(span.toSpanData()); }
+        @Override public boolean isEndRequired() { return true; }
     }
 
     private DeliveryContext context() { return context(mapper.writeValueAsString(event), Map.of("tianji-event-fingerprint", event.fingerprint()), NOW.plusSeconds(30)); }

@@ -64,7 +64,7 @@ public final class HttpAgentResultClient implements AgentResultClient, AutoClose
                 || !baseUri.normalize().equals(baseUri) || !("https".equalsIgnoreCase(baseUri.getScheme())
                 || "http".equalsIgnoreCase(baseUri.getScheme()) && loopback)) throw new IllegalArgumentException("Agent result service URI is invalid");
         String value = baseUri.toASCIIString();
-        this.endpoint = URI.create(value.endsWith("/") ? value : value + "/").resolve("api/tianji/v1/agent-result-inbox");
+        this.endpoint = URI.create(value.endsWith("/") ? value : value + "/").resolve(AgentResultTraceLinkCarrier.PATH.substring(1));
         this.http = Objects.requireNonNull(http, "http");
         if (http.followRedirects() != HttpClient.Redirect.NEVER) throw new IllegalArgumentException("Agent result client must not follow redirects");
         this.tokens = Objects.requireNonNull(tokens, "tokens");
@@ -73,6 +73,11 @@ public final class HttpAgentResultClient implements AgentResultClient, AutoClose
     }
 
     @Override public AgentResultReceipt receive(AgentTerminalEvent event) {
+        return receive(event, null);
+    }
+
+    /** The optional diagnostic link never participates in authorization or event identity. */
+    public AgentResultReceipt receive(AgentTerminalEvent event, String traceLink) {
         Objects.requireNonNull(event, "event");
         long started = calls.begin();
         long tenant = event.tenantId();
@@ -81,10 +86,14 @@ public final class HttpAgentResultClient implements AgentResultClient, AutoClose
         try { body = mapper.writeValueAsBytes(event); }
         catch (RuntimeException invalid) { throw new IllegalArgumentException("Agent result event cannot be encoded"); }
         if (body.length > MAX_BYTES) throw new IllegalArgumentException("Agent result event exceeds its size limit");
-        var request = HttpRequest.newBuilder(endpoint).timeout(Duration.ofNanos(calls.remaining(started)))
+        var builder = HttpRequest.newBuilder(endpoint).timeout(Duration.ofNanos(calls.remaining(started)))
                 .header("Authorization", "Bearer " + token).header("X-Egon-Tianji-Tenant", Long.toString(tenant))
-                .header("Content-Type", "application/json").header("Accept", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
+                .header("Content-Type", "application/json").header("Accept", "application/json");
+        if ("https".equalsIgnoreCase(endpoint.getScheme()) && AgentResultTraceLinkCarrier.PATH.equals(endpoint.getRawPath())
+                && AgentResultTraceLinkCarrier.isValid(traceLink)) {
+            builder.header(AgentResultTraceLinkCarrier.HEADER, traceLink);
+        }
+        var request = builder.POST(HttpRequest.BodyPublishers.ofByteArray(body)).build();
         java.util.concurrent.CompletableFuture<HttpResponse<byte[]>> pending;
         try { pending = calls.track(http.sendAsync(request, ignored -> new BoundedBodySubscriber(MAX_BYTES))); }
         catch (RuntimeException failure) { throw unavailable(); }

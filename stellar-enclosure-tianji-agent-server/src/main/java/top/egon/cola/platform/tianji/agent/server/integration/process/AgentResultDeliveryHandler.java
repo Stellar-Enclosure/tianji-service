@@ -41,6 +41,7 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
     private final Set<String> destinations;
     private final Clock clock;
     private final AgentResultSpanObservation observation;
+    private final boolean crossProcessSpanLinksEnabled;
 
     public AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock) {
         this(ledgers, routes, clock, AgentResultSpanObservation.disabled());
@@ -48,7 +49,13 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
 
     AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock,
                                AgentResultSpanObservation observation) {
+        this(ledgers, routes, clock, observation, false);
+    }
+
+    AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock,
+                               AgentResultSpanObservation observation, boolean crossProcessSpanLinksEnabled) {
         this.observation = Objects.requireNonNull(observation, "observation");
+        this.crossProcessSpanLinksEnabled = crossProcessSpanLinksEnabled;
         this.ledgers = Objects.requireNonNull(ledgers, "ledgers");
         this.clock = Objects.requireNonNull(clock, "clock");
         if (routes == null || routes.isEmpty() || routes.size() > 1000) throw invalid();
@@ -98,12 +105,13 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
         if (Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
             return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
         }
-        try (var ignored = observation.delivery(context.traceId())) {
+        try (var delivery = observation.delivery(context.traceId())) {
+            String traceLink = crossProcessSpanLinksEnabled ? delivery.wireCarrier() : null;
             if (observation.isEnabled()
                     && Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
                 return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
             }
-            var receipt = route.client().receive(event);
+            var receipt = traceLink == null ? route.client().receive(event) : route.client().receive(event, traceLink);
             if (receipt == null || !event.eventId().equals(receipt.eventId()) || !event.fingerprint().equals(receipt.eventFingerprint())) {
                 return permanent("TIANJI_RESULT_RECEIPT_INVALID");
             }

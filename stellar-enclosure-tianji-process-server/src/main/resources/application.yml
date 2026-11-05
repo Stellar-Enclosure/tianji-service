@@ -89,6 +89,7 @@ stellar:
         enabled: false
         publish-enabled: false
       agent-results:
+        receive-span-links-enabled: false
         lag-metrics-enabled: false
       agent-bridge:
         enabled: false

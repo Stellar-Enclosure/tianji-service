@@ -42,6 +42,8 @@ stellar:
     agent:
       terminal-events:
         span-links-enabled: false
+      result-delivery:
+        cross-process-span-links-enabled: false
       storage:
         model-usage-enabled: false
         model-usage-cumulative-route-refs: []

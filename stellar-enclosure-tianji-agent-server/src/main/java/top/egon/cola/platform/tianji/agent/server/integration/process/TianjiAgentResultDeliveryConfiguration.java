@@ -87,7 +87,9 @@ public class TianjiAgentResultDeliveryConfiguration {
         var observation = environment.getProperty(AgentResultSpanObservation.FLAG, Boolean.class, false)
                 ? AgentResultSpanObservation.enabled(telemetry::getIfUnique, meters::getIfUnique)
                 : AgentResultSpanObservation.disabled();
-        return new AgentResultDeliveryHandler(ledgers::getObject, clients.routes(), Clock.systemUTC(), observation);
+        boolean crossProcess = observation.isEnabled()
+                && environment.getProperty(AgentResultSpanObservation.CROSS_PROCESS_FLAG, Boolean.class, false);
+        return new AgentResultDeliveryHandler(ledgers::getObject, clients.routes(), Clock.systemUTC(), observation, crossProcess);
     }
 
     static final class ResultDeliveryClients implements AutoCloseable {

@@ -12,6 +12,7 @@ import io.opentelemetry.api.trace.TraceState;
 import io.opentelemetry.api.trace.Tracer;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier;
 
 import java.util.EnumMap;
 import java.util.Map;
@@ -19,9 +20,10 @@ import java.util.Objects;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
-/** Optional AS-only observation. The terminal event, transport and Outbox fingerprint are independent of it. */
+/** Optional AS observation for the terminal event. The event and Outbox fingerprint remain independent. */
 final class AgentResultSpanObservation {
     static final String FLAG = "stellar.tianji.agent.terminal-events.span-links-enabled";
+    static final String CROSS_PROCESS_FLAG = "stellar.tianji.agent.result-delivery.cross-process-span-links-enabled";
     private static final String PREFIX = "tianji-link-v1:";
     private static final int CARRIER_LENGTH = 70;
     private static final Pattern CARRIER = Pattern.compile(PREFIX + "00-([0-9a-f]{32})-([0-9a-f]{16})-01");
@@ -85,7 +87,20 @@ final class AgentResultSpanObservation {
                     .setSpanKind(SpanKind.CONSUMER).addLink(source).startSpan();
             count(created.isRecording() ? Result.LINKED : Result.UNAVAILABLE);
             Span delivery = created;
-            return () -> end(delivery);
+            return new Delivery() {
+                @Override public String wireCarrier() {
+                    try {
+                        SpanContext context = delivery.getSpanContext();
+                        if (!delivery.isRecording() || !context.isValid() || context.isRemote() || !context.isSampled()) return null;
+                        String value = "00-" + context.getTraceId() + "-" + context.getSpanId() + "-01";
+                        return AgentResultTraceLinkCarrier.isValid(value) ? value : null;
+                    } catch (RuntimeException unavailable) {
+                        return null;
+                    }
+                }
+
+                @Override public void close() { end(delivery); }
+            };
         } catch (RuntimeException unavailable) {
             end(created);
             count(Result.UNAVAILABLE);
@@ -157,6 +172,7 @@ final class AgentResultSpanObservation {
 
     @FunctionalInterface
     interface Delivery extends AutoCloseable {
+        default String wireCarrier() { return null; }
         @Override void close();
     }
 }

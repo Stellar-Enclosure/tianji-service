@@ -1,11 +1,27 @@
 package top.egon.cola.platform.tianji.process.server.api;
 
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanKind;
+import io.opentelemetry.api.trace.TracerProvider;
+import io.opentelemetry.context.Context;
+import io.opentelemetry.context.propagation.ContextPropagators;
+import io.opentelemetry.sdk.trace.ReadWriteSpan;
+import io.opentelemetry.sdk.trace.ReadableSpan;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.SpanProcessor;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpInputMessage;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import tools.jackson.databind.json.JsonMapper;
+import top.egon.cola.platform.tianji.client.AgentResultTraceLinkCarrier;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
@@ -24,7 +40,9 @@ import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -32,6 +50,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
 class AgentResultInboxControllerTest {
+    private static final String REMOTE_TRACE = "1".repeat(32);
+    private static final String REMOTE_SPAN = "2".repeat(16);
+    private static final String LINK = "00-" + REMOTE_TRACE + "-" + REMOTE_SPAN + "-01";
     private static final Instant NOW = Instant.parse("2026-10-30T00:00:00Z");
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final AgentResultInbox inbox = mock(AgentResultInbox.class);
@@ -112,8 +133,132 @@ class AgentResultInboxControllerTest {
                 "agent-east", "process-east", "https://idp.example/20", "process-worker"));
     }
 
+    @Test
+    void records_one_remote_link_only_after_durable_receive_and_keeps_the_local_parent() throws Exception {
+        var collected = new CollectingSpans();
+        try (var provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn()).addSpanProcessor(collected).build()) {
+            var observation = AgentResultInboxReceiveObservation.enabled(() -> telemetry(provider));
+            var receipt = new AgentResultReceipt(event.eventId(), event.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+            when(access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API)).thenReturn(producer);
+            when(inbox.receive(producer, event)).thenAnswer(ignored -> {
+                assertTrue(collected.spans.isEmpty());
+                return receipt;
+            });
+            var parent = provider.get("local-ps-parent").spanBuilder("existing PS request").startSpan();
+            try (var scope = parent.makeCurrent()) {
+                performLinked(mvc(new AgentResultInboxController(inbox, access, observation)), LINK)
+                        .andExpect(status().isAccepted()).andExpect(header().string("Cache-Control", "no-store"))
+                        .andExpect(header().doesNotExist(AgentResultTraceLinkCarrier.HEADER))
+                        .andExpect(jsonPath("$.state").value("RECEIVED"))
+                        .andExpect(jsonPath("$.eventFingerprint").value(event.fingerprint()));
+                assertEquals(parent.getSpanContext(), Span.current().getSpanContext());
+                assertEquals(1, collected.spans.size());
+                var span = collected.spans.getFirst();
+                assertEquals("tianji.process.agent.result.receive", span.getName());
+                assertEquals(SpanKind.CONSUMER, span.getKind());
+                assertEquals(parent.getSpanContext().getTraceId(), span.getSpanContext().getTraceId());
+                assertEquals(parent.getSpanContext().getSpanId(), span.getParentSpanContext().getSpanId());
+                assertTrue(span.getAttributes().isEmpty());
+                assertTrue(span.getEvents().isEmpty());
+                assertEquals(1, span.getLinks().size());
+                var link = span.getLinks().getFirst();
+                assertEquals(REMOTE_TRACE, link.getSpanContext().getTraceId());
+                assertEquals(REMOTE_SPAN, link.getSpanContext().getSpanId());
+                assertTrue(link.getSpanContext().isRemote());
+                assertTrue(link.getSpanContext().isSampled());
+                assertTrue(link.getAttributes().isEmpty());
+            } finally {
+                parent.end();
+            }
+            verify(inbox).receive(producer, event);
+        }
+    }
+
+    @Test
+    void ignores_disabled_malformed_duplicate_unsampled_or_unavailable_links_and_failed_receipts() throws Exception {
+        var collected = new CollectingSpans();
+        var lookups = new AtomicInteger();
+        try (var provider = SdkTracerProvider.builder().setSampler(Sampler.alwaysOn()).addSpanProcessor(collected).build()) {
+            var observation = AgentResultInboxReceiveObservation.enabled(() -> {
+                lookups.incrementAndGet();
+                return telemetry(provider);
+            });
+            when(access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API)).thenReturn(producer);
+            when(inbox.receive(producer, event)).thenReturn(new AgentResultReceipt(
+                    event.eventId(), event.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW));
+            performLinked(mvc(), LINK).andExpect(status().isAccepted());
+            var mvc = mvc(new AgentResultInboxController(inbox, access, observation));
+            for (String invalid : List.of(LINK + ", " + LINK, " " + LINK, LINK.substring(0, 53) + "00",
+                    "00-" + "0".repeat(32) + "-" + REMOTE_SPAN + "-01", "00-A" + LINK.substring(4))) {
+                performLinked(mvc, invalid).andExpect(status().isAccepted());
+            }
+            performLinked(mvc, LINK, LINK).andExpect(status().isAccepted());
+            mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON)
+                    .content(mapper.writeValueAsBytes(event))).andExpect(status().isAccepted());
+            mvc.perform(post("/internal" + AgentResultTraceLinkCarrier.PATH).contextPath("/internal")
+                    .contentType(MediaType.APPLICATION_JSON).header(AgentResultTraceLinkCarrier.HEADER, LINK)
+                    .content(mapper.writeValueAsBytes(event)))
+                    .andExpect(status().isAccepted()).andExpect(jsonPath("$.state").value("RECEIVED"));
+            assertObservationSkipsBeforeReadingHeader(observation, "GET", AgentResultTraceLinkCarrier.PATH);
+            assertObservationSkipsBeforeReadingHeader(observation, "POST", "/%61pi/tianji/v1/agent-result-inbox");
+            assertEquals(0, lookups.get());
+
+            for (var unavailable : List.of(AgentResultInboxReceiveObservation.enabled(() -> null),
+                    AgentResultInboxReceiveObservation.enabled(() -> { throw new IllegalStateException("private detail"); }))) {
+                performLinked(mvc(new AgentResultInboxController(inbox, access, unavailable)), LINK)
+                        .andExpect(status().isAccepted()).andExpect(jsonPath("$.state").value("RECEIVED"));
+            }
+            when(inbox.receive(producer, event)).thenThrow(new ProcessConflictException());
+            performLinked(mvc, LINK).andExpect(status().isConflict());
+            when(access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API)).thenReturn(
+                    ProcessActor.verified(20, ProcessActor.SubjectType.USER, "user", "https://idp.example/20"));
+            performLinked(mvc, LINK).andExpect(status().isForbidden());
+            assertEquals(0, lookups.get());
+            assertTrue(collected.spans.isEmpty());
+        }
+    }
+
+    private static void assertObservationSkipsBeforeReadingHeader(
+            AgentResultInboxReceiveObservation observation, String method, String rawUri) {
+        var request = spy(new MockHttpServletRequest(method, rawUri));
+        request.addHeader(AgentResultTraceLinkCarrier.HEADER, LINK);
+        var previous = RequestContextHolder.getRequestAttributes();
+        RequestContextHolder.setRequestAttributes(new ServletRequestAttributes(request));
+        try {
+            observation.afterReceive();
+            verify(request, never()).getHeaders(AgentResultTraceLinkCarrier.HEADER);
+        } finally {
+            RequestContextHolder.setRequestAttributes(previous);
+        }
+    }
+
+    private org.springframework.test.web.servlet.ResultActions performLinked(
+            org.springframework.test.web.servlet.MockMvc mvc, String... values) throws Exception {
+        return mvc.perform(post("/api/tianji/v1/agent-result-inbox").contentType(MediaType.APPLICATION_JSON)
+                .header(AgentResultTraceLinkCarrier.HEADER, (Object[]) values).content(mapper.writeValueAsBytes(event)));
+    }
+
+    private static OpenTelemetry telemetry(TracerProvider provider) {
+        return new OpenTelemetry() {
+            @Override public TracerProvider getTracerProvider() { return provider; }
+            @Override public ContextPropagators getPropagators() { return ContextPropagators.noop(); }
+        };
+    }
+
+    private static final class CollectingSpans implements SpanProcessor {
+        private final List<SpanData> spans = new ArrayList<>();
+        @Override public void onStart(Context parentContext, ReadWriteSpan span) { }
+        @Override public boolean isStartRequired() { return false; }
+        @Override public void onEnd(ReadableSpan span) { spans.add(span.toSpanData()); }
+        @Override public boolean isEndRequired() { return true; }
+    }
+
     private org.springframework.test.web.servlet.MockMvc mvc() {
-        return MockMvcBuilders.standaloneSetup(new AgentResultInboxController(inbox, access))
+        return mvc(new AgentResultInboxController(inbox, access));
+    }
+
+    private org.springframework.test.web.servlet.MockMvc mvc(AgentResultInboxController controller) {
+        return MockMvcBuilders.standaloneSetup(controller)
                 .setControllerAdvice(new ProcessApiErrors(), new ProcessRequestBodyAdvice()).build();
     }
     private static AgentTerminalEvent event() {
