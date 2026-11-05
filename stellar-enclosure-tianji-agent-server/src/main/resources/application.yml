@@ -37,6 +37,7 @@ egon:
               TIANJI_MEMORY_READ: ["tianji:memory:read"]
               TIANJI_MEMORY_WRITE: ["tianji:memory:write"]
               TIANJI_MEMORY_FORGET: ["tianji:memory:forget"]
+              TIANJI_AGENT_TOOL_RECEIPT_RECONCILE: ["tianji:agent:tool-receipt:reconcile"]
 
 stellar:
   tianji:
@@ -53,6 +54,8 @@ stellar:
         model-usage-cumulative-route-refs: []
       recovery:
         checkpoint-capture:
+          enabled: false
+        historical-start-receipt:
           enabled: false
       checkpoint-resume:
         api:

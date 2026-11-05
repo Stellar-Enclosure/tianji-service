@@ -37,6 +37,9 @@ public class TianjiAgentSecurityConfiguration {
             ObjectProvider<Rbac3BearerAuthenticationFilter> authorizationFilters,
             ObjectProvider<PermissionExecutionGuard> policies) throws Exception {
         boolean enabled = environment.getProperty("stellar.tianji.agent.api.enabled", Boolean.class, false);
+        boolean historicalReceiptEnabled = enabled && environment.getProperty(
+                TianjiHistoricalStartReceiptPermissions.ENABLED, Boolean.class, false)
+                && environment.getProperty("stellar.tianji.agent.storage.enabled", Boolean.class, false);
         http.csrf(csrf -> csrf.disable())
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(cache -> cache.disable())
@@ -49,6 +52,11 @@ public class TianjiAgentSecurityConfiguration {
                         .requestMatchers("/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**")
                             .authenticated()
                         .requestMatchers("/api/tianji/v1/memories", "/api/tianji/v1/memories/**").authenticated()
+                        .requestMatchers(HttpMethod.POST, TianjiHistoricalStartReceiptPermissions.PATH)
+                        .access((authentication, context) -> new org.springframework.security.authorization.AuthorizationDecision(
+                                historicalReceiptEnabled && authentication.get()
+                                        instanceof top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken user
+                                        && user.isAuthenticated()))
                         .requestMatchers("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**")
                             .authenticated()
                         .anyRequest().denyAll())

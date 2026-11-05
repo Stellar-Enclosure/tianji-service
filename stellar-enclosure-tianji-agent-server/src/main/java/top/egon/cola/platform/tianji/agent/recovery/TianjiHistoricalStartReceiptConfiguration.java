@@ -48,7 +48,7 @@ public class TianjiHistoricalStartReceiptConfiguration {
             reader = new TianjiFixedBpmnStartReceiptReader(binding.bindings(), verifier, client, 2,
                     binding.readRegistrationByBackendSha256());
             var reconciliation = new ToolStartReceiptReconciliationService(source, ledger, binding.historicalAuthority(), reader);
-            return new HistoricalStartReceiptHost(reconciliation, reader, client);
+            return new HistoricalStartReceiptHost(reconciliation, reader, client, binding.historicalAuthority());
         } catch (RuntimeException privateConfiguration) {
             closeResources(reader, client);
             throw invalid();
@@ -72,13 +72,19 @@ public class TianjiHistoricalStartReceiptConfiguration {
         private final ToolStartReceiptReconciliationService reconciliation;
         private final TianjiFixedBpmnStartReceiptReader reader;
         private final HttpClient client;
+        private final HistoricalToolReceiptAuthorization authority;
         private final AtomicBoolean closed = new AtomicBoolean();
 
         private HistoricalStartReceiptHost(ToolStartReceiptReconciliationService reconciliation,
-                TianjiFixedBpmnStartReceiptReader reader, HttpClient client) {
+                TianjiFixedBpmnStartReceiptReader reader, HttpClient client, HistoricalToolReceiptAuthorization authority) {
             this.reconciliation = reconciliation;
             this.reader = reader;
             this.client = client;
+            this.authority = authority;
+        }
+
+        public boolean usesAuthority(HistoricalToolReceiptAuthorization candidate) {
+            return authority == candidate;
         }
 
         public ReceiptVO observe(TrustedAgentActor owner, String dispatchRunId, UUID intentId) {
