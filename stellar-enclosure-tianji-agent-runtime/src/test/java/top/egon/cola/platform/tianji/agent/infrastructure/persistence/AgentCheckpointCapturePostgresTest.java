@@ -1,5 +1,8 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.adk.agents.RunConfig;
+import com.google.adk.events.Event;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
 import jakarta.validation.Validation;
@@ -18,8 +21,11 @@ import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import reactor.core.publisher.Flux;
+import top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties;
+import top.egon.cola.component.agentflow.config.AgentFlowConfigDTO;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
+import top.egon.cola.component.agentflow.runtime.AgentFlowSessionRunner;
 import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
 import top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory;
 import top.egon.cola.component.common.core.validation.ValidationUtils;
@@ -28,6 +34,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
@@ -67,9 +74,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.CAPTURE;
+import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.NATIVE_RESUME;
+import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.RECONCILE;
 
 /** Explicit isolated PostgreSQL proof of first-input capture and its transaction failure boundary. */
 @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture", matches = "true")
@@ -89,6 +100,8 @@ class AgentCheckpointCapturePostgresTest {
     private static final String ROUTE = "checkpoint-fixture-route";
     private static final String POLICY = "checkpoint-fixture-policy";
     private static final String CHECKPOINT = "tianji_agent.agent_checkpoint";
+    private static final RunConfig NATIVE_RESUME_CONFIG = RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE)
+            .setMaxLlmCalls(1).setAutoCreateSession(false).build();
     private static final String HISTORY = """
             SELECT version,script,type,checksum,success FROM tianji_agent.flyway_schema_history
             WHERE version IS NOT NULL ORDER BY installed_rank
@@ -165,7 +178,7 @@ class AgentCheckpointCapturePostgresTest {
     @Timeout(150)
     @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture.fork", matches = "true")
     void forced_process_exit_preserves_checkpoint_and_reconciles_expired_run_without_execution() throws Exception {
-        verifyProductCheckpointForks(provision(), (fixture, cut) -> { });
+        verifyProductCheckpointForks(provision(), RECONCILE, (fixture, cut) -> { });
     }
 
     @Test
@@ -181,12 +194,19 @@ class AgentCheckpointCapturePostgresTest {
         var readerJdbc = new JdbcTemplate(readSource);
         assertCheckpointReaderPrivileges(readerJdbc);
         var service = new AgentCheckpointObservationService(readSource);
-        verifyProductCheckpointForks(database, (fixture, cut) ->
+        verifyProductCheckpointForks(database, RECONCILE, (fixture, cut) ->
                 fixture.assertCheckpointObservation(cut, service, readerJdbc, '"' + readerRole + '"'));
     }
 
-    private static void verifyProductCheckpointForks(Database database, BiConsumer<RunFixture, ForkCut> afterReconcile)
-            throws Exception {
+    @Test
+    @Timeout(150)
+    @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture.native-resume", matches = "true")
+    void resumes_product_first_input_checkpoint_after_process_death_under_original_run_lease() throws Exception {
+        verifyProductCheckpointForks(provision(), NATIVE_RESUME, (fixture, cut) -> { });
+    }
+
+    private static void verifyProductCheckpointForks(Database database, AgentCheckpointForkHandoff.Phase replacementPhase,
+                                                     BiConsumer<RunFixture, ForkCut> afterReconcile) throws Exception {
         var setupLedger = new AgentLedgerService(database.setup());
         String setupRole = database.observer().queryForObject("SELECT current_user", String.class);
         String runtimeRole = database.runtime().getUsername();
@@ -197,11 +217,11 @@ class AgentCheckpointCapturePostgresTest {
             var directory = Files.createTempDirectory(FORK_DIRECTORY_PREFIX,
                     PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))).toRealPath();
             var captureMarker = directory.resolve("capture");
-            var reconcileMarker = directory.resolve("reconcile");
+            var replacementMarker = directory.resolve(replacementPhase.markerName());
             try {
                 String url = database.setup().getUrl();
                 var capture = new AgentCheckpointForkHandoff.Request(url, setupRole, runtimeRole, vectorVersion,
-                        typed, fixture.query.runId(), null);
+                        typed, fixture.query.runId(), CAPTURE, null);
                 var original = startForkChild(capture, captureMarker);
                 long originalPid = original.pid();
                 ForkCut cut;
@@ -222,23 +242,35 @@ class AgentCheckpointCapturePostgresTest {
                 fixture.assertCommittedCut();
                 fixture.assertNoExecutionEvidence();
                 assertEquals(cut.sha256(), fixture.forkCut().sha256());
-                fixture.expireForkRunLease(cut);
-                var reconcile = new AgentCheckpointForkHandoff.Request(url, setupRole, runtimeRole, vectorVersion,
-                        typed, fixture.query.runId(), cut.sha256());
-                var replacement = startForkChild(reconcile, reconcileMarker);
+                NativeForkWitness before = null;
+                if (replacementPhase == NATIVE_RESUME) {
+                    before = fixture.nativeForkWitness(cut);
+                    fixture.expireNativeSessionLease(before);
+                } else {
+                    fixture.expireForkRunLease(cut);
+                }
+                String handoffDigest = before == null ? cut.sha256() : before.handoffSha256();
+                var continuation = new AgentCheckpointForkHandoff.Request(url, setupRole, runtimeRole, vectorVersion,
+                        typed, fixture.query.runId(), replacementPhase, handoffDigest);
+                var replacement = startForkChild(continuation, replacementMarker);
                 try {
                     assertNotEquals(originalPid, replacement.pid());
                     assertNotEquals(ProcessHandle.current().pid(), replacement.pid());
-                    assertTrue(replacement.waitFor(FORK_CHILD_SECONDS, TimeUnit.SECONDS), "reconciliation process did not exit");
-                    assertEquals(0, replacement.exitValue(), "reconciliation process did not verify the durable cut");
-                    assertEquals(forkMarker("RECONCILED", replacement.pid(), cut.sha256()), readForkMarker(reconcileMarker));
+                    assertTrue(replacement.waitFor(FORK_CHILD_SECONDS, TimeUnit.SECONDS), "checkpoint replacement process did not exit");
+                    assertEquals(0, replacement.exitValue(), "checkpoint replacement process did not verify the durable cut");
+                    String stage = replacementPhase == NATIVE_RESUME ? "RESUMED" : "RECONCILED";
+                    assertEquals(forkMarker(stage, replacement.pid(), handoffDigest), readForkMarker(replacementMarker));
                 } finally {
                     reapForkChild(replacement);
                 }
-                fixture.assertReconciled(cut);
-                afterReconcile.accept(fixture, cut);
+                if (before != null) {
+                    fixture.assertNativeResumed(before);
+                } else {
+                    fixture.assertReconciled(cut);
+                    afterReconcile.accept(fixture, cut);
+                }
             } finally {
-                Files.deleteIfExists(reconcileMarker);
+                Files.deleteIfExists(replacementMarker);
                 Files.deleteIfExists(captureMarker);
                 Files.deleteIfExists(directory);
             }
@@ -256,26 +288,32 @@ class AgentCheckpointCapturePostgresTest {
                 || !directory.getFileName().toString().startsWith(FORK_DIRECTORY_PREFIX)
                 || !Files.getPosixFilePermissions(directory, LinkOption.NOFOLLOW_LINKS)
                         .equals(PosixFilePermissions.fromString("rwx------"))
-                || !(request.reconcile() ? "reconcile" : "capture").equals(marker.getFileName().toString())
+                || !request.phase().markerName().equals(marker.getFileName().toString())
                 || Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
             throw new IllegalArgumentException("Invalid disposable checkpoint fork marker target");
         }
         var database = openForkDatabase(request);
         var fixture = new RunFixture(database, new AgentLedgerService(database.setup()),
                 AgentCheckpointForkHandoff.tenant(request.typed()), request.typed(), Duration.ZERO, request.runId());
-        if (request.reconcile()) {
-            fixture.assertCommittedCut();
-            fixture.assertNoExecutionEvidence();
-            var cut = fixture.forkCut();
-            assertEquals(request.cutSha256(), cut.sha256());
-            fixture.assertOnlyDueRun(cut);
-            var reconcilerLedger = new AgentLedgerService(database.runtime());
-            assertEquals(1, reconcilerLedger.reconcileDue(1));
-            fixture.assertReconciled(cut);
-            writeForkMarker(marker, "RECONCILED", cut.sha256());
-        } else {
+        if (request.phase() == CAPTURE) {
             captureForkCut(database, fixture, request.typed(), marker);
+            return;
         }
+        fixture.assertCommittedCut();
+        fixture.assertNoExecutionEvidence();
+        var cut = fixture.forkCut();
+        if (request.phase() == NATIVE_RESUME) {
+            var before = fixture.nativeForkWitness(cut);
+            assertEquals(request.cutSha256(), before.handoffSha256());
+            resumeNativeFork(database, fixture, before, request.typed(), marker);
+            return;
+        }
+        assertEquals(request.cutSha256(), cut.sha256());
+        fixture.assertOnlyDueRun(cut);
+        var reconcilerLedger = new AgentLedgerService(database.runtime());
+        assertEquals(1, reconcilerLedger.reconcileDue(1));
+        fixture.assertReconciled(cut);
+        writeForkMarker(marker, "RECONCILED", cut.sha256());
     }
 
     private static void captureForkCut(Database database, RunFixture fixture, boolean typed, Path marker) {
@@ -315,6 +353,67 @@ class AgentCheckpointCapturePostgresTest {
                 control.shutdownNow();
             }
         }
+    }
+
+    private static void resumeNativeFork(Database database, RunFixture fixture, NativeForkWitness before,
+                                         boolean typed, Path marker) throws IOException {
+        var store = new PostgresAdkSessionService(database.runtime(), fixture.actor, APP, false, typed);
+        var lease = store.acquireSessionLease(SESSION, before.runLease(), Duration.ofSeconds(30));
+        try {
+            fixture.assertReplacementSession(before.cut(), true);
+            var bound = store.withLease(lease);
+            var prior = bound.getSession(APP, bound.adkUserId(), SESSION, Optional.empty())
+                    .timeout(5, TimeUnit.SECONDS).blockingGet().immutableEvents();
+            assertEquals(1, prior.size());
+            String invocation = prior.getFirst().invocationId();
+            assertFalse(invocation.isBlank());
+            assertEquals(before.prefix().eventId(), prior.getFirst().id());
+
+            var model = new FakeModel(prompt -> {
+                store.verifySessionLease(lease);
+                assertEquals(1L, prompt.getInstructions().stream().filter(message -> INPUT.equals(message.getText())).count());
+            });
+            var factory = new AgentFlowFactory(new SpringAiModelAdapterFactory(), new AgentWorkflowStrategyFactory(List.of()));
+            var snapshot = new AgentLedgerService(database.runtime()).executionMaterial(fixture.actor, fixture.query).snapshot();
+            assertEquals("CONFIG", snapshot.definition().executionMode());
+            var config = new ObjectMapper().convertValue(snapshot.definition().configuration(), AgentFlowConfigDTO.class);
+            try (var validators = Validation.buildDefaultValidatorFactory()) {
+                var validator = new AgentFlowConfigValidator(new ValidationUtils(validators.getValidator()));
+                validator.validate(new AgentFlowProperties(true, Duration.ofMinutes(2), Duration.ofSeconds(10),
+                        Map.of(APP, config)));
+                var root = factory.compileRoot(APP, config, Map.of("fixtureModel", model), List.of());
+                var runner = AgentFlowSessionRunner.withExplicitResume(root, APP, bound, List.of());
+                try {
+                    var output = runner.runAsync(bound.adkUserId(), SESSION, invocation, null, NATIVE_RESUME_CONFIG, null)
+                            .timeout(5, TimeUnit.SECONDS).toList().blockingGet();
+                    assertFalse(output.isEmpty());
+                    assertTrue(output.stream().allMatch(event -> invocation.equals(event.invocationId())));
+                    assertTrue(output.stream().anyMatch(AgentCheckpointCapturePostgresTest::hasNativeOutput));
+                    assertEquals(1, model.streams.get());
+                    assertEquals(0, model.calls.get());
+                    var persisted = fixture.nativeRows();
+                    assertTrue(persisted.size() > 1);
+                    assertEquals(before.prefix(), persisted.getFirst());
+
+                    assertTrue(runner.runAsync(bound.adkUserId(), SESSION, invocation, null, NATIVE_RESUME_CONFIG, null)
+                            .timeout(5, TimeUnit.SECONDS).toList().blockingGet().isEmpty());
+                    assertEquals(1, model.streams.get());
+                    assertEquals(0, model.calls.get());
+                    assertTrue(persisted.equals(fixture.nativeRows()), "completed repeat must preserve the persisted native history");
+                } finally {
+                    runner.close().timeout(5, TimeUnit.SECONDS).blockingAwait();
+                }
+            }
+        } finally {
+            assertTrue(store.releaseSessionLease(lease));
+        }
+        fixture.assertNativeResumed(before);
+        writeForkMarker(marker, "RESUMED", before.handoffSha256());
+    }
+
+    private static boolean hasNativeOutput(Event event) {
+        return event.content().flatMap(content -> content.parts()).orElse(List.of()).stream()
+                .anyMatch(part -> part.text().filter(OUTPUT::equals).isPresent());
     }
 
     private static Database openForkDatabase(AgentCheckpointForkHandoff.Request request) {
@@ -424,6 +523,23 @@ class AgentCheckpointCapturePostgresTest {
     private record ForkCut(String sha256, long epoch, long revision, long sequence, String leaseOwner,
                            long sessionEpoch, String sessionLeaseOwner) {
         @Override public String toString() { return "ForkCut[redacted]"; }
+    }
+
+    private record NativeForkWitness(ForkCut cut, AgentRunLease runLease, NativeRow prefix, String checkpointSha256) {
+        String handoffSha256() {
+            String owner = runLease.owner();
+            return forkDigest(cut.sha256() + owner.length() + ":" + owner + runLease.expiresAt());
+        }
+
+        @Override public String toString() { return "NativeForkWitness[redacted]"; }
+    }
+
+    private record NativeRow(long sequence, String eventId, long timestampMillis, String payload) {
+        @Override public String toString() { return "NativeRow[redacted]"; }
+    }
+
+    private record SessionFence(long epoch, String owner, boolean live, boolean released) {
+        @Override public String toString() { return "SessionFence[redacted]"; }
     }
 
     private static String forkDigest(String witness) {
@@ -700,6 +816,112 @@ class AgentCheckpointCapturePostgresTest {
                     SESSION, cut.revision(), cut.sequence(), cut.epoch(), cut.leaseOwner()));
         }
 
+        NativeForkWitness nativeForkWitness(ForkCut cut) {
+            var prefix = nativeRows();
+            assertEquals(1, prefix.size());
+            assertEquals(1, prefix.getFirst().sequence());
+            return new NativeForkWitness(cut, liveForkRunLease(cut), prefix.getFirst(), checkpointDigest());
+        }
+
+        private AgentRunLease liveForkRunLease(ForkCut cut) {
+            return database.observer().queryForObject("""
+                    SELECT lease_expires_at FROM tianji_agent.agent_run
+                    WHERE tenant_id=? AND run_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND session_id=?
+                      AND status='RUNNING' AND attempt=1 AND revision=? AND last_event_sequence=? AND lease_epoch=?
+                      AND lease_owner=? AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()
+                      AND cancel_requested_at IS NULL AND result IS NULL AND finished_at IS NULL
+                    """, (row, index) -> new AgentRunLease(query.runId(), cut.leaseOwner(), cut.epoch(),
+                    row.getTimestamp("lease_expires_at").toInstant()),
+                    actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    SESSION, cut.revision(), cut.sequence(), cut.epoch(), cut.leaseOwner());
+        }
+
+        void expireNativeSessionLease(NativeForkWitness before) {
+            var cut = before.cut();
+            assertNotNull(cut.sessionLeaseOwner());
+            assertEquals(1, database.observer().update("""
+                    UPDATE tianji_agent.agent_session_lease l SET lease_expires_at=clock_timestamp()-interval '1 second'
+                    FROM tianji_agent.agent_checkpoint c JOIN tianji_agent.agent_run r
+                      ON (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id,r.session_id)=
+                         (c.tenant_id,c.run_id,c.subject_type,c.subject_issuer,c.subject_id,c.session_id)
+                    WHERE (l.tenant_id,l.subject_type,l.subject_issuer,l.subject_id,l.app_name,l.session_id)=
+                          (c.tenant_id,c.subject_type,c.subject_issuer,c.subject_id,c.app_name,c.session_id)
+                      AND c.tenant_id=? AND c.run_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
+                      AND c.app_name=? AND c.session_id=? AND c.attempt=1 AND c.checkpoint_no=1
+                      AND r.status='RUNNING' AND r.attempt=1 AND r.lease_epoch=? AND r.lease_owner=?
+                      AND r.revision=? AND r.last_event_sequence=? AND r.lease_expires_at=?
+                      AND r.lease_expires_at>clock_timestamp() AND r.deadline_at>clock_timestamp()
+                      AND r.cancel_requested_at IS NULL AND r.result IS NULL AND r.finished_at IS NULL
+                      AND l.lease_epoch=c.session_lease_epoch AND l.lease_epoch=? AND l.lease_owner=?
+                      AND l.lease_expires_at>clock_timestamp()
+                    """, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
+                    APP, SESSION, cut.epoch(), cut.leaseOwner(), cut.revision(), cut.sequence(),
+                    java.sql.Timestamp.from(before.runLease().expiresAt()), cut.sessionEpoch(), cut.sessionLeaseOwner()));
+        }
+
+        void assertReplacementSession(ForkCut original, boolean active) {
+            var fence = database.observer().queryForObject("""
+                    SELECT lease_epoch, lease_owner,
+                           lease_expires_at>clock_timestamp() AS live, lease_expires_at IS NULL AS released
+                    FROM tianji_agent.agent_session_lease
+                    """ + SESSION_SCOPE, (row, index) -> new SessionFence(row.getLong("lease_epoch"),
+                    row.getString("lease_owner"), row.getBoolean("live"), row.getBoolean("released")), scope());
+            assertNotNull(fence);
+            assertEquals(original.sessionEpoch() + 1, fence.epoch());
+            if (active) {
+                assertNotNull(fence.owner());
+                assertTrue(!original.sessionLeaseOwner().equals(fence.owner()), "the successor must own a distinct Session lease");
+                assertTrue(fence.live());
+            } else {
+                assertTrue(fence.owner() == null && fence.released(), "the successor must release its Session lease");
+            }
+        }
+
+        List<NativeRow> nativeRows() {
+            return database.observer().query("""
+                    SELECT sequence,native_event_id,event_timestamp_ms,payload FROM tianji_agent.agent_session_event
+                    """ + SESSION_SCOPE + " ORDER BY sequence LIMIT 9", (row, index) -> new NativeRow(row.getLong("sequence"),
+                    row.getString("native_event_id"), row.getLong("event_timestamp_ms"), row.getString("payload")), scope());
+        }
+
+        private String checkpointDigest() {
+            String witness = database.observer().queryForObject("""
+                    SELECT jsonb_build_array(to_jsonb(c)-'captured_at',extract(epoch FROM c.captured_at))::text
+                    FROM tianji_agent.agent_checkpoint c
+                    WHERE c.tenant_id=? AND c.run_id=? AND c.subject_type=? AND c.subject_issuer=? AND c.subject_id=?
+                      AND c.app_name=? AND c.session_id=? AND c.attempt=1 AND c.checkpoint_no=1
+                    """, String.class, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(),
+                    actor.subjectId(), APP, SESSION);
+            return forkDigest(witness);
+        }
+
+        void assertNativeResumed(NativeForkWitness before) {
+            assertTrue(before.runLease().equals(liveForkRunLease(before.cut())), "the original Run lease must stay live and unchanged");
+            assertReplacementSession(before.cut(), false);
+            assertEquals(1, checkpoints());
+            assertEquals(before.checkpointSha256(), checkpointDigest());
+            var rows = nativeRows();
+            assertTrue(rows.size() > 1 && rows.size() <= 8, "native history must have bounded continuation");
+            assertEquals(before.prefix(), rows.getFirst());
+
+            var session = sessions.getSession(APP, sessions.adkUserId(), SESSION, Optional.empty())
+                    .timeout(5, TimeUnit.SECONDS).blockingGet();
+            assertNotNull(session);
+            var history = session.immutableEvents();
+            assertEquals(rows.size(), history.size());
+            var original = history.getFirst();
+            assertEquals(before.prefix().eventId(), original.id());
+            assertEquals("user", original.author());
+            assertEquals(1L, history.stream().filter(event -> "user".equals(event.author())).count());
+            assertTrue(history.stream().allMatch(event -> original.invocationId().equals(event.invocationId())));
+            assertTrue(history.stream().anyMatch(AgentCheckpointCapturePostgresTest::hasNativeOutput));
+            assertTrue(history.stream().anyMatch(event -> "writer".equals(event.author()) && event.actions().endOfAgent()));
+            assertNoExecutionEvidence();
+            assertEquals(0, database.observer().queryForObject("""
+                    SELECT count(*) FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND origin_run_id=?
+                    """, Integer.class, actor.tenantId(), query.runId()));
+        }
+
         void assertOnlyDueRun(ForkCut cut) {
             assertEquals(List.of(query.runId()), database.observer().queryForList("""
                     SELECT run_id FROM tianji_agent.agent_run
@@ -862,6 +1084,11 @@ class AgentCheckpointCapturePostgresTest {
         final AtomicInteger streams = new AtomicInteger();
         final AtomicInteger calls = new AtomicInteger();
         private final ChatOptions options = ToolCallingChatOptions.builder().model(MODEL).build();
+        private final Consumer<Prompt> beforeStream;
+
+        FakeModel() { this(prompt -> { }); }
+
+        FakeModel(Consumer<Prompt> beforeStream) { this.beforeStream = beforeStream; }
 
         @Override public ChatOptions getOptions() { return options; }
 
@@ -872,6 +1099,7 @@ class AgentCheckpointCapturePostgresTest {
 
         @Override public Flux<ChatResponse> stream(Prompt prompt) {
             return Flux.defer(() -> {
+                beforeStream.accept(prompt);
                 streams.incrementAndGet();
                 return Flux.just(new ChatResponse(List.of(new Generation(new AssistantMessage(OUTPUT),
                         ChatGenerationMetadata.builder().finishReason("stop").build()))));
