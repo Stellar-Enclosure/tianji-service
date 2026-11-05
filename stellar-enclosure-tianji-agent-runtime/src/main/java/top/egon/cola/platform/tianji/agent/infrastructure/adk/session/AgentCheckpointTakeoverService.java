@@ -215,18 +215,27 @@ public final class AgentCheckpointTakeoverService {
         @Override public String toString() { return "Launch[redacted]"; }
     }
 
-    public TakeoverResult takeOver(TrustedAgentActor actor, ResumeCommand command, String workerId) {
-        if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.USER
-                || "LEGACY".equals(actor.issuerFingerprint())) throw denied();
-        Objects.requireNonNull(command, "command");
-        if (!text(workerId, 128)) throw new IllegalArgumentException("Agent checkpoint takeover worker is invalid");
-        if (TransactionSynchronizationManager.isActualTransactionActive()
-                || TransactionSynchronizationManager.isSynchronizationActive()
-                || TransactionSynchronizationManager.hasResource(source)) {
-            throw new IllegalStateException("Agent checkpoint takeover must own its transactions");
+    /** Supplies the exact read-only cut for synchronous grant issuance. An exact committed replay needs no new ticket. */
+    public Optional<ResumeRequest> previewAuthorization(TrustedAgentActor actor, ResumeCommand command) {
+        requireCommandOwner(actor, command);
+        String requestHash = commandHash(actor, command);
+        try {
+            if (readReceipt(actor, command, requestHash).isPresent()) return Optional.empty();
+            var preview = checkpoint.matchForTakeover(actor, new GetAgentRunQuery(command.runId()));
+            if (preview.isPresent() && preview.orElseThrow().revision() == command.expectedRevision()) {
+                return preview.map(exact -> new ResumeRequest(exact.request(), command, exact.cutSha256()));
+            }
+            if (readReceipt(actor, command, requestHash).isPresent()) return Optional.empty();
+            throw conflict();
+        } catch (DataAccessException | TransactionException failure) {
+            throw unavailable();
         }
-        String requestHash = hash(List.of(PURPOSE, actor.identityFingerprint(), command.runId(), command.commandId(),
-                Long.toString(command.expectedRevision())));
+    }
+
+    public TakeoverResult takeOver(TrustedAgentActor actor, ResumeCommand command, String workerId) {
+        requireCommandOwner(actor, command);
+        if (!text(workerId, 128)) throw new IllegalArgumentException("Agent checkpoint takeover worker is invalid");
+        String requestHash = commandHash(actor, command);
         try {
             var replay = readReceipt(actor, command, requestHash);
             if (replay.isPresent()) return replay.get();
@@ -248,6 +257,22 @@ public final class AgentCheckpointTakeoverService {
         } catch (DataAccessException | TransactionException failure) {
             throw unavailable();
         }
+    }
+
+    private void requireCommandOwner(TrustedAgentActor actor, ResumeCommand command) {
+        if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.USER
+                || "LEGACY".equals(actor.issuerFingerprint())) throw denied();
+        Objects.requireNonNull(command, "command");
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(source)) {
+            throw new IllegalStateException("Agent checkpoint takeover must own its transactions");
+        }
+    }
+
+    private static String commandHash(TrustedAgentActor actor, ResumeCommand command) {
+        return hash(List.of(PURPOSE, actor.identityFingerprint(), command.runId(), command.commandId(),
+                Long.toString(command.expectedRevision())));
     }
 
     private ResumePermit authorize(ResumeRequest request) {

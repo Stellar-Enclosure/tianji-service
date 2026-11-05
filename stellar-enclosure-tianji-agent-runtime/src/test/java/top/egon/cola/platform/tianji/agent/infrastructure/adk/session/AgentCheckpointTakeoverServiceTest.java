@@ -246,6 +246,64 @@ class AgentCheckpointTakeoverServiceTest {
     }
 
     @Test
+    void exact_preview_is_read_only_and_neither_authorizes_nor_writes() throws Exception {
+        try (var fixture = new Fixture()) {
+            var preview = fixture.service.previewAuthorization(OWNER, COMMAND).orElseThrow();
+            assertEquals(new ResumeRequest(EXECUTION, COMMAND, MATCH.cutSha256()), preview);
+            assertEquals(0, fixture.authorizationCalls);
+            assertTrue(fixture.actions.isEmpty());
+            assertTrue(fixture.eventSequences.isEmpty());
+            verify(fixture.connection).setReadOnly(true);
+            verify(fixture.connection).setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            verify(fixture.connection).commit();
+            verify(fixture.source).getConnection();
+            verify(fixture.statement).executeUpdate("SET TRANSACTION READ ONLY");
+        }
+    }
+
+    @Test
+    void preview_of_an_exact_committed_replay_needs_no_new_authorization_cut() throws Exception {
+        try (var fixture = new Fixture()) {
+            fixture.service.takeOver(OWNER, COMMAND, WORKER);
+            fixture.actions.clear();
+            var observation = fixture.observationMocks.constructed().getFirst();
+            clearInvocations(observation, fixture.connection, fixture.source);
+
+            assertTrue(fixture.service.previewAuthorization(OWNER, COMMAND).isEmpty());
+            assertEquals(1, fixture.authorizationCalls);
+            assertTrue(fixture.actions.isEmpty());
+            verifyNoInteractions(observation);
+            verify(fixture.connection).setReadOnly(true);
+            verify(fixture.connection).commit();
+            verify(fixture.source).getConnection();
+
+            var changed = new ResumeCommand(RUN, COMMAND.commandId(), COMMAND.expectedRevision() + 1);
+            assertCode(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, () -> fixture.service.previewAuthorization(OWNER, changed));
+            assertEquals(1, fixture.authorizationCalls);
+            assertTrue(fixture.actions.isEmpty());
+            verifyNoInteractions(observation);
+        }
+    }
+
+    @Test
+    void stale_or_ambient_preview_fails_without_authorization_or_writes() throws Exception {
+        try (var fixture = new Fixture()) {
+            var stale = new ResumeCommand(RUN, COMMAND.commandId(), COMMAND.expectedRevision() + 1);
+            assertCode(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, () -> fixture.service.previewAuthorization(OWNER, stale));
+            TransactionSynchronizationManager.initSynchronization();
+            try {
+                assertThrows(IllegalStateException.class, () -> fixture.service.previewAuthorization(OWNER, COMMAND));
+            } finally {
+                TransactionSynchronizationManager.clearSynchronization();
+            }
+            assertEquals(0, fixture.authorizationCalls);
+            assertTrue(fixture.actions.isEmpty());
+            verify(fixture.connection, times(2)).setReadOnly(true);
+            verify(fixture.source, times(2)).getConnection();
+        }
+    }
+
+    @Test
     void authority_binding_changes_with_cut_command_or_resource() {
         URI primary = URI.create("https://agent.example.test");
         var first = new ResumeRequest(EXECUTION, COMMAND, MATCH.cutSha256());

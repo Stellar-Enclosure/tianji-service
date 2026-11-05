@@ -20,6 +20,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheck
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.Acknowledgement;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumeAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumeCommand;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumeRequest;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantAuthorizer;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -28,11 +29,13 @@ import javax.sql.DataSource;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** The trusted host imports this configuration explicitly after provisioning recovery resources. */
 @Configuration(proxyBeanMethods = false)
@@ -71,7 +74,7 @@ public class TianjiAgentCheckpointResumeConfiguration {
                 Thread.ofPlatform().daemon().inheritInheritableThreadLocals(false).name("tianji-agent-resume-", 0).factory(),
                 new ThreadPoolExecutor.AbortPolicy());
         return new ResumeHost(new AgentCheckpointResumeDispatcher(executor, worker, takeover, recovery, authority),
-                executor, reconciler);
+                executor, reconciler, takeover, authority);
     }
 
     public record ResumeBinding(DataSource recoverySource, String recoveryRole, ResumeAuthorization resumeAuthority) {
@@ -91,24 +94,43 @@ public class TianjiAgentCheckpointResumeConfiguration {
         private final AgentCheckpointResumeDispatcher dispatcher;
         private final ThreadPoolExecutor executor;
         private final AgentRunReconciler reconciler;
+        private final AgentCheckpointTakeoverService takeover;
+        private final ResumeAuthorization authority;
+        private final AtomicBoolean closed = new AtomicBoolean();
 
         private ResumeHost(AgentCheckpointResumeDispatcher dispatcher, ThreadPoolExecutor executor,
-                           AgentRunReconciler reconciler) {
+                           AgentRunReconciler reconciler, AgentCheckpointTakeoverService takeover, ResumeAuthorization authority) {
             this.dispatcher = dispatcher;
             this.executor = executor;
             this.reconciler = reconciler;
+            this.takeover = takeover;
+            this.authority = authority;
+        }
+
+        public boolean usesAuthorization(ResumeAuthorization candidate) {
+            return authority == candidate;
+        }
+
+        public Optional<ResumeRequest> previewAuthorization(TrustedAgentActor actor, ResumeCommand command) {
+            requireReady();
+            return takeover.previewAuthorization(actor, command);
         }
 
         public CompletionStage<Acknowledgement> dispatch(TrustedAgentActor actor, ResumeCommand command) {
-            if (!reconciler.isRunning()) {
+            requireReady();
+            return dispatcher.dispatch(actor, command);
+        }
+
+        private void requireReady() {
+            if (closed.get() || !reconciler.isRunning()) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
                         "Agent checkpoint reconciliation is unavailable");
             }
-            return dispatcher.dispatch(actor, command);
         }
 
         @Override
         public void close() {
+            if (!closed.compareAndSet(false, true)) return;
             boolean drained = false;
             try {
                 dispatcher.close();
