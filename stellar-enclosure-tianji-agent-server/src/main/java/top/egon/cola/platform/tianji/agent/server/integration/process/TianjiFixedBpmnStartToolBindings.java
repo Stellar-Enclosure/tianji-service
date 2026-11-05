@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.integration.process;
 
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
@@ -47,8 +48,14 @@ public final class TianjiFixedBpmnStartToolBindings {
     }
 
     public ResolvedBindingVO resolve(FixedBpmnStartToolTransport.Request request) {
+        if (request == null) throw unavailable();
+        return resolve(request.run(), request.descriptor());
+    }
+
+    ResolvedBindingVO resolve(AgentRunAuthorization.Request run, ToolDescriptor descriptor) {
         try {
-            if (request == null) throw unavailable(); var run = request.run(); var actor = run.actor(); var descriptor = request.descriptor();
+            if (run == null || descriptor == null) throw unavailable();
+            var actor = run.actor();
             if ("LEGACY".equals(actor.issuerFingerprint())) throw unavailable();
             var slot = List.<Object>of(actor.tenantId(), actor.issuerFingerprint(), actor.subjectType(), run.definitionKey(), run.definitionVersion(), descriptor.key(), descriptor.version());
             var selected = routes.get(slot);

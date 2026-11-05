@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -19,6 +20,7 @@ import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 
 import javax.sql.DataSource;
+import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
@@ -35,6 +37,55 @@ import java.util.UUID;
 /** Internal transaction participant for governed preparation and bounded historical facts. */
 final class ToolActionIntentSql {
     static final Set<String> STATES = Set.of("PREPARED", "AWAITING_APPROVAL", "DISPATCHING", "APPLIED", "REJECTED", "FAILED_KNOWN", "UNKNOWN", "EXPIRED");
+    private static final String OWNER_ROW_PROJECTION = """
+                SELECT a.*,
+                  (o.run_id IS NOT NULL AND o.subject_type=a.owner_type AND o.subject_issuer=a.owner_issuer AND o.subject_id=a.owner_id) AS origin_owner_matches,
+                  (a.dispatch_epoch=0 OR (d.run_id IS NOT NULL AND d.subject_type=a.owner_type AND d.subject_issuer=a.owner_issuer AND d.subject_id=a.owner_id)) AS dispatch_owner_matches,
+                  (a.dispatch_epoch=0 OR (i.invocation_id IS NOT NULL AND i.owner_type=a.owner_type AND i.owner_issuer=a.owner_issuer AND i.owner_id=a.owner_id
+                    AND i.intent_id=a.intent_id AND i.tool_key=a.tool_key AND i.tool_version=a.tool_version AND i.tool_sha256=a.tool_sha256
+                    AND i.binding_sha256=a.binding_sha256 AND i.risk=a.risk AND i.run_id=a.dispatch_run_id AND i.invocation_id=a.dispatch_invocation_id
+                    AND i.dispatch_epoch=a.dispatch_epoch AND i.dispatch_nonce_sha256=a.dispatch_nonce_sha256 AND i.executor_issuer=a.executor_issuer AND i.executor_id=a.executor_id)) AS dispatch_identity_matches,
+                  (a.dispatch_epoch=0 OR (i.state=CASE a.state WHEN 'APPLIED' THEN 'SUCCEEDED' ELSE a.state END
+                    AND a.result IS NOT DISTINCT FROM i.outcome AND a.business_receipt_id IS NOT DISTINCT FROM i.business_receipt_id
+                    AND a.last_error_code IS NOT DISTINCT FROM i.error_code AND a.side_effect_outcome=i.side_effect_outcome)) AS dispatch_fact_matches,
+                  i.parameters_sha256 AS dispatch_parameters_sha256
+                """;
+    private static final String OWNER_ROW_JOINS = """
+                FROM %1$stianji_agent.agent_tool_action_intent a
+                LEFT JOIN %1$stianji_agent.agent_run o ON o.tenant_id=a.tenant_id AND o.run_id=a.origin_run_id
+                LEFT JOIN %1$stianji_agent.agent_run d ON d.tenant_id=a.tenant_id AND d.run_id=a.dispatch_run_id
+                LEFT JOIN %1$stianji_agent.agent_tool_invocation i ON i.tenant_id=a.tenant_id AND i.run_id=a.dispatch_run_id AND i.invocation_id=a.dispatch_invocation_id
+                """;
+    private static final String OWNER_ROW_KEY = """
+                WHERE a.tenant_id=? AND a.owner_type=? AND a.owner_issuer=? AND a.owner_id=? AND a.intent_id=?
+                """;
+    private static final String OWNER_ROW_READ = OWNER_ROW_PROJECTION + OWNER_ROW_JOINS.formatted("") + OWNER_ROW_KEY;
+    private static final int ACTION_STAMP_BYTES = 524_288;
+    private static final int INVOCATION_STAMP_BYTES = 262_144;
+    private static final int RUN_STAMP_BYTES = 8_388_608;
+    private static final String HISTORICAL_START = OWNER_ROW_PROJECTION + """
+                , i.revision AS invocation_revision, i.dispatch_not_after,
+                  sealed.action_stamp, sealed.invocation_stamp, sealed.origin_stamp, sealed.dispatch_stamp
+                """ + OWNER_ROW_JOINS.formatted("ONLY ") + """
+                CROSS JOIN LATERAL (
+                    SELECT pg_catalog.to_jsonb(a)::text AS action_stamp,
+                           pg_catalog.to_jsonb(i)::text AS invocation_stamp,
+                           pg_catalog.to_jsonb(o)::text AS origin_stamp,
+                           pg_catalog.to_jsonb(d)::text AS dispatch_stamp
+                ) sealed
+                """ + OWNER_ROW_KEY + """
+                  AND a.dispatch_run_id=? AND a.dispatch_epoch>0
+                  AND a.state IN ('DISPATCHING','UNKNOWN','APPLIED')
+                  AND d.lease_owner IS NULL AND d.lease_expires_at IS NULL
+                  AND (d.status IN ('COMPLETED','FAILED','CANCELLED','TIMED_OUT')
+                      OR (d.status='SUSPENDED' AND d.wait_reason='LEASE_EXPIRED'))
+                  AND i.dispatch_not_after<=pg_catalog.clock_timestamp()
+                  AND pg_catalog.octet_length(sealed.action_stamp)<=?
+                  AND pg_catalog.octet_length(sealed.invocation_stamp)<=?
+                  AND pg_catalog.octet_length(sealed.origin_stamp)<=?
+                  AND pg_catalog.octet_length(sealed.dispatch_stamp)<=?
+                LIMIT 2
+                """;
     private final DataSource source;
     private final AgentLedgerService ledger;
     private final JdbcTemplate jdbc;
@@ -98,6 +149,51 @@ final class ToolActionIntentSql {
         sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
         var found = read(action.owner(), UUID.fromString(action.intentId()), false, storageDeadline);
         found.ifPresent(row -> same(row, action)); return found;
+    }
+
+    /** Reads the exact historical source and seals the same snapshot for the later positive observation. */
+    Optional<HistoricalStartReceiptVO> historicalStartReceipt(TrustedAgentActor owner, String dispatchRunId, UUID intentId, Instant deadline) {
+        if (owner == null || !hash(owner.issuerFingerprint()) || !runId(dispatchRunId) || intentId == null) throw invalid();
+        if (!TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                || !Integer.valueOf(TransactionDefinition.ISOLATION_REPEATABLE_READ)
+                        .equals(TransactionSynchronizationManager.getCurrentTransactionIsolationLevel())) throw unavailable();
+        now(deadline);
+        try {
+            var rows = jdbc.query(HISTORICAL_START, (rs, number) -> {
+                var verified = verifiedRow(rs, owner, intentId, deadline);
+                return new HistoricalStartReceiptVO(verified.action(), verified.dispatchRun(), rs.getLong("invocation_revision"),
+                        time(rs, "dispatch_not_after"), rs.getString("dispatch_parameters_sha256"),
+                        rs.getString("action_stamp"), rs.getString("invocation_stamp"), rs.getString("origin_stamp"), rs.getString("dispatch_stamp"));
+            }, owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), intentId,
+                    dispatchRunId, ACTION_STAMP_BYTES, INVOCATION_STAMP_BYTES, RUN_STAMP_BYTES, RUN_STAMP_BYTES);
+            Instant checked = now(deadline);
+            if (rows.isEmpty()) return Optional.empty();
+            if (rows.size() != 1 || !dispatchRunId.equals(rows.getFirst().dispatchRun().runId())
+                    || rows.getFirst().dispatchNotAfter().isAfter(checked)) throw unavailable();
+            return Optional.of(rows.getFirst());
+        } catch (DataAccessException privateStorage) {
+            throw unavailable();
+        }
+    }
+
+    record HistoricalStartReceiptVO(Row action, AgentRunAuthorization.Request dispatchRun, long invocationRevision,
+                                    Instant dispatchNotAfter, String parametersSha256, String actionStamp,
+                                    String invocationStamp, String originRunStamp, String dispatchRunStamp) {
+        HistoricalStartReceiptVO {
+            if (action == null || action.dispatch() == null || dispatchRun == null
+                    || !Set.of("DISPATCHING", "UNKNOWN", "APPLIED").contains(action.state())
+                    || !action.action().owner().equals(dispatchRun.actor()) || !action.dispatch().runId().equals(dispatchRun.runId())
+                    || invocationRevision < 1 || dispatchNotAfter == null || !hash(parametersSha256)
+                    || !validStamp(actionStamp, ACTION_STAMP_BYTES) || !validStamp(invocationStamp, INVOCATION_STAMP_BYTES)
+                    || !validStamp(originRunStamp, RUN_STAMP_BYTES) || !validStamp(dispatchRunStamp, RUN_STAMP_BYTES)) throw unavailable();
+        }
+
+        private static boolean validStamp(String stamp, int maximumBytes) {
+            return stamp != null && stamp.length() <= maximumBytes && stamp.startsWith("{") && stamp.endsWith("}")
+                    && stamp.getBytes(StandardCharsets.UTF_8).length <= maximumBytes;
+        }
+
+        @Override public String toString() { return "ToolActionIntentHistoricalStartReceipt[redacted]"; }
     }
 
     Row lockForApproval(ToolActionRequest action, ToolDescriptor descriptor, Instant deadline) {
@@ -289,24 +385,9 @@ final class ToolActionIntentSql {
             now(deadline); if (locked.size() > 1) throw unavailable(); if (locked.isEmpty()) return Optional.empty();
             if (!id.equals(locked.getFirst())) throw unavailable();
         }
-        var rows = jdbc.query("""
-                SELECT a.*,
-                  (o.run_id IS NOT NULL AND o.subject_type=a.owner_type AND o.subject_issuer=a.owner_issuer AND o.subject_id=a.owner_id) AS origin_owner_matches,
-                  (a.dispatch_epoch=0 OR (d.run_id IS NOT NULL AND d.subject_type=a.owner_type AND d.subject_issuer=a.owner_issuer AND d.subject_id=a.owner_id)) AS dispatch_owner_matches,
-                  (a.dispatch_epoch=0 OR (i.invocation_id IS NOT NULL AND i.owner_type=a.owner_type AND i.owner_issuer=a.owner_issuer AND i.owner_id=a.owner_id
-                    AND i.intent_id=a.intent_id AND i.tool_key=a.tool_key AND i.tool_version=a.tool_version AND i.tool_sha256=a.tool_sha256
-                    AND i.binding_sha256=a.binding_sha256 AND i.risk=a.risk AND i.run_id=a.dispatch_run_id AND i.invocation_id=a.dispatch_invocation_id
-                    AND i.dispatch_epoch=a.dispatch_epoch AND i.dispatch_nonce_sha256=a.dispatch_nonce_sha256 AND i.executor_issuer=a.executor_issuer AND i.executor_id=a.executor_id)) AS dispatch_identity_matches,
-                  (a.dispatch_epoch=0 OR (i.state=CASE a.state WHEN 'APPLIED' THEN 'SUCCEEDED' ELSE a.state END
-                    AND a.result IS NOT DISTINCT FROM i.outcome AND a.business_receipt_id IS NOT DISTINCT FROM i.business_receipt_id
-                    AND a.last_error_code IS NOT DISTINCT FROM i.error_code AND a.side_effect_outcome=i.side_effect_outcome)) AS dispatch_fact_matches,
-                  i.parameters_sha256 AS dispatch_parameters_sha256
-                FROM tianji_agent.agent_tool_action_intent a
-                LEFT JOIN tianji_agent.agent_run o ON o.tenant_id=a.tenant_id AND o.run_id=a.origin_run_id
-                LEFT JOIN tianji_agent.agent_run d ON d.tenant_id=a.tenant_id AND d.run_id=a.dispatch_run_id
-                LEFT JOIN tianji_agent.agent_tool_invocation i ON i.tenant_id=a.tenant_id AND i.run_id=a.dispatch_run_id AND i.invocation_id=a.dispatch_invocation_id
-                WHERE a.tenant_id=? AND a.owner_type=? AND a.owner_issuer=? AND a.owner_id=? AND a.intent_id=?
-                """, (rs, number) -> row(rs, owner, id, deadline), owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), id);
+        var rows = jdbc.query(OWNER_ROW_READ,
+                (rs, number) -> verifiedRow(rs, owner, id, deadline).action(),
+                owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), id);
         now(deadline); if (rows.size() > 1) throw unavailable();
         if (lock && rows.isEmpty()) throw unavailable();
         return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
@@ -345,7 +426,11 @@ final class ToolActionIntentSql {
         if (!TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
     }
 
-    private Row row(ResultSet rs, TrustedAgentActor expectedOwner, UUID expectedId, Instant deadline) throws SQLException {
+    private record VerifiedRow(Row action, AgentRunAuthorization.Request dispatchRun) {
+        @Override public String toString() { return "ToolActionIntentVerifiedRow[redacted]"; }
+    }
+
+    private VerifiedRow verifiedRow(ResultSet rs, TrustedAgentActor expectedOwner, UUID expectedId, Instant deadline) throws SQLException {
         try {
             var owner = new TrustedAgentActor(rs.getLong("tenant_id"), TrustedAgentActor.SubjectType.valueOf(rs.getString("owner_type")), rs.getString("owner_id"), rs.getString("owner_issuer"));
             if (!owner.equals(expectedOwner) || !expectedId.equals(rs.getObject("intent_id", UUID.class))) throw unavailable();
@@ -368,8 +453,8 @@ final class ToolActionIntentSql {
             }
             if (dispatch != null && !descriptor.parametersSha256(action.arguments()).equals(rs.getString("dispatch_parameters_sha256"))) throw unavailable();
             requireHistoricalSource(owner, stored.originRunId(), descriptor, stored.originSnapshotSha256(), deadline);
-            if (dispatch != null) requireHistoricalSource(owner, dispatch.runId(), descriptor, null, deadline);
-            return stored;
+            var dispatchRun = dispatch == null ? null : requireHistoricalSource(owner, dispatch.runId(), descriptor, null, deadline);
+            return new VerifiedRow(stored, dispatchRun);
         } catch (RuntimeException malformed) { throw unavailable(); }
     }
 
@@ -396,7 +481,8 @@ final class ToolActionIntentSql {
         return new DispatchVO(run, invocation, epoch, nonce, new TrustedAgentActor(owner.tenantId(), TrustedAgentActor.SubjectType.SERVICE, id, issuer));
     }
 
-    private void requireHistoricalSource(TrustedAgentActor owner, String id, ToolDescriptor descriptor, String snapshotSha256, Instant deadline) {
+    private AgentRunAuthorization.Request requireHistoricalSource(TrustedAgentActor owner, String id, ToolDescriptor descriptor,
+                                                                   String snapshotSha256, Instant deadline) {
         now(deadline);
         AgentLedgerService.ExecutionMaterial material;
         try { material = ledger.executionMaterial(owner, new GetAgentRunQuery(id)); }
@@ -414,6 +500,7 @@ final class ToolActionIntentSql {
                 || snapshot.effectivePolicy().maxToolCalls() < 1 || descriptor.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
                 && !Objects.equals(descriptor.policy().approvalPolicyRef(), snapshot.effectivePolicy().approvalPolicyRef())) throw unavailable();
         now(deadline);
+        return authorization;
     }
 
     private static void binding(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor) {

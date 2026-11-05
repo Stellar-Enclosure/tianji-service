@@ -6,6 +6,7 @@ import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTr
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiFixedBpmnStartToolBindings.BackendVO;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier.CredentialVO;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier.TargetVO;
@@ -151,9 +152,7 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
                     if (bounded) scope.narrowCallDeadline(callDeadlineAt);
                     current(scope, backend);
                     client = client(backend, scope);
-                    var action = request.action();
-                    command = new StartProcessCommand(backend.processDefinitionKey(), backend.releaseVersion(), action.businessKey(),
-                            action.intentId(), action.intentId(), action.arguments());
+                    command = startCommand(backend, request.action());
                     scope.beginOperation();
                 } catch (RuntimeException notSent) { throw failure(FailureKind.OPERATION_NOT_SENT); }
                 return TianjiFixedBpmnStartToolTransport.this.start(backend, credential.actor(), client, command);
@@ -196,11 +195,28 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
         catch (RuntimeException privateReceipt) { throw failure(FailureKind.OPERATION_RESULT_UNKNOWN); }
     }
 
+    static StartProcessCommand startCommand(BackendVO backend, ToolActionRequest action) {
+        return new StartProcessCommand(backend.processDefinitionKey(), backend.releaseVersion(), action.businessKey(),
+                action.intentId(), action.intentId(), action.arguments());
+    }
+
     static String hostReceiptReference(BackendVO backend, TrustedAgentActor executor, StartProcessCommand command, ProcessInstanceDTO acknowledgement) {
+        return hostReceiptReference(backend, executor, command, acknowledgement.instanceId(), acknowledgement.definitionKey(),
+                acknowledgement.releaseVersion(), acknowledgement.businessKey(), acknowledgement.correlationId());
+    }
+
+    static String hostReceiptReferenceForInstance(BackendVO backend, TrustedAgentActor executor, StartProcessCommand command, String instanceId) {
+        return hostReceiptReference(backend, executor, command, instanceId, command.definitionKey(),
+                command.releaseVersion(), command.businessKey(), command.correlationId());
+    }
+
+    private static String hostReceiptReference(BackendVO backend, TrustedAgentActor executor, StartProcessCommand command,
+                                               String instanceId, String definitionKey, String releaseVersion,
+                                               String businessKey, String correlationId) {
         return "tianji:ps-start:v1:" + OrchestrationRequestDigests.hash(List.of("TIANJI_PS_START_RECEIPT_REFERENCE_V1",
                 backend.processIssuer().toASCIIString(), backend.processResourceUri().toASCIIString(), Long.toString(executor.tenantId()), "SERVICE",
                 executor.issuerFingerprint(), executor.subjectId(), "START", command.commandId(), OrchestrationRequestDigests.start(command),
-                acknowledgement.instanceId(), acknowledgement.definitionKey(), acknowledgement.releaseVersion(), acknowledgement.businessKey(), acknowledgement.correlationId()), Map.of());
+                instanceId, definitionKey, releaseVersion, businessKey, correlationId), Map.of());
     }
 
     private HttpProcessClient client(BackendVO backend, CallScope scope) {
