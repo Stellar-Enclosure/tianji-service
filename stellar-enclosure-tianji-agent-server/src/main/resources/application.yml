@@ -47,6 +47,8 @@ stellar:
       storage:
         model-usage-enabled: false
         model-usage-cumulative-route-refs: []
+      recovery-diagnostics:
+        enabled: false
       native-templates:
         enabled: false
         model-bean-name: ""
