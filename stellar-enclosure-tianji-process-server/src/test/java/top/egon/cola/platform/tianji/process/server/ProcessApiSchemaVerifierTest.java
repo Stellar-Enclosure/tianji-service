@@ -43,6 +43,9 @@ import static org.mockito.Mockito.withSettings;
 class ProcessApiSchemaVerifierTest {
     private static final String V8 = "V8__add_formal_cmmn_case_support.sql";
     private static final String V9 = "V9__add_process_cancellation_receipts.sql";
+    private static final String V10 = "V10__add_process_worker_recovery_receipts.sql";
+    private static final String V10_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
+    private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
     private static final String V9_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
     private static final String PROVENANCE = "tianji_case_start_provenance";
     private static final String PLAN_RECEIPT = "tianji_case_plan_item_receipt";
@@ -51,13 +54,30 @@ class ProcessApiSchemaVerifierTest {
     private static final String DISPATCH = "tianji_process_agent_dispatch";
 
     @Test
-    void history_accepts_only_none_exact_v8_or_exact_v8_followed_by_v9() throws Exception {
+    void history_accepts_only_exact_v8_v9_v10_prefixes() throws Exception {
         assertFalse(assertDoesNotThrow(() -> checkHistory(List.of())));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8))))));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8)),
                 history("9", V9, true, checksum(V9))))));
+        assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8)),
+                history("9", V9, true, checksum(V9)), history("10", V10, true, checksum(V10))))),
+                "exact V8/V9/V10 prefix");
 
+
+        var v8 = history("8", V8, true, checksum(V8));
+        var v9 = history("9", V9, true, checksum(V9));
+        var v10 = history("10", V10, true, checksum(V10));
+        var wrongType = history("10", V10, true, checksum(V10));
+        wrongType.put("type", "JDBC");
         for (List<Map<String, Object>> invalid : List.of(
+                List.of(v10), List.of(v8, v10), List.of(v8, v10, v9), List.of(v8, v9, v10, v10),
+                List.of(v8, v9, history("10", "V10__other.sql", true, checksum(V10))),
+                List.of(v8, v9, history("10", V10, false, checksum(V10))),
+                List.of(v8, v9, history("10", V10, true, checksum(V10) + 1)),
+                List.of(v8, v9, history("10", V10, true, null)),
+                List.of(v8, v9, wrongType),
+                List.of(v8, v9, v10, history("11", "V11__unknown.sql", true, 0)),
+                List.of(v8, v9, v10, history(null, "R__unknown.sql", true, 0)),
                 List.of(history("9", V9, true, checksum(V9))),
                 List.of(history("8", V8, false, checksum(V8))),
                 List.of(history("8", V8, true, checksum(V8)), history("9", V9, false, checksum(V9))),
@@ -187,6 +207,102 @@ class ProcessApiSchemaVerifierTest {
         rejects(c -> c.safeRole = false);
     }
 
+    @Test
+    void v10_keeps_existing_readiness_without_recovery_grants() throws Exception {
+        var catalog = Catalog.ready();
+        catalog.history = recoveryHistory();
+        catalog.rejectRecoveryQueries = true;
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = spy(new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process"));
+            doNothing().when(verifier).verify();
+            doNothing().when(verifier).verifyAgentDispatch();
+            assertTrue(assertDoesNotThrow(verifier::hasCaseMigration));
+            assertDoesNotThrow(verifier::verifyCase);
+            assertDoesNotThrow(verifier::verifyCancellation);
+        }
+        assertFalse(catalog.roleSql.containsKey(RECOVERY_RECEIPT));
+        assertTrue(catalog.nativeTables.isEmpty());
+    }
+
+    @Test
+    void recovery_requires_exact_v10_catalog_and_role() throws Exception {
+        var catalog = Catalog.recoveryReady();
+        verifyRecovery(catalog, false);
+        assertEquals(32, catalog.rows.get("columns:" + RECOVERY_RECEIPT).size());
+        assertEquals(11, catalog.names("checks:" + RECOVERY_RECEIPT).size());
+        assertEquals(4, catalog.names("keys:" + RECOVERY_RECEIPT).size());
+        assertEquals(Set.of("tianji_process_worker_recovery_receipt_pkey", "tianji_process_worker_recovery_job_uk"),
+                catalog.names("indexes:" + RECOVERY_RECEIPT));
+        assertEquals(Set.of(RECOVERY_RECEIPT), catalog.roleSql.keySet());
+        String role = catalog.roleSql.get(RECOVERY_RECEIPT);
+        assertRoleSafety(role);
+        assertColumnPrivilegeSafety(role, false);
+        assertTrue(role.contains("has_table_privilege(c.oid,'INSERT')"));
+        assertTrue(role.contains("NOT has_table_privilege(c.oid,'UPDATE')"));
+        assertTrue(role.contains("NOT pg_has_role(n.nspowner,'MEMBER')"));
+        assertEquals(Set.of("act_ru_execution", "act_ru_deadletter_job", "act_ru_external_job",
+                "act_ru_job", "act_ru_timer_job", "act_ru_suspended_job"), catalog.nativeTables);
+        assertTrue(catalog.nativeSql.get("act_ru_execution").contains("has_any_column_privilege"));
+        assertTrue(catalog.nativeSql.get("act_ru_deadletter_job").contains("has_any_column_privilege"));
+        assertTrue(catalog.nativeSql.get("act_ru_deadletter_job").contains("'DELETE'"));
+        assertTrue(catalog.nativeSql.get("act_ru_external_job").contains("'INSERT'"));
+
+        recoveryRejects(c -> c.history = c.history.subList(0, 2));
+        recoveryRejects(c -> c.column(RECOVERY_RECEIPT, "failure_decided_at").put("type", "timestamp without time zone"));
+        recoveryRejects(c -> c.column(RECOVERY_RECEIPT, "reason").put("collname", "default"));
+        recoveryRejects(c -> c.column(RECOVERY_RECEIPT, "job_id").put("attnotnull", false));
+        recoveryRejects(c -> c.column(RECOVERY_RECEIPT, "retries").put("default_value", "1"));
+        recoveryRejects(c -> c.rows.get("columns:" + RECOVERY_RECEIPT).add(catalogExtraColumn()));
+        recoveryRejects(c -> c.named("checks:" + RECOVERY_RECEIPT, "tianji_process_worker_recovery_reason")
+                .put("expression", "reason <> ''"));
+        recoveryRejects(c -> c.named("keys:" + RECOVERY_RECEIPT, "tianji_process_worker_recovery_start_fk")
+                .put("deletion", "c"));
+        recoveryRejects(c -> c.named("keys:" + RECOVERY_RECEIPT, "tianji_process_worker_recovery_definition_fk")
+                .put("target_schema", "foreign_schema"));
+        recoveryRejects(c -> c.named("indexes:" + RECOVERY_RECEIPT, "tianji_process_worker_recovery_job_uk")
+                .put("predicate", "job_id IS NOT NULL"));
+        recoveryRejects(c -> c.named("indexes:" + RECOVERY_RECEIPT, "tianji_process_worker_recovery_job_uk")
+                .put("indisunique", false));
+        recoveryRejects(c -> c.recoveryReadWrite = false);
+        recoveryRejects(c -> c.safeRole = false);
+        recoveryRejects(c -> c.badNativeTable = "act_ru_external_job");
+    }
+
+    @Test
+    void recovery_verifier_pins_the_frozen_v10_resource_identity() throws Exception {
+        try (InputStream input = ProcessApiSchemaVerifierTest.class.getResourceAsStream("/db/tianji-process/" + V10)) {
+            assertNotNull(input);
+            assertEquals(V10_SHA256, HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(input.readAllBytes())));
+        }
+        assertEquals(186112865, checksum(V10));
+        var field = ProcessApiSchemaVerifier.class.getDeclaredField("RECOVERY_SHA256");
+        field.setAccessible(true);
+        assertEquals(V10_SHA256, field.get(null));
+    }
+
+    private static void verifyRecovery(Catalog catalog, boolean reject) {
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process");
+            if (reject) assertThrows(IllegalStateException.class, verifier::verifyWorkerRecovery);
+            else assertDoesNotThrow(verifier::verifyWorkerRecovery);
+        }
+    }
+
+    private static void recoveryRejects(Consumer<Catalog> mutation) throws Exception {
+        var catalog = Catalog.recoveryReady();
+        mutation.accept(catalog);
+        verifyRecovery(catalog, true);
+    }
+
+    private static Map<String, Object> catalogExtraColumn() {
+        return Catalog.catalogColumn("unrelated", "integer", false);
+    }
+
+    private static List<Map<String, Object>> recoveryHistory() throws Exception {
+        return List.of(history("8", V8, true, checksum(V8)), history("9", V9, true, checksum(V9)),
+                history("10", V10, true, checksum(V10)));
+    }
+
     private static void assertRoleSafety(String sql) {
         assertNotNull(sql);
         for (String required : List.of("NOT c.relrowsecurity", "NOT c.relforcerowsecurity", "NOT c.relispartition",
@@ -280,6 +396,11 @@ class ProcessApiSchemaVerifierTest {
         private final Map<String, String> roleSql = new HashMap<>();
         private List<Map<String, Object>> history;
         private String historySql;
+        private final Set<String> nativeTables = new java.util.HashSet<>();
+        private final Map<String, String> nativeSql = new HashMap<>();
+        private boolean rejectRecoveryQueries;
+        private boolean recoveryReadWrite = true;
+        private String badNativeTable;
         private boolean provenanceSelect = true;
         private boolean auditReadWrite = true;
         private boolean dispatchReadWrite = true;
@@ -309,6 +430,13 @@ class ProcessApiSchemaVerifierTest {
             return catalog;
         }
 
+        static Catalog recoveryReady() throws Exception {
+            var catalog = ready();
+            catalog.history = recoveryHistory();
+            catalog.addV10();
+            return catalog;
+        }
+
         Map<String, Object> column(String table, String name) {
             return rows.get("columns:" + table).stream().filter(row -> name.equals(row.get("attname"))).findFirst().orElseThrow();
         }
@@ -328,6 +456,14 @@ class ProcessApiSchemaVerifierTest {
             }
             String table = table(sql, args);
             if (sql.contains("pg_is_in_recovery()")) return true;
+            if (rejectRecoveryQueries && (RECOVERY_RECEIPT.equals(table) || table.startsWith("act_ru_"))) {
+                throw new AssertionError("Legacy readiness queried recovery storage");
+            }
+            if (table.startsWith("act_ru_")) {
+                nativeTables.add(table);
+                nativeSql.put(table, sql);
+                return !table.equals(badNativeTable);
+            }
             if (sql.contains("has_table_privilege")) {
                 roleSql.put(table, sql);
                 if (!safeRole) return false;
@@ -338,6 +474,7 @@ class ProcessApiSchemaVerifierTest {
                 if (CASE_INBOX.equals(table)) return caseInsert && caseInboxUpdate;
                 if (CANCEL_RECEIPT.equals(table)) return auditReadWrite;
                 if (DISPATCH.equals(table)) return dispatchReadWrite;
+                if (RECOVERY_RECEIPT.equals(table)) return recoveryReadWrite;
                 return true;
             }
             if (sql.contains("schema_history")) {
@@ -370,7 +507,9 @@ class ProcessApiSchemaVerifierTest {
         }
 
         private static String table(String sql, Object[] args) {
-            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH,
+            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT,
+                    "act_ru_execution", "act_ru_deadletter_job", "act_ru_external_job",
+                    "act_ru_job", "act_ru_timer_job", "act_ru_suspended_job",
                     "tianji_process_release_definition", "tianji_human_task_receipt");
             String argument = Arrays.stream(args).filter(String.class::isInstance).map(String.class::cast)
                     .filter(known::contains).reduce((first, second) -> second).orElse("");
@@ -455,6 +594,92 @@ class ProcessApiSchemaVerifierTest {
                     index("tianji_agent_dispatch_scope_open_idx",
                             List.of("tenant_id", "scope_type", "scope_id", "occurrence_id"),
                             false, false, "state <> 'CLOSED'"))));
+        }
+
+        /** Independent catalog fixture for the reviewed V10 physical contract. */
+        private void addV10() {
+            rows.put("columns:" + RECOVERY_RECEIPT, new ArrayList<>(List.of(
+                    catalogColumn("tenant_id", "bigint", false),
+                    catalogColumn("subject_type", "character varying(16)", true),
+                    catalogColumn("subject_issuer", "character varying(64)", true),
+                    catalogColumn("subject_id", "character varying(256)", true),
+                    catalogColumn("command_type", "character varying(32)", true),
+                    catalogColumn("command_id", "character varying(128)", true),
+                    catalogColumn("request_sha256", "character(64)", true),
+                    catalogColumn("process_instance_id", "character varying(255)", true),
+                    catalogColumn("start_command_type", "character varying(32)", true),
+                    catalogColumn("start_command_id", "character varying(128)", true),
+                    catalogColumn("start_request_sha256", "character(64)", true),
+                    catalogColumn("release_key", "character varying(128)", true),
+                    catalogColumn("model_type", "character varying(8)", true),
+                    catalogColumn("definition_key", "character varying(128)", true),
+                    catalogColumn("engine_definition_id", "character varying(255)", true),
+                    catalogColumn("definition_sha256", "character(64)", true),
+                    catalogColumn("business_key", "character varying(255)", true),
+                    catalogColumn("correlation_id", "character varying(128)", true),
+                    catalogColumn("job_id", "character varying(255)", true),
+                    catalogColumn("occurrence_id", "character varying(255)", true),
+                    catalogColumn("execution_id", "character varying(255)", true),
+                    catalogColumn("element_id", "character varying(128)", true),
+                    catalogColumn("deadletter_revision", "integer", false),
+                    catalogColumn("expected_version", "character(64)", true),
+                    catalogColumn("evidence_sha256", "character(64)", true),
+                    catalogColumn("admission_policy", "character varying(32)", true),
+                    catalogColumn("failure_code", "character varying(64)", true),
+                    catalogColumn("failure_decided_at", "timestamp(6) with time zone", false),
+                    catalogColumn("reason", "character varying(512)", true),
+                    catalogColumn("result_status", "character varying(24)", true),
+                    catalogColumn("retries", "integer", false),
+                    catalogColumn("decided_at", "timestamp(6) with time zone", false))));
+            rows.put("checks:" + RECOVERY_RECEIPT, new ArrayList<>(List.of(
+                    catalogCheck("tianji_process_worker_recovery_tenant", "tenant_id > 0"),
+                    catalogCheck("tianji_process_worker_recovery_owner", "subject_type = ANY(ARRAY['USER', 'SERVICE']) " +
+                            "AND subject_issuer ~ '^[0-9a-f]{64}$' " +
+                            "AND subject_id <> '' AND subject_id = btrim(subject_id) AND subject_id !~ '[[:cntrl:]]'"),
+                    catalogCheck("tianji_process_worker_recovery_kind", "command_type = 'PROCESS_WORKER_RECOVER' AND start_command_type = 'START' AND model_type = 'BPMN'"),
+                    catalogCheck("tianji_process_worker_recovery_command", "command_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$' " +
+                            "AND start_command_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$' " +
+                            "AND correlation_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'"),
+                    catalogCheck("tianji_process_worker_recovery_hashes", "request_sha256 ~ '^[0-9a-f]{64}$' AND start_request_sha256 ~ '^[0-9a-f]{64}$' " +
+                            "AND definition_sha256 ~ '^[0-9a-f]{64}$' AND expected_version ~ '^[0-9a-f]{64}$' " +
+                            "AND evidence_sha256 ~ '^[0-9a-f]{64}$'"),
+                    catalogCheck("tianji_process_worker_recovery_release", "release_key ~ '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' " +
+                            "AND definition_key ~ '^[A-Za-z_][A-Za-z0-9_.-]{0,127}$'"),
+                    catalogCheck("tianji_process_worker_recovery_instance", "process_instance_id <> '' AND process_instance_id = btrim(process_instance_id) " +
+                            "AND process_instance_id !~ '[[:cntrl:]]' AND process_instance_id <> '.' AND process_instance_id <> '..'"),
+                    catalogCheck("tianji_process_worker_recovery_affinity", "engine_definition_id <> '' AND engine_definition_id = btrim(engine_definition_id) " +
+                            "AND engine_definition_id !~ '[[:cntrl:]]' " +
+                            "AND business_key <> '' AND business_key = btrim(business_key) AND business_key !~ '[[:cntrl:]]' " +
+                            "AND job_id <> '' AND job_id = btrim(job_id) AND job_id !~ '[[:cntrl:]]' AND char_length(job_id) <= 64 " +
+                            "AND occurrence_id = job_id " +
+                            "AND execution_id <> '' AND execution_id = btrim(execution_id) AND execution_id !~ '[[:cntrl:]]' " +
+                            "AND element_id <> '' AND element_id = btrim(element_id) AND element_id !~ '[[:cntrl:]]' " +
+                            "AND deadletter_revision > 0"),
+                    catalogCheck("tianji_process_worker_recovery_evidence", "admission_policy = 'READ_ONLY_EXHAUSTED_RETRY_V1' AND failure_code ~ '^[A-Z][A-Z0-9_]{0,63}$'"),
+                    catalogCheck("tianji_process_worker_recovery_reason", "reason <> '' AND reason = btrim(reason) AND octet_length(reason) <= 2048 " +
+                            "AND translate(reason, " +
+                            "chr(1) || chr(2) || chr(3) || chr(4) || chr(5) || chr(6) || chr(7) || chr(8) " +
+                            "|| chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(14) || chr(15) || chr(16) " +
+                            "|| chr(17) || chr(18) || chr(19) || chr(20) || chr(21) || chr(22) || chr(23) || chr(24) " +
+                            "|| chr(25) || chr(26) || chr(27) || chr(28) || chr(29) || chr(30) || chr(31) || chr(127), '') = reason"),
+                    catalogCheck("tianji_process_worker_recovery_result", "result_status = 'RETRY_SCHEDULED' AND retries = 1"))));
+            List<String> command = List.of("tenant_id", "subject_type", "subject_issuer", "subject_id",
+                    "command_type", "command_id");
+            List<String> start = List.of("tenant_id", "subject_type", "subject_issuer", "subject_id",
+                    "start_command_type", "start_command_id");
+            List<String> definition = List.of("tenant_id", "release_key", "model_type", "definition_key");
+            String pk = "tianji_process_worker_recovery_receipt_pkey";
+            rows.put("keys:" + RECOVERY_RECEIPT, new ArrayList<>(List.of(
+                    catalogKey(pk, "p", command, null, List.of()),
+                    catalogKey("tianji_process_worker_recovery_command_fk", "f", command,
+                            "tianji_process_command_receipt", command),
+                    catalogKey("tianji_process_worker_recovery_start_fk", "f", start,
+                            "tianji_process_command_receipt", command),
+                    catalogKey("tianji_process_worker_recovery_definition_fk", "f", definition,
+                            "tianji_process_release_definition", definition))));
+            rows.put("indexes:" + RECOVERY_RECEIPT, new ArrayList<>(List.of(
+                    index(pk, command, true, true, null),
+                    index("tianji_process_worker_recovery_job_uk", List.of("job_id"), true, false, null))));
         }
 
         private static Map<String, Object> catalogColumn(String name, String type, boolean cCollation) {

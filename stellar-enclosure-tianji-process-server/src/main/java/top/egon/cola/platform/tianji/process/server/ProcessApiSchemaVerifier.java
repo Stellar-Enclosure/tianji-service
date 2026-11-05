@@ -12,6 +12,7 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -35,6 +36,9 @@ public final class ProcessApiSchemaVerifier {
     private static final String CANCEL_FILE = "V9__add_process_cancellation_receipts.sql";
     private static final String CANCEL_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
     private static final String CANCEL_RECEIPT = "tianji_process_cancel_receipt";
+    private static final String RECOVERY_FILE = "V10__add_process_worker_recovery_receipts.sql";
+    private static final String RECOVERY_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
+    private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final String schema;
@@ -56,13 +60,85 @@ public final class ProcessApiSchemaVerifier {
         }
     }
 
+    /** Verifies only the recovery capability's audit and native storage. */
+    public void verifyWorkerRecovery() {
+        jdbc.setQueryTimeout(5);
+        try {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
+                    || laterMigrations().size() != 3) throw invalid();
+            var audit = tableContracts(recoveryMigration(), Map.of(RECOVERY_RECEIPT, 32)).get(RECOVERY_RECEIPT);
+            verifyCaseColumns(RECOVERY_RECEIPT, audit.columns());
+            verifyCaseChecks(RECOVERY_RECEIPT, audit.checks(), false);
+            verifyCaseKeys(RECOVERY_RECEIPT, audit.keys());
+            verifyCaseIndexes(RECOVERY_RECEIPT, audit.indexes());
+            verifyCaseRole(RECOVERY_RECEIPT, false, true);
+            verifyRecoveryNativeStorage();
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Process Worker recovery storage schema verification failed", failure);
+        }
+    }
+
+    private void verifyRecoveryNativeStorage() {
+        String idType = "character varying(64)";
+        String identifier = "character varying(255)";
+        String lock = " AND has_any_column_privilege(c.oid,'UPDATE')";
+        verifyRecoveryNativeTable("act_ru_execution", Map.ofEntries(
+                Map.entry("id_", idType), Map.entry("rev_", "integer"), Map.entry("proc_inst_id_", idType),
+                Map.entry("proc_def_id_", idType), Map.entry("parent_id_", idType), Map.entry("tenant_id_", identifier),
+                Map.entry("business_key_", identifier), Map.entry("suspension_state_", "integer"),
+                Map.entry("act_id_", identifier)), lock);
+        var job = Map.ofEntries(Map.entry("id_", idType), Map.entry("rev_", "integer"), Map.entry("type_", identifier),
+                Map.entry("tenant_id_", identifier), Map.entry("process_instance_id_", idType), Map.entry("proc_def_id_", idType),
+                Map.entry("execution_id_", idType), Map.entry("element_id_", identifier), Map.entry("scope_id_", identifier),
+                Map.entry("sub_scope_id_", identifier), Map.entry("scope_type_", identifier),
+                Map.entry("scope_definition_id_", identifier), Map.entry("handler_type_", identifier),
+                Map.entry("handler_cfg_", "character varying(4000)"), Map.entry("correlation_id_", identifier));
+        var deadletter = new HashMap<>(job);
+        deadletter.put("exception_msg_", "character varying(4000)");
+        verifyRecoveryNativeTable("act_ru_deadletter_job", deadletter, lock + " AND has_table_privilege(c.oid,'DELETE')");
+        var external = new HashMap<>(job);
+        external.put("retries_", "integer");
+        external.put("lock_owner_", identifier);
+        external.put("lock_exp_time_", "timestamp without time zone");
+        verifyRecoveryNativeTable("act_ru_external_job", external, " AND has_table_privilege(c.oid,'INSERT')");
+        for (String table : List.of("act_ru_job", "act_ru_timer_job", "act_ru_suspended_job")) {
+            verifyRecoveryNativeTable(table, Map.of("id_", idType), "");
+        }
+    }
+
+    private void verifyRecoveryNativeTable(String table, Map<String, String> columns, String extraPrivileges) {
+        String pairs = String.join(",", java.util.Collections.nCopies(columns.size(), "(?,?)"));
+        String sql = """
+                SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                  AND NOT c.relispartition AND c.relpersistence='p'
+                  AND has_schema_privilege(n.oid,'USAGE') AND has_table_privilege(c.oid,'SELECT')
+                  AND EXISTS (SELECT 1 FROM pg_index i JOIN pg_attribute a ON a.attrelid=c.oid
+                    WHERE i.indrelid=c.oid AND i.indisprimary AND i.indisunique
+                      AND i.indisvalid AND i.indisready AND i.indislive AND i.indnkeyatts=1 AND i.indnatts=1
+                      AND a.attname='id_' AND a.attnotnull AND NOT a.attisdropped AND i.indkey[0]=a.attnum)
+                  AND (SELECT count(*) FROM pg_attribute a WHERE a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
+                      AND (a.attname::text,format_type(a.atttypid,a.atttypmod)) IN (
+                """ + pairs + "))=?"
+                + extraPrivileges + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace"
+                + " WHERE n.nspname=? AND c.relname=? AND c.relkind='r'";
+        var parameters = new ArrayList<Object>();
+        columns.forEach((name, type) -> {
+            parameters.add(name);
+            parameters.add(type);
+        });
+        parameters.add(columns.size());
+        parameters.add(schema);
+        parameters.add(table);
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(sql, Boolean.class, parameters.toArray()))) throw invalid();
+    }
+
     /** Cancellation reads immutable Case provenance without enabling the Case write capability. */
     public void verifyCancellation() {
         jdbc.setQueryTimeout(5);
         verifyAgentDispatch();
         try {
             if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
-                    || laterMigrations().size() != 2) throw invalid();
+                    || laterMigrations().size() < 2) throw invalid();
             String migration = cancellationMigration();
             var audit = tableContracts(migration, Map.of(CANCEL_RECEIPT, 26)).get(CANCEL_RECEIPT);
             verifyCaseColumns(CANCEL_RECEIPT, audit.columns());
@@ -122,7 +198,7 @@ public final class ProcessApiSchemaVerifier {
         }
     }
 
-    /** Case-off task readers retain the exact V8 task authority when the additive V9 is present. */
+    /** Case-off task readers retain the exact V8 task authority throughout the known later prefix. */
     public boolean hasCaseMigration() { return !laterMigrations().isEmpty(); }
 
     private List<CaseVersion> laterMigrations() {
@@ -130,13 +206,20 @@ public final class ProcessApiSchemaVerifier {
                         + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        if (versions.size() > 2) throw invalid();
+        var numbers = List.of("8", "9", "10");
+        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE);
+        if (versions.size() > numbers.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
-            String number = index == 0 ? "8" : "9", file = index == 0 ? CASE_FILE : CANCEL_FILE;
+            String number = numbers.get(index), file = files.get(index);
             if (!number.equals(version.version()) || !"SQL".equals(version.type()) || !file.equals(version.script())
                     || !version.success() || version.checksum() == null || version.checksum() != checksum(file)) throw invalid();
-            if (index == 0) caseMigration(); else cancellationMigration();
+            switch (number) {
+                case "8" -> caseMigration();
+                case "9" -> cancellationMigration();
+                case "10" -> recoveryMigration();
+                default -> throw invalid();
+            }
         }
         return versions;
     }
@@ -229,6 +312,7 @@ public final class ProcessApiSchemaVerifier {
         String columns = cancellation ? " AND NOT has_any_column_privilege(c.oid,'REFERENCES')"
                 + (mutable ? "" : " AND NOT has_any_column_privilege(c.oid,'UPDATE')") : "";
         String insert = requireInsert ? " AND has_table_privilege(c.oid,'INSERT')" : "";
+        String schemaOwnership = RECOVERY_RECEIPT.equals(table) ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
         String update = mutable ? "has_table_privilege(c.oid,'UPDATE')" : "NOT has_table_privilege(c.oid,'UPDATE')";
         Boolean valid = jdbc.queryForObject("""
                 SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relispartition AND c.relpersistence='p'
@@ -240,7 +324,7 @@ public final class ProcessApiSchemaVerifier {
                   AND NOT has_table_privilege(c.oid,'TRIGGER') AND NOT has_table_privilege(c.oid,'REFERENCES')
                   AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
                     AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
-                """ + columns + insert + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
+                """ + columns + insert + schemaOwnership + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
                 Boolean.class, schema, table);
         if (!Boolean.TRUE.equals(valid)) throw invalid();
     }
@@ -305,6 +389,17 @@ public final class ProcessApiSchemaVerifier {
             throw new IllegalStateException("Process cancellation migration resource is unavailable", failure);
         }
     }
+    private static String recoveryMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + RECOVERY_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readAllBytes();
+            if (!RECOVERY_SHA256.equals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("Process Worker recovery migration resource is unavailable", failure);
+        }
+    }
+
     private static int caseClosing(String value, int open) {
         int depth = 0; boolean quoted = false;
         for (int i = open; i < value.length(); i++) {
