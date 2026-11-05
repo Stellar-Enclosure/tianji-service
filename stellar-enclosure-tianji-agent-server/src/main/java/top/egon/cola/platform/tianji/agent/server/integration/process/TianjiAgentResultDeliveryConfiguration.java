@@ -17,6 +17,8 @@ import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2C
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceTokenRequest;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 
+import io.micrometer.core.instrument.MeterRegistry;
+import io.opentelemetry.api.OpenTelemetry;
 import java.net.http.HttpClient;
 import java.time.Clock;
 import java.time.Duration;
@@ -79,8 +81,13 @@ public class TianjiAgentResultDeliveryConfiguration {
     }
 
     @Bean
-    AgentResultDeliveryHandler tianjiAgentResultDeliveryHandler(ObjectProvider<AgentLedgerService> ledgers, ResultDeliveryClients clients) {
-        return new AgentResultDeliveryHandler(ledgers::getObject, clients.routes(), Clock.systemUTC());
+    AgentResultDeliveryHandler tianjiAgentResultDeliveryHandler(ObjectProvider<AgentLedgerService> ledgers, ResultDeliveryClients clients,
+                                                                Environment environment, ObjectProvider<OpenTelemetry> telemetry,
+                                                                ObjectProvider<MeterRegistry> meters) {
+        var observation = environment.getProperty(AgentResultSpanObservation.FLAG, Boolean.class, false)
+                ? AgentResultSpanObservation.enabled(telemetry::getIfUnique, meters::getIfUnique)
+                : AgentResultSpanObservation.disabled();
+        return new AgentResultDeliveryHandler(ledgers::getObject, clients.routes(), Clock.systemUTC(), observation);
     }
 
     static final class ResultDeliveryClients implements AutoCloseable {

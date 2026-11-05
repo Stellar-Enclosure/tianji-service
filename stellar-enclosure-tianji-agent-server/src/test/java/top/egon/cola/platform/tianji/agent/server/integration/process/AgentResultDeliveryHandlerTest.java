@@ -3,6 +3,8 @@ package top.egon.cola.platform.tianji.agent.server.integration.process;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.config.YamlMapFactoryBean;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -136,6 +138,49 @@ class AgentResultDeliveryHandlerTest {
             assertTrue(context.getBean(AgentLedgerService.class).hasTerminalPublisher(context.getBean(OutboxAgentTerminalEventPublisher.class)));
             verifyNoInteractions(source);
         }
+    }
+
+    @Test
+    void verifiedAttemptLinksWithoutChangingWireOrRetry() {
+        String carrier = "tianji-link-v1:00-" + "a".repeat(32) + "-" + "b".repeat(16) + "-01";
+        var observation = mock(AgentResultSpanObservation.class);
+        var close = mock(AgentResultSpanObservation.Delivery.class);
+        when(observation.isEnabled()).thenReturn(true);
+        when(observation.delivery(carrier)).thenReturn(close);
+        var enabled = new AgentResultDeliveryHandler(() -> ledger, List.of(
+                new AgentResultDeliveryHandler.Route("process-one", "process-east", owner, client)),
+                Clock.fixed(NOW, ZoneOffset.UTC), observation);
+
+        var original = context();
+        var invalid = new DeliveryContext(original.messageId(), original.channel(), original.destination(),
+                original.payload(), original.contentType(), original.schemaVersion(), Map.of(), carrier,
+                original.attempt(), original.maxAttempts(), original.deadline());
+        assertEquals(DeliveryResult.Kind.PERMANENT_FAILURE, enabled.deliver(invalid).kind());
+        verifyNoInteractions(ledger, observation);
+        verify(client, never()).receive(any());
+
+        var context = new DeliveryContext(original.messageId(), original.channel(), original.destination(),
+                original.payload(), original.contentType(), original.schemaVersion(), original.headers(), carrier,
+                original.attempt(), original.maxAttempts(), original.deadline());
+        when(client.receive(event)).thenThrow(new ProcessClientException(503, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null));
+        assertEquals(DeliveryResult.Kind.RETRYABLE_FAILURE, enabled.deliver(context).kind());
+        var calls = inOrder(ledger, observation, client, close);
+        calls.verify(ledger).terminalReference(owner, new GetAgentRunQuery(event.runId()), Duration.ofSeconds(5));
+        calls.verify(observation).delivery(carrier);
+        calls.verify(client).receive(event);
+        calls.verify(close).close();
+        verify(client, times(1)).receive(event);
+    }
+
+    @Test
+    void terminalSpanLinksFlagDefaultsOffWithoutEnablingPublication() {
+        var yaml = new YamlMapFactoryBean();
+        yaml.setResources(new ClassPathResource("application.yml"));
+        var stellar = assertInstanceOf(Map.class, yaml.getObject().get("stellar"));
+        var tianji = assertInstanceOf(Map.class, stellar.get("tianji"));
+        var agent = assertInstanceOf(Map.class, tianji.get("agent"));
+        var terminal = assertInstanceOf(Map.class, agent.get("terminal-events"));
+        assertEquals(Map.of("span-links-enabled", false), terminal);
     }
 
     private DeliveryContext context() { return context(mapper.writeValueAsString(event), Map.of("tianji-event-fingerprint", event.fingerprint()), NOW.plusSeconds(30)); }

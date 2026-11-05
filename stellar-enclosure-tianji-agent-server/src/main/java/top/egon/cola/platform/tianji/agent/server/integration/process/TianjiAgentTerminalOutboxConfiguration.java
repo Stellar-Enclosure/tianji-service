@@ -17,6 +17,8 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 
 import javax.sql.DataSource;
+import io.opentelemetry.api.OpenTelemetry;
+import org.springframework.beans.factory.ObjectProvider;
 import java.util.Map;
 
 /** Opt-in publication only; authenticated delivery and the Process Inbox have their own activation gates. */
@@ -31,9 +33,14 @@ public class TianjiAgentTerminalOutboxConfiguration {
 
     @Bean
     OutboxAgentTerminalEventPublisher tianjiAgentTerminalEventPublisher(DataSource source, OutboxInfrastructure infrastructure,
-                                                                     TransactionalOutbox outbox, Environment environment) {
+                                                                     TransactionalOutbox outbox, Environment environment,
+                                                                     ObjectProvider<OpenTelemetry> telemetry) {
+        var observation = environment.getProperty(AgentResultSpanObservation.FLAG, Boolean.class, false)
+                ? AgentResultSpanObservation.enabled(telemetry::getIfUnique, () -> null)
+                : AgentResultSpanObservation.disabled();
         return new OutboxAgentTerminalEventPublisher(source, infrastructure, outbox, environment.getProperty(PREFIX + "producer-id"),
-                Binder.get(environment).bind(PREFIX + "destinations", Bindable.mapOf(String.class, String.class)).orElse(Map.of()));
+                Binder.get(environment).bind(PREFIX + "destinations", Bindable.mapOf(String.class, String.class)).orElse(Map.of()),
+                observation);
     }
 
     @Bean

@@ -28,9 +28,16 @@ public final class OutboxAgentTerminalEventPublisher implements AgentTerminalEve
     private final OutboxTransactionGuard guard;
     private final String producerId;
     private final Map<String, String> destinations;
+    private final AgentResultSpanObservation observation;
 
     public OutboxAgentTerminalEventPublisher(DataSource source, OutboxInfrastructure infrastructure, TransactionalOutbox outbox,
                                              String producerId, Map<String, String> destinations) {
+        this(source, infrastructure, outbox, producerId, destinations, AgentResultSpanObservation.disabled());
+    }
+
+    OutboxAgentTerminalEventPublisher(DataSource source, OutboxInfrastructure infrastructure, TransactionalOutbox outbox,
+                                      String producerId, Map<String, String> destinations,
+                                      AgentResultSpanObservation observation) {
         if (source == null || infrastructure == null || source != infrastructure.dataSource()
                 || !(infrastructure.transactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() != source
                 || producerId == null || !producerId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
@@ -44,6 +51,7 @@ public final class OutboxAgentTerminalEventPublisher implements AgentTerminalEve
         this.guard = new OutboxTransactionGuard(source);
         this.producerId = producerId;
         this.destinations = Map.copyOf(destinations);
+        this.observation = Objects.requireNonNull(observation, "observation");
     }
 
     @Override public String producerId() { return producerId; }
@@ -54,9 +62,11 @@ public final class OutboxAgentTerminalEventPublisher implements AgentTerminalEve
         if (event == null || !producerId.equals(event.producerId())) throw invalid();
         String destination = destinations.get(event.link().sourceId());
         if (destination == null) throw invalid();
+        String payload = encode(event);
         var receipt = outbox.enqueue(OutboxMessage.builder().messageId(event.eventId()).idempotencyKey(event.eventId())
-                .channel(CHANNEL).destination(destination).schemaVersion("1").payload(encode(event))
-                .headers(Map.of("tianji-event-fingerprint", event.fingerprint())).build());
+                .channel(CHANNEL).destination(destination).schemaVersion("1").payload(payload)
+                .headers(Map.of("tianji-event-fingerprint", event.fingerprint()))
+                .traceId(observation.enqueueCarrier()).build());
         if (receipt == null || !event.eventId().equals(receipt.messageId()) || !event.eventId().equals(receipt.idempotencyKey())) {
             throw new IllegalStateException("Agent terminal Outbox receipt does not match its event");
         }

@@ -16,6 +16,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import javax.sql.DataSource;
 import java.sql.Connection;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -100,6 +101,45 @@ class OutboxAgentTerminalEventPublisherTest {
                 outbox, "agent-east", Map.of("process-east", "process-destination")));
         assertThrows(IllegalArgumentException.class, () -> new OutboxAgentTerminalEventPublisher(source, infrastructure(), outbox,
                 "agent-east", Map.of("process-east", "https://unconfigured.example/callback")));
+    }
+
+    @Test
+    void traceCarrierIsOptionalAndTransactionOwned() throws Exception {
+        var connection = connection();
+        var event = event("agent-east");
+        var observation = mock(AgentResultSpanObservation.class);
+        String carrier = "tianji-link-v1:00-" + "a".repeat(32) + "-" + "b".repeat(16) + "-01";
+        var enabled = new OutboxAgentTerminalEventPublisher(source, infrastructure(), outbox, "agent-east",
+                Map.of("process-east", "process-destination"), observation);
+        assertThrows(RuntimeException.class, () -> enabled.publish(event));
+        assertThrows(IllegalArgumentException.class, () -> new TransactionTemplate(manager)
+                .executeWithoutResult(status -> enabled.publish(event("another-agent"))));
+        verifyNoInteractions(observation, outbox);
+
+        when(observation.enqueueCarrier()).thenReturn(carrier);
+        var messages = new ArrayList<OutboxMessage>();
+        when(outbox.enqueue(any())).thenAnswer(call -> {
+            messages.add(call.getArgument(0));
+            return new OutboxReceipt(event.eventId(), event.eventId(), messages.size() == 1);
+        });
+        new TransactionTemplate(manager).executeWithoutResult(status -> publisher().publish(event));
+        new TransactionTemplate(manager).executeWithoutResult(status -> enabled.publish(event));
+        assertEquals(2, messages.size());
+        var original = messages.getFirst();
+        var observed = messages.getLast();
+        assertNull(original.traceId());
+        assertEquals(carrier, observed.traceId());
+        assertEquals(original.messageId(), observed.messageId());
+        assertEquals(original.idempotencyKey(), observed.idempotencyKey());
+        assertEquals(original.channel(), observed.channel());
+        assertEquals(original.destination(), observed.destination());
+        assertEquals(original.schemaVersion(), observed.schemaVersion());
+        assertEquals(original.contentType(), observed.contentType());
+        assertEquals(original.payload(), observed.payload());
+        assertEquals(Map.of("tianji-event-fingerprint", event.fingerprint()), observed.headers());
+        assertEquals(original.headers(), observed.headers());
+        verify(observation, times(1)).enqueueCarrier();
+        verify(connection, times(2)).commit();
     }
 
     private Connection connection() throws Exception {

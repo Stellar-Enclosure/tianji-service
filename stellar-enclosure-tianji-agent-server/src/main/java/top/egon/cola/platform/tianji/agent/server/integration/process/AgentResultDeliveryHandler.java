@@ -40,8 +40,15 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
     private final Map<Key, Route> routes;
     private final Set<String> destinations;
     private final Clock clock;
+    private final AgentResultSpanObservation observation;
 
     public AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock) {
+        this(ledgers, routes, clock, AgentResultSpanObservation.disabled());
+    }
+
+    AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock,
+                               AgentResultSpanObservation observation) {
+        this.observation = Objects.requireNonNull(observation, "observation");
         this.ledgers = Objects.requireNonNull(ledgers, "ledgers");
         this.clock = Objects.requireNonNull(clock, "clock");
         if (routes == null || routes.isEmpty() || routes.size() > 1000) throw invalid();
@@ -91,7 +98,11 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
         if (Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
             return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
         }
-        try {
+        try (var ignored = observation.delivery(context.traceId())) {
+            if (observation.isEnabled()
+                    && Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
+                return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
+            }
             var receipt = route.client().receive(event);
             if (receipt == null || !event.eventId().equals(receipt.eventId()) || !event.fingerprint().equals(receipt.eventFingerprint())) {
                 return permanent("TIANJI_RESULT_RECEIPT_INVALID");
