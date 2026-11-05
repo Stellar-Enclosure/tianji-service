@@ -48,6 +48,30 @@ final class JdbcAdkSessionRepository {
                 }, actor.tenantId(), type(), actor.issuerFingerprint(), actor.subjectId(), runId).stream().findFirst();
     }
 
+    void boundCheckpointFirstRead() {
+        jdbc.execute("SET LOCAL statement_timeout = '2s'");
+        jdbc.execute("SET LOCAL lock_timeout = '1s'");
+        jdbc.execute("SET LOCAL search_path = pg_catalog, tianji_agent");
+    }
+
+    boolean checkpointRunMatches(String id, AgentRunLease lease, AgentCheckpointObservationService.ResumeMatch cut) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT NOT pg_catalog.pg_is_in_recovery()
+                  AND pg_catalog.current_setting('transaction_read_only')='off'
+                  AND pg_catalog.current_setting('transaction_isolation')='read committed'
+                  AND EXISTS (
+                    SELECT 1 FROM ONLY tianji_agent.agent_run
+                    WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?
+                      AND session_id=? AND status='RUNNING' AND attempt=1 AND revision=? AND last_event_sequence=?
+                      AND lease_owner=? AND lease_epoch=? AND lease_expires_at=? AND deadline_at=?
+                      AND wait_reason IS NULL AND cancel_requested_at IS NULL AND finished_at IS NULL
+                      AND result IS NULL AND error_code IS NULL
+                  )
+                """, Boolean.class, actor.tenantId(), type(), actor.issuerFingerprint(), actor.subjectId(), lease.runId(),
+                id, cut.revision() + 2, cut.lastEventSequence() + 2, lease.owner(), lease.epoch(),
+                Timestamp.from(lease.expiresAt()), Timestamp.from(cut.request().deadlineAt())));
+    }
+
     boolean liveFences(String id, AgentRunLease run, String sessionOwner, long sessionEpoch) {
         Boolean live = jdbc.queryForObject("""
                 WITH fence_clock AS (SELECT clock_timestamp() AS now)

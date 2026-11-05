@@ -169,33 +169,44 @@ public final class AgentCheckpointObservationService {
     }
 
     private static ResumeMatch resumeMatch(AgentLedgerService.ExecutionMaterial material, CheckpointRow row) {
-        var request = material.authorization();
-        long runEpoch = Math.incrementExact(row.capturedRunEpoch());
-        try {
-            var digest = MessageDigest.getInstance("SHA-256");
-            for (String field : List.of("TIANJI_FIRST_INPUT_RESUME_CUT_V1", request.actor().identityFingerprint(),
-                    request.runId(), request.definitionSha256(), request.requestSha256(), request.snapshotSha256(),
-                    request.policyVersionRef(), request.deadlineAt().toString(), row.sessionId(),
-                    row.eventId(), row.invocationId(), Long.toString(material.run().revision()),
-                    Long.toString(material.run().lastEventSequence()), Long.toString(runEpoch),
-                    Long.toString(row.sessionEpoch()), Long.toString(row.sessionRevision()),
-                    Long.toString(row.sessionSequence()), Integer.toString(row.stateVersion()),
-                    Long.toString(row.eventTimestamp()), row.sessionState(), row.eventPayload())) {
-                byte[] bytes = field.getBytes(StandardCharsets.UTF_8);
-                digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
-                digest.update(bytes);
-            }
-            return new ResumeMatch(request, row.sessionId(), row.invocationId(), material.run().revision(),
-                    material.run().lastEventSequence(), runEpoch, row.sessionEpoch(),
-                    row.sessionRevision(), row.sessionSequence(), HexFormat.of().formatHex(digest.digest()));
-        } catch (NoSuchAlgorithmException failure) {
-            throw new IllegalStateException("Agent checkpoint fingerprint is unavailable");
-        }
+        var match = new ResumeMatch(material.authorization(), row.sessionId(), row.invocationId(),
+                material.run().revision(), material.run().lastEventSequence(), Math.incrementExact(row.capturedRunEpoch()),
+                row.sessionEpoch(), row.sessionRevision(), row.sessionSequence(), "");
+        String digest = match.digest(row.eventId(), row.stateVersion(), row.eventTimestamp(), row.sessionState(), row.eventPayload());
+        return new ResumeMatch(match.request(), match.sessionId(), match.invocationId(), match.revision(),
+                match.lastEventSequence(), match.runEpoch(), match.sessionEpoch(), match.sessionRevision(),
+                match.sessionSequence(), digest);
     }
 
     record ResumeMatch(AgentRunAuthorization.Request request, String sessionId, String invocationId,
                        long revision, long lastEventSequence, long runEpoch, long sessionEpoch,
                        long sessionRevision, long sessionSequence, String cutSha256) {
+        boolean matchesFirstRead(JdbcAdkSessionRepository.SessionRow session, JdbcAdkSessionRepository.EventRow event) {
+            return sessionId.equals(session.id()) && sessionRevision == session.revision()
+                    && sessionSequence == session.lastEventSequence() && sessionSequence == event.sequence()
+                    && cutSha256.equals(digest(event.nativeId(), session.codecVersion(),
+                            event.timestampMillis(), session.state(), event.payload()));
+        }
+
+        String digest(String eventId, int stateVersion, long eventTimestamp, String sessionState, String eventPayload) {
+            try {
+                var digest = MessageDigest.getInstance("SHA-256");
+                for (String field : List.of("TIANJI_FIRST_INPUT_RESUME_CUT_V1", request.actor().identityFingerprint(),
+                        request.runId(), request.definitionSha256(), request.requestSha256(), request.snapshotSha256(),
+                        request.policyVersionRef(), request.deadlineAt().toString(), sessionId, eventId, invocationId,
+                        Long.toString(revision), Long.toString(lastEventSequence), Long.toString(runEpoch),
+                        Long.toString(sessionEpoch), Long.toString(sessionRevision), Long.toString(sessionSequence),
+                        Integer.toString(stateVersion), Long.toString(eventTimestamp), sessionState, eventPayload)) {
+                    byte[] bytes = field.getBytes(StandardCharsets.UTF_8);
+                    digest.update(ByteBuffer.allocate(Integer.BYTES).putInt(bytes.length).array());
+                    digest.update(bytes);
+                }
+                return HexFormat.of().formatHex(digest.digest());
+            } catch (NoSuchAlgorithmException failure) {
+                throw new IllegalStateException("Agent checkpoint fingerprint is unavailable");
+            }
+        }
+
         @Override public String toString() { return "ResumeMatch[redacted]"; }
     }
 

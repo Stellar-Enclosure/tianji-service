@@ -132,9 +132,14 @@ public final class AgentCheckpointTakeoverService {
         @Override public String toString() { return "TakeoverResult[redacted]"; }
     }
 
-    record Launch(AgentRunLease runLease, PostgresAdkSessionService.SessionLease sessionLease,
+    record Launch(DataSource source, AgentRunLease runLease, PostgresAdkSessionService.SessionLease sessionLease,
                   AgentCheckpointObservationService.ResumeMatch checkpoint, ResumeRequest authorizationRequest) {
         String invocationId() { return checkpoint.invocationId(); }
+
+        PostgresAdkSessionService bindSession(PostgresAdkSessionService store) {
+            return store.withResumeCheckpoint(source, sessionLease, checkpoint);
+        }
+
         @Override public String toString() { return "Launch[redacted]"; }
     }
 
@@ -242,7 +247,7 @@ public final class AgentCheckpointTakeoverService {
         if (!Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT pg_catalog.clock_timestamp()<LEAST(CAST(? AS timestamptz),CAST(? AS timestamptz))
                 """, Boolean.class, Timestamp.from(runLease.expiresAt()), Timestamp.from(sessionLease.expiresAt())))) throw conflict();
-        return new TakeoverResult(ack, new Launch(runLease, sessionLease, expected, permit.request()));
+        return new TakeoverResult(ack, new Launch(source, runLease, sessionLease, expected, permit.request()));
     }
 
     private void requirePrimary(boolean readOnly) {

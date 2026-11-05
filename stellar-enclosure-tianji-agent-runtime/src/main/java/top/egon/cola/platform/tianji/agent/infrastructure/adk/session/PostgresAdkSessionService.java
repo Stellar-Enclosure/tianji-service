@@ -17,6 +17,7 @@ import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.core.Single;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -24,6 +25,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointObservationService.ResumeMatch;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
@@ -49,6 +51,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     private static final EventActions EMPTY_EVENT_ACTIONS = EventActions.builder().build();
     private static final int MAX_SESSIONS = 500;
     private static final int MAX_EVENTS = 1_000;
+    private static final long MAX_FIRST_INPUT_BYTES = 1_048_576;
     private static final long MAX_HISTORY_BYTES = 8L * 1_048_576;
     private static final int MAX_SCOPE_ENTRIES = 500;
     private static final long MAX_SCOPE_BYTES = 4L * 1_048_576;
@@ -67,6 +70,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     private final Map<Session, Long> revisions;
     private final SessionLease lease;
     private final FirstInputCheckpointBO firstInputCheckpoint;
+    private final ResumeFirstRead resumeFirstRead;
 
     /** App-wide state writes are disabled unless the trusted host explicitly enables them. */
     public PostgresAdkSessionService(DataSource dataSource, TrustedAgentActor actor, String appName) {
@@ -96,10 +100,11 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         this.revisions = Collections.synchronizedMap(new WeakHashMap<>());
         this.lease = null;
         this.firstInputCheckpoint = null;
+        this.resumeFirstRead = null;
     }
 
     private PostgresAdkSessionService(PostgresAdkSessionService source, SessionLease lease,
-                                      FirstInputCheckpointBO firstInputCheckpoint) {
+                                      FirstInputCheckpointBO firstInputCheckpoint, ResumeFirstRead resumeFirstRead) {
         this.dataSource = source.dataSource;
         this.actor = source.actor;
         this.appName = source.appName;
@@ -113,6 +118,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         this.revisions = source.revisions;
         this.lease = lease;
         this.firstInputCheckpoint = firstInputCheckpoint;
+        this.resumeFirstRead = resumeFirstRead;
     }
 
     /** The ADK user identifier is a local namespace; the database additionally binds tenant and principal type. */
@@ -161,6 +167,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
     }
 
     public SessionLease renewSessionLease(SessionLease existing, Duration duration) {
+        if (resumeFirstRead != null) throw leaseExpired();
         requireLeaseScope(existing);
         long millis = leaseMillis(duration);
         return write.execute(status -> {
@@ -191,17 +198,32 @@ public final class PostgresAdkSessionService implements BaseSessionService {
 
     /** Returns a run-bound adapter; every durable append checks both database leases. */
     public PostgresAdkSessionService withLease(SessionLease existing) {
+        if (resumeFirstRead != null) throw invalid();
         requireLeaseScope(existing);
-        return new PostgresAdkSessionService(this, existing, null);
+        return new PostgresAdkSessionService(this, existing, null, null);
     }
 
     public PostgresAdkSessionService withLease(SessionLease existing, FirstInputCheckpointBO checkpoint) {
+        if (resumeFirstRead != null) throw invalid();
         requireLeaseScope(existing);
         Objects.requireNonNull(checkpoint, "checkpoint");
         if (!actor.equals(checkpoint.request().actor()) || !"tianji".equals(appName)
                 || !existing.sessionId.equals(checkpoint.claimed().sessionId())
                 || !existing.runLease.runId().equals(checkpoint.request().runId())) throw invalid();
-        return new PostgresAdkSessionService(this, existing, checkpoint);
+        return new PostgresAdkSessionService(this, existing, checkpoint, null);
+    }
+
+    /** Binds the new fences to the verified first input on the exact takeover primary. */
+    PostgresAdkSessionService withResumeCheckpoint(DataSource source, SessionLease successor, ResumeMatch cut) {
+        Objects.requireNonNull(cut, "cut");
+        requireLeaseScope(successor);
+        if (source != dataSource || lease != null || !"tianji".equals(appName) || allowAppStateWrites
+                || !actor.equals(cut.request().actor()) || !successor.sessionId.equals(cut.sessionId())
+                || !successor.runLease.runId().equals(cut.request().runId())
+                || successor.epoch != Math.incrementExact(cut.sessionEpoch())
+                || successor.runLease.epoch() != Math.incrementExact(cut.runEpoch())
+                || !successor.expiresAt.equals(successor.runLease.expiresAt())) throw invalid();
+        return new PostgresAdkSessionService(this, successor, null, new ResumeFirstRead(cut));
     }
 
     @Override
@@ -242,6 +264,16 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             requireIdentity(requestedApp, requestedUser);
             String id = sessionId(sessionId);
             Objects.requireNonNull(config, "config");
+            if (resumeFirstRead != null && !resumeFirstRead.loaded) {
+                synchronized (resumeFirstRead) {
+                    if (!resumeFirstRead.loaded) {
+                        if (config.isPresent()) throw revisionConflict();
+                        Session session = register(readResumeFirstView(id));
+                        resumeFirstRead.loaded = true;
+                        return Maybe.just(session);
+                    }
+                }
+            }
             SessionView view = readableSession(id, row -> view(row, loadEvents(row, config)));
             return view == null ? Maybe.empty() : Maybe.just(register(view));
         });
@@ -283,6 +315,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         return Single.fromCallable(() -> {
             requireIdentity(requestedApp, requestedUser);
             String id = sessionId(sessionId);
+            requireResumeFirstRead();
             List<Event> events = readableSession(id, row -> loadEvents(row, Optional.empty()));
             if (events == null) throw notFound();
             return ListEventsResponse.builder().events(events).build();
@@ -297,6 +330,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
             requireIdentity(session.appName(), session.userId());
             String id = sessionId(session.id());
             if (lease == null || !lease.sessionId.equals(id)) throw leaseExpired();
+            requireResumeFirstRead();
             if (event.partial().orElse(false)) return event;
             String payload = eventCodec.encode(event);
             Event durable = eventCodec.decode(payload);
@@ -373,6 +407,50 @@ public final class PostgresAdkSessionService implements BaseSessionService {
                 && id.chars().allMatch(value -> value >= 33 && value <= 126);
     }
 
+    private void requireResumeFirstRead() {
+        if (resumeFirstRead != null && !resumeFirstRead.loaded) throw revisionConflict();
+    }
+
+    private SessionView readResumeFirstView(String id) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw new IllegalStateException("ADK resume first read must own its transaction");
+        }
+        if (!lease.sessionId.equals(id)) throw leaseExpired();
+        ResumeMatch cut = resumeFirstRead.cut;
+        var boundedRead = transaction(write.getTransactionManager(), false);
+        boundedRead.setTimeout(2);
+        return boundedRead.execute(status -> {
+            repository.boundCheckpointFirstRead();
+            requireRunFence(id, lease.runLease);
+            if (!repository.checkpointRunMatches(id, lease.runLease, cut)) throw leaseExpired();
+            var row = repository.session(id, true).orElseThrow(PostgresAdkSessionService::notFound);
+            if (!lease.expiresAt.equals(requireSessionFence(id, lease).expiresAt())) throw leaseExpired();
+            if (row.revision() != cut.sessionRevision() || row.lastEventSequence() != cut.sessionSequence()
+                    || !repository.tryLockScopeForCheckpoint()) throw revisionConflict();
+            var bounds = repository.scopeBounds();
+            Map<String, Object> state = localState(row);
+            if (bounds.appCount() != 0 || bounds.userCount() != 0 || !state.isEmpty()) throw revisionConflict();
+
+            var history = repository.eventBounds(id, 2, null);
+            if (history.count() != 1 || history.firstSequence() != cut.sessionSequence()
+                    || history.lastSequence() != cut.sessionSequence() || history.bytes() > MAX_FIRST_INPUT_BYTES) {
+                throw revisionConflict();
+            }
+            var rows = repository.events(id, 2, null);
+            if (rows.size() != 1 || !cut.matchesFirstRead(row, rows.getFirst())) throw revisionConflict();
+            var stored = rows.getFirst();
+            Event input = eventCodec.decode(stored.payload());
+            if (!stored.nativeId().equals(input.id()) || input.timestamp() != stored.timestampMillis()
+                    || !cut.invocationId().equals(input.invocationId())) throw revisionConflict();
+
+            SessionView verified = sessionView(row, List.of(input), state);
+            requireLiveFences(id, lease);
+            return verified;
+        });
+    }
+
     private <T> T readableSession(String id, Function<JdbcAdkSessionRepository.SessionRow, T> reader) {
         if (lease == null) {
             return read.execute(status -> repository.session(id, false).map(reader).orElse(null));
@@ -424,6 +502,10 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         requireScopeWithinBounds();
         Map<String, Object> state = localState(row);
         repository.scopeState().forEach((key, value) -> state.put(key, stateCodec.decodeValue(value.value(), value.codecVersion())));
+        return sessionView(row, events, state);
+    }
+
+    private SessionView sessionView(JdbcAdkSessionRepository.SessionRow row, List<Event> events, Map<String, Object> state) {
         Session session = Session.builder(row.id()).appName(appName).userId(userId).state(state)
                 .events(events).lastUpdateTime(row.updatedAt()).build();
         return new SessionView(session, row.revision());
@@ -501,10 +583,11 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         }
     }
 
-    private void requireSessionFence(String id, SessionLease expected) {
+    private JdbcAdkSessionRepository.LeaseRow requireSessionFence(String id, SessionLease expected) {
         JdbcAdkSessionRepository.LeaseRow current = repository.lockLease(id);
         if (!current.live() || current.expiresAt() == null || !current.expiresAt().isAfter(repository.databaseNow())
                 || !expected.owner.equals(current.owner()) || expected.epoch != current.epoch()) throw leaseExpired();
+        return current;
     }
 
     private void requireLiveFences(String id, SessionLease expected) {
@@ -541,7 +624,7 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         return millis;
     }
 
-    private static TransactionTemplate transaction(DataSourceTransactionManager manager, boolean readOnly) {
+    private static TransactionTemplate transaction(PlatformTransactionManager manager, boolean readOnly) {
         TransactionTemplate template = new TransactionTemplate(manager);
         template.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         template.setIsolationLevel(readOnly ? TransactionDefinition.ISOLATION_REPEATABLE_READ
@@ -562,6 +645,13 @@ public final class PostgresAdkSessionService implements BaseSessionService {
         return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "ADK session history exceeds its safe limit");
     }
     private static IllegalStateException corruptHistory() { return new IllegalStateException("ADK session history is inconsistent"); }
+
+    private static final class ResumeFirstRead {
+        private final ResumeMatch cut;
+        private volatile boolean loaded;
+
+        private ResumeFirstRead(ResumeMatch cut) { this.cut = cut; }
+    }
 
     private record SessionView(Session session, long revision) { }
     private record AppendResult(JdbcAdkSessionRepository.SessionRow row, boolean applyToSession) { }
