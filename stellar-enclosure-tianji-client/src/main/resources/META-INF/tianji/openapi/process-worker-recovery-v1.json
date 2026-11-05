@@ -1,0 +1,1013 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Process Worker Recovery Consumer Contract",
+    "version": "1.0.0",
+    "description": "Contract-first consumer artifact. stellar.tianji.process.worker-recovery.enabled=false by default. Runtime PostgreSQL, Flowable and IAM acceptance is separate. Illustrative identity.example OAuth URLs are documentation only. SDK requires HTTPS or a literal loopback fixture, sends no-store and makes one bounded send per invocation."
+  },
+  "tags": [
+    {
+      "name": "Worker recovery",
+      "description": "Exact-owner BPMN failure observation and governed retry scheduling."
+    }
+  ],
+  "paths": {
+    "/api/tianji/v1/process-instances/{instanceId}/worker-failures": {
+      "get": {
+        "operationId": "getProcessWorkerFailures",
+        "tags": [
+          "Worker recovery"
+        ],
+        "description": "Observe a complete bounded failure list for the exact currently authorized START owner.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:read",
+              "tianji:process:worker-recover"
+            ]
+          }
+        ],
+        "x-resource-key": "tianji.api.process.instance.worker-failures",
+        "x-required-permissions": [
+          "TIANJI_PROCESS_READ",
+          "TIANJI_PROCESS_WORKER_RECOVER"
+        ],
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "x-java-utf16-max-length": 255,
+              "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+              "description": "Exact process instance ID. Java blank-text and surrogate checks are authoritative.",
+              "not": {
+                "enum": [
+                  ".",
+                  ".."
+                ]
+              }
+            }
+          },
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional positive decimal long equal to the verified tenant, with a maximum of 9223372036854775807. Tenant is derived from verified identity.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$",
+              "x-java-long-max": "9223372036854775807"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Observe a complete bounded failure list for the exact currently authorized START owner.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessWorkerFailuresDTO"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INTERNAL_ERROR"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tianji/v1/process-instances/{instanceId}/worker-recoveries": {
+      "post": {
+        "operationId": "recoverProcessWorker",
+        "tags": [
+          "Worker recovery"
+        ],
+        "description": "Schedule one technical retry for the exact currently authorized START owner. An exact replay returns the original accepted scheduling decision. Use one explicit call. A response confirms scheduling only. Framework HTTP 415 is outside the application JSON error envelope.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:read",
+              "tianji:process:worker-recover"
+            ]
+          }
+        ],
+        "x-resource-key": "tianji.api.process.instance.worker-recoveries",
+        "x-required-permissions": [
+          "TIANJI_PROCESS_READ",
+          "TIANJI_PROCESS_WORKER_RECOVER"
+        ],
+        "x-allowed-principals": [
+          "USER",
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "instanceId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "x-java-utf16-max-length": 255,
+              "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+              "description": "Exact process instance ID. Java blank-text and surrogate checks are authoritative.",
+              "not": {
+                "enum": [
+                  ".",
+                  ".."
+                ]
+              }
+            }
+          },
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional positive decimal long equal to the verified tenant, with a maximum of 9223372036854775807. Tenant is derived from verified identity.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$",
+              "x-java-long-max": "9223372036854775807"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule one technical retry for the exact currently authorized START owner. An exact replay returns the original accepted scheduling decision.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecoverProcessWorkerResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INVALID_COMMAND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_UNAUTHENTICATED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_PERMISSION_DENIED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_RESOURCE_NOT_FOUND"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_TENANT_CONTEXT_CHANGED",
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_PROCESS_VERSION_CONFLICT",
+                        "TIANJI_PROCESS_WORKER_RECOVERY_BLOCKED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_REQUEST_TOO_LARGE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_INTERNAL_ERROR"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Safe documented failure.",
+            "headers": {
+              "Cache-Control": {
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestrationErrorDTO",
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "TIANJI_DEPENDENCY_UNAVAILABLE"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "x-max-request-bytes": 8192,
+          "description": "The instanceId in the command must equal the path instanceId exactly.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecoverProcessWorkerCommand"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Bearer access token from the existing configured issuer; both scopes and current backend permission checks are mandatory for USER and SERVICE. Synthetic URLs do not configure a new OAuth client.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://identity.example/oauth/authorize",
+            "tokenUrl": "https://identity.example/oauth/token",
+            "scopes": {
+              "tianji:process:read": "Read owned process state",
+              "tianji:process:worker-recover": "Observe or recover owned process Worker failures"
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/oauth/token",
+            "scopes": {
+              "tianji:process:read": "Read owned process state",
+              "tianji:process:worker-recover": "Observe or recover owned process Worker failures"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ProcessWorkerFailureDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "jobId",
+          "activityId",
+          "nativeDeadletter",
+          "status",
+          "reason",
+          "reportedFailure",
+          "expectedVersion"
+        ],
+        "properties": {
+          "jobId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact scoped job identifier. Java blank-text and surrogate checks are authoritative."
+          },
+          "activityId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "x-java-utf16-max-length": 128,
+                "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+                "description": "Proved activity identifier when available. Java blank-text and surrogate checks are authoritative."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "nativeDeadletter": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkerRecoveryFailureStatusEnum"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/WorkerRecoveryReasonEnum"
+          },
+          "reportedFailure": {
+            "$ref": "#/components/schemas/WorkerRecoveryReportedFailureEnum"
+          },
+          "expectedVersion": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "RETRY_AVAILABLE"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "nativeDeadletter": {
+                  "const": true
+                },
+                "activityId": {
+                  "type": "string"
+                },
+                "expectedVersion": {
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "NONE"
+                },
+                "reportedFailure": {
+                  "const": "RETRYABLE"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "MANUAL_REVIEW"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "nativeDeadletter": {
+                  "const": true
+                },
+                "expectedVersion": {
+                  "type": "null"
+                },
+                "reason": {
+                  "enum": [
+                    "UNKNOWN_OUTCOME",
+                    "BUSINESS_REJECTED",
+                    "RESTORE_LIMIT_REACHED",
+                    "UNSUPPORTED_NATIVE_JOB",
+                    "PROCESS_INACTIVE",
+                    "EVIDENCE_CONFLICT",
+                    "ACTIVE_LEASE",
+                    "BINDING_UNVERIFIED",
+                    "HISTORY_INCOMPLETE",
+                    "UNSUPPORTED_EFFECT"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "HISTORICAL_FAILURE"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "nativeDeadletter": {
+                  "const": false
+                },
+                "expectedVersion": {
+                  "type": "null"
+                },
+                "reason": {
+                  "enum": [
+                    "NO_NATIVE_DEADLETTER",
+                    "UNKNOWN_OUTCOME",
+                    "BUSINESS_REJECTED",
+                    "HISTORY_INCOMPLETE"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reason": {
+                  "const": "UNKNOWN_OUTCOME"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "reportedFailure": {
+                  "const": "UNKNOWN"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "reason": {
+                  "const": "BUSINESS_REJECTED"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "reportedFailure": {
+                  "const": "BUSINESS_REJECTED"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "ProcessWorkerFailuresDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "observedAt",
+          "failures"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact process instance ID. Java blank-text and surrogate checks are authoritative.",
+            "not": {
+              "enum": [
+                ".",
+                ".."
+              ]
+            }
+          },
+          "observedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$",
+            "x-canonical-format": "java.time.Instant.toString",
+            "description": "ProcessDB snapshot observation sample in UTC."
+          },
+          "failures": {
+            "type": "array",
+            "maxItems": 128,
+            "uniqueItems": true,
+            "x-unique-by": "jobId",
+            "x-sort-order": "unsigned-utf8-jobId",
+            "items": {
+              "$ref": "#/components/schemas/ProcessWorkerFailureDTO"
+            }
+          }
+        }
+      },
+      "RecoverProcessWorkerCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "jobId",
+          "commandId",
+          "expectedVersion",
+          "reason"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact process instance ID. Java blank-text and surrogate checks are authoritative.",
+            "not": {
+              "enum": [
+                ".",
+                ".."
+              ]
+            }
+          },
+          "jobId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact scoped job identifier. Java blank-text and surrogate checks are authoritative."
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "expectedVersion": {
+            "type": "string",
+            "minLength": 64,
+            "maxLength": 64,
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "x-java-utf16-max-length": 512,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact private operator reason. Accepted text is preserved. Java blank-text and surrogate checks are authoritative."
+          }
+        }
+      },
+      "RecoverProcessWorkerResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "instanceId",
+          "jobId",
+          "occurrenceId",
+          "commandId",
+          "status",
+          "retries",
+          "decidedAt"
+        ],
+        "properties": {
+          "instanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact process instance ID. Java blank-text and surrogate checks are authoritative.",
+            "not": {
+              "enum": [
+                ".",
+                ".."
+              ]
+            }
+          },
+          "jobId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact scoped job identifier. Java blank-text and surrogate checks are authoritative."
+          },
+          "occurrenceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "x-java-utf16-max-length": 255,
+            "pattern": "^(?![\\u0000-\\u0020])(?![\\s\\S]*[\\u0000-\\u0020]$)(?:[^\\u0000-\\u001F\\u007F\\uD800-\\uDFFF]|[\\uD800-\\uDBFF][\\uDC00-\\uDFFF])+$",
+            "description": "Exact scoped job identifier. Java blank-text and surrogate checks are authoritative.",
+            "x-equals-field": "jobId"
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+          },
+          "status": {
+            "$ref": "#/components/schemas/WorkerRecoveryResultStatusEnum"
+          },
+          "retries": {
+            "type": "integer",
+            "const": 1
+          },
+          "decidedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$",
+            "x-canonical-format": "java.time.Instant.toString",
+            "description": "Original committed ProcessDB decision instant in UTC, retained on exact replay."
+          }
+        }
+      },
+      "OrchestrationErrorDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "correlationId"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "correlationId": {
+            "type": "null"
+          }
+        }
+      },
+      "WorkerRecoveryFailureStatusEnum": {
+        "type": "string",
+        "enum": [
+          "RETRY_AVAILABLE",
+          "MANUAL_REVIEW",
+          "HISTORICAL_FAILURE"
+        ]
+      },
+      "WorkerRecoveryReasonEnum": {
+        "type": "string",
+        "enum": [
+          "NONE",
+          "NO_NATIVE_DEADLETTER",
+          "UNKNOWN_OUTCOME",
+          "BUSINESS_REJECTED",
+          "RESTORE_LIMIT_REACHED",
+          "UNSUPPORTED_NATIVE_JOB",
+          "PROCESS_INACTIVE",
+          "EVIDENCE_CONFLICT",
+          "ACTIVE_LEASE",
+          "BINDING_UNVERIFIED",
+          "HISTORY_INCOMPLETE",
+          "UNSUPPORTED_EFFECT"
+        ]
+      },
+      "WorkerRecoveryReportedFailureEnum": {
+        "type": "string",
+        "enum": [
+          "NONE",
+          "RETRYABLE",
+          "BUSINESS_REJECTED",
+          "UNKNOWN",
+          "UNVERIFIED"
+        ]
+      },
+      "WorkerRecoveryResultStatusEnum": {
+        "type": "string",
+        "enum": [
+          "RETRY_SCHEDULED"
+        ],
+        "const": "RETRY_SCHEDULED"
+      }
+    }
+  }
+}
