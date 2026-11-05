@@ -32,6 +32,7 @@ egon:
               TIANJI_AGENT_START: ["tianji:agent:start"]
               TIANJI_AGENT_READ: ["tianji:agent:read"]
               TIANJI_AGENT_CANCEL: ["tianji:agent:cancel"]
+              TIANJI_AGENT_CHECKPOINT_RESUME: ["tianji:agent:checkpoint-resume"]
               TIANJI_SESSION_DELETE: ["tianji:session:delete"]
               TIANJI_MEMORY_READ: ["tianji:memory:read"]
               TIANJI_MEMORY_WRITE: ["tianji:memory:write"]
@@ -52,6 +53,9 @@ stellar:
         model-usage-cumulative-route-refs: []
       recovery:
         checkpoint-capture:
+          enabled: false
+      checkpoint-resume:
+        api:
           enabled: false
       recovery-diagnostics:
         enabled: false

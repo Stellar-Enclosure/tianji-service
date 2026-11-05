@@ -13,6 +13,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         labelPage = "tianji.permissions", labelKey = "permission.agent.read")
 @PermissionDefinition(code = TianjiAgentPermissions.CANCEL, meaning = "Request cancellation of an owned Agent run",
         labelPage = "tianji.permissions", labelKey = "permission.agent.cancel")
+@PermissionDefinition(code = TianjiAgentPermissions.CHECKPOINT_RESUME, meaning = "Resume an owned Agent run from its verified expired checkpoint",
+        labelPage = "tianji.permissions", labelKey = "permission.agent.checkpointResume")
 @PermissionDefinition(code = TianjiAgentPermissions.SESSION_DELETE, meaning = "Delete an owned Agent session",
         labelPage = "tianji.permissions", labelKey = "permission.session.delete")
 @PermissionDefinition(code = TianjiAgentPermissions.LINKED_SUBMIT, meaning = "Submit an authorized process-linked Agent run",
@@ -27,6 +29,9 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Read Agent runs and events"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "permission.agent.cancel", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Cancel Agent runs"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "permission.agent.checkpointResume", defaultLocale = "en-US",
+        defaults = {@LocalizedText(locale = "en-US", text = "Resume owned Agent checkpoints"),
+                @LocalizedText(locale = "zh-CN", text = "恢复本人 Agent 检查点")})
 @PermissionMessage(pageCode = "tianji.permissions", key = "permission.session.delete", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Delete Agent sessions"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "permission.linked.submit", defaultLocale = "en-US",
@@ -53,6 +58,9 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Observe Agent events"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.cancel", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Cancel an Agent run"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.checkpointResume", defaultLocale = "en-US",
+        defaults = {@LocalizedText(locale = "en-US", text = "Resume an owned Agent run from its expired checkpoint"),
+                @LocalizedText(locale = "zh-CN", text = "从已失联检查点恢复本人 Agent 运行")})
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.authorization.current", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read the current permission view"))
 @PermissionMessage(pageCode = "tianji.permissions", key = "api.session.create", defaultLocale = "en-US",
@@ -125,6 +133,7 @@ public final class TianjiAgentPermissions {
     public static final String START = "TIANJI_AGENT_START";
     public static final String READ = "TIANJI_AGENT_READ";
     public static final String CANCEL = "TIANJI_AGENT_CANCEL";
+    public static final String CHECKPOINT_RESUME = "TIANJI_AGENT_CHECKPOINT_RESUME";
     public static final String SESSION_DELETE = "TIANJI_SESSION_DELETE";
     public static final String LINKED_SUBMIT = "TIANJI_LINKED_AGENT_SUBMIT";
     public static final String LINKED_RESOLVE = "TIANJI_LINKED_AGENT_RESOLVE";
@@ -138,6 +147,7 @@ public final class TianjiAgentPermissions {
     public static final String RESULT_API = "tianji.api.agent.result";
     public static final String EVENTS_API = "tianji.api.agent.events";
     public static final String CANCEL_API = "tianji.api.agent.cancel";
+    public static final String CHECKPOINT_RESUME_API = "tianji.api.agent.checkpointResume";
     public static final String CURRENT_AUTH_API = "tianji.api.authorization.current";
     public static final String SESSION_CREATE_API = "tianji.api.session.create";
     public static final String SESSION_GET_API = "tianji.api.session.get";
@@ -149,6 +159,7 @@ public final class TianjiAgentPermissions {
     public static final String START_SCOPE = "tianji:agent:start";
     public static final String READ_SCOPE = "tianji:agent:read";
     public static final String CANCEL_SCOPE = "tianji:agent:cancel";
+    public static final String CHECKPOINT_RESUME_SCOPE = "tianji:agent:checkpoint-resume";
     public static final String SESSION_DELETE_SCOPE = "tianji:session:delete";
     public static final String LINKED_SUBMIT_SCOPE = LinkedAgentClient.SUBMIT_SCOPE;
     public static final String LINKED_RESOLVE_SCOPE = LinkedAgentClient.RESOLVE_SCOPE;

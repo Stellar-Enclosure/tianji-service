@@ -16,6 +16,7 @@ import org.springframework.security.web.authentication.AnonymousAuthenticationFi
 import org.springframework.web.filter.RequestContextFilter;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
+import top.egon.cola.platform.tianji.agent.server.api.AgentCheckpointResumeController;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunEventStream;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
@@ -42,6 +43,7 @@ public class TianjiAgentSecurityConfiguration {
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers("/actuator/health", "/actuator/health/**").permitAll()
                         .requestMatchers(HttpMethod.GET, "/api/v1/authorization/effective-permissions").authenticated()
+                        .requestMatchers(HttpMethod.POST, AgentCheckpointResumeController.PATH).authenticated()
                         .requestMatchers("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**")
                             .authenticated()
                         .requestMatchers("/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**")

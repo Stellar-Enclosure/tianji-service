@@ -1,0 +1,338 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Agent expired checkpoint resume",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/api/tianji/v1/agent-checkpoints/resume": {
+      "post": {
+        "operationId": "resumeOwnedExpiredAgentCheckpoint",
+        "summary": "Resume an owned Agent run from a verified expired checkpoint",
+        "description": "Default disabled. Requires the current dedicated USER authority and READ. Applies only to the supported SUSPENDED/LEASE_EXPIRED first-attempt cut. WAITING, wait tokens, input or approval continuations, and new attempts are outside this operation. No query parameters are admitted. The HTTP response waits at most 35 seconds after submission; the original admitted worker has its own lifecycle.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:agent:checkpoint-resume",
+              "tianji:agent:read"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_AGENT_CHECKPOINT_RESUME",
+          "TIANJI_AGENT_READ"
+        ],
+        "x-resource-key": "tianji.api.agent.checkpointResume",
+        "x-allowed-principals": [
+          "USER"
+        ],
+        "parameters": [
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion matching the already authenticated tenant; does not select authority.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Closed JSON, at most 4096 bytes. expectedRevision must be an integer JSON token.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeCommand"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The original durable takeover acknowledgement, including on exact replay. RUNNING describes the acknowledged takeover, even if the run has advanced since.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Acknowledgement"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or oversized identifiers, absent or nonintegral revision, unknown or duplicate fields, trailing JSON, or query parameters.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Verified USER authentication required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current exact RESUME/READ policy or tenant USER authority denied.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No exact owned run exists.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Expected revision changed, the checkpoint cut is ineligible, the command key conflicts, or the tenant assertion mismatches.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "JSON body exceeds 4096 bytes.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The bounded recovery dispatcher or same-command submission slot is full.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Required recovery dependency unavailable or acknowledgement response wait timed out. The response timeout does not cancel an admitted worker. Retry only the exact same command.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Deployment supplies its existing identity endpoints.",
+        "flows": {
+          "authorizationCode": {
+            "authorizationUrl": "https://identity.example/authorize",
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:agent:checkpoint-resume": "Resume a verified expired Agent checkpoint",
+              "tianji:agent:read": "Read owned Agent runs and sessions"
+            }
+          },
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:agent:checkpoint-resume": "Resume a verified expired Agent checkpoint",
+              "tianji:agent:read": "Read owned Agent runs and sessions"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ResumeCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runId",
+          "commandId",
+          "expectedRevision"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "commandId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775805
+          }
+        }
+      },
+      "Acknowledgement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runId",
+          "status",
+          "attempt",
+          "revision"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "status": {
+            "type": "string",
+            "const": "RUNNING"
+          },
+          "attempt": {
+            "type": "integer",
+            "const": 1
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 2
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^TIANJI_[A-Z_]+$"
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "decisionId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retryAfter": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -7,6 +7,7 @@ import org.springframework.security.web.SecurityFilterChain;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
+import top.egon.cola.platform.tianji.agent.server.api.AgentCheckpointResumeController;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunController;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.CurrentEffectivePermissionView;
@@ -29,6 +30,7 @@ class TianjiSecurityConfigurationTest {
             assertThat(context).hasNotFailed();
             assertThat(context).hasSingleBean(SecurityFilterChain.class);
             assertThat(context).doesNotHaveBean(AgentRunController.class);
+            assertThat(context).doesNotHaveBean(AgentCheckpointResumeController.class);
         });
     }
 
@@ -57,6 +59,8 @@ class TianjiSecurityConfigurationTest {
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER_OR_SERVICE);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/actuator/health")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.PUBLIC);
+        assertThat(policy.requirement(new MockHttpServletRequest("POST", AgentCheckpointResumeController.PATH)))
+                .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER);
         assertThat(policy.requirement(new MockHttpServletRequest("GET", "/unclassified")))
                 .isEqualTo(IdpEndpointAuthenticationPolicy.Requirement.USER);
     }
