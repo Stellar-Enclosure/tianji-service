@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/DMN/20151101"
+             id="expenseDefinitions" name="Expense decision definitions"
+             namespace="https://stellar-enclosure.example/test">
+    <decision id="expenseRouting" name="Expense routing">
+        <decisionTable id="expenseRouteTable" hitPolicy="FIRST">
+            <input>
+                <inputExpression id="amountExpression" typeRef="number"><text>amount</text></inputExpression>
+            </input>
+            <output id="reviewLaneOutput" name="reviewLane" typeRef="string"/>
+            <rule id="smallExpense">
+                <inputEntry id="smallAmount"><text>&lt;= 1000</text></inputEntry>
+                <outputEntry id="standardLane"><text>'standard'</text></outputEntry>
+            </rule>
+            <rule id="largeExpense">
+                <inputEntry id="largeAmount"><text>&gt; 1000</text></inputEntry>
+                <outputEntry id="exceptionLane"><text>'exception'</text></outputEntry>
+            </rule>
+        </decisionTable>
+    </decision>
+</definitions>

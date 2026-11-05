@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/CMMN/20151109/MODEL"
+             xmlns:task="urn:stellar-enclosure:tianji:task:1"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <case id="expenseException" name="Expense exception">
+        <casePlanModel id="casePlan" name="Expense exception plan" autoComplete="false">
+            <planItem id="primary" name="Primary" definitionRef="primaryTask">
+                <itemControl>
+                    <requiredRule id="primaryRequired"/>
+                    <manualActivationRule id="primaryManualActivation"/>
+                </itemControl>
+            </planItem>
+            <planItem id="supplemental" name="Supplemental" definitionRef="supplementalTask">
+                <itemControl>
+                    <requiredRule id="supplementalRequired"/>
+                    <manualActivationRule id="supplementalManualActivation"/>
+                </itemControl>
+                <entryCriterion id="supplementalEntry" sentryRef="primaryCompleted"/>
+            </planItem>
+            <planItem id="milestone" name="Milestone" definitionRef="completionMilestone">
+                <itemControl>
+                    <requiredRule id="milestoneRequired"/>
+                </itemControl>
+                <entryCriterion id="milestoneCompletedEntry" sentryRef="supplementalCompleted"/>
+                <entryCriterion id="milestoneTerminatedEntry" sentryRef="supplementalTerminated"/>
+            </planItem>
+
+            <sentry id="primaryCompleted">
+                <planItemOnPart id="primaryCompletedPart" sourceRef="primary">
+                    <standardEvent>complete</standardEvent>
+                </planItemOnPart>
+            </sentry>
+            <sentry id="supplementalCompleted">
+                <planItemOnPart id="supplementalCompletedPart" sourceRef="supplemental">
+                    <standardEvent>complete</standardEvent>
+                </planItemOnPart>
+            </sentry>
+            <sentry id="supplementalTerminated">
+                <planItemOnPart id="supplementalTerminatedPart" sourceRef="supplemental">
+                    <standardEvent>terminate</standardEvent>
+                </planItemOnPart>
+            </sentry>
+
+            <humanTask id="primaryTask" name="Review expense exception"
+                       task:kind="ACTION" task:initialLane="operator">
+                <extensionElements>
+                    <task:taskLane key="operator" roleIds="502,602"/>
+                </extensionElements>
+            </humanTask>
+            <humanTask id="supplementalTask" name="Investigate supplemental evidence"
+                       task:kind="ACTION" task:initialLane="operator">
+                <extensionElements>
+                    <task:taskLane key="operator" roleIds="503,603"/>
+                </extensionElements>
+            </humanTask>
+            <milestone id="completionMilestone" name="Expense exception reviewed"/>
+        </casePlanModel>
+    </case>
+</definitions>

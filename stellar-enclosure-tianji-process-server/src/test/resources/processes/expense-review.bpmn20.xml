@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:flowable="http://flowable.org/bpmn"
+             xmlns:tianji="urn:stellar-enclosure:tianji:worker:1"
+             xmlns:task="urn:stellar-enclosure:tianji:task:1"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             targetNamespace="https://stellar-enclosure.example/test">
+    <message id="agentFinished" name="TianjiAgentFinishedV1"/>
+    <message id="caseFinished" name="TianjiCaseCompletedV1"/>
+    <process id="expenseReview" name="Expense review" isExecutable="true">
+        <startEvent id="start"/>
+        <serviceTask id="classifyExpense" flowable:type="dmn">
+            <extensionElements>
+                <flowable:field name="decisionTableReferenceKey">
+                    <flowable:string>expenseRouting</flowable:string>
+                </flowable:field>
+            </extensionElements>
+        </serviceTask>
+        <serviceTask id="reserveExpense" flowable:type="external-worker" flowable:topic="reserveBusiness:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="reserveBusiness" tianji:schemaVersion="1"
+                     tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <boundaryEvent id="reserveCompBoundary" attachedToRef="reserveExpense" cancelActivity="false">
+            <compensateEventDefinition/>
+        </boundaryEvent>
+        <serviceTask id="agentStart" flowable:type="external-worker" flowable:topic="agentStart:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="agentStart" tianji:schemaVersion="1"
+                     tianji:effectSafety="EXTERNAL_IDEMPOTENT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="amount" target="requestedAmount" tianji:type="INTEGER"/>
+                <flowable:externalWorkerOutParameter source="runId" target="agentRunId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <eventBasedGateway id="agentWait"/>
+        <intermediateCatchEvent id="waitAgentResult" tianji:workerRef="agentStart" tianji:statusVariable="agentStatus">
+            <messageEventDefinition messageRef="agentFinished"/>
+        </intermediateCatchEvent>
+        <intermediateCatchEvent id="waitAgentTimeout">
+            <timerEventDefinition><timeDuration>PT20S</timeDuration></timerEventDefinition>
+        </intermediateCatchEvent>
+        <exclusiveGateway id="agentStatusRouting" default="onAgentFailure"/>
+        <serviceTask id="notifyExpense" flowable:type="external-worker" flowable:topic="notifyExpense:1"
+                     flowable:doNotIncludeVariables="true" tianji:topic="notifyExpense" tianji:schemaVersion="1"
+                     tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <endEvent id="normalEnd"/>
+        <userTask id="reviewExpense" name="Review expense" task:kind="ACTION" task:laneVariable="reviewLane">
+            <extensionElements>
+                <task:taskLane key="standard" roleIds="501,601"/>
+                <task:taskLane key="exception" roleIds="502,602"/>
+                <task:taskField name="finding" target="reviewFinding" type="STRING"/>
+            </extensionElements>
+        </userTask>
+        <serviceTask id="caseSource" flowable:type="case" flowable:caseDefinitionKey="expenseException"/>
+        <eventBasedGateway id="caseWait"/>
+        <intermediateCatchEvent id="waitCaseResult">
+            <messageEventDefinition messageRef="caseFinished"/>
+        </intermediateCatchEvent>
+        <intermediateCatchEvent id="waitCaseTimeout">
+            <timerEventDefinition><timeDuration>PT3M</timeDuration></timerEventDefinition>
+        </intermediateCatchEvent>
+        <endEvent id="caseTimeoutEnd"/>
+        <exclusiveGateway id="compensationJoin"/>
+        <intermediateThrowEvent id="throwUndo">
+            <compensateEventDefinition activityRef="reserveExpense" waitForCompletion="true"/>
+        </intermediateThrowEvent>
+        <endEvent id="compensatedEnd"/>
+        <serviceTask id="undoReservation" isForCompensation="true" flowable:type="external-worker"
+                     flowable:topic="undoReservation:1" flowable:doNotIncludeVariables="true"
+                     tianji:topic="undoReservation" tianji:schemaVersion="1" tianji:effectSafety="TRANSACTIONAL_RECEIPT">
+            <extensionElements>
+                <flowable:externalWorkerInParameter source="operationId" target="operationId" tianji:type="STRING"/>
+            </extensionElements>
+        </serviceTask>
+        <sequenceFlow id="toClassify" sourceRef="start" targetRef="classifyExpense"/>
+        <sequenceFlow id="toReserve" sourceRef="classifyExpense" targetRef="reserveExpense"/>
+        <sequenceFlow id="reserveNormal" sourceRef="reserveExpense" targetRef="agentStart"/>
+        <sequenceFlow id="toAgentWait" sourceRef="agentStart" targetRef="agentWait"/>
+        <sequenceFlow id="toAgentResult" sourceRef="agentWait" targetRef="waitAgentResult"/>
+        <sequenceFlow id="toAgentTimeout" sourceRef="agentWait" targetRef="waitAgentTimeout"/>
+        <sequenceFlow id="toAgentStatus" sourceRef="waitAgentResult" targetRef="agentStatusRouting"/>
+        <sequenceFlow id="onAgentSuccess" sourceRef="agentStatusRouting" targetRef="notifyExpense">
+            <conditionExpression xsi:type="tFormalExpression">${agentStatus == 'COMPLETED'}</conditionExpression>
+        </sequenceFlow>
+        <sequenceFlow id="onAgentFailure" sourceRef="agentStatusRouting" targetRef="compensationJoin"/>
+        <sequenceFlow id="toNormalEnd" sourceRef="notifyExpense" targetRef="normalEnd"/>
+        <sequenceFlow id="toReview" sourceRef="waitAgentTimeout" targetRef="reviewExpense"/>
+        <sequenceFlow id="toCaseSource" sourceRef="reviewExpense" targetRef="caseSource"/>
+        <sequenceFlow id="toCaseWait" sourceRef="caseSource" targetRef="caseWait"/>
+        <sequenceFlow id="toCaseResult" sourceRef="caseWait" targetRef="waitCaseResult"/>
+        <sequenceFlow id="toCaseTimeout" sourceRef="caseWait" targetRef="waitCaseTimeout"/>
+        <sequenceFlow id="onCaseCompleted" sourceRef="waitCaseResult" targetRef="compensationJoin"/>
+        <sequenceFlow id="onCaseTimeout" sourceRef="waitCaseTimeout" targetRef="caseTimeoutEnd"/>
+        <sequenceFlow id="toThrowUndo" sourceRef="compensationJoin" targetRef="throwUndo"/>
+        <sequenceFlow id="toCompensatedEnd" sourceRef="throwUndo" targetRef="compensatedEnd"/>
+        <association id="reserveCompAssociation" sourceRef="reserveCompBoundary"
+                     targetRef="undoReservation" associationDirection="One"/>
+    </process>
+</definitions>
