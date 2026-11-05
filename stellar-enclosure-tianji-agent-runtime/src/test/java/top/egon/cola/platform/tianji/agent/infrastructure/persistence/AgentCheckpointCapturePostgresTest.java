@@ -31,6 +31,7 @@ import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
 import top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory;
 import top.egon.cola.component.common.core.validation.ValidationUtils;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
+import top.egon.cola.platform.tianji.agent.application.run.AgentCheckpointResumeDispatcher;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -80,8 +81,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -243,6 +248,17 @@ class AgentCheckpointCapturePostgresTest {
     @Timeout(150)
     @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.resume-executor", matches = "true")
     void resumes_the_claimed_checkpoint_to_completion_and_replays_only_the_acknowledgement() throws Exception {
+        verifyCheckpointResumeExecutorForks(false);
+    }
+
+    @Test
+    @Timeout(150)
+    @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.resume-dispatch", matches = "true")
+    void admits_and_dispatches_reconciled_checkpoints_for_both_codecs() throws Exception {
+        verifyCheckpointResumeExecutorForks(true);
+    }
+
+    private static void verifyCheckpointResumeExecutorForks(boolean throughDispatcher) throws Exception {
         String role = System.getProperty("tianji.postgres.checkpoint.resume-executor.role", "");
         if (!role.matches("tianji_it_checkpoint_resume_executor_[a-z0-9_]{1,24}")) {
             throw new IllegalArgumentException("checkpoint execution requires an exact disposable resume executor role");
@@ -260,7 +276,7 @@ class AgentCheckpointCapturePostgresTest {
                   AND NOT has_table_privilege('tianji_agent.agent_checkpoint','DELETE,TRUNCATE,TRIGGER')
                 """, Boolean.class, role)));
         verifyProductCheckpointForks(database, RECONCILE,
-                (fixture, cut) -> fixture.assertCheckpointResumeExecution(cut, executionSource));
+                (fixture, cut) -> fixture.assertCheckpointResumeExecution(cut, executionSource, throughDispatcher));
     }
 
     private static void verifyProductCheckpointForks(Database database, AgentCheckpointForkHandoff.Phase replacementPhase,
@@ -1224,7 +1240,7 @@ class AgentCheckpointCapturePostgresTest {
                     """, Integer.class, actor.tenantId(), query.runId()));
         }
 
-        void assertCheckpointResumeExecution(ForkCut cut, DriverManagerDataSource executionSource) {
+        void assertCheckpointResumeExecution(ForkCut cut, DriverManagerDataSource executionSource, boolean throughDispatcher) {
             expireReconciledSessionLease(cut);
             assertReconciled(cut);
             var ledger = new AgentLedgerService(executionSource);
@@ -1256,14 +1272,8 @@ class AgentCheckpointCapturePostgresTest {
                 return Optional.of(new ResumePermit(request, expiry));
             };
             var takeover = new AgentCheckpointTakeoverService(executionSource, resumeAuthority);
-            String worker = "checkpoint-resume-executor";
-            var winning = takeover.takeOver(actor, command, worker);
             var acknowledgement = new Acknowledgement(query.runId(), AgentRunStatusEnum.RUNNING, 1, suspended.revision() + 2);
-            assertEquals(acknowledgement, winning.acknowledgement());
-            assertEquals(1, resumeDecisions.get());
-            assertTakeoverCommitted(cut, suspended.lastEventSequence(), acknowledgement, worker, permittedUntil.get());
-            String receipt = resumeReceiptDigest(command, acknowledgement);
-
+            var receiptBeforeModel = new AtomicReference<String>();
             var modelDecisions = new AtomicInteger();
             AgentRunAuthorization modelAuthority = (request, boundary) -> {
                 assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
@@ -1275,6 +1285,7 @@ class AgentCheckpointCapturePostgresTest {
                         || current.run().attempt() != 1 || current.run().revision() != acknowledgement.revision()) {
                     return AgentRunAuthorization.Decision.DENY;
                 }
+                if (throughDispatcher) receiptBeforeModel.set(resumeReceiptDigest(command, acknowledgement));
                 modelDecisions.incrementAndGet();
                 return AgentRunAuthorization.Decision.ALLOW;
             };
@@ -1293,19 +1304,52 @@ class AgentCheckpointCapturePostgresTest {
                             Map.of("fixtureModel", model), Map.of(), control, estimator(() -> { }),
                             executionSource, codec == 2, modelAuthority, new DefaultContextAssembler(),
                             new AgentContextRuntimeOptions(false, false), null, false);
-                    var completed = executor.executeResume(winning, resumeAuthority).orElseThrow();
-                    assertEquals(AgentRunStatusEnum.COMPLETED, completed.status());
-                    assertEquals(query.runId(), completed.runId());
-                    assertEquals(1, completed.attempt());
-                    var beforeReplay = resumeExecutionWitness(cut, ledger, checkpoint, prefix);
-                    assertEquals(completed, beforeReplay.run());
-                    assertTrue(executor.executeResume(winning, resumeAuthority).isEmpty());
-                    var replay = takeover.takeOver(actor, command, "checkpoint-replay-worker");
-                    assertEquals(acknowledgement, replay.acknowledgement());
-                    assertTrue(executor.executeResume(replay, resumeAuthority).isEmpty());
-                    assertEquals(receipt, resumeReceiptDigest(command, replay.acknowledgement()));
+                    String receipt;
+                    ResumeExecutionWitness beforeReplay;
+                    if (throughDispatcher) {
+                        var host = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(1),
+                                Thread.ofPlatform().daemon().name("checkpoint-resume-dispatch-fixture").factory(),
+                                new ThreadPoolExecutor.AbortPolicy());
+                        try (var dispatcher = new AgentCheckpointResumeDispatcher(host, executor, takeover, executionSource, resumeAuthority)) {
+                            assertDispatchCapacityBeforeClaim(host, dispatcher, command, cut);
+                            assertEquals(0, resumeDecisions.get());
+                            assertEquals(acknowledgement, assertDoesNotThrow(() ->
+                                    dispatcher.dispatch(actor, command).toCompletableFuture().get(30, TimeUnit.SECONDS)));
+                            receipt = receiptBeforeModel.get();
+                            assertNotNull(receipt, "the real MODEL boundary must see the durable acknowledgement");
+                            beforeReplay = resumeExecutionWitness(cut, ledger, checkpoint, prefix);
+                            var takeoverEvents = beforeReplay.events().stream()
+                                    .filter(event -> event.sequence() > suspended.lastEventSequence()).limit(2).toList();
+                            assertCheckpointTakeoverTransitions(takeoverEvents, suspended.lastEventSequence());
+                            assertEquals(acknowledgement, assertDoesNotThrow(() ->
+                                    dispatcher.dispatch(actor, command).toCompletableFuture().get(5, TimeUnit.SECONDS)));
+                            dispatcher.close();
+                            assertTrue(dispatcher.awaitQuiescence(Duration.ofSeconds(5)));
+                            assertFalse(host.isShutdown());
+                        } finally {
+                            host.shutdownNow();
+                        }
+                    } else {
+                        String worker = "checkpoint-resume-executor";
+                        var winning = takeover.takeOver(actor, command, worker);
+                        assertEquals(acknowledgement, winning.acknowledgement());
+                        assertEquals(1, resumeDecisions.get());
+                        assertTakeoverCommitted(cut, suspended.lastEventSequence(), acknowledgement, worker, permittedUntil.get());
+                        receipt = resumeReceiptDigest(command, acknowledgement);
+                        var completed = executor.executeResume(winning, resumeAuthority).orElseThrow();
+                        assertEquals(AgentRunStatusEnum.COMPLETED, completed.status());
+                        assertEquals(query.runId(), completed.runId());
+                        assertEquals(1, completed.attempt());
+                        beforeReplay = resumeExecutionWitness(cut, ledger, checkpoint, prefix);
+                        assertEquals(completed, beforeReplay.run());
+                        assertTrue(executor.executeResume(winning, resumeAuthority).isEmpty());
+                        var replay = takeover.takeOver(actor, command, "checkpoint-replay-worker");
+                        assertEquals(acknowledgement, replay.acknowledgement());
+                        assertTrue(executor.executeResume(replay, resumeAuthority).isEmpty());
+                    }
+                    assertEquals(receipt, resumeReceiptDigest(command, acknowledgement));
                     assertEquals(1, resumeReceipts());
-                    assertTrue(beforeReplay.equals(resumeExecutionWitness(cut, ledger, checkpoint, prefix)),
+                    assertEquals(beforeReplay, resumeExecutionWitness(cut, ledger, checkpoint, prefix),
                             "replay must preserve the complete result, events and budget");
                 } finally {
                     control.shutdownNow();
@@ -1315,6 +1359,31 @@ class AgentCheckpointCapturePostgresTest {
             assertEquals(1, modelDecisions.get());
             assertEquals(1, model.streams.get());
             assertEquals(0, model.calls.get());
+        }
+
+        private void assertDispatchCapacityBeforeClaim(ThreadPoolExecutor host, AgentCheckpointResumeDispatcher dispatcher,
+                                                       ResumeCommand command, ForkCut cut) {
+            var occupied = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            Future<?> blocking = host.submit(() -> {
+                occupied.countDown();
+                assertTrue(assertDoesNotThrow(() -> release.await(20, TimeUnit.SECONDS)));
+            });
+            Future<?> queued;
+            try {
+                assertTrue(assertDoesNotThrow(() -> occupied.await(5, TimeUnit.SECONDS)));
+                queued = host.submit(() -> { });
+                var rejected = dispatcher.dispatch(actor, command).toCompletableFuture();
+                var failure = assertThrows(ExecutionException.class, () -> rejected.get(5, TimeUnit.SECONDS));
+                assertEquals(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED,
+                        assertInstanceOf(AgentLedgerException.class, failure.getCause()).code());
+                assertEquals(0, resumeReceipts());
+                assertReconciled(cut);
+            } finally {
+                release.countDown();
+            }
+            assertDoesNotThrow(() -> blocking.get(5, TimeUnit.SECONDS));
+            assertDoesNotThrow(() -> queued.get(5, TimeUnit.SECONDS));
         }
 
         private ResumeExecutionWitness resumeExecutionWitness(ForkCut cut, AgentLedgerService ledger,
@@ -1420,14 +1489,18 @@ class AgentCheckpointCapturePostgresTest {
                     actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), APP, SESSION);
             assertNotNull(lease, "the committed Run and Session leases must be live, exact and bounded by authority");
             var events = ledger.events(actor, new AgentEventsQuery(query.runId(), suspendedSequence, 3));
+            assertCheckpointTakeoverTransitions(events, suspendedSequence);
+            assertTrue(ledger.getResult(actor, query).isEmpty());
+            return new TakeoverCommitWitness(forkDigest(lease), events);
+        }
+
+        private static void assertCheckpointTakeoverTransitions(List<AgentEventDTO> events, long suspendedSequence) {
             assertEquals(2, events.size());
             assertEquals(suspendedSequence + 1, events.getFirst().sequence());
             assertEquals(suspendedSequence + 2, events.getLast().sequence());
             assertTrue(events.stream().allMatch(event -> "RUN_STATUS_CHANGED".equals(event.type())));
             assertEquals(Map.of("from", "SUSPENDED", "status", "QUEUED", "reason", "CHECKPOINT_RESUME"), events.getFirst().payload());
             assertEquals(Map.of("from", "QUEUED", "status", "RUNNING", "reason", "CHECKPOINT_RESUME"), events.getLast().payload());
-            assertTrue(ledger.getResult(actor, query).isEmpty());
-            return new TakeoverCommitWitness(forkDigest(lease), events);
         }
 
         void assertCommittedCut() {
