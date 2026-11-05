@@ -540,31 +540,42 @@ def summarize_report(root, ref, owner, selectors):
     raw, _ = root.ref(ref, XML_LIMIT)
     root.xml_bytes += len(raw)
     require(root.xml_bytes <= ALL_XML_LIMIT)
-    suite = parse_xml(raw)
+    return summarize_xml_suite(parse_xml(raw), owner, selectors)
+
+
+def summarize_xml_suite(suite, owner, selectors, *, suffix="", expected_basedir=None,
+                        expected_properties=None, expected_repetitions=None):
+    name = owner["className"] + (f"({suffix})" if suffix else "")
     require(suite.tag == "testsuite" and suite.get("name") == name
             and all(child.tag in ("properties", "testcase", "system-out", "system-err") for child in suite))
     props = suite.findall("properties")
     require(len(props) == 1)
     fields = {}
-    for key in ("test", "basedir"):
+    expected_properties = expected_properties or {}
+    for key in dict.fromkeys(("test", "basedir", *expected_properties)):
         values = [child.get("value") for child in props[0] if child.tag == "property" and child.get("name") == key]
         require(len(values) == 1 and values[0] is not None)
         fields[key] = values[0]
+    require(all(fields[key] == value for key, value in expected_properties.items()))
     test_selectors = fields["test"].split(",")
     require(unique(test_selectors) == selectors)
     basedir = fields["basedir"]
+    normalized_basedir = os.path.normpath(basedir)
     require(basedir.startswith("/") and "\\" not in basedir
-            and Path(os.path.normpath(basedir)).name == owner["module"])
+            and Path(normalized_basedir).name == owner["module"]
+            and (expected_basedir is None or normalized_basedir == expected_basedir))
 
-    cases = set()
+    cases = {}
+    expected_repetitions = expected_repetitions or {}
     counts = dict.fromkeys(COUNT_FIELDS, 0)
     flaky = False
     outcomes = {"failure": "failures", "error": "errors", "skipped": "skipped"}
     retries = ("flakyFailure", "flakyError", "rerunFailure", "rerunError")
     for case in suite.findall("testcase"):
         case_name = text(case.get("name"), limit=4096)
-        require(case.get("classname") == name and case_name not in cases)
-        cases.add(case_name)
+        occurrences = cases.get(case_name, 0) + 1
+        require(case.get("classname") == name and occurrences <= expected_repetitions.get(case_name, 1))
+        cases[case_name] = occurrences
         tags = [child.tag for child in case]
         require(all(tag in outcomes or tag in retries or tag in ("system-out", "system-err") for tag in tags))
         states = [outcomes[tag] for tag in tags if tag in outcomes]
@@ -572,14 +583,16 @@ def summarize_report(root, ref, owner, selectors):
         if states:
             counts[states[0]] += 1
         flaky |= any(tag in retries for tag in tags)
-    counts["tests"] = len(cases)
+    require(all(cases.get(case) == count for case, count in expected_repetitions.items()))
+    counts["tests"] = sum(cases.values())
     counts["executed"] = counts["tests"] - counts["skipped"]
     for key in ("tests", "failures", "errors", "skipped"):
         stated = text(suite.get(key), r"(?:0|[1-9][0-9]{0,6})")
         require(int(stated) == counts[key])
     methods = set(owner["methods"])
-    require(not methods or cases <= methods)
-    complete = len(cases) >= owner["minimumTests"] and (not methods or cases == methods)
+    names = set(cases)
+    require(not methods or names <= methods)
+    complete = counts["tests"] >= owner["minimumTests"] and (not methods or names == methods)
     return counts, flaky, complete
 
 
