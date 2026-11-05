@@ -1,6 +1,8 @@
 package top.egon.cola.platform.tianji.agent.server.acceptance;
 
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.prompt.Prompt;
@@ -23,6 +25,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -36,6 +39,29 @@ class S07GovernedStartAgentFixtureTest {
     private static final String FIXTURE = "tianji.expense.fixture.";
     private static final String SETTINGS = "stellar.tianji.agent.s07-fixture.";
     private static final String OWNER = "fixture-owner";
+
+    @Test
+    void fixture_configurations_are_mutually_exclusive_during_component_scanning() {
+        String ordinary = ExpenseAgentAcceptanceMain.FixtureConfiguration.class.getName();
+        String s07 = S07GovernedStartAgentFixtureConfiguration.class.getName();
+        assertEquals(Set.of(), fixtureConfigurations(new MockEnvironment()));
+        assertEquals(Set.of(), fixtureConfigurations(new MockEnvironment()
+                .withProperty("tianji.expense.fixture.s07-governed-start", "true")));
+        var authorized = new MockEnvironment().withProperty("tianji.expense.fixture.run-authorized", "true");
+        assertEquals(Set.of(ordinary), fixtureConfigurations(authorized));
+        assertEquals(Set.of(ordinary), fixtureConfigurations(authorized.withProperty("tianji.expense.fixture.s07-governed-start", "false")));
+        assertEquals(Set.of(s07), fixtureConfigurations(authorized.withProperty("tianji.expense.fixture.s07-governed-start", "true")));
+    }
+
+    private static Set<String> fixtureConfigurations(MockEnvironment environment) {
+        var names = Set.of(ExpenseAgentAcceptanceMain.FixtureConfiguration.class.getName(),
+                S07GovernedStartAgentFixtureConfiguration.class.getName());
+        var scanner = new ClassPathScanningCandidateComponentProvider(false, environment);
+        scanner.addIncludeFilter((metadata, readers) -> names.contains(metadata.getClassMetadata().getClassName()));
+        return scanner.findCandidateComponents(ExpenseAgentAcceptanceMain.class.getPackageName()).stream()
+                .map(definition -> definition.getBeanClassName())
+                .collect(java.util.stream.Collectors.toUnmodifiableSet());
+    }
 
     @Test
     void actual_boot_binders_accept_only_exact_per_tenant_tool_definition_and_backend_slots() {

@@ -129,6 +129,7 @@ public final class ExpenseAgentAcceptanceMain {
 
     @TestConfiguration(proxyBeanMethods = false)
     @ConditionalOnProperty(prefix = "tianji.expense.fixture", name = "run-authorized", havingValue = "true")
+    @ConditionalOnProperty(prefix = "tianji.expense.fixture", name = "s07-governed-start", havingValue = "false", matchIfMissing = true)
     static class FixtureConfiguration {
         @Bean(MODEL_BEAN)
         ChatModel expenseFixtureModel() {

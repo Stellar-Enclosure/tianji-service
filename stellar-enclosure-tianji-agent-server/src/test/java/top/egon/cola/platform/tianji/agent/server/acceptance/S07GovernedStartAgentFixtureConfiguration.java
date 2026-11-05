@@ -15,6 +15,7 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.beans.factory.SmartInitializingSingleton;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -57,6 +58,7 @@ import java.util.Set;
 
 /** Opt-in, disposable Agent fixture. All execution and Tool authority beans remain production beans. */
 @TestConfiguration(proxyBeanMethods = false)
+@ConditionalOnProperty(prefix = "tianji.expense.fixture", name = {"run-authorized", "s07-governed-start"}, havingValue = "true")
 final class S07GovernedStartAgentFixtureConfiguration {
     private static final String INPUT = "stellar.tianji.agent.s07-fixture.";
     private static final String FIXTURE = "tianji.expense.fixture.";
