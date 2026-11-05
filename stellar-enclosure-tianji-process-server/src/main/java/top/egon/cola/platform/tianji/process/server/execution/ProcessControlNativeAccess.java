@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.process.server.execution;
 
+import org.flowable.common.engine.api.FlowableOptimisticLockingException;
+import org.flowable.common.engine.impl.context.Context;
 import org.flowable.common.engine.impl.history.HistoryLevel;
 import org.flowable.engine.HistoryService;
 import org.flowable.engine.ManagementService;
@@ -7,6 +9,7 @@ import org.flowable.engine.RuntimeService;
 import org.flowable.engine.TaskService;
 import org.flowable.eventsubscription.api.EventSubscription;
 import org.flowable.job.api.Job;
+import org.flowable.job.api.JobNotFoundException;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flowable.task.api.Task;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -16,6 +19,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessActiveWaitDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessActiveWaitKindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceStatusEnum;
+import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
@@ -41,6 +45,9 @@ import java.util.TreeSet;
 /** Bounded same-source Flowable control facts and root fence. */
 public final class ProcessControlNativeAccess {
     private static final String OWN_DELETE_REASON = "TIANJI_PROCESS_CANCELLED";
+    private static final String RECOVERY_JOB_COLUMNS = "id_,rev_,type_,tenant_id_,process_instance_id_,proc_def_id_,"
+            + "execution_id_,element_id_,scope_id_,sub_scope_id_,scope_type_,scope_definition_id_,"
+            + "correlation_id_,handler_type_,handler_cfg_";
     private static final Comparator<ProcessActiveWaitDTO> WAIT_ORDER = Comparator
             .comparing((ProcessActiveWaitDTO wait) -> wait.kind().name())
             .thenComparing(ProcessActiveWaitDTO::activityKey);
@@ -53,6 +60,7 @@ public final class ProcessControlNativeAccess {
     private final ManagementService management;
     private final JdbcTemplate jdbc;
     private final String executionTable;
+    private final String recoveryTablePrefix;
 
     public ProcessControlNativeAccess(DataSource source, SpringProcessEngineConfiguration engine) {
         this.source = Objects.requireNonNull(source, "source");
@@ -79,7 +87,8 @@ public final class ProcessControlNativeAccess {
         management = managementService;
         jdbc = new JdbcTemplate(source);
         jdbc.setQueryTimeout(5);
-        executionTable = '"' + schema + "\".act_ru_execution";
+        recoveryTablePrefix = '"' + schema + "\".";
+        executionTable = recoveryTablePrefix + "act_ru_execution";
     }
 
     public boolean usesDataSource(DataSource candidate) {
@@ -172,6 +181,188 @@ public final class ProcessControlNativeAccess {
         if (value == null) throw unavailable();
         return value.toInstant();
     }
+
+    public void verifyRecoveryTransaction() {
+        requireTransaction();
+        if (!engine.getDatabaseSchema().equals(jdbc.queryForObject("SELECT current_schema()", String.class))) {
+            throw unavailable();
+        }
+    }
+
+    public Optional<LockedRoot> readRecoveryRoot(ProcessCommandReceiptStore.TaskOrigin start) {
+        requireTransaction();
+        return readRoot(scope(start, null, null), false);
+    }
+
+    public String recoveryHistoryDefinitionId(ProcessCommandReceiptStore.TaskOrigin start) {
+        requireTransaction();
+        Scope scope = scope(start, null, null);
+        var ended = history.createHistoricProcessInstanceQuery().processInstanceId(scope.instanceId())
+                .processInstanceTenantId(scope.tenantText()).singleResult();
+        if (ended == null || ended.getEndTime() == null || !scope.instanceId().equals(ended.getId())
+                || !scope.tenantText().equals(ended.getTenantId()) || !textValue(ended.getProcessDefinitionId(), 255)) {
+            throw unavailable();
+        }
+        return ended.getProcessDefinitionId();
+    }
+
+    public List<RecoveryDeadletter> findRecoveryDeadletters(ProcessCommandReceiptStore.TaskOrigin start) {
+        requireTransaction();
+        Scope scope = scope(start, null, null);
+        var rows = jdbc.query("SELECT " + RECOVERY_JOB_COLUMNS + " FROM " + recoveryTablePrefix + "act_ru_deadletter_job"
+                        + " WHERE tenant_id_=? AND process_instance_id_=? ORDER BY id_ COLLATE \"C\" LIMIT 129",
+                (rs, index) -> recoveryJob(rs), scope.tenantText(), scope.instanceId());
+        if (rows.size() > 129 || rows.stream().anyMatch(row -> !scopedRecoveryJob(scope, row))) throw unavailable();
+        return List.copyOf(rows);
+    }
+
+    public Optional<RecoveryDeadletter> lockRecoveryDeadletter(ProcessCommandReceiptStore.TaskOrigin start,
+            ProcessReleaseService.Definition definition, String jobId) {
+        requireTransaction();
+        Scope scope = scope(start, Objects.requireNonNull(definition, "definition"), null);
+        if (!textValue(jobId, 255) || TransactionSynchronizationManager.isCurrentTransactionReadOnly()) throw invalid();
+        var rows = jdbc.query("SELECT " + RECOVERY_JOB_COLUMNS + " FROM " + recoveryTablePrefix + "act_ru_deadletter_job"
+                        + " WHERE id_=? AND tenant_id_=? AND process_instance_id_=? AND proc_def_id_=?"
+                        + " AND type_='externalWorker' FOR UPDATE",
+                (rs, index) -> recoveryJob(rs), jobId, scope.tenantText(), scope.instanceId(), scope.definitionId());
+        if (rows.size() > 1) throw unavailable();
+        if (rows.isEmpty()) return Optional.empty();
+        var row = rows.getFirst();
+        if (!scopedRecoveryJob(scope, row) || !jobId.equals(row.jobId()) || !Job.JOB_TYPE_EXTERNAL_WORKER.equals(row.type())) {
+            throw unavailable();
+        }
+        return Optional.of(row);
+    }
+
+    public Optional<RecoveryExecution> readRecoveryExecution(ProcessCommandReceiptStore.TaskOrigin start,
+            ProcessReleaseService.Definition definition, RecoveryDeadletter job) {
+        requireTransaction();
+        Scope scope = scope(start, Objects.requireNonNull(definition, "definition"), null);
+        if (!scopedRecoveryJob(scope, job) || !textValue(job.executionId(), 255) || !definitionValue(job.elementId())) {
+            return Optional.empty();
+        }
+        var rows = jdbc.query("SELECT id_,act_id_,proc_inst_id_,proc_def_id_,tenant_id_ FROM " + executionTable
+                        + " WHERE id_=? AND tenant_id_=? AND proc_inst_id_=? AND proc_def_id_=?",
+                (rs, index) -> new RecoveryExecution(rs.getString("id_"), rs.getString("act_id_"),
+                        rs.getString("proc_inst_id_"), rs.getString("proc_def_id_"), rs.getString("tenant_id_")),
+                job.executionId(), scope.tenantText(), scope.instanceId(), scope.definitionId());
+        if (rows.size() > 1) throw unavailable();
+        if (rows.isEmpty()) return Optional.empty();
+        var row = rows.getFirst();
+        if (!job.executionId().equals(row.executionId()) || !scope.instanceId().equals(row.instanceId())
+                || !scope.definitionId().equals(row.definitionId()) || !scope.tenantText().equals(row.tenant())) {
+            throw unavailable();
+        }
+        return job.elementId().equals(row.activityId()) ? Optional.of(row) : Optional.empty();
+    }
+
+    public boolean hasRecoveryCollision(String jobId) {
+        requireTransaction();
+        return !recoveryRuntimePresence(jobId).onlyDeadletter();
+    }
+
+    public boolean recoveryFailureCodeMatches(RecoveryDeadletter job, String code) {
+        requireTransaction();
+        if (job == null || job.revision() == null || job.revision() < 1 || code == null
+                || !code.matches("[A-Z][A-Z0-9_]{0,63}")) return false;
+        var rows = jdbc.query("SELECT COALESCE(octet_length(exception_msg_) = octet_length(CAST(? AS text))"
+                        + " AND exception_msg_ COLLATE \"C\" = CAST(? AS text) COLLATE \"C\", false)"
+                        + " FROM " + recoveryTablePrefix + "act_ru_deadletter_job"
+                        + " WHERE id_=? AND tenant_id_=? AND process_instance_id_=? AND proc_def_id_=?"
+                        + " AND type_='externalWorker' AND rev_=?",
+                (rs, index) -> rs.getBoolean(1), code, code, job.jobId(), job.tenant(),
+                job.instanceId(), job.definitionId(), job.revision());
+        if (rows.size() != 1) throw unavailable();
+        return rows.getFirst();
+    }
+
+    public void moveAndVerifyRecovery(RecoveryDeadletter fenced) {
+        verifyRecoveryTransaction();
+        if (TransactionSynchronizationManager.isCurrentTransactionReadOnly() || Context.getCommandContext() != null
+                || fenced == null || fenced.revision() == null || fenced.revision() < 1 || !textValue(fenced.jobId(), 255)
+                || !Job.JOB_TYPE_EXTERNAL_WORKER.equals(fenced.type()) || !"external-worker-complete".equals(fenced.handler())) {
+            throw unavailable();
+        }
+        Job moved;
+        try {
+            moved = management.moveDeadLetterJobToExecutableJob(fenced.jobId(), 1);
+        } catch (JobNotFoundException missing) {
+            if (fenced.jobId().equals(missing.getJobId())) throw new ProcessVersionConflictException();
+            throw unavailable();
+        } catch (FlowableOptimisticLockingException race) {
+            throw new ProcessVersionConflictException();
+        }
+        if (moved == null || moved.getRetries() != 1 || !sameMovedRecoveryJob(fenced,
+                new RecoveryDeadletter(moved.getId(), fenced.revision(), moved.getJobType(), moved.getTenantId(),
+                        moved.getProcessInstanceId(), moved.getProcessDefinitionId(), moved.getExecutionId(), moved.getElementId(),
+                        moved.getScopeId(), moved.getSubScopeId(), moved.getScopeType(), moved.getScopeDefinitionId(),
+                        moved.getCorrelationId(), moved.getJobHandlerType(), moved.getJobHandlerConfiguration()))) {
+            throw unavailable();
+        }
+        if (!recoveryRuntimePresence(fenced.jobId()).onlyExternal()) throw unavailable();
+        var rows = jdbc.query("SELECT " + RECOVERY_JOB_COLUMNS + ", retries_,"
+                        + " (lock_owner_ IS NULL AND lock_exp_time_ IS NULL) AS recovery_unlocked"
+                        + " FROM " + recoveryTablePrefix + "act_ru_external_job WHERE id_=?",
+                (rs, index) -> rs.getInt("retries_") == 1 && rs.getBoolean("recovery_unlocked")
+                        && Objects.equals(moved.getCorrelationId(), rs.getString("correlation_id_"))
+                        && sameMovedRecoveryJob(fenced, recoveryJob(rs)), fenced.jobId());
+        if (rows.size() != 1 || !rows.getFirst()) throw unavailable();
+    }
+
+    private RecoveryRuntimePresence recoveryRuntimePresence(String jobId) {
+        if (!textValue(jobId, 255)) throw invalid();
+        var rows = jdbc.query("SELECT EXISTS (SELECT 1 FROM " + recoveryTablePrefix + "act_ru_deadletter_job WHERE id_=?)"
+                        + ", EXISTS (SELECT 1 FROM " + recoveryTablePrefix + "act_ru_external_job WHERE id_=?)"
+                        + ", EXISTS (SELECT 1 FROM " + recoveryTablePrefix + "act_ru_job WHERE id_=?)"
+                        + ", EXISTS (SELECT 1 FROM " + recoveryTablePrefix + "act_ru_timer_job WHERE id_=?)"
+                        + ", EXISTS (SELECT 1 FROM " + recoveryTablePrefix + "act_ru_suspended_job WHERE id_=?)",
+                (rs, index) -> new RecoveryRuntimePresence(rs.getBoolean(1), rs.getBoolean(2),
+                        rs.getBoolean(3), rs.getBoolean(4), rs.getBoolean(5)), jobId, jobId, jobId, jobId, jobId);
+        if (rows.size() != 1) throw unavailable();
+        return rows.getFirst();
+    }
+
+    private static boolean scopedRecoveryJob(Scope scope, RecoveryDeadletter job) {
+        return job != null && textValue(job.jobId(), 255) && scope.tenantText().equals(job.tenant())
+                && scope.instanceId().equals(job.instanceId())
+                && (scope.definitionId() == null || scope.definitionId().equals(job.definitionId()));
+    }
+
+    private static RecoveryDeadletter recoveryJob(ResultSet rs) throws SQLException {
+        return new RecoveryDeadletter(rs.getString("id_"), rs.getObject("rev_", Integer.class),
+                rs.getString("type_"), rs.getString("tenant_id_"), rs.getString("process_instance_id_"),
+                rs.getString("proc_def_id_"), rs.getString("execution_id_"), rs.getString("element_id_"),
+                rs.getString("scope_id_"), rs.getString("sub_scope_id_"), rs.getString("scope_type_"),
+                rs.getString("scope_definition_id_"), rs.getString("correlation_id_"), rs.getString("handler_type_"),
+                rs.getString("handler_cfg_"));
+    }
+
+    private static boolean sameMovedRecoveryJob(RecoveryDeadletter expected, RecoveryDeadletter actual) {
+        if (expected.correlationId() != null) return expected.equals(actual);
+        return (actual.correlationId() == null || textValue(actual.correlationId(), 255))
+                && expected.equals(new RecoveryDeadletter(actual.jobId(), actual.revision(), actual.type(), actual.tenant(),
+                        actual.instanceId(), actual.definitionId(), actual.executionId(), actual.elementId(), actual.scopeId(),
+                        actual.subScopeId(), actual.scopeType(), actual.scopeDefinitionId(), null, actual.handler(), actual.topic()));
+    }
+
+    private record RecoveryRuntimePresence(boolean deadletter, boolean external, boolean executable,
+                                           boolean timer, boolean suspended) {
+        private boolean onlyDeadletter() {
+            return deadletter && !external && !executable && !timer && !suspended;
+        }
+
+        private boolean onlyExternal() {
+            return !deadletter && external && !executable && !timer && !suspended;
+        }
+    }
+
+    public record RecoveryDeadletter(String jobId, Integer revision, String type, String tenant, String instanceId,
+                                     String definitionId, String executionId, String elementId, String scopeId,
+                                     String subScopeId, String scopeType, String scopeDefinitionId, String correlationId,
+                                     String handler, String topic) { }
+
+    public record RecoveryExecution(String executionId, String activityId, String instanceId,
+                                    String definitionId, String tenant) { }
 
     private Optional<LockedRoot> readRoot(Scope scope, boolean lock) {
         String sql = "SELECT id_,rev_,proc_def_id_,business_key_,suspension_state_,tenant_id_,proc_inst_id_ FROM "

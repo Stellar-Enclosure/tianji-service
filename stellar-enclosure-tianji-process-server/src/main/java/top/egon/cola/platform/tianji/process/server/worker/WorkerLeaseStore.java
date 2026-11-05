@@ -42,6 +42,51 @@ public final class WorkerLeaseStore {
         this.table = '"' + schema + "\".tianji_worker_lease_receipt";
     }
 
+    public List<String> findFailureJobIds(long tenantId, String instanceId) {
+        requireTransaction();
+        if (tenantId <= 0) throw invalid();
+        id(instanceId, 255);
+        List<String> rows = jdbc.queryForList("SELECT job_id FROM " + table
+                + " WHERE tenant_id=? AND scope_type='BPMN' AND scope_id=? AND failure_kind IS NOT NULL"
+                + " GROUP BY job_id ORDER BY job_id COLLATE \"C\" LIMIT 129", String.class, tenantId, instanceId);
+        if (rows.size() > 129) throw invalid();
+        rows.forEach(jobId -> id(jobId, 255));
+        return List.copyOf(rows);
+    }
+
+    public List<RecoveryLeaseEvidence> readRecoveryHistory(long tenantId, String jobId) {
+        requireTransaction();
+        if (tenantId <= 0) throw invalid();
+        id(jobId, 255);
+        var rows = jdbc.query("SELECT tenant_id,subject_issuer,subject_id,topic,schema_version,job_id,occurrence_id,"
+                        + "scope_type,scope_id,release_key,definition_id,element_id,idempotency_key,model_sha256,input_sha256,"
+                        + "result_sha256,state,decided_at,failure_kind,failure_code,leased_at,lease_expires_at,"
+                        + "business_receipt_id IS NOT NULL AS has_business_receipt FROM " + table
+                        + " WHERE tenant_id=? AND job_id=? LIMIT 33",
+                (rs, row) -> new RecoveryLeaseEvidence(rs.getLong("tenant_id"), rs.getString("subject_issuer"),
+                        rs.getString("subject_id"), rs.getString("topic"), rs.getString("schema_version"),
+                        rs.getString("job_id"), rs.getString("occurrence_id"), rs.getString("scope_type"),
+                        rs.getString("scope_id"), rs.getString("release_key"), rs.getString("definition_id"),
+                        rs.getString("element_id"), rs.getString("idempotency_key"), rs.getString("model_sha256"),
+                        rs.getString("input_sha256"), rs.getString("result_sha256"), rs.getString("state"),
+                        instant(rs.getTimestamp("decided_at")), rs.getString("failure_kind"), rs.getString("failure_code"),
+                        instant(rs.getTimestamp("leased_at")), instant(rs.getTimestamp("lease_expires_at")),
+                        rs.getBoolean("has_business_receipt")), tenantId, jobId);
+        if (rows.size() > 33) throw invalid();
+        return List.copyOf(rows);
+    }
+
+    private static Instant instant(Timestamp timestamp) {
+        return timestamp == null ? null : timestamp.toInstant();
+    }
+
+    public record RecoveryLeaseEvidence(long tenantId, String subjectIssuer, String subjectId, String topic,
+                                        String schemaVersion, String jobId, String occurrenceId, String scopeType,
+                                        String scopeId, String releaseKey, String definitionId, String elementId,
+                                        String idempotencyKey, String modelSha256, String inputSha256, String resultSha256,
+                                        String state, Instant decidedAt, String failureKind, String failureCode,
+                                        Instant leasedAt, Instant leaseExpiresAt, boolean hasBusinessReceipt) { }
+
     public Lease claim(Claim claim) {
         requireTransaction();
         Objects.requireNonNull(claim, "claim");

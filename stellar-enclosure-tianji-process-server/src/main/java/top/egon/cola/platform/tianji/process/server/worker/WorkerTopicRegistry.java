@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -41,9 +42,27 @@ public final class WorkerTopicRegistry {
     public Registration require(ProcessActor actor, String topic, String schemaVersion) {
         if (actor == null || actor.subjectType() != ProcessActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())) throw unavailable();
         ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
-        Registration result = registrations.get(new Key(actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), topic, schemaVersion));
+        Registration result = findRegistration(actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), topic, schemaVersion);
         if (result == null) throw unavailable();
         return result;
+    }
+
+    Optional<Registration> findRecoveryRegistration(long tenantId, String issuerFingerprint, String subjectId,
+                                                    String topic, String schemaVersion) {
+        if (tenantId <= 0 || issuerFingerprint == null || !issuerFingerprint.matches("[0-9a-f]{64}") || subjectId == null) {
+            return Optional.empty();
+        }
+        try {
+            ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
+        } catch (IllegalArgumentException invalid) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(findRegistration(tenantId, issuerFingerprint, subjectId, topic, schemaVersion));
+    }
+
+    private Registration findRegistration(long tenantId, String issuerFingerprint, String subjectId,
+                                          String topic, String schemaVersion) {
+        return registrations.get(new Key(tenantId, issuerFingerprint, subjectId, topic, schemaVersion));
     }
 
     public List<Registration> registrations() { return List.copyOf(registrations.values()); }

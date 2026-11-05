@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.process.server.execution;
 
+import org.flowable.common.engine.impl.context.Context;
+import org.flowable.common.engine.impl.interceptor.CommandContext;
 import org.flowable.common.engine.impl.history.HistoryLevel;
 import org.flowable.engine.HistoryService;
 import org.flowable.engine.ManagementService;
@@ -49,6 +51,7 @@ import java.util.function.Supplier;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -370,6 +373,178 @@ class ProcessControlNativeAccessTest {
         verify(fixture.management, never()).createExternalWorkerJobQuery();
         verify(fixture.management, never()).createTimerJobQuery();
         verify(fixture.runtime, never()).createEventSubscriptionQuery();
+    }
+
+    @Test
+    void locksOnlyExactOrdinaryDeadletter() {
+        RecoveryFixture fixture = new RecoveryFixture();
+        fixture.scopeMatch = false;
+        var absent = assertDoesNotThrow(() -> transaction(fixture.base.source,
+                () -> fixture.base.access.lockRecoveryDeadletter(start(), definition(), "foreign-job")));
+        assertTrue(absent.isEmpty());
+        String lock = fixture.lastStatement();
+        assertTrue(lock.contains("id_=? AND tenant_id_=? AND process_instance_id_=? AND proc_def_id_=?"));
+        assertTrue(lock.endsWith("AND type_='externalWorker' FOR UPDATE"));
+        assertEquals(List.of("foreign-job", TENANT_TEXT, INSTANCE, DEFINITION_ID), fixture.base.arguments.get(lock));
+        assertFalse(lock.contains("exception_msg_"));
+        assertFalse(lock.contains("exception_stack_id_"));
+        assertFalse(lock.contains("retries_"));
+        assertFalse(lock.contains("lock_owner_"));
+        assertFalse(lock.contains("lock_exp_time_"));
+        fixture.scopeMatch = true;
+        assertEquals(fixture.job, assertDoesNotThrow(() -> transaction(fixture.base.source,
+                () -> fixture.base.access.lockRecoveryDeadletter(start(), definition(), "job-1"))).orElseThrow());
+        var all = assertDoesNotThrow(() -> transaction(fixture.base.source,
+                () -> fixture.base.access.findRecoveryDeadletters(start())));
+        assertEquals(List.of(fixture.job), all);
+        assertTrue(fixture.lastStatement().contains("WHERE tenant_id_=? AND process_instance_id_=?"));
+        assertTrue(fixture.lastStatement().endsWith("ORDER BY id_ COLLATE \"C\" LIMIT 129"));
+        assertEquals(List.of(TENANT_TEXT, INSTANCE), fixture.base.arguments.get(fixture.lastStatement()));
+    }
+
+    @Test
+    void recoveryFailureComparisonAndCollisionAreBoundedAndDoNotReturnSecrets() {
+        RecoveryFixture fixture = new RecoveryFixture();
+        assertTrue(assertDoesNotThrow(() -> transaction(fixture.base.source,
+                () -> fixture.base.access.recoveryFailureCodeMatches(fixture.job, "TEMP_ERROR"))));
+        String compare = fixture.lastStatement();
+        assertTrue(compare.startsWith("SELECT COALESCE(octet_length(exception_msg_) = octet_length(CAST(? AS text))"));
+        assertTrue(compare.contains("exception_msg_ COLLATE \"C\" = CAST(? AS text) COLLATE \"C\""));
+        assertEquals(List.of("TEMP_ERROR", "TEMP_ERROR", "job-1", TENANT_TEXT, INSTANCE, DEFINITION_ID, 2),
+                fixture.base.arguments.get(compare));
+        fixture.codeEqual = false;
+        assertFalse(transaction(fixture.base.source,
+                () -> fixture.base.access.recoveryFailureCodeMatches(fixture.job, "TEMP_ERROR")));
+        assertFalse(transaction(fixture.base.source, () -> fixture.base.access.hasRecoveryCollision("job-1")));
+        for (int collision = 1; collision < 5; collision++) {
+            fixture.presence[collision] = true;
+            assertTrue(transaction(fixture.base.source, () -> fixture.base.access.hasRecoveryCollision("job-1")));
+            fixture.presence[collision] = false;
+        }
+        String probes = fixture.lastStatement();
+        for (String name : List.of("deadletter_job", "external_job", "job", "timer_job", "suspended_job")) {
+            assertTrue(probes.contains("act_ru_" + name + " WHERE id_=?"));
+        }
+        assertEquals(List.of("job-1", "job-1", "job-1", "job-1", "job-1"), fixture.base.arguments.get(probes));
+    }
+
+    @Test
+    void requiresExactFlushedExternalReadback() {
+        RecoveryFixture fixture = new RecoveryFixture();
+        assertDoesNotThrow(() -> transaction(fixture.base.source, () -> {
+            fixture.base.access.moveAndVerifyRecovery(fixture.job);
+            return null;
+        }));
+        verify(fixture.base.management).moveDeadLetterJobToExecutableJob("job-1", 1);
+        String readback = fixture.lastStatement();
+        assertTrue(readback.contains("(lock_owner_ IS NULL AND lock_exp_time_ IS NULL) AS recovery_unlocked"));
+        assertTrue(readback.endsWith("act_ru_external_job WHERE id_=?"));
+        assertEquals(List.of("job-1"), fixture.base.arguments.get(readback));
+
+        for (String fault : List.of("old", "missing", "colliding", "locked", "wrong-retries", "wrong-id", "wrong-topic",
+                "bad-revision", "wrong-correlation", "wrong-schema", "nested-context", "read-only")) {
+            RecoveryFixture failed = new RecoveryFixture();
+            switch (fault) {
+                case "old" -> failed.keepOld = true;
+                case "missing" -> failed.readbackPresent = false;
+                case "colliding" -> failed.presence[2] = true;
+                case "locked" -> failed.externalRow.put("recovery_unlocked", false);
+                case "wrong-retries" -> failed.externalRow.put("retries_", 2);
+                case "wrong-id" -> failed.externalRow.put("id_", "foreign");
+                case "wrong-topic" -> failed.externalRow.put("handler_cfg_", "different");
+                case "bad-revision" -> failed.externalRow.put("rev_", 0);
+                case "wrong-correlation" -> failed.externalRow.put("correlation_id_", "different");
+                case "wrong-schema" -> when(failed.base.jdbc.queryForObject("SELECT current_schema()", String.class))
+                        .thenReturn("foreign");
+                default -> { }
+            }
+            assertThrows(IllegalStateException.class, () -> transaction(failed.base.source, () -> {
+                if (fault.equals("nested-context")) Context.setCommandContext(mock(CommandContext.class));
+                if (fault.equals("read-only")) TransactionSynchronizationManager.setCurrentTransactionReadOnly(true);
+                try {
+                    failed.base.access.moveAndVerifyRecovery(failed.job);
+                    return null;
+                } finally {
+                    if (fault.equals("nested-context")) Context.removeCommandContext();
+                    if (fault.equals("read-only")) TransactionSynchronizationManager.setCurrentTransactionReadOnly(false);
+                }
+            }), fault);
+            if (Set.of("wrong-schema", "nested-context", "read-only").contains(fault)) {
+                verify(failed.base.management, never()).moveDeadLetterJobToExecutableJob(anyString(), eq(1));
+            }
+        }
+    }
+
+    private static final class RecoveryFixture {
+        private final Fixture base = new Fixture();
+        private final ProcessControlNativeAccess.RecoveryDeadletter job = new ProcessControlNativeAccess.RecoveryDeadletter(
+                "job-1", 2, "externalWorker", TENANT_TEXT, INSTANCE, DEFINITION_ID, "execution-1", "workerTask",
+                null, null, null, null, "correlation", "external-worker-complete", "invoice");
+        private final Map<String, Object> externalRow = new LinkedHashMap<>();
+        private final boolean[] presence = {true, false, false, false, false};
+        private boolean scopeMatch = true;
+        private boolean codeEqual = true;
+        private boolean readbackPresent = true;
+        private boolean keepOld;
+
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        private RecoveryFixture() {
+            externalRow.put("id_", job.jobId());
+            externalRow.put("rev_", job.revision());
+            externalRow.put("type_", job.type());
+            externalRow.put("tenant_id_", job.tenant());
+            externalRow.put("process_instance_id_", job.instanceId());
+            externalRow.put("proc_def_id_", job.definitionId());
+            externalRow.put("execution_id_", job.executionId());
+            externalRow.put("element_id_", job.elementId());
+            externalRow.put("correlation_id_", job.correlationId());
+            externalRow.put("handler_type_", job.handler());
+            externalRow.put("handler_cfg_", job.topic());
+            externalRow.put("retries_", 1);
+            externalRow.put("recovery_unlocked", true);
+            when(base.jdbc.queryForObject("SELECT current_schema()", String.class)).thenReturn("process");
+            Job moved = mock(Job.class);
+            when(moved.getId()).thenReturn(job.jobId());
+            when(moved.getJobType()).thenReturn(job.type());
+            when(moved.getTenantId()).thenReturn(job.tenant());
+            when(moved.getProcessInstanceId()).thenReturn(job.instanceId());
+            when(moved.getProcessDefinitionId()).thenReturn(job.definitionId());
+            when(moved.getExecutionId()).thenReturn(job.executionId());
+            when(moved.getElementId()).thenReturn(job.elementId());
+            when(moved.getCorrelationId()).thenReturn(job.correlationId());
+            when(moved.getJobHandlerType()).thenReturn(job.handler());
+            when(moved.getJobHandlerConfiguration()).thenReturn(job.topic());
+            when(moved.getRetries()).thenReturn(1);
+            when(base.management.moveDeadLetterJobToExecutableJob("job-1", 1)).thenAnswer(invocation -> {
+                presence[0] = keepOld;
+                presence[1] = true;
+                return moved;
+            });
+            doAnswer(invocation -> {
+                String statement = invocation.getArgument(0);
+                base.sql.add(statement);
+                base.arguments.put(statement, Arrays.asList(((Object[]) invocation.getRawArguments()[2]).clone()));
+                RowMapper mapper = invocation.getArgument(1);
+                ResultSet row = resultSet(externalRow);
+                when(row.getObject("rev_", Integer.class)).thenReturn((Integer) externalRow.get("rev_"));
+                when(row.getBoolean("recovery_unlocked")).thenReturn((Boolean) externalRow.get("recovery_unlocked"));
+                if (statement.startsWith("SELECT EXISTS")) {
+                    for (int position = 1; position <= 5; position++) {
+                        when(row.getBoolean(position)).thenReturn(presence[position - 1]);
+                    }
+                } else if (statement.startsWith("SELECT COALESCE")) {
+                    when(row.getBoolean(1)).thenReturn(codeEqual);
+                } else if (statement.contains("act_ru_external_job") && !readbackPresent
+                        || statement.contains("act_ru_deadletter_job") && !scopeMatch) {
+                    return List.of();
+                }
+                return List.of(mapper.mapRow(row, 0));
+            }).when(base.jdbc).query(anyString(), any(RowMapper.class), any(Object[].class));
+        }
+
+        private String lastStatement() {
+            return base.sql.getLast();
+        }
     }
 
     private static Fixture oneTask(String activity, String modelActivity) {

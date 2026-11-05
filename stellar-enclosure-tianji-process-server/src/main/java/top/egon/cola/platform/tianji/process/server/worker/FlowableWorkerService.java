@@ -5,6 +5,7 @@ import org.flowable.engine.runtime.ProcessInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskResult;
@@ -25,6 +26,8 @@ import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInsp
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.RecoveryDeadletter;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -34,8 +37,11 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerBusinessError;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore.RecoveryLeaseEvidence;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 
+import javax.sql.DataSource;
 import java.security.SecureRandom;
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -54,6 +60,7 @@ import java.util.stream.Collectors;
 /** Secured callers provide a verified SERVICE actor; all native job changes share the lease transaction. */
 public final class FlowableWorkerService {
     private final SpringProcessEngineConfiguration process;
+    private final DataSource source;
     private final ProcessModelValidator validator;
     private final WorkerTopicRegistry registry;
     private final ProcessReleaseService releases;
@@ -75,11 +82,160 @@ public final class FlowableWorkerService {
         this.agentWaits = new FlowableAgentWaitInspector(process, releases, models, validator);
         if (!(process.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null
                 || process.getManagementService() == null || process.getRuntimeService() == null) throw invalidConfiguration();
+        this.source = manager.getDataSource();
         this.schema = process.getDatabaseSchema();
         new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
         this.leases = new WorkerLeaseStore(manager.getDataSource(), manager, schema);
         this.jdbc = new JdbcTemplate(manager.getDataSource());
         this.transaction = new TransactionTemplate(manager);
+    }
+
+    public boolean usesRecoveryStorage(SpringProcessEngineConfiguration engine, DataSource candidate) {
+        return process == engine && source == candidate && transaction.getTransactionManager() == engine.getTransactionManager()
+                && schema.equals(engine.getDatabaseSchema());
+    }
+
+    public List<String> findFailureJobIds(long tenantId, String instanceId) {
+        requireRecoveryTransaction();
+        return leases.findFailureJobIds(tenantId, instanceId);
+    }
+
+    public List<RecoveryLeaseEvidence> readRecoveryHistory(long tenantId, String jobId) {
+        requireRecoveryTransaction();
+        return leases.readRecoveryHistory(tenantId, jobId);
+    }
+
+    public RecoveryProvenance readRecoveryProvenance(TaskOrigin start, Definition definition, RecoveryDeadletter job) {
+        requireRecoveryTransaction();
+        if (start == null || start.requester() == null || "LEGACY".equals(start.requester().issuerFingerprint())
+                || definition == null || definition.type() != Type.BPMN || job == null
+                || !Long.toString(start.requester().tenantId()).equals(job.tenant())
+                || !start.instanceId().equals(job.instanceId()) || !definition.engineDefinitionId().equals(job.definitionId())
+                || job.elementId() == null || job.executionId() == null) {
+            return RecoveryProvenance.unverified();
+        }
+        long tenantId = start.requester().tenantId();
+        VerifiedJobModel released;
+        try {
+            released = verifiedJobModel(tenantId, recoveryIdentity(job));
+        } catch (ProcessResourceNotFoundException missing) {
+            return RecoveryProvenance.unverified();
+        }
+        long matching = released.release().definitions().stream().filter(item -> item.type() == Type.BPMN
+                && definition.engineDefinitionId().equals(item.engineDefinitionId())).count();
+        if (matching != 1 || !start.releaseKey().equals(released.release().releaseKey())
+                || !definition.equals(released.definition())) return RecoveryProvenance.unverified();
+
+        var model = released.model();
+        var worker = model.workerTasks().get(job.elementId());
+        if (model.caseSources().containsKey(job.elementId())
+                || model.caseSources().values().stream().anyMatch(caseSource -> job.elementId().equals(caseSource.messageElementId())
+                        || job.elementId().equals(caseSource.timerElementId()))
+                || model.messageWaits().values().stream().anyMatch(wait -> job.elementId().equals(wait.workerElementId()))
+                || worker != null && registry.isInternalAgentDispatch(tenantId, worker)) {
+            return RecoveryProvenance.unsupported();
+        }
+        if (worker == null || !ProcessModelValidator.nativeWorkerTopic(worker.topic(), worker.schemaVersion()).equals(job.topic())) {
+            return RecoveryProvenance.unverified();
+        }
+        return new RecoveryProvenance(false, released, job);
+    }
+
+    public RecoveryBinding verifyRecoveryBinding(TaskOrigin start, Definition definition, RecoveryDeadletter job,
+                                                  RecoveryProvenance provenance, RecoveryLeaseEvidence selected) {
+        requireRecoveryTransaction();
+        if (provenance == null || !provenance.ordinary() || !provenance.job.equals(job) || selected == null
+                || start == null || start.requester() == null || definition == null
+                || !definition.equals(provenance.released.definition())
+                || !start.releaseKey().equals(provenance.released.release().releaseKey())
+                || !start.instanceId().equals(job.instanceId())) return RecoveryBinding.unverified();
+        long tenantId = start.requester().tenantId();
+        if (selected.tenantId() != tenantId || !Long.toString(tenantId).equals(job.tenant())
+                || !"BPMN".equals(selected.scopeType()) || !job.jobId().equals(selected.jobId())
+                || !job.jobId().equals(selected.occurrenceId()) || !job.instanceId().equals(selected.scopeId())
+                || !job.definitionId().equals(selected.definitionId()) || !job.elementId().equals(selected.elementId())
+                || !start.releaseKey().equals(selected.releaseKey()) || !definition.modelSha256().equals(selected.modelSha256())
+                || !workerOccurrenceKey(tenantId, job.jobId()).equals(selected.idempotencyKey())) return RecoveryBinding.unverified();
+
+        var reporter = registry.findRecoveryRegistration(tenantId, selected.subjectIssuer(), selected.subjectId(),
+                selected.topic(), selected.schemaVersion());
+        if (reporter.isEmpty() || reporter.get().internalAgentDispatch()) return RecoveryBinding.unverified();
+        var registration = reporter.get();
+        var identity = recoveryIdentity(job);
+        VerifiedJob verified;
+        try {
+            requireCompatibleJob(identity, registration);
+            verified = verifyJob(tenantId, identity, registration, provenance.released);
+        } catch (IllegalArgumentException mismatch) {
+            return RecoveryBinding.unverified();
+        }
+        if (!start.releaseKey().equals(verified.releaseKey()) || !definition.modelSha256().equals(verified.modelSha256())
+                || !start.correlationId().equals(verified.correlationId())
+                || !inputHash(identity, registration, verified.inputs()).equals(selected.inputSha256())) {
+            return RecoveryBinding.unverified();
+        }
+        return RecoveryBinding.verified(registration.effectSafety(), verified.businessKey());
+    }
+
+    private void requireRecoveryTransaction() {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source) || Thread.currentThread().isInterrupted()) {
+            throw new IllegalStateException("Worker recovery evidence requires the owning JDBC transaction");
+        }
+    }
+
+    private static JobIdentity recoveryIdentity(RecoveryDeadletter job) {
+        return new JobIdentity(job.jobId(), job.instanceId(), job.executionId(), job.definitionId(), job.elementId(), job.topic());
+    }
+
+    public static String workerOccurrenceKey(long tenantId, String jobId) {
+        return "tw-" + ProcessRequestDigest.hash(List.of("worker-occurrence-v1", Long.toString(tenantId), jobId), Map.of());
+    }
+
+    public static final class RecoveryProvenance {
+        private final boolean unsupported;
+        private final VerifiedJobModel released;
+        private final RecoveryDeadletter job;
+
+        private RecoveryProvenance(boolean unsupported, VerifiedJobModel released, RecoveryDeadletter job) {
+            this.unsupported = unsupported;
+            this.released = released;
+            this.job = job;
+        }
+
+        public static RecoveryProvenance unsupported() {
+            return new RecoveryProvenance(true, null, null);
+        }
+
+        public static RecoveryProvenance unverified() {
+            return new RecoveryProvenance(false, null, null);
+        }
+
+        public boolean ordinary() {
+            return released != null;
+        }
+
+        public boolean provesUnsupported() {
+            return unsupported;
+        }
+
+        public boolean provesUnverified() {
+            return !unsupported && !ordinary();
+        }
+    }
+
+    public record RecoveryBinding(boolean verified, WorkerEffect effect, String businessKey) {
+        public static RecoveryBinding unverified() {
+            return new RecoveryBinding(false, null, null);
+        }
+
+        public static RecoveryBinding verified(WorkerEffect effect, String businessKey) {
+            return new RecoveryBinding(true, effect, businessKey);
+        }
+
+        public boolean provesUnverified() {
+            return !verified;
+        }
     }
 
     public AcquireWorkerTaskResult acquire(ProcessActor actor, AcquireWorkerTaskCommand command) {
@@ -116,8 +272,8 @@ public final class FlowableWorkerService {
             VerifiedJob verified = verifyJob(actor.tenantId(), nativeJob, registration);
             Map<String, Object> inputs = ProcessValues.inputs(registration.inputs(), job.getVariables());
             if (!inputs.equals(verified.inputs())) throw conflict();
-            String inputHash = inputHash(nativeJob, registration, inputs);
-            String intent = "tw-" + ProcessRequestDigest.hash(List.of("worker-occurrence-v1", Long.toString(actor.tenantId()), nativeJob.id()), Map.of());
+            String inputHash = inputHash(nativeJob.identity(), registration, inputs);
+            String intent = workerOccurrenceKey(actor.tenantId(), nativeJob.id());
             var claim = new WorkerLeaseStore.Claim(actor, tokenHash, command.topic(), command.schemaVersion(), nativeJob.id(), nativeJob.id(),
                     WorkerScopeTypeEnum.BPMN, nativeJob.processInstanceId(), verified.releaseKey(), nativeJob.definitionId(), nativeJob.elementId(),
                     intent, verified.modelSha256(), inputHash, nativeOwner, nativeJob.expiresAt(), registration.leaseDuration());
@@ -155,7 +311,7 @@ public final class FlowableWorkerService {
             if (!"LEASED".equals(current.state())) return receipt(leases.finish(actor, command.taskId(), hash, finish));
             VerifiedJob verified = verifyLease(actor, current, nativeJob, registration);
             Map<String, Object> output = ProcessValues.inputs(registration.outputs(), command.output());
-            if (!current.inputSha256().equals(inputHash(nativeJob, registration, verified.inputs()))) throw conflict();
+            if (!current.inputSha256().equals(inputHash(nativeJob.identity(), registration, verified.inputs()))) throw conflict();
             process.getManagementService().createExternalWorkerCompletionBuilder(nativeJob.id(), nativeJob.owner()).variables(output).complete();
             return receipt(leases.finish(actor, command.taskId(), hash, finish));
         }));
@@ -178,7 +334,7 @@ public final class FlowableWorkerService {
                     || registration.effectSafety() != ValidatedProcessModel.WorkerEffect.EXTERNAL_IDEMPOTENT
                     || !registration.outputs().equals(Map.of("runId", ValidatedProcessModel.ValueType.STRING))) throw unavailable();
             VerifiedJob verified = verifyLease(actor, lease, job, registration);
-            if (!lease.inputSha256().equals(inputHash(job, registration, verified.inputs()))) throw conflict();
+            if (!lease.inputSha256().equals(inputHash(job.identity(), registration, verified.inputs()))) throw conflict();
             var intent = dispatch.prepare(new AgentDispatchStore.Seed(binding, lease.scopeId(), lease.occurrenceId(), lease.releaseKey(),
                     lease.definitionId(), lease.modelSha256(), lease.elementId(), lease.inputSha256(),
                     verified.businessKey(), verified.correlationId(), verified.inputs()));
@@ -248,7 +404,7 @@ public final class FlowableWorkerService {
             current = leases.lock(actor, command.taskId(), hash);
             if (!"LEASED".equals(current.state())) return replayFailure(actor, command, hash, resultHash, current);
             VerifiedJob verified = verifyLease(actor, current, nativeJob, registration);
-            if (!current.inputSha256().equals(inputHash(nativeJob, registration, verified.inputs()))) throw conflict();
+            if (!current.inputSha256().equals(inputHash(nativeJob.identity(), registration, verified.inputs()))) throw conflict();
             WorkerReceiptOutcomeEnum outcome;
             if (command.kind() == WorkerFailureKindEnum.BUSINESS_REJECTED && !agentDispatch
                     && !registration.internalAgentDispatch() && verified.businessError() != null) {
@@ -317,12 +473,29 @@ public final class FlowableWorkerService {
     }
 
     private VerifiedJob verifyJob(long tenantId, NativeJob job, WorkerTopicRegistry.Registration registration) {
-        if (job == null || job.processInstanceId() == null || job.executionId() == null || job.definitionId() == null || job.elementId() == null
-                || !ProcessModelValidator.nativeWorkerTopic(registration.topic(), registration.schemaVersion()).equals(job.topic())) throw unavailable();
+        JobIdentity identity = job == null ? null : job.identity();
+        requireCompatibleJob(identity, registration);
+        return verifyJob(tenantId, identity, registration, verifiedJobModel(tenantId, identity));
+    }
+
+    private static void requireCompatibleJob(JobIdentity job, WorkerTopicRegistry.Registration registration) {
+        if (job == null || job.processInstanceId() == null || job.executionId() == null || job.definitionId() == null
+                || job.elementId() == null || !ProcessModelValidator.nativeWorkerTopic(registration.topic(),
+                registration.schemaVersion()).equals(job.topic())) throw unavailable();
+    }
+
+    private VerifiedJobModel verifiedJobModel(long tenantId, JobIdentity job) {
         var release = releases.getForProcessDefinition(tenantId, job.definitionId());
-        Definition processBinding = release.definitions().stream().filter(item -> item.type() == Type.BPMN
+        Definition definition = release.definitions().stream().filter(item -> item.type() == Type.BPMN
                 && item.engineDefinitionId().equals(job.definitionId())).findFirst().orElseThrow(FlowableWorkerService::unavailable);
-        var model = models.runningProcess(tenantId, processBinding);
+        return new VerifiedJobModel(release, definition, models.runningProcess(tenantId, definition));
+    }
+
+    private VerifiedJob verifyJob(long tenantId, JobIdentity job, WorkerTopicRegistry.Registration registration,
+                                  VerifiedJobModel released) {
+        var release = released.release();
+        var processBinding = released.definition();
+        var model = released.model();
         var worker = model.workerTasks().get(job.elementId());
         if (worker == null || !registration.topic().equals(worker.topic()) || !registration.schemaVersion().equals(worker.schemaVersion())
                 || !registry.acceptsModel(tenantId, worker)) throw unavailable();
@@ -366,7 +539,7 @@ public final class FlowableWorkerService {
                 }, jobId, Long.toString(tenantId));
     }
 
-    private static String inputHash(NativeJob job, WorkerTopicRegistry.Registration registration, Map<String, Object> inputs) {
+    private static String inputHash(JobIdentity job, WorkerTopicRegistry.Registration registration, Map<String, Object> inputs) {
         List<String> fields = new ArrayList<>(List.of("worker-input-v2", job.id(), job.processInstanceId(), job.definitionId(), job.elementId(),
                 registration.topic(), registration.schemaVersion(), registration.effectSafety().name(), Integer.toString(registration.maxConcurrent()),
                 Long.toString(registration.leaseDuration().toMillis()), Long.toString(registration.retryDelay().toMillis())));
@@ -404,7 +577,16 @@ public final class FlowableWorkerService {
     private static WorkerLeaseLostException lost() { return new WorkerLeaseLostException(); }
 
     private record NativeJob(String id, String owner, Instant expiresAt, String processInstanceId, String executionId,
-                             String definitionId, String elementId, String topic, int retries, boolean live) { }
+                             String definitionId, String elementId, String topic, int retries, boolean live) {
+        private JobIdentity identity() {
+            return new JobIdentity(id, processInstanceId, executionId, definitionId, elementId, topic);
+        }
+    }
+
+    private record JobIdentity(String id, String processInstanceId, String executionId,
+                               String definitionId, String elementId, String topic) { }
+    private record VerifiedJobModel(ProcessReleaseService.Release release, Definition definition,
+                                    ValidatedProcessModel model) { }
     private record VerifiedJob(String releaseKey, String modelSha256, String businessKey, String correlationId,
                                Map<String, Object> inputs, WorkerBusinessError businessError) { }
 }
