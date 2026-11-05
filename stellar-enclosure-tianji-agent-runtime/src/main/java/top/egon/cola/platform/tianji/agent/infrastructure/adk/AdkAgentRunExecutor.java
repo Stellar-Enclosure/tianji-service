@@ -255,6 +255,10 @@ public final class AdkAgentRunExecutor {
     /** Lets a host verify that discovery and execution use the same ledger. */
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
 
+    public boolean usesSessionDataSource(DataSource candidate) {
+        return candidate != null && candidate == sessionDataSource;
+    }
+
     /** Uses one CAS to claim the run and one subscription to the ADK root invocation. */
     public AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
         Objects.requireNonNull(actor, "actor");

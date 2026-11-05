@@ -67,6 +67,10 @@ public final class AgentCheckpointTakeoverService {
         writer.setTimeout(2);
     }
 
+    public boolean usesSourceAndAuthority(DataSource candidate, ResumeAuthorization candidateAuthority) {
+        return source == candidate && authorization == candidateAuthority;
+    }
+
     /** The trusted host obtains a fresh, exact current RESUME decision. This port is called outside JDBC transactions. */
     @FunctionalInterface
     public interface ResumeAuthorization {
