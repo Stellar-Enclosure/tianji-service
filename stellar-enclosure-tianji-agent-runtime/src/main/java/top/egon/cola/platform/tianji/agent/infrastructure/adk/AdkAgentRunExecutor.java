@@ -7,6 +7,7 @@ import com.google.adk.agents.LoopAgent;
 import com.google.adk.agents.ParallelAgent;
 import com.google.adk.agents.RunConfig;
 import com.google.adk.agents.SequentialAgent;
+import com.google.adk.events.Event;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.Session;
 import com.google.adk.tools.BaseTool;
@@ -37,6 +38,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
 import top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.LeaseHeartbeat;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.Execution;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.ResumeAuthorization;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.AgentCheckpointTakeoverService.TakeoverResult;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService.FirstInputCheckpointBO;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.session.PostgresAdkSessionService.SessionLease;
@@ -53,11 +57,13 @@ import javax.sql.DataSource;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
@@ -69,7 +75,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
-/** Executes one explicitly selected queued run; it does not schedule or expose an endpoint. */
+/** Executes an explicitly selected Run or trusted checkpoint claim. */
 public final class AdkAgentRunExecutor {
     private static final Logger log = LoggerFactory.getLogger(AdkAgentRunExecutor.class);
     private static final Duration LEASE_DURATION = Duration.ofSeconds(30);
@@ -254,6 +260,49 @@ public final class AdkAgentRunExecutor {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(query, "query");
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Agent execution cannot run inside a database transaction");
+        return withExecutionContext(actor, () -> executeScoped(actor, query));
+    }
+
+    /** Executes the one winning, explicitly authorized checkpoint claim in this process. */
+    public Optional<AgentRunDTO> executeResume(TakeoverResult takeover, ResumeAuthorization authority) {
+        Objects.requireNonNull(takeover, "takeover");
+        Objects.requireNonNull(authority, "authority");
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Agent execution cannot run inside a database transaction");
+        }
+        if (sessionDataSource == null) throw resumeUnavailable();
+        checkpointEngineVersion();
+        return takeover.consumeForExecution(sessionDataSource, authority, typedSessionWrites)
+                .map(resume -> withExecutionContext(resume.actor(), () -> executeResumed(resume)));
+    }
+
+    private AgentRunDTO executeResumed(Execution resume) {
+        var actor = resume.actor();
+        var lease = resume.runLease();
+        var query = new GetAgentRunQuery(lease.runId());
+        boolean entered = false;
+        try {
+            var material = ledger.executionMaterial(actor, query);
+            if (!resume.matchesClaimed(material)) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent resumed run changed before execution");
+            }
+            var authorization = new AgentExecutionAuthorization((request, boundary) -> {
+                if (boundary != AgentRunAuthorization.Boundary.MODEL || !resume.request().equals(request)) {
+                    return AgentRunAuthorization.Decision.DENY;
+                }
+                var decision = resume.authorizeResume(ledger.databaseNow());
+                return decision == AgentRunAuthorization.Decision.ALLOW
+                        ? authorizer.authorize(request, boundary) : decision;
+            }, material.authorization());
+            var claimed = new ClaimedAgentRun(material.run(), lease);
+            entered = true;
+            return runClaimed(actor, query, material, authorization, claimed, resume);
+        } finally {
+            if (!entered) releaseSession(resume.boundSession(), resume.sessionLease());
+        }
+    }
+
+    private AgentRunDTO withExecutionContext(TrustedAgentActor actor, Supplier<AgentRunDTO> execution) {
         Map<String, String> previous = MDC.getCopyOfContextMap();
         try {
             MDC.put("tenantId", Long.toString(actor.tenantId()));
@@ -262,7 +311,7 @@ public final class AdkAgentRunExecutor {
             } else {
                 MDC.remove("userId");
             }
-            return executeScoped(actor, query);
+            return execution.get();
         } finally {
             MDC.clear();
             if (previous != null && !previous.isEmpty()) MDC.setContextMap(previous);
@@ -318,13 +367,19 @@ public final class AdkAgentRunExecutor {
             }
             throw race;
         }
+        return runClaimed(actor, query, material, authorization, claimed, null);
+    }
+
+    private AgentRunDTO runClaimed(TrustedAgentActor actor, GetAgentRunQuery query,
+                                  AgentLedgerService.ExecutionMaterial material, AgentExecutionAuthorization authorization,
+                                  ClaimedAgentRun claimed, Execution resume) {
         AgentRunDTO running = claimed.run();
         AgentRunLease lease = claimed.lease();
         AtomicReference<AgentRunDTO> current = new AtomicReference<>(running);
         RunEventSink eventSink = new RunEventSink(actor, lease, current);
         Runner runner = null;
-        PostgresAdkSessionService sessions = null;
-        SessionLease sessionLease = null;
+        PostgresAdkSessionService sessions = resume == null ? null : resume.boundSession();
+        SessionLease sessionLease = resume == null ? null : resume.sessionLease();
         AdkGovernedToolBridge.Scope toolScope = null;
         NativeAgentGate nativeGate = null;
         boolean nativeSelected = "CODE_FIRST".equals(material.snapshot().definition().executionMode())
@@ -334,8 +389,10 @@ public final class AdkAgentRunExecutor {
         try {
             AgentExecutionSnapshot snapshot = material.snapshot();
             requireSupportedInput(snapshot, running);
-            var input = contextAssembler.assemble(snapshot.input());
-            Content userInput = Content.fromParts(input.parts().stream().map(Part::fromText).toArray(Part[]::new));
+            if (resume != null && !checkpointRequestEligible(material, running)) throw resumeUnavailable();
+            Content userInput = resume == null
+                    ? Content.fromParts(contextAssembler.assemble(snapshot.input()).parts().stream().map(Part::fromText).toArray(Part[]::new))
+                    : null;
             var dependencies = snapshot.definition().dependencies();
             NativeAgentCompilerStrategy nativeCompiler = nativeSelected
                     ? (NativeAgentCompilerStrategy) codeFirstFactories.get(snapshot.definition().codeRef()) : null;
@@ -346,6 +403,7 @@ public final class AdkAgentRunExecutor {
             }
             List<BaseTool> tools = toolScope == null ? List.of() : toolScope.declaredTools();
             BaseAgent root = buildRoot(snapshot.definition(), tools);
+            if (resume != null && !checkpointRootEligible(root)) throw resumeUnavailable();
             Set<String> agentNames = new HashSet<>();
             validateAgentTopology(root, agentNames, new HashSet<>());
             requireGovernedTools(root, tools);
@@ -364,7 +422,13 @@ public final class AdkAgentRunExecutor {
                     authorization, Schedulers.from(controlExecutor), controlExecutor, contextAssembler, material.authorization(), contextOptions, toolScope, nativeGate);
             String userId;
             String sessionId;
-            if (running.sessionId() == null) {
+            if (resume != null) {
+                requireResumeFence(resume);
+                userId = sessions.adkUserId();
+                sessionId = running.sessionId();
+                budget.bindResumeContext(userId, sessionId, resume.invocationId());
+                runner = AgentFlowSessionRunner.withExplicitResume(root, "tianji", sessions, List.of(budget));
+            } else if (running.sessionId() == null) {
                 runner = new AgentFlowInMemoryRunner(root, "tianji_" + query.runId().replace('-', '_'), List.of(budget));
                 userId = actor.tenantId() + ":" + actor.subjectType().name() + ":" + actor.subjectId();
                 Session session = runner.sessionService().createSession(runner.appName(), userId).blockingGet();
@@ -379,8 +443,11 @@ public final class AdkAgentRunExecutor {
                 userId = sessions.adkUserId();
                 sessionId = running.sessionId();
             }
-            Duration remaining = Duration.between(ledger.databaseNow(), running.deadlineAt());
+            boolean cappedByLease = resume != null && lease.expiresAt().isBefore(running.deadlineAt());
+            Instant executionDeadline = cappedByLease ? lease.expiresAt() : running.deadlineAt();
+            Duration remaining = Duration.between(ledger.databaseNow(), executionDeadline);
             if (remaining.isZero() || remaining.isNegative()) {
+                if (cappedByLease) throw resumeLeaseExpired();
                 throw new IllegalStateException("Agent deadline has elapsed", new TimeoutException());
             }
             RunConfig config = RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE)
@@ -389,14 +456,18 @@ public final class AdkAgentRunExecutor {
             if (remaining.compareTo(Duration.ofMillis(deadlineMillis)) > 0 && deadlineMillis < Long.MAX_VALUE) {
                 deadlineMillis++;
             }
-            Flowable<Long> deadline = Flowable.timer(deadlineMillis, TimeUnit.MILLISECONDS)
-                    .flatMap(ignored -> Flowable.error(new TimeoutException("Agent deadline elapsed")));
+            Flowable<Long> deadline = resume == null
+                    ? Flowable.timer(deadlineMillis, TimeUnit.MILLISECONDS)
+                        .flatMap(ignored -> Flowable.error(new TimeoutException("Agent deadline elapsed")))
+                    : Flowable.timer(remaining.toNanos(), TimeUnit.NANOSECONDS)
+                        .flatMap(ignored -> Flowable.error(cappedByLease ? resumeLeaseExpired() : new TimeoutException("Agent deadline elapsed")));
             PostgresAdkSessionService durableSessions = sessions;
             SessionLease durableLease = sessionLease;
-            if (durableSessions != null) budget.bindSessionFence(() -> durableSessions.verifySessionLease(durableLease));
-            Flowable<Long> control = Flowable.interval(HEARTBEAT_SECONDS, TimeUnit.SECONDS,
-                            Schedulers.from(controlExecutor))
-                    .concatMap(ignored -> switch (ledger.heartbeat(actor, lease, LEASE_DURATION)) {
+            if (resume != null) budget.bindSessionFence(() -> requireResumeFence(resume));
+            else if (durableSessions != null) budget.bindSessionFence(() -> durableSessions.verifySessionLease(durableLease));
+            Flowable<Long> ticks = Flowable.interval(HEARTBEAT_SECONDS, TimeUnit.SECONDS, Schedulers.from(controlExecutor));
+            Flowable<Long> control = resume != null ? ticks.concatMap(ignored -> observeResumeControl(actor, query, resume))
+                    : ticks.concatMap(ignored -> switch (ledger.heartbeat(actor, lease, LEASE_DURATION)) {
                         case ACTIVE -> {
                             if (durableSessions != null) durableSessions.renewSessionLease(durableLease, LEASE_DURATION);
                             yield Flowable.empty();
@@ -409,10 +480,12 @@ public final class AdkAgentRunExecutor {
             Map<String, String> agentOutputs = new LinkedHashMap<>();
             NativeAgentGate activeNativeGate = nativeGate;
             invocationStarted = true;
-            runner.runAsync(userId, sessionId, userInput, config)
-                    .takeUntil(Flowable.merge(deadline, control, budget.idleTimeout(),
+            Flowable<Event> invocation = resume == null ? runner.runAsync(userId, sessionId, userInput, config)
+                    : runner.runAsync(userId, sessionId, resume.invocationId(), null, config, null);
+            invocation.takeUntil(Flowable.merge(deadline, control, budget.idleTimeout(),
                             activeNativeGate == null ? Flowable.never() : activeNativeGate.failureSignal()))
                     .blockingForEach(event -> {
+                        if (resume != null && !resume.invocationId().equals(event.invocationId())) throw resumeUnavailable();
                         var projection = projector.project(event, agentNames);
                         if (activeNativeGate != null) activeNativeGate.observeEvent(event, projection);
                         projection.ifPresent(projected -> {
@@ -503,14 +576,47 @@ public final class AdkAgentRunExecutor {
                             closeFailure.getClass().getSimpleName());
                 }
             }
-            if (sessions != null && sessionLease != null) {
-                try {
-                    sessions.releaseSessionLease(sessionLease);
-                } catch (RuntimeException releaseFailure) {
-                    log.warn("Agent session stage=RELEASE outcome=ERROR errorType={}",
-                            releaseFailure.getClass().getSimpleName());
-                }
-            }
+            releaseSession(sessions, sessionLease);
+        }
+    }
+
+    private Flowable<Long> observeResumeControl(TrustedAgentActor actor, GetAgentRunQuery query, Execution resume)
+            throws TimeoutException {
+        var latest = ledger.get(actor, query);
+        Instant observedAt = ledger.databaseNow();
+        if (!AgentRunTransitions.terminal(latest.status()) && !latest.deadlineAt().isAfter(observedAt)) {
+            throw new TimeoutException("Agent deadline elapsed");
+        }
+        if (latest.status() == AgentRunStatusEnum.RUNNING && latest.cancelRequested()) {
+            throw new CancellationSignal();
+        }
+        requireResumeFence(resume);
+        return Flowable.empty();
+    }
+
+    private void requireResumeFence(Execution resume) {
+        Instant observedAt = ledger.databaseNow();
+        if (!resume.runLease().expiresAt().isAfter(observedAt) || !resume.sessionLease().expiresAt().isAfter(observedAt)) {
+            throw resumeLeaseExpired();
+        }
+        resume.boundSession().verifySessionLease(resume.sessionLease());
+    }
+
+    private static AgentLedgerException resumeLeaseExpired() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent resume lease is no longer valid");
+    }
+
+    private static AgentLedgerException resumeUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Agent checkpoint resume is unavailable");
+    }
+
+    private static void releaseSession(PostgresAdkSessionService sessions, SessionLease lease) {
+        if (sessions == null || lease == null) return;
+        try {
+            sessions.releaseSessionLease(lease);
+        } catch (RuntimeException releaseFailure) {
+            log.warn("Agent session stage=RELEASE outcome=ERROR errorType={}", releaseFailure.getClass().getSimpleName());
         }
     }
 
@@ -620,24 +726,33 @@ public final class AdkAgentRunExecutor {
     }
 
     private FirstInputCheckpointBO firstInputCheckpoint(AgentLedgerService.ExecutionMaterial material,
-                                                            AgentRunDTO running, BaseAgent root, Content userInput) {
-        if (checkpointEngineVersion == null || running.attempt() != 1 || contextAssembler.hasProviders()
-                || contextOptions.snapshots() || contextOptions.trimming()) return null;
+                                                       AgentRunDTO running, BaseAgent root, Content userInput) {
+        if (checkpointEngineVersion == null || !checkpointRequestEligible(material, running) || !checkpointRootEligible(root)) {
+            return null;
+        }
+        return new FirstInputCheckpointBO(material.authorization(), running, userInput, checkpointEngineVersion);
+    }
+
+    private boolean checkpointRequestEligible(AgentLedgerService.ExecutionMaterial material, AgentRunDTO running) {
         var request = material.authorization();
         var snapshot = material.snapshot();
         var definition = snapshot.definition();
         var dependencies = definition.dependencies();
         var policy = snapshot.effectivePolicy();
-        if (request.actor().subjectType() != TrustedAgentActor.SubjectType.USER
-                || "LEGACY".equals(request.actor().issuerFingerprint()) || !request.sessionRequired()
-                || !"CONFIG".equals(definition.executionMode()) || !(root instanceof LlmAgent agent)
-                || !agent.subAgents().isEmpty() || agent.outputKey().isPresent()
-                || !dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty() || !dependencies.tools().isEmpty()
-                || policy.maxToolCalls() != 0 || !policy.allowedToolVersions().isEmpty()
-                || snapshot.processLink() != null || !snapshot.input().artifactRefs().isEmpty()
-                || !snapshot.input().taskData().isEmpty() || snapshot.input().text() == null
-                || snapshot.input().text().isBlank()) return null;
-        return new FirstInputCheckpointBO(request, running, userInput, checkpointEngineVersion);
+        return running.attempt() == 1 && !contextAssembler.hasProviders()
+                && !contextOptions.snapshots() && !contextOptions.trimming()
+                && request.actor().subjectType() == TrustedAgentActor.SubjectType.USER
+                && !"LEGACY".equals(request.actor().issuerFingerprint()) && request.sessionRequired()
+                && "CONFIG".equals(definition.executionMode())
+                && dependencies.prompts().isEmpty() && dependencies.skills().isEmpty() && dependencies.tools().isEmpty()
+                && policy.maxToolCalls() == 0 && policy.allowedToolVersions().isEmpty()
+                && snapshot.processLink() == null && snapshot.input().artifactRefs().isEmpty()
+                && snapshot.input().taskData().isEmpty() && snapshot.input().text() != null
+                && !snapshot.input().text().isBlank();
+    }
+
+    private static boolean checkpointRootEligible(BaseAgent root) {
+        return root instanceof LlmAgent agent && agent.subAgents().isEmpty() && agent.outputKey().isEmpty();
     }
 
     private static String checkpointEngineVersion() {

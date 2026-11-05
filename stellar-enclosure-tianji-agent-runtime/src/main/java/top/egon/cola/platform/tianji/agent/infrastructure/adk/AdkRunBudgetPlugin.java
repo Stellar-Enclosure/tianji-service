@@ -74,6 +74,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private String nativeSessionId;
     private String nativeInvocationId;
     private final java.util.concurrent.atomic.AtomicReference<Runnable> sessionFence = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<ResumeContext> resumeContext = new java.util.concurrent.atomic.AtomicReference<>();
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
     private final Map<String, ModelUsageSeedVO> usageSlots = new java.util.HashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
@@ -145,6 +146,25 @@ final class AdkRunBudgetPlugin implements Plugin {
     void bindSessionFence(Runnable fence) {
         if (!authorizationRequest.sessionRequired() || !sessionFence.compareAndSet(null, Objects.requireNonNull(fence, "fence"))) throw new IllegalStateException("Persistent Session fencing is already bound or unsupported");
     }
+    void bindResumeContext(String userId, String sessionId, String invocationId) {
+        var expected = new ResumeContext(Objects.requireNonNull(userId, "userId"), Objects.requireNonNull(sessionId, "sessionId"),
+                Objects.requireNonNull(invocationId, "invocationId"));
+        if (!authorizationRequest.sessionRequired() || !resumeContext.compareAndSet(null, expected)) {
+            throw new IllegalStateException("Agent resume context is already bound or unsupported");
+        }
+    }
+
+    private void requireResumeContext(CallbackContext context) {
+        var expected = resumeContext.get();
+        if (expected != null && (!expected.userId().equals(context.userId()) || !expected.sessionId().equals(context.sessionId())
+                || !expected.invocationId().equals(context.invocationId()))) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    "Agent resumed native context does not match the checkpoint");
+        }
+    }
+
+    private record ResumeContext(String userId, String sessionId, String invocationId) { }
+
     private void requireSessionFence() {
         if (!authorizationRequest.sessionRequired()) return; var fence = sessionFence.get();
         if (fence == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Persistent Session source fencing is unavailable"); fence.run();
@@ -156,6 +176,7 @@ final class AdkRunBudgetPlugin implements Plugin {
         var preparedContext = new java.util.concurrent.atomic.AtomicReference<AdkContextSnapshotProjector.PreparedCall>();
         var contextPlan = new java.util.concurrent.atomic.AtomicReference<AdkContextWindowPlan>();
         return callbackErrors(Maybe.<LlmResponse>defer(() -> {
+            requireResumeContext(context);
             if (tracking()) requireNativeContext(context, false);
             if (nativeGate != null) nativeGate.requireExpectedAgent(context);
             authorization.require(AgentRunAuthorization.Boundary.MODEL);
@@ -336,6 +357,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public Maybe<LlmResponse> afterModelCallback(CallbackContext context, LlmResponse response) {
         return callbackErrors(Maybe.defer(() -> {
+            requireResumeContext(context);
             if (tracking()) requireNativeContext(context, true);
             if (response.partial().orElse(false)) {
                 if (nativeGate != null) nativeGate.validateResponseEnvelope(context, response);

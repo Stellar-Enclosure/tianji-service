@@ -14,6 +14,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
@@ -119,17 +120,84 @@ public final class AgentCheckpointTakeoverService {
     public static final class TakeoverResult {
         private final Acknowledgement acknowledgement;
         private final AtomicReference<Launch> launch;
+        private final ResumeAuthorization issuingAuthority;
 
-        private TakeoverResult(Acknowledgement acknowledgement, Launch launch) {
+        private TakeoverResult(Acknowledgement acknowledgement, Launch launch, ResumeAuthorization issuingAuthority) {
             this.acknowledgement = acknowledgement;
             this.launch = new AtomicReference<>(launch);
+            this.issuingAuthority = issuingAuthority;
         }
 
         public Acknowledgement acknowledgement() { return acknowledgement; }
 
         Optional<Launch> takeLaunch() { return Optional.ofNullable(launch.getAndSet(null)); }
 
+        /** Redeems the in-process winner only for its exact configured execution owner. */
+        public Optional<Execution> consumeForExecution(DataSource source, ResumeAuthorization authority, boolean typedWrites) {
+            if (TransactionSynchronizationManager.isActualTransactionActive()
+                    || TransactionSynchronizationManager.isSynchronizationActive()
+                    || (source != null && TransactionSynchronizationManager.hasResource(source))) {
+                throw new IllegalStateException("Agent checkpoint execution cannot begin inside a transaction");
+            }
+            var winning = launch.get();
+            if (winning == null) return Optional.empty();
+            if (source != winning.source() || authority != issuingAuthority) throw denied();
+            if (!launch.compareAndSet(winning, null)) return Optional.empty();
+            var store = new PostgresAdkSessionService(source, winning.authorizationRequest().execution().actor(),
+                    APP, false, typedWrites);
+            return Optional.of(new Execution(winning, winning.bindSession(store), authority));
+        }
+
         @Override public String toString() { return "TakeoverResult[redacted]"; }
+    }
+
+    /** A private-construction execution handle for the claimed Run and checkpoint-bound Session. */
+    public static final class Execution {
+        private final Launch launch;
+        private final PostgresAdkSessionService boundSession;
+        private final ResumeAuthorization authority;
+
+        private Execution(Launch launch, PostgresAdkSessionService boundSession, ResumeAuthorization authority) {
+            this.launch = launch;
+            this.boundSession = boundSession;
+            this.authority = authority;
+        }
+
+        public TrustedAgentActor actor() { return request().actor(); }
+        public AgentRunAuthorization.Request request() { return launch.authorizationRequest().execution(); }
+        public AgentRunLease runLease() { return launch.runLease(); }
+        public PostgresAdkSessionService.SessionLease sessionLease() { return launch.sessionLease(); }
+        public PostgresAdkSessionService boundSession() { return boundSession; }
+        public String invocationId() { return launch.invocationId(); }
+
+        public boolean matchesClaimed(AgentLedgerService.ExecutionMaterial material) {
+            if (material == null || !request().equals(material.authorization())) return false;
+            var run = material.run();
+            var cut = launch.checkpoint();
+            return runLease().runId().equals(run.runId()) && cut.sessionId().equals(run.sessionId())
+                    && run.status() == AgentRunStatusEnum.RUNNING && !run.cancelRequested() && run.attempt() == 1
+                    && run.revision() == cut.revision() + 2 && run.lastEventSequence() == cut.lastEventSequence() + 2;
+        }
+
+        /** Performs a fresh authority call before a model boundary without extending the winning lease. */
+        public AgentRunAuthorization.Decision authorizeResume(Instant observedAt) {
+            Objects.requireNonNull(observedAt, "observedAt");
+            if (TransactionSynchronizationManager.isActualTransactionActive()
+                    || TransactionSynchronizationManager.isSynchronizationActive()
+                    || TransactionSynchronizationManager.hasResource(launch.source())) {
+                throw new IllegalStateException("Agent resume authorization cannot run inside a transaction");
+            }
+            Instant fixedExpiry = runLease().expiresAt();
+            if (!fixedExpiry.isAfter(observedAt)) return AgentRunAuthorization.Decision.UNAVAILABLE;
+            var current = authority.authorize(launch.authorizationRequest());
+            if (current == null) return AgentRunAuthorization.Decision.UNAVAILABLE;
+            if (current.isEmpty()) return AgentRunAuthorization.Decision.DENY;
+            var permit = current.orElseThrow();
+            return launch.authorizationRequest().equals(permit.request()) && !permit.expiresAt().isBefore(fixedExpiry)
+                    ? AgentRunAuthorization.Decision.ALLOW : AgentRunAuthorization.Decision.UNAVAILABLE;
+        }
+
+        @Override public String toString() { return "Execution[redacted]"; }
     }
 
     record Launch(DataSource source, AgentRunLease runLease, PostgresAdkSessionService.SessionLease sessionLease,
@@ -247,7 +315,7 @@ public final class AgentCheckpointTakeoverService {
         if (!Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT pg_catalog.clock_timestamp()<LEAST(CAST(? AS timestamptz),CAST(? AS timestamptz))
                 """, Boolean.class, Timestamp.from(runLease.expiresAt()), Timestamp.from(sessionLease.expiresAt())))) throw conflict();
-        return new TakeoverResult(ack, new Launch(source, runLease, sessionLease, expected, permit.request()));
+        return new TakeoverResult(ack, new Launch(source, runLease, sessionLease, expected, permit.request()), authorization);
     }
 
     private void requirePrimary(boolean readOnly) {
@@ -289,7 +357,7 @@ public final class AgentCheckpointTakeoverService {
         }
         if (!command.runId().equals(row.ackRunId()) || !"RUNNING".equals(row.status()) || !row.firstAttempt()
                 || row.revision() == null || row.revision() != command.expectedRevision() + 2) throw unavailable();
-        return Optional.of(new TakeoverResult(new Acknowledgement(row.runId(), AgentRunStatusEnum.RUNNING, 1, row.revision()), null));
+        return Optional.of(new TakeoverResult(new Acknowledgement(row.runId(), AgentRunStatusEnum.RUNNING, 1, row.revision()), null, null));
     }
 
     private AdvancedRun advanceRun(TrustedAgentActor actor, ResumeCommand command, String workerId,

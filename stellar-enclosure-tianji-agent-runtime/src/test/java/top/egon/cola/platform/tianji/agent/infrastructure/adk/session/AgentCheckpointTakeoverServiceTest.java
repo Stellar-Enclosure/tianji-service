@@ -11,7 +11,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
@@ -77,6 +79,46 @@ class AgentCheckpointTakeoverServiceTest {
             assertEquals(1, fixture.actions.stream().filter("advance"::equals).count());
             assertEquals(1, fixture.actions.stream().filter("acquire"::equals).count());
         }
+    }
+
+    @Test
+    void execution_handle_requires_the_issuing_source_and_authority_and_rechecks_current_permit() throws Exception {
+        try (var fixture = new Fixture()) {
+            var result = fixture.service.takeOver(OWNER, COMMAND, WORKER);
+            assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () ->
+                    result.consumeForExecution(mock(DataSource.class), fixture.authority, true));
+            assertCode(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, () ->
+                    result.consumeForExecution(fixture.source, ignored -> Optional.empty(), true));
+            var execution = result.consumeForExecution(fixture.source, fixture.authority, true).orElseThrow();
+            assertEquals(EXECUTION, execution.request());
+            assertEquals(INVOCATION, execution.invocationId());
+            assertSame(fixture.sessionLease, execution.sessionLease());
+            assertEquals(EXPIRY, execution.runLease().expiresAt());
+            assertTrue(result.consumeForExecution(fixture.source, fixture.authority, true).isEmpty());
+            var material = mock(AgentLedgerService.ExecutionMaterial.class);
+            when(material.authorization()).thenReturn(EXECUTION);
+            when(material.run()).thenReturn(resumedRun(5));
+            assertTrue(execution.matchesClaimed(material));
+            when(material.run()).thenReturn(resumedRun(6));
+            assertFalse(execution.matchesClaimed(material));
+
+            assertEquals(AgentRunAuthorization.Decision.ALLOW, execution.authorizeResume(NOW));
+            fixture.decide = request -> Optional.of(new ResumePermit(request, EXPIRY.minusMillis(1)));
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, execution.authorizeResume(NOW));
+            fixture.decide = request -> Optional.empty();
+            assertEquals(AgentRunAuthorization.Decision.DENY, execution.authorizeResume(NOW));
+            int calls = fixture.authorizationCalls;
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, execution.authorizeResume(EXPIRY));
+            assertEquals(calls, fixture.authorizationCalls);
+            var replay = fixture.service.takeOver(OWNER, COMMAND, WORKER);
+            assertTrue(replay.consumeForExecution(fixture.source, fixture.authority, true).isEmpty());
+            assertEquals(calls, fixture.authorizationCalls);
+        }
+    }
+
+    private static AgentRunDTO resumedRun(long revision) {
+        return new AgentRunDTO(RUN, "fixture", 1, SESSION, AgentRunStatusEnum.RUNNING, null, false,
+                1, revision, 5, DEADLINE, NOW, null);
     }
 
     @Test
@@ -233,6 +275,7 @@ class AgentCheckpointTakeoverServiceTest {
         private final MockedConstruction<JdbcAdkSessionRepository> sessionRepositoryMocks;
         private final MockedConstruction<PostgresAdkSessionService> sessionServiceMocks;
         private final AgentCheckpointTakeoverService service;
+        private final AgentCheckpointTakeoverService.ResumeAuthorization authority;
         private final List<String> actions = new ArrayList<>();
         private final List<Long> eventSequences = new ArrayList<>();
         private Optional<AgentCheckpointObservationService.ResumeMatch> actual = Optional.of(MATCH);
@@ -290,6 +333,11 @@ class AgentCheckpointTakeoverServiceTest {
                 });
             });
             sessionServiceMocks = mockConstruction(PostgresAdkSessionService.class, (mock, context) -> {
+                if (context.arguments().size() == 5) {
+                    assertEquals(List.of(source, OWNER, "tianji", false, true), context.arguments());
+                    when(mock.withResumeCheckpoint(source, sessionLease, MATCH)).thenReturn(mock);
+                    return;
+                }
                 assertEquals(List.of(source, OWNER, "tianji"), context.arguments());
                 when(mock.acquireCheckpointLeaseInTransaction(eq(SESSION), any(AgentRunLease.class), eq(11L), eq(EXPIRY)))
                         .thenAnswer(ignored -> {
@@ -300,13 +348,14 @@ class AgentCheckpointTakeoverServiceTest {
                         });
             });
             try {
-                service = new AgentCheckpointTakeoverService(source, request -> {
+                authority = request -> {
                     assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
                     assertFalse(TransactionSynchronizationManager.hasResource(source));
                     assertEquals(new ResumeRequest(EXECUTION, COMMAND, MATCH.cutSha256()), request);
                     authorizationCalls++;
                     return decide.apply(request);
-                });
+                };
+                service = new AgentCheckpointTakeoverService(source, authority);
             } catch (RuntimeException | Error failure) {
                 close();
                 throw failure;
