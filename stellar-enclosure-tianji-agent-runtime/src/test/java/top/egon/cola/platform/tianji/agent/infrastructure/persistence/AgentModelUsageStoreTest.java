@@ -49,6 +49,27 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verifyNoInteractions;
+import org.mockito.ArgumentCaptor;
+import java.util.Optional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.SimpleTransactionStatus;
+import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
+import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.never;
 
 class AgentModelUsageStoreTest {
     private static final TrustedAgentActor ACTOR = new TrustedAgentActor(
@@ -346,6 +367,137 @@ class AgentModelUsageStoreTest {
                 }
             }
             return result;
+        }
+    }
+
+    @Test
+    void finiteUsageMutationFollowsExistingBudgetScope() {
+        var fixture = new UsageMutationFixture();
+        var reserved = fixture.service.reserveBudget(ACTOR, fixture.lease, fixture.request, null, fixture.seed);
+        assertTrue(reserved.newlyCreated());
+        var reserveOrder = inOrder(fixture.repository, fixture.manager);
+        reserveOrder.verify(fixture.repository).lockRunForBudget(ACTOR, "run");
+        reserveOrder.verify(fixture.repository).insertBudgetReservation(ACTOR, fixture.lease, fixture.request, NOW);
+        reserveOrder.verify(fixture.repository).reserveBudget(eq(ACTOR), eq(fixture.lease), eq(fixture.request), any());
+        reserveOrder.verify(fixture.repository).budgetReservation(ACTOR, "run", "slot", true);
+        reserveOrder.verify(fixture.repository).insertModelUsageSeed(ACTOR, fixture.lease, "slot", fixture.seed, NOW);
+        reserveOrder.verify(fixture.manager).commit(any());
+
+        clearInvocations(fixture.repository, fixture.manager);
+        var settled = fixture.service.settleBudget(ACTOR, fixture.lease, "slot", fixture.actual, fixture.observed);
+        assertEquals(AgentBudgetReservation.State.SETTLED, settled.state());
+        var settleOrder = inOrder(fixture.repository, fixture.manager);
+        settleOrder.verify(fixture.repository).lockRunForBudget(ACTOR, "run");
+        settleOrder.verify(fixture.repository).lockLeaseForSettlement(ACTOR, fixture.lease);
+        settleOrder.verify(fixture.repository).budgetReservation(ACTOR, "run", "slot", true);
+        settleOrder.verify(fixture.repository).settleBudget(ACTOR.tenantId(), "run", "slot", AgentBudgetReservation.State.SETTLED, fixture.actual, NOW);
+        settleOrder.verify(fixture.repository).modelUsageForUpdate(ACTOR, fixture.lease, "slot");
+        var measure = ArgumentCaptor.forClass(AgentBudgetService.ModelUsageMeasurementVO.class);
+        settleOrder.verify(fixture.repository).settleModelUsage(eq(ACTOR), eq(fixture.lease), eq("slot"), measure.capture(), eq(NOW));
+        settleOrder.verify(fixture.manager).commit(any());
+        assertEquals("PRICED", measure.getValue().state());
+        assertEquals(new BigDecimal("0.00000550"), measure.getValue().cost());
+        assertTrue(measure.getValue().finalSha256().matches("[0-9a-f]{64}"));
+
+        clearInvocations(fixture.repository, fixture.manager);
+        when(fixture.repository.modelUsageForUpdate(ACTOR, fixture.lease, "slot")).thenReturn(Optional.of(fixture.row(
+                "PRICED", null, measure.getValue().finalSha256())));
+        assertEquals(settled, fixture.service.settleBudget(ACTOR, fixture.lease, "slot", fixture.actual, fixture.observed));
+        verify(fixture.repository, never()).settleModelUsage(any(), any(), anyString(), any(), any());
+        verify(fixture.manager).commit(any());
+
+        clearInvocations(fixture.repository, fixture.manager);
+        var contradictory = new AgentBudgetService.ModelUsageFinalVO("route-v1", "fixture-model", null, null,
+                AgentBudgetService.ModelUsageUnknownReason.INVALID_USAGE);
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
+                assertThrows(AgentLedgerException.class,
+                        () -> fixture.service.settleBudget(ACTOR, fixture.lease, "slot", fixture.actual, contradictory)).code());
+        verify(fixture.repository, never()).settleModelUsage(any(), any(), anyString(), any(), any());
+        verify(fixture.manager).rollback(any());
+
+        var historic = new UsageMutationFixture();
+        when(historic.repository.insertBudgetReservation(ACTOR, historic.lease, historic.request, NOW)).thenReturn(0);
+        when(historic.repository.validLease(ACTOR, historic.lease)).thenReturn(true);
+        when(historic.repository.modelUsageForUpdate(ACTOR, historic.lease, "slot")).thenReturn(Optional.empty());
+        assertFalse(historic.service.reserveBudget(ACTOR, historic.lease, historic.request, null, historic.seed).newlyCreated());
+        verify(historic.repository, never()).insertModelUsageSeed(any(), any(), anyString(), any(), any());
+
+        var legacy = new UsageMutationFixture();
+        assertTrue(legacy.service.reserveBudget(ACTOR, legacy.lease, legacy.request).newlyCreated());
+        legacy.service.settleBudget(ACTOR, legacy.lease, "slot", legacy.actual);
+        verify(legacy.repository, never()).insertModelUsageSeed(any(), any(), anyString(), any(), any());
+        verify(legacy.repository, never()).modelUsageForUpdate(any(), any(), anyString());
+        verify(legacy.repository, never()).settleModelUsage(any(), any(), anyString(), any(), any());
+
+        var failed = new UsageMutationFixture();
+        when(failed.repository.settleModelUsage(eq(ACTOR), eq(failed.lease), eq("slot"), any(), eq(NOW)))
+                .thenThrow(new IllegalStateException("forced fixture SQL failure"));
+        assertThrows(IllegalStateException.class,
+                () -> failed.service.settleBudget(ACTOR, failed.lease, "slot", failed.actual, failed.observed));
+        verify(failed.repository).settleBudget(ACTOR.tenantId(), "run", "slot", AgentBudgetReservation.State.SETTLED, failed.actual, NOW);
+        verify(failed.manager).rollback(any());
+        verify(failed.manager, never()).commit(any());
+
+        var exceeded = new UsageMutationFixture();
+        var overshot = new AgentBudgetSettlement(11L, 2L, new BigDecimal("0.1"));
+        var oversized = new AgentBudgetService.ModelUsageFinalVO("route-v1", "fixture-model", 11L, 2L, null);
+        assertEquals(AgentErrorCodeEnum.TIANJI_BUDGET_EXCEEDED,
+                assertThrows(AgentLedgerException.class,
+                        () -> exceeded.service.settleBudget(ACTOR, exceeded.lease, "slot", overshot, oversized)).code());
+        verify(exceeded.repository).settleBudget(ACTOR.tenantId(), "run", "slot", AgentBudgetReservation.State.UNKNOWN, overshot, NOW);
+        verify(exceeded.repository).settleModelUsage(eq(ACTOR), eq(exceeded.lease), eq("slot"), any(), eq(NOW));
+        verify(exceeded.manager).commit(any());
+    }
+
+    private static final class UsageMutationFixture {
+        final AgentLedgerService ledger = mock(AgentLedgerService.class);
+        final JdbcAgentLedgerRepository repository = mock(JdbcAgentLedgerRepository.class);
+        final PlatformTransactionManager manager = mock(PlatformTransactionManager.class);
+        final AgentBudgetService service = new AgentBudgetService(ledger, repository, new TransactionTemplate(manager));
+        final AgentRunLease lease = new AgentRunLease("run", "worker", 1, NOW.plusSeconds(30));
+        final AgentBudgetRequest request = new AgentBudgetRequest("slot", AgentBudgetRequest.Kind.MODEL, null, 10, 8, BigDecimal.ONE);
+        final AgentModelUsagePriceVO price = new AgentModelUsagePriceVO("route-v1", "fixture-model", "USD", new BigDecimal("0.5"), new BigDecimal("2"));
+        final AgentBudgetService.ModelUsageSeedVO seed = new AgentBudgetService.ModelUsageSeedVO("route-v1", "fixture-model", price);
+        final AgentBudgetSettlement actual = new AgentBudgetSettlement(3L, 2L, new BigDecimal("0.1"));
+        final AgentBudgetService.ModelUsageFinalVO observed = new AgentBudgetService.ModelUsageFinalVO("route-v1", "fixture-model", 3L, 2L, null);
+
+        UsageMutationFixture() {
+            when(manager.getTransaction(any())).thenReturn(new SimpleTransactionStatus());
+            when(ledger.acceptsModelUsage("CONFIG", "route-v1")).thenReturn(true);
+            var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(10), Duration.ofSeconds(5), 4, 0,
+                    1000, 1000, BigDecimal.TEN, "USD", 1, java.util.Set.of(), null, null);
+            var definition = new AgentDefinitionSpecDTO("assistant", 1, "CONFIG", null, "1", "1",
+                    new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "route-v1", "policy-v1"),
+                    policy, java.util.Map.of("modelName", "fixture-model", "chatModelBeanName", "fixture"));
+            when(ledger.snapshot(ACTOR, new GetAgentRunQuery("run"))).thenReturn(new AgentExecutionSnapshot(
+                    definition, "a".repeat(64), policy, new AgentInputDTO("fixture", null, null), null));
+            when(repository.databaseNow()).thenReturn(NOW);
+            when(repository.lockRunForBudget(ACTOR, "run")).thenReturn(true);
+            when(repository.lockLeaseForSettlement(ACTOR, lease)).thenReturn(true);
+            when(repository.insertBudgetReservation(ACTOR, lease, request, NOW)).thenReturn(1);
+            when(repository.reserveBudget(ACTOR, lease, request, policy)).thenReturn(1);
+            var settled = new java.util.concurrent.atomic.AtomicBoolean(false);
+            when(repository.budgetReservation(eq(ACTOR), eq("run"), eq("slot"), anyBoolean())).thenAnswer(call ->
+                    java.util.Optional.of(settled.get() ? reservation(AgentBudgetReservation.State.SETTLED, actual)
+                            : reservation(AgentBudgetReservation.State.RESERVED, new AgentBudgetSettlement(null, null, null))));
+            when(repository.adjustBudget(eq(ACTOR), eq(lease), eq(AgentBudgetRequest.Kind.MODEL), anyLong(), anyLong(), any()))
+                    .thenReturn(1);
+            doAnswer(call -> { settled.set(true); return null; }).when(repository)
+                    .settleBudget(eq(ACTOR.tenantId()), eq("run"), eq("slot"), any(), any(), eq(NOW));
+            when(repository.insertModelUsageSeed(ACTOR, lease, "slot", seed, NOW)).thenReturn(1);
+            when(repository.modelUsageForUpdate(ACTOR, lease, "slot")).thenReturn(java.util.Optional.of(row("PENDING", null, null)));
+            when(repository.settleModelUsage(eq(ACTOR), eq(lease), eq("slot"), any(), eq(NOW))).thenReturn(1);
+        }
+
+        private AgentBudgetReservation reservation(AgentBudgetReservation.State state, AgentBudgetSettlement values) {
+            return new AgentBudgetReservation("slot", lease.epoch(), AgentBudgetRequest.Kind.MODEL, null,
+                    request.inputTokens(), request.outputTokens(), request.estimatedCost(), state,
+                    values.inputTokens(), values.outputTokens(), values.actualCost(), false);
+        }
+
+        JdbcAgentLedgerRepository.ModelUsageWriteRow row(String state, String reason, String hash) {
+            return new JdbcAgentLedgerRepository.ModelUsageWriteRow(seed.routeRef(), seed.modelName(), price.priceVersionRef(),
+                    price.currency(), price.inputRatePerMillion(), price.outputRatePerMillion(), state, reason, hash, CREATED);
         }
     }
 }

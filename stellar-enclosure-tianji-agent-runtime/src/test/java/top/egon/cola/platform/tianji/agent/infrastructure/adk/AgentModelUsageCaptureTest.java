@@ -1,16 +1,30 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.adk;
 
+import com.google.adk.agents.CallbackContext;
 import com.google.adk.models.LlmRequest;
 import com.google.adk.models.LlmResponse;
+import com.google.genai.types.GenerateContentResponseUsageMetadata;
+import io.reactivex.rxjava3.schedulers.Schedulers;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import top.egon.cola.platform.tianji.agent.autoconfigure.ModelBudgetProperties;
+import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageFinalVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageSeedVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageUnknownReason;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
@@ -19,17 +33,25 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 
 import java.math.BigDecimal;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -182,5 +204,127 @@ class AgentModelUsageCaptureTest {
 
     private static LlmRequest request(String model) {
         return LlmRequest.builder().model(model).build();
+    }
+    @Test
+    void onlyAdmittedConfigFinalAddsUsage() {
+        try (var fixture = new CaptureFixture("CONFIG", true)) {
+            fixture.before("exact-call");
+            var seed = new ModelUsageSeedVO(FIXTURE_ROUTE, MODEL, fixture.price);
+            verify(fixture.budgets).reserveBudget(eq(fixture.actor), eq(fixture.lease), any(), isNull(), eq(seed));
+            assertNull(fixture.after("exact-call", response(3, 2, 5, false)));
+            verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "exact-call", fixture.actual,
+                    new ModelUsageFinalVO(FIXTURE_ROUTE, MODEL, 3L, 2L, null));
+
+            fixture.before("bad-total");
+            assertNull(fixture.after("bad-total", response(3, 2, 6, false)));
+            verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "bad-total", fixture.actual,
+                    new ModelUsageFinalVO(FIXTURE_ROUTE, MODEL, null, null, ModelUsageUnknownReason.INVALID_USAGE));
+
+            fixture.before("absent-usage");
+            assertNull(fixture.after("absent-usage", LlmResponse.builder().build()));
+            verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "absent-usage", fixture.actual,
+                    new ModelUsageFinalVO(FIXTURE_ROUTE, MODEL, null, null, ModelUsageUnknownReason.MISSING_USAGE));
+
+            fixture.before("known-error");
+            var failure = fixture.after("known-error", LlmResponse.builder().errorMessage("synthetic error").build());
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name(), failure.errorMessage().orElseThrow());
+            verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "known-error",
+                    new AgentBudgetSettlement(null, null, null),
+                    new ModelUsageFinalVO(FIXTURE_ROUTE, MODEL, null, null, ModelUsageUnknownReason.MODEL_ERROR));
+        }
+        for (String mode : List.of("CONFIG", "CODE_FIRST")) {
+            try (var fixture = new CaptureFixture(mode, false)) {
+                fixture.before("unpriced-path");
+                assertNull(fixture.after("unpriced-path", response(3, 2, 5, false)));
+                verify(fixture.budgets).reserveBudget(eq(fixture.actor), eq(fixture.lease), any());
+                verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "unpriced-path", fixture.actual);
+                verify(fixture.estimator, never()).modelUsagePrice(any(), any());
+                verify(fixture.budgets, never()).reserveBudget(any(), any(), any(), any(), any());
+                verify(fixture.budgets, never()).settleBudget(any(), any(), anyString(), any(), any());
+            }
+        }
+    }
+
+    @Test
+    void partialAndClosedCallbacksDoNotRecord() {
+        try (var fixture = new CaptureFixture("CONFIG", true)) {
+            fixture.before("closing-call");
+            assertNull(fixture.after("closing-call", response(3, 2, 5, true)));
+            verify(fixture.budgets, never()).settleBudget(any(), any(), anyString(), any(), any());
+            verify(fixture.budgets, never()).settleBudget(any(), any(), anyString(), any());
+
+            fixture.plugin.close().blockingAwait();
+            assertNull(fixture.after("closing-call", response(3, 2, 5, false)));
+            verify(fixture.budgets, never()).settleBudget(any(), any(), anyString(), any(), any());
+            verify(fixture.budgets).settleBudget(fixture.actor, fixture.lease, "closing-call", fixture.actual);
+        }
+    }
+
+    private static LlmResponse response(int input, int output, int total, boolean partial) {
+        return LlmResponse.builder().partial(partial).usageMetadata(GenerateContentResponseUsageMetadata.builder()
+                .promptTokenCount(input).candidatesTokenCount(output).totalTokenCount(total).build()).build();
+    }
+
+    private static final class CaptureFixture implements AutoCloseable {
+        private final Instant now = Instant.parse("2026-11-05T05:50:00Z");
+        private final TrustedAgentActor actor = TrustedAgentActor.verified(42, TrustedAgentActor.SubjectType.USER, "owner", "https://idp.example/42");
+        private final AgentRunLease lease = new AgentRunLease("run-one", "worker-one", 1, now.plusSeconds(30));
+        private final AgentLedgerService ledger = mock(AgentLedgerService.class);
+        private final AgentBudgetService budgets = mock(AgentBudgetService.class);
+        private final AgentModelBudgetEstimator estimator = mock(AgentModelBudgetEstimator.class);
+        private final ScheduledExecutorService control = Executors.newSingleThreadScheduledExecutor(task -> Thread.ofPlatform().daemon().unstarted(task));
+        private final AgentBudgetSettlement actual = new AgentBudgetSettlement(3L, 2L, new BigDecimal("0.1"));
+        private final AgentModelUsagePriceVO price = price(FIXTURE_ROUTE, MODEL, "USD", new BigDecimal("0.5"), new BigDecimal("2"));
+        private final AdkRunBudgetPlugin plugin;
+
+        private CaptureFixture(String mode, boolean admitted) {
+            String code = "CONFIG".equals(mode) ? null : "fixture-native";
+            Map<String, Object> configuration = "CONFIG".equals(mode) ? Map.of("modelName", MODEL, "chatModelBeanName", "modelBean") : Map.of();
+            var source = snapshot(FIXTURE_ROUTE, "policy-v1", "USD", mode, code, configuration);
+            var authorization = new AgentRunAuthorization.Request(actor, "run-one", "assistant", 1,
+                    "a".repeat(64), "b".repeat(64), "c".repeat(64), "policy-v1", false, now.plusSeconds(60));
+            when(ledger.databaseNow()).thenReturn(now);
+            when(ledger.budgets()).thenReturn(budgets);
+            when(ledger.acceptsModelUsage("CONFIG", FIXTURE_ROUTE)).thenReturn(admitted);
+            when(estimator.estimate(eq(source), any())).thenReturn(new AgentModelBudgetEstimator.Estimate(10, 8, BigDecimal.ONE));
+            when(estimator.contextWindow(eq(source), any())).thenReturn(new AgentModelBudgetEstimator.ContextWindow(MODEL, FIXTURE_ROUTE, "policy-v1", 100, 5));
+            when(estimator.modelUsagePrice(eq(source), any())).thenReturn(Optional.of(price));
+            when(estimator.actualUsage(eq(source), any())).thenReturn(actual);
+            when(budgets.reserveBudget(eq(actor), eq(lease), any())).thenAnswer(call -> reservation(call.getArgument(2), true));
+            when(budgets.reserveBudget(eq(actor), eq(lease), any(), isNull(), any())).thenAnswer(call -> reservation(call.getArgument(2), true));
+            when(budgets.settleBudget(eq(actor), eq(lease), anyString(), any()))
+                    .thenAnswer(call -> settled(call.getArgument(2)));
+            when(budgets.settleBudget(eq(actor), eq(lease), anyString(), any(), any()))
+                    .thenAnswer(call -> settled(call.getArgument(2)));
+            plugin = new AdkRunBudgetPlugin(ledger, actor, lease, source, estimator,
+                    new AgentExecutionAuthorization((request, boundary) -> AgentRunAuthorization.Decision.ALLOW, authorization),
+                    Schedulers.from(control), control, new DefaultContextAssembler(List.of()), authorization);
+        }
+
+        private AgentBudgetReservation reservation(AgentBudgetRequest request, boolean created) {
+            return new AgentBudgetReservation(request.reservationId(), lease.epoch(), request.kind(), null, request.inputTokens(),
+                    request.outputTokens(), request.estimatedCost(), AgentBudgetReservation.State.RESERVED, null, null, null, created);
+        }
+
+        private AgentBudgetReservation settled(String eventId) {
+            return new AgentBudgetReservation(eventId, lease.epoch(), AgentBudgetRequest.Kind.MODEL, null, 10, 8,
+                    BigDecimal.ONE, AgentBudgetReservation.State.SETTLED, actual.inputTokens(), actual.outputTokens(), actual.actualCost(), false);
+        }
+
+        private void before(String id) {
+            assertNull(plugin.beforeModelCallback(callback(id), LlmRequest.builder().model(MODEL)).blockingGet());
+        }
+
+        private LlmResponse after(String id, LlmResponse response) {
+            return plugin.afterModelCallback(callback(id), response).blockingGet();
+        }
+
+        private static CallbackContext callback(String id) {
+            var context = mock(CallbackContext.class);
+            when(context.eventId()).thenReturn(id);
+            return context;
+        }
+
+        @Override public void close() { plugin.close().blockingAwait(); control.shutdownNow(); }
     }
 }

@@ -26,6 +26,9 @@ import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageFinalVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageSeedVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentBudgetService.ModelUsageUnknownReason;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
@@ -72,6 +75,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     private String nativeInvocationId;
     private final java.util.concurrent.atomic.AtomicReference<Runnable> sessionFence = new java.util.concurrent.atomic.AtomicReference<>();
     private final Map<String, IdleGuard> idleGuards = new ConcurrentHashMap<>();
+    private final Map<String, ModelUsageSeedVO> usageSlots = new java.util.HashMap<>();
     private final Map<String, AgentModelBudgetEstimator.ContextWindow> contextWindows = new ConcurrentHashMap<>();
     private final FlowableProcessor<Boolean> idleSignal = ReplayProcessor.<Boolean>createWithSize(1).toSerialized();
 
@@ -204,13 +208,27 @@ final class AdkRunBudgetPlugin implements Plugin {
             var budgetRequest = new AgentBudgetRequest(context.eventId(), AgentBudgetRequest.Kind.MODEL, null,
                     estimate.inputTokens(), outputLimit, estimate.maximumCost());
             requireSessionFence();
-            AgentBudgetReservation reservation;
-            if (snapshots == null) reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest);
-            else {
-                request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
-                var metadata = snapshots.capture(preparedContext.get(), request.build(), window, estimate, outputLimit, fragments,
-                        estimator.modelAdapterFingerprint(snapshot, request.build()), trimDecisions, trimmingPolicy);
-                reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest, metadata);
+            var finalConfig = config.toBuilder().maxOutputTokens(outputLimit).build();
+            boolean usageAdmitted = ledger.acceptsModelUsage(snapshot.definition().executionMode(), window.modelRouteRef());
+            if (snapshots != null || usageAdmitted) request.config(finalConfig);
+            var metadata = snapshots == null ? null : snapshots.capture(preparedContext.get(), request.build(), window, estimate,
+                    outputLimit, fragments, estimator.modelAdapterFingerprint(snapshot, request.build()), trimDecisions, trimmingPolicy);
+            AgentBudgetReservation reservation = null;
+            if (usageAdmitted) {
+                synchronized (admittedContexts) {
+                    if (!closed) {
+                        var price = estimator.modelUsagePrice(snapshot, request.build()).filter(value ->
+                                window.modelRouteRef().equals(value.routeRef()) && window.modelName().equals(value.modelName())
+                                        && value.currency().equals(snapshot.effectivePolicy().currency())).orElse(null);
+                        var seed = new ModelUsageSeedVO(window.modelRouteRef(), window.modelName(), price);
+                        reservation = ledger.budgets().reserveBudget(actor, lease, budgetRequest, metadata, seed);
+                        if (reservation.newlyCreated()) usageSlots.put(context.eventId(), seed);
+                    }
+                }
+            }
+            if (reservation == null) {
+                reservation = snapshots == null ? ledger.budgets().reserveBudget(actor, lease, budgetRequest)
+                        : ledger.budgets().reserveBudget(actor, lease, budgetRequest, metadata);
             }
             if (!reservation.newlyCreated()) {
                 throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
@@ -225,7 +243,7 @@ final class AdkRunBudgetPlugin implements Plugin {
                             "model call idle guard was already registered");
                 }
                 guard.touch();
-                if (snapshots == null) request.config(config.toBuilder().maxOutputTokens(outputLimit).build());
+                if (snapshots == null && !usageAdmitted) request.config(finalConfig);
                 if (tracking()) {
                     InvocationContext nativeContext = context.invocationContext();
                     nativeSessionId = context.sessionId(); nativeInvocationId = context.invocationId();
@@ -328,7 +346,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             closeIdleGuard(context.eventId());
             if (response.errorMessage().isPresent() || response.errorCode().isPresent()
                     || response.interrupted().orElse(false)) {
-                ledger.budgets().settleBudget(actor, lease, context.eventId(), new AgentBudgetSettlement(null, null, null));
+                settleModelBudget(context.eventId(), response, new AgentBudgetSettlement(null, null, null), true);
                 if (nativeGate != null) nativeGate.markFatal(new AgentLedgerException(
                         AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Native Agent model response failed"));
                 return Maybe.just(LlmResponse.builder()
@@ -337,7 +355,7 @@ final class AdkRunBudgetPlugin implements Plugin {
             }
             AgentBudgetSettlement actual = actualUsage(response);
             if (actual == null) actual = new AgentBudgetSettlement(null, null, null);
-            AgentBudgetReservation settled = ledger.budgets().settleBudget(actor, lease, context.eventId(), actual);
+            AgentBudgetReservation settled = settleModelBudget(context.eventId(), response, actual, false);
             if (settled.state() == AgentBudgetReservation.State.UNKNOWN
                     && (actual.inputTokens() == null || actual.outputTokens() == null
                     || (snapshot.effectivePolicy().maxEstimatedCost() != null && actual.actualCost() == null))) {
@@ -347,6 +365,38 @@ final class AdkRunBudgetPlugin implements Plugin {
             if (nativeGate != null) nativeGate.observeResponse(context, response);
             return Maybe.empty();
         }));
+    }
+
+    private AgentBudgetReservation settleModelBudget(String eventId, LlmResponse response,
+                                                       AgentBudgetSettlement actual, boolean modelError) {
+        synchronized (admittedContexts) {
+            var seed = usageSlots.get(eventId);
+            if (!closed && seed != null) {
+                return ledger.budgets().settleBudget(actor, lease, eventId, actual, observedUsage(seed, response, actual, modelError));
+            }
+        }
+        return ledger.budgets().settleBudget(actor, lease, eventId, actual);
+    }
+
+    private static ModelUsageFinalVO observedUsage(ModelUsageSeedVO seed, LlmResponse response,
+                                                    AgentBudgetSettlement actual, boolean modelError) {
+        if (modelError) return unknownUsage(seed, ModelUsageUnknownReason.MODEL_ERROR);
+        var metadata = response.usageMetadata().orElse(null);
+        if (metadata == null || metadata.promptTokenCount().isEmpty() || metadata.candidatesTokenCount().isEmpty()) {
+            return unknownUsage(seed, ModelUsageUnknownReason.MISSING_USAGE);
+        }
+        long input = metadata.promptTokenCount().orElseThrow();
+        long output = metadata.candidatesTokenCount().orElseThrow();
+        if (input < 0 || output < 0 || input > Long.MAX_VALUE - output
+                || !Objects.equals(input, actual.inputTokens()) || !Objects.equals(output, actual.outputTokens())
+                || metadata.totalTokenCount().isPresent() && metadata.totalTokenCount().orElseThrow().longValue() != input + output) {
+            return unknownUsage(seed, ModelUsageUnknownReason.INVALID_USAGE);
+        }
+        return new ModelUsageFinalVO(seed.routeRef(), seed.modelName(), input, output, null);
+    }
+
+    private static ModelUsageFinalVO unknownUsage(ModelUsageSeedVO seed, ModelUsageUnknownReason reason) {
+        return new ModelUsageFinalVO(seed.routeRef(), seed.modelName(), null, null, reason);
     }
 
     @Override
@@ -362,7 +412,7 @@ final class AdkRunBudgetPlugin implements Plugin {
     @Override
     public io.reactivex.rxjava3.core.Completable close() {
         return io.reactivex.rxjava3.core.Completable.fromAction(() -> {
-            synchronized (admittedContexts) { closed = true; admittedContexts.clear(); }
+            synchronized (admittedContexts) { closed = true; admittedContexts.clear(); usageSlots.clear(); }
             idleGuards.values().forEach(IdleGuard::close);
             idleGuards.clear();
             if (nativeGate != null) nativeGate.close();

@@ -514,6 +514,70 @@ final class JdbcAgentLedgerRepository {
                 runId, reservationId).stream().findFirst();
     }
 
+    int insertModelUsageSeed(TrustedAgentActor actor, AgentRunLease lease, String reservationId,
+                             AgentBudgetService.ModelUsageSeedVO seed, Instant createdAt) {
+        var price = seed.price();
+        return jdbc.update("""
+                INSERT INTO tianji_agent.agent_model_usage
+                    (tenant_id, run_id, reservation_id, lease_epoch, model_route_ref, model_name,
+                     price_version_ref, currency, input_rate_per_million, output_rate_per_million, state, created_at)
+                SELECT b.tenant_id, b.run_id, b.reservation_id, b.lease_epoch, ?, ?, ?, ?, ?, ?, 'PENDING', ?
+                FROM tianji_agent.agent_budget_reservation b
+                JOIN tianji_agent.agent_run r ON r.tenant_id=b.tenant_id AND r.run_id=b.run_id
+                WHERE b.tenant_id=? AND b.run_id=? AND b.reservation_id=? AND b.lease_epoch=?
+                  AND b.kind='MODEL' AND b.state='RESERVED'
+                  AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                  AND r.status='RUNNING' AND r.lease_epoch=b.lease_epoch AND r.lease_owner=?
+                ON CONFLICT (tenant_id,run_id,reservation_id) DO NOTHING
+                """, seed.routeRef(), seed.modelName(), price == null ? null : price.priceVersionRef(),
+                price == null ? null : price.currency(), price == null ? null : price.inputRatePerMillion(),
+                price == null ? null : price.outputRatePerMillion(), Timestamp.from(createdAt), actor.tenantId(),
+                lease.runId(), reservationId, lease.epoch(), actor.subjectType().name(), actor.issuerFingerprint(),
+                actor.subjectId(), lease.owner());
+    }
+
+    Optional<ModelUsageWriteRow> modelUsageForUpdate(TrustedAgentActor actor, AgentRunLease lease, String reservationId) {
+        return jdbc.query("""
+                SELECT u.model_route_ref,u.model_name,u.price_version_ref,u.currency,u.input_rate_per_million,
+                       u.output_rate_per_million,u.state,u.safe_reason,u.final_sha256,u.created_at
+                FROM tianji_agent.agent_model_usage u
+                JOIN tianji_agent.agent_budget_reservation b
+                  ON b.tenant_id=u.tenant_id AND b.run_id=u.run_id AND b.reservation_id=u.reservation_id
+                JOIN tianji_agent.agent_run r ON r.tenant_id=b.tenant_id AND r.run_id=b.run_id
+                WHERE u.tenant_id=? AND u.run_id=? AND u.reservation_id=? AND u.lease_epoch=?
+                  AND b.kind='MODEL' AND b.lease_epoch=u.lease_epoch
+                  AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                FOR UPDATE OF u
+                """, (rs, row) -> new ModelUsageWriteRow(rs.getString("model_route_ref"), rs.getString("model_name"),
+                rs.getString("price_version_ref"), rs.getString("currency"), rs.getBigDecimal("input_rate_per_million"),
+                rs.getBigDecimal("output_rate_per_million"), rs.getString("state"), rs.getString("safe_reason"),
+                rs.getString("final_sha256"), rs.getObject("created_at", java.time.OffsetDateTime.class).toInstant()),
+                actor.tenantId(), lease.runId(), reservationId, lease.epoch(), actor.subjectType().name(),
+                actor.issuerFingerprint(), actor.subjectId()).stream().findFirst();
+    }
+
+    int settleModelUsage(TrustedAgentActor actor, AgentRunLease lease, String reservationId,
+                         AgentBudgetService.ModelUsageMeasurementVO value, Instant measuredAt) {
+        return jdbc.update("""
+                UPDATE tianji_agent.agent_model_usage u
+                SET state=?,actual_input_tokens=?,actual_output_tokens=?,actual_cost=?,safe_reason=?,final_sha256=?,measured_at=?
+                FROM tianji_agent.agent_budget_reservation b
+                JOIN tianji_agent.agent_run r ON r.tenant_id=b.tenant_id AND r.run_id=b.run_id
+                WHERE u.tenant_id=? AND u.run_id=? AND u.reservation_id=? AND u.lease_epoch=? AND u.state='PENDING'
+                  AND b.tenant_id=u.tenant_id AND b.run_id=u.run_id AND b.reservation_id=u.reservation_id
+                  AND b.kind='MODEL' AND b.lease_epoch=u.lease_epoch
+                  AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                  AND r.status='RUNNING' AND r.lease_epoch=u.lease_epoch AND r.lease_owner=?
+                """, value.state(), value.inputTokens(), value.outputTokens(), value.cost(), value.safeReason(),
+                value.finalSha256(), measuredAt == null ? null : Timestamp.from(measuredAt), actor.tenantId(),
+                lease.runId(), reservationId, lease.epoch(), actor.subjectType().name(), actor.issuerFingerprint(),
+                actor.subjectId(), lease.owner());
+    }
+
+    record ModelUsageWriteRow(String routeRef, String modelName, String priceVersionRef, String currency,
+                              BigDecimal inputRatePerMillion, BigDecimal outputRatePerMillion, String state,
+                              String safeReason, String finalSha256, Instant createdAt) { }
+
     boolean validLease(TrustedAgentActor actor, AgentRunLease lease) {
         Boolean valid = jdbc.queryForObject("""
                 SELECT EXISTS(SELECT 1 FROM tianji_agent.agent_run
