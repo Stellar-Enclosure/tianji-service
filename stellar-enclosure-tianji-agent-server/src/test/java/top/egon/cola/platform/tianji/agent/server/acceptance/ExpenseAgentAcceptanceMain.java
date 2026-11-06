@@ -24,6 +24,7 @@ import tools.jackson.core.StreamReadFeature;
 import tools.jackson.databind.DeserializationFeature;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
+import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
@@ -56,6 +57,7 @@ import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 
@@ -86,6 +88,13 @@ public final class ExpenseAgentAcceptanceMain {
             Properties settings = privateChildSettings(args, "AGENT");
             boolean s07 = "true".equals(settings.getProperty(FIXTURE + "s07-governed-start"));
             if ("true".equals(settings.getProperty(FIXTURE + "s07-approved-start")) && !s07) throw unavailable();
+            boolean modelUsage = "true".equals(settings.getProperty(FIXTURE + "s12-model-usage"));
+            String usageEnabled = settings.getProperty("stellar.tianji.agent.storage.model-usage-enabled", "false");
+            String usageRoute = settings.getProperty("stellar.tianji.agent.storage.model-usage-cumulative-route-refs[0]");
+            if (!Boolean.toString(modelUsage).equals(usageEnabled)
+                    || modelUsage && (s07 || settings.containsKey(FIXTURE + "s12-receive-link")
+                            || settings.containsKey(FIXTURE + "s12-metrics") || !ROUTE.equals(usageRoute))
+                    || !modelUsage && usageRoute != null) throw unavailable();
             var required = s07 ? List.of("storage", "api", "runtime", "reconciliation", "dispatch", "execution-grants", "execution-authorization")
                     : List.of("storage", "api", "runtime", "reconciliation", "dispatch", "linked",
                     "service-execution", "terminal-events", "result-delivery");
@@ -164,7 +173,8 @@ public final class ExpenseAgentAcceptanceMain {
         }
 
         @Bean("expenseFixtureModelBudgetEstimator")
-        AgentModelBudgetEstimator expenseFixtureModelBudgetEstimator() {
+        AgentModelBudgetEstimator expenseFixtureModelBudgetEstimator(Environment environment) {
+            boolean modelUsage = environment.getProperty(FIXTURE + "s12-model-usage", Boolean.class, false);
             return new AgentModelBudgetEstimator() {
                 @Override
                 public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) {
@@ -193,6 +203,14 @@ public final class ExpenseAgentAcceptanceMain {
                 public ContextPolicy contextPolicy(AgentExecutionSnapshot snapshot, LlmRequest request) {
                     requireModel(snapshot, request);
                     return new ContextPolicy(POLICY, 1, 1, false, false);
+                }
+
+                @Override
+                public Optional<AgentModelUsagePriceVO> modelUsagePrice(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                    requireModel(snapshot, request);
+                    if (!modelUsage) return Optional.empty();
+                    return Optional.of(new AgentModelUsagePriceVO(ROUTE, MODEL, "USD",
+                            new BigDecimal("3000"), new BigDecimal("4000")));
                 }
 
                 @Override

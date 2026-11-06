@@ -458,6 +458,9 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
             values.setProperty(prefix + "s07-governed-start", "true");
             if (manifest.suite() == Suite.S07_APPROVED_START) values.setProperty(prefix + "s07-approved-start", "true");
         }
+        if (role == ChildRole.AGENT && manifest.suite() == Suite.S12_MODEL_USAGE) {
+            values.setProperty(prefix + "s12-model-usage", "true");
+        }
         values.setProperty(prefix + "role", role.name());
         values.setProperty(prefix + "trust-store", manifest.tls().trustStore());
         values.setProperty(prefix + "trust-password-file", manifest.tls().credentialFile());
@@ -489,7 +492,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
                 loaderPath += "," + library.getKey();
             }
         }
-        var environment = manifest.suite().collectsMetrics()
+        var environment = manifest.suite().collectsMetrics() || manifest.suite() == Suite.S12_MODEL_USAGE
                 ? Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false", "OTEL_TRACES_EXPORTER", "none",
                         "OTEL_METRICS_EXPORTER", "none", "OTEL_LOGS_EXPORTER", "none")
                 : Map.of("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false");
@@ -633,7 +636,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     Path publishEvidence(ExpenseEvidenceDTO evidence) {
         if (manifest.suite().observesReceiveLinks() || manifest.suite().collectsMetrics()
-                || manifest.suite().isS07()) throw invalid();
+                || manifest.suite().isS07() || manifest.suite() == Suite.S12_MODEL_USAGE) throw invalid();
         validateEvidence(evidence);
         Path output = requirePrivateChild(absolute(manifest.privateRoot()), manifest.outputDirectory(), true);
         Path destination = output.resolve("expense-" + manifest.runId() + ".json");
@@ -808,7 +811,7 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
     private record RunningChild(ChildIdentityDTO identity, OwnedChild handle) { }
 
     enum Suite {
-        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S12_OWNER_OBSERVATION,
+        BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S12_OWNER_OBSERVATION, S12_MODEL_USAGE,
         S07_GOVERNED_START, S07_APPROVED_START;
 
         boolean collectsMetrics() { return this == S12_METRICS || this == S12_OWNER_OBSERVATION; }

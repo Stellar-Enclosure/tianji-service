@@ -6,10 +6,15 @@ import com.google.adk.models.LlmResponse;
 import com.google.genai.types.Content;
 import com.google.genai.types.Part;
 import org.junit.jupiter.api.Test;
+import org.springframework.mock.env.MockEnvironment;
 import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +40,25 @@ class ExpenseAcceptanceModelTest {
         }
         var failure = assertThrows(IllegalStateException.class, () -> collect(bridge, assemble(700)));
         assertEquals(ExpenseAgentAcceptanceMain.FAILURE, failure.getMessage());
+    }
+
+    @Test
+    void exact_v15_mode_prices_the_single_actual_fake_final() {
+        var fixture = new ExpenseAgentAcceptanceMain.FixtureConfiguration();
+        var definition = ExpenseAgentAcceptanceMain.fixtureDefinition();
+        var input = new AgentInputDTO(ExpenseAgentAcceptanceMain.INSTRUCTION, List.of(), Map.of("requestedAmount", 100));
+        var snapshot = new AgentExecutionSnapshot(definition, "a".repeat(64), definition.policy(), input, "expense-usage-fixture");
+        var request = LlmRequest.builder().model(ExpenseAgentAcceptanceMain.MODEL).build();
+        assertTrue(fixture.expenseFixtureModelBudgetEstimator(new MockEnvironment()).modelUsagePrice(snapshot, request).isEmpty());
+
+        var enabled = new MockEnvironment().withProperty("tianji.expense.fixture.s12-model-usage", "true");
+        var estimator = fixture.expenseFixtureModelBudgetEstimator(enabled);
+        assertEquals(new AgentModelUsagePriceVO("expense-fixture-route", ExpenseAgentAcceptanceMain.MODEL, "USD",
+                new BigDecimal("3000"), new BigDecimal("4000")), estimator.modelUsagePrice(snapshot, request).orElseThrow());
+        var finals = collect(bridge(), assemble(100)).stream()
+                .filter(response -> !response.partial().orElse(false) && response.usageMetadata().isPresent()).toList();
+        assertEquals(1, finals.size());
+        assertEquals(new AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05")), estimator.actualUsage(snapshot, finals.getFirst()));
     }
 
     @Test

@@ -173,6 +173,7 @@ class BusinessProcessAgentAcceptanceIT {
                 case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
                 case S07_APPROVED_START -> "tianji.s07.approved-start.manifest";
                 case S12_OWNER_OBSERVATION -> "tianji.s12.owner-observation.manifest";
+                case S12_MODEL_USAGE -> "tianji.s12.model-usage.manifest";
                 case S12_METRICS -> logs == null
                         ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
@@ -851,6 +852,31 @@ class BusinessProcessAgentAcceptanceIT {
             }
         }
 
+        void verifyModelUsage(RunDTO run) {
+            require(manifest.suite() == Suite.S12_MODEL_USAGE, "Exact S12 model usage fixture suite");
+            String runId = dispatch(run).orElseThrow().runId();
+            var facts = db(StoreOwner.AGENT).query("""
+                    SELECT r.run_id,b.reservation_id,b.lease_epoch,b.kind,b.state AS budget_state,
+                           b.actual_input_tokens AS budget_input,b.actual_output_tokens AS budget_output,b.actual_cost AS budget_cost,
+                           b.settled_at,u.lease_epoch AS usage_epoch,u.model_route_ref,u.model_name,u.price_version_ref,u.currency,
+                           u.input_rate_per_million,u.output_rate_per_million,u.state AS usage_state,u.actual_input_tokens,
+                           u.actual_output_tokens,u.actual_cost,u.safe_reason,u.final_sha256,u.created_at,u.measured_at
+                    FROM tianji_agent.agent_run r
+                    JOIN tianji_agent.agent_process_dispatch d ON (d.tenant_id,d.run_id)=(r.tenant_id,r.run_id)
+                    JOIN tianji_agent.agent_budget_reservation b ON (b.tenant_id,b.run_id)=(r.tenant_id,r.run_id)
+                    LEFT JOIN tianji_agent.agent_model_usage u
+                      ON (u.tenant_id,u.run_id,u.reservation_id)=(b.tenant_id,b.run_id,b.reservation_id)
+                    WHERE r.tenant_id=? AND r.run_id=? AND r.subject_type='SERVICE' AND r.subject_issuer=? AND r.subject_id=?
+                      AND r.definition_key='expenseAnalysis' AND r.definition_version=1 AND r.status='COMPLETED' AND r.correlation_id=?
+                      AND d.subject_issuer=r.subject_issuer AND d.subject_id=r.subject_id
+                      AND d.source_id=? AND d.scope_type='BPMN' AND d.scope_id=?
+                    LIMIT 2
+                    """, S12ModelUsageEvidence::read, run.tenant().tenantId(), runId, issuerSha(run.tenant()),
+                    setting(run.tenant(), "identity.bridge-subject"), run.instance().correlationId(),
+                    sourceId(run), run.instance().instanceId());
+            S12ModelUsageEvidence.verify(run.tenant().tenantId(), runId, facts);
+        }
+
         private Instant observerTime(StoreOwner owner) {
             return Objects.requireNonNull(db(owner).queryForObject("SELECT pg_catalog.clock_timestamp()", OffsetDateTime.class))
                     .toInstant();
@@ -1241,7 +1267,8 @@ class BusinessProcessAgentAcceptanceIT {
                     ? S12ChildLogPrivacy.Credential.AGENT_DB : S12ChildLogPrivacy.Credential.PROCESS_DB, runtimePassword);
             put(config, "spring.datasource.password", runtimePassword);
             put(config, "spring.datasource.hikari.schema", store.schema());
-            if (!manifest.suite().collectsMetrics() && !manifest.suite().isS07()) {
+            if (!manifest.suite().collectsMetrics() && !manifest.suite().isS07()
+                    && manifest.suite() != Suite.S12_MODEL_USAGE) {
                 put(config, "management.otlp.tracing.endpoint", manifest.endpoints().collector());
                 put(config, "management.tracing.sampling.probability", "1.0");
             }
@@ -1285,6 +1312,10 @@ class BusinessProcessAgentAcceptanceIT {
             put(config, "egon.cola.component.agent-flow-registry.enabled", "false");
             put(config, prefix + "linked.submission-enabled", "true");
             put(config, prefix + "terminal-events.producer-id", PRODUCER);
+            if (manifest.suite() == Suite.S12_MODEL_USAGE) {
+                put(config, prefix + "storage.model-usage-enabled", "true");
+                put(config, prefix + "storage.model-usage-cumulative-route-refs[0]", S12ModelUsageEvidence.ROUTE);
+            }
             for (int index = 0; index < tenants().size(); index++) {
                 var tenant = tenants().get(index);
                 String bridge = setting(tenant, "identity.bridge-subject");
@@ -1505,10 +1536,12 @@ class BusinessProcessAgentAcceptanceIT {
             String vector = locked.owner() == StoreOwner.AGENT ? one(jdbc,
                     "SELECT extversion FROM pg_extension WHERE extname='vector'", (rs, row) -> rs.getString(1)).orElseThrow() : "NONE";
             String system = new JdbcTemplate(access.setup()).queryForObject("SELECT system_identifier::text FROM pg_control_system()", String.class);
-            String history = history(jdbc, locked.owner());
+            String history = history(jdbc, locked.owner(), manifest.suite());
             boolean empty = switch (locked.owner()) {
                 case AGENT -> count(jdbc, "SELECT count(*) FROM tianji_agent.agent_run") == 0
-                        && count(jdbc, "SELECT count(*) FROM tianji_agent.egon_cola_outbox_message") == 0;
+                        && count(jdbc, "SELECT count(*) FROM tianji_agent.egon_cola_outbox_message") == 0
+                        && (manifest.suite() != Suite.S12_MODEL_USAGE
+                            || count(jdbc, "SELECT count(*) FROM tianji_agent.agent_model_usage") == 0);
                 case PROCESS -> count(jdbc, "SELECT count(*) FROM tianji_process.tianji_process_command_receipt") == 0
                         && count(jdbc, "SELECT count(*) FROM tianji_process.act_ru_execution") == 0;
                 case BUSINESS -> count(jdbc, "SELECT count(*) FROM tianji_worker.tianji_worker_execution_receipt") == 0
@@ -1559,13 +1592,17 @@ class BusinessProcessAgentAcceptanceIT {
                 """, Boolean.class));
     }
 
-    private static String history(JdbcTemplate jdbc, StoreOwner owner) {
+    private static String history(JdbcTemplate jdbc, StoreOwner owner, Suite suite) {
         String table = switch (owner) {
             case AGENT -> "tianji_agent.flyway_schema_history";
             case PROCESS -> "tianji_process.tianji_process_schema_history";
             case BUSINESS -> "tianji_worker.tianji_worker_schema_history";
         };
-        int count = switch (owner) { case AGENT -> 14; case PROCESS -> 10; case BUSINESS -> 2; };
+        int count = switch (owner) {
+            case AGENT -> suite == Suite.S12_MODEL_USAGE ? 15 : 14;
+            case PROCESS -> 10;
+            case BUSINESS -> 2;
+        };
         var rows = jdbc.query("SELECT version,script,checksum,success,type FROM " + table + " WHERE version IS NOT NULL ORDER BY installed_rank",
                 (rs, index) -> {
                     require(rs.getBoolean("success") && "SQL".equals(rs.getString("type"))
