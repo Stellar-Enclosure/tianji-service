@@ -95,6 +95,26 @@ final class PlatformReleaseSignatureVerifier {
             byte[] candidateBytes = input.readSignatureInput(candidatePath, 1_048_576);
             byte[] signatureBytes = input.readSignatureInput(signaturePath, 8_192);
             byte[] trustBytes = input.readSignatureInput(trustPath, 8_192);
+            var result = verifyBytes(candidateBytes, signatureBytes, trustBytes, expectedCandidateSha, expectedTrustSha,
+                    tenant, channel, clock);
+            if (snapshot == null) return canonicalLine(result.payload());
+            return canonicalLine(compareSnapshot(input, snapshot, result));
+        } catch (PlatformReleaseArtifactValidator.ValidationFailure failure) {
+            throw failure.exitCode() == 66 ? unavailable() : invalid();
+        } catch (IllegalArgumentException malformed) {
+            throw invalid();
+        } catch (IOException | UnsupportedOperationException | SecurityException | ProviderException failure) {
+            throw unavailable();
+        }
+    }
+
+    static VerifiedCandidate verifyBytes(byte[] candidateBytes, byte[] signatureBytes, byte[] trustBytes,
+                                         String expectedCandidateSha, String expectedTrustSha, long tenant,
+                                         String channel, Clock clock) {
+        if (!bounded(candidateBytes, 1_048_576) || !bounded(signatureBytes, 8_192) || !bounded(trustBytes, 8_192)) {
+            throw invalid();
+        }
+        try {
             if (!expectedTrustSha.equals(hash(trustBytes))) throw rejected();
 
             var envelope = parse(candidateBytes);
@@ -135,22 +155,23 @@ final class PlatformReleaseSignatureVerifier {
             }
             verifySignature(key, claims.canonicalClaims(), signature);
 
-            var result = new ReleaseSignatureResultDTO(candidateSha, envelopeSha, field(candidate, "sourceRevision"),
-                    tenantText, channel, trust.scope().get("keyId"), expectedTrustSha, claims.issuedAt(), claims.expiresAt());
-            if (snapshot == null) return canonicalLine(result.payload());
-            return canonicalLine(compareSnapshot(input, snapshot, candidate.get("process"), result));
-        } catch (PlatformReleaseArtifactValidator.ValidationFailure failure) {
-            throw failure.exitCode() == 66 ? unavailable() : invalid();
-        } catch (IllegalArgumentException malformed) {
+            var process = candidate.get("process");
+            return new VerifiedCandidate(candidateSha, envelopeSha, field(candidate, "sourceRevision"), tenantText,
+                    channel, trust.scope().get("keyId"), expectedTrustSha, claims.issuedAt(), claims.expiresAt(),
+                    field(process, "releaseVersion"), field(process, "manifestSha256"), models(process.get("models"), "modelSha256"));
+        } catch (PlatformReleaseArtifactValidator.ValidationFailure | IllegalArgumentException malformed) {
             throw invalid();
-        } catch (IOException | UnsupportedOperationException | SecurityException | ProviderException failure) {
+        } catch (UnsupportedOperationException | SecurityException | ProviderException unavailable) {
             throw unavailable();
         }
     }
 
+    private static boolean bounded(byte[] bytes, int maximum) {
+        return bytes != null && bytes.length > 0 && bytes.length <= maximum;
+    }
+
     private static Map<String, Object> compareSnapshot(PlatformReleaseArtifactValidator input,
-                                                       ProcessSnapshotInputDTO reference, JsonNode candidate,
-                                                       ReleaseSignatureResultDTO signature) {
+                                                       ProcessSnapshotInputDTO reference, VerifiedCandidate signature) {
         try {
             byte[] bytes = input.readSignatureInput(reference.path(), SNAPSHOT_LIMIT);
             String snapshotSha = hash(bytes);
@@ -160,9 +181,7 @@ final class PlatformReleaseSignatureVerifier {
             shape(snapshot, "releaseVersion", "manifestSha256", "createdAt", "models");
             var published = new ProcessReleaseDTO(field(snapshot, "releaseVersion"), field(snapshot, "manifestSha256"),
                     snapshotCreatedAt(snapshot), models(snapshot.get("models"), "contentSha256"));
-            if (!published.releaseVersion().equals(field(candidate, "releaseVersion"))
-                    || !published.manifestSha256().equals(field(candidate, "manifestSha256"))
-                    || !Set.copyOf(published.models()).equals(Set.copyOf(models(candidate.get("models"), "modelSha256")))) {
+            if (!signature.matchesProcess(published.releaseVersion(), published.manifestSha256(), published.models())) {
                 throw new SignatureFailure(65, SNAPSHOT_MISMATCH);
             }
 
@@ -460,8 +479,14 @@ final class PlatformReleaseSignatureVerifier {
                                              Instant issuedAt, Instant expiresAt, String canonicalClaims) { }
     private record ReleaseSignatureTrustDTO(Map<String, String> scope, String publicKey, Instant notBefore,
                                             Instant notAfter) { }
-    private record ReleaseSignatureResultDTO(String candidateSha, String envelopeSha, String revision, String tenant,
-                                             String channel, String keyId, String trustSha, Instant issuedAt, Instant expiresAt) {
+    record VerifiedCandidate(String candidateSha, String envelopeSha, String revision, String tenant, String channel,
+                             String keyId, String trustSha, Instant issuedAt, Instant expiresAt, String releaseVersion,
+                             String manifestSha, List<ProcessModelDTO> processModels) {
+        boolean matchesProcess(String version, String digest, List<ProcessModelDTO> models) {
+            return releaseVersion.equals(version) && manifestSha.equals(digest)
+                    && Set.copyOf(processModels).equals(Set.copyOf(models));
+        }
+
         Map<String, Object> payload() {
             return Map.ofEntries(Map.entry("schemaVersion", 1), Map.entry("status", "ARTIFACT_SIGNATURE_VERIFIED_OFFLINE"),
                     Map.entry("candidateSha256", candidateSha), Map.entry("candidateEnvelopeSha256", envelopeSha),

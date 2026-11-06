@@ -35,8 +35,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 final class PlatformReleaseSignatureVerifierTest {
     private static final JsonMapper JSON = JsonMapper.builder().build();
-    private static final String CANDIDATE_PIN = "0b2c53ee4d2ca2489f8780627f335cfee2b8ce72f9373dff2dabe120dd93f27c";
-    private static final String TRUST_PIN = "b5597e82a6a47af5a043029fe9e9eca7a67eb7994934a069472c510598703972";
+    static final String CANDIDATE_PIN = "0b2c53ee4d2ca2489f8780627f335cfee2b8ce72f9373dff2dabe120dd93f27c";
+    static final String TRUST_PIN = "b5597e82a6a47af5a043029fe9e9eca7a67eb7994934a069472c510598703972";
     private static final String WRONG_PIN = "0".repeat(64);
     private static final String USAGE = "TIANJI_RELEASE_SIGNATURE_USAGE";
     private static final String INVALID = "TIANJI_RELEASE_SIGNATURE_INVALID";
@@ -47,7 +47,7 @@ final class PlatformReleaseSignatureVerifierTest {
     private static final Instant EXPIRES = Instant.parse("2050-01-01T00:00:00Z");
     private static final String MISMATCH = "TIANJI_RELEASE_SIGNATURE_MISMATCH";
     // Public fixture vectors over an actual A1 candidate, independently signed once.
-    private static final String CANDIDATE = fixture("""
+    static final String CANDIDATE = fixture("""
             {
               "candidate": {
                 "agent": {
@@ -140,7 +140,7 @@ final class PlatformReleaseSignatureVerifierTest {
               "candidateSha256": "0b2c53ee4d2ca2489f8780627f335cfee2b8ce72f9373dff2dabe120dd93f27c"
             }
             """);
-    private static final String TRUST = fixture("""
+    static final String TRUST = fixture("""
             {
               "algorithm": "Ed25519",
               "channel": "expense",
@@ -154,7 +154,7 @@ final class PlatformReleaseSignatureVerifierTest {
               "tenantId": "20"
             }
             """);
-    private static final String SIDECAR = fixture("""
+    static final String SIDECAR = fixture("""
             {
               "claims": {
                 "algorithm": "Ed25519",

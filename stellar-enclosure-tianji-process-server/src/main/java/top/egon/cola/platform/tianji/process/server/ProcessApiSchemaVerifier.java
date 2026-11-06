@@ -39,6 +39,10 @@ public final class ProcessApiSchemaVerifier {
     private static final String RECOVERY_FILE = "V10__add_process_worker_recovery_receipts.sql";
     private static final String RECOVERY_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
     private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
+    private static final String CANDIDATE_REVIEW_FILE = "V11__add_platform_release_candidate_reviews.sql";
+    private static final String CANDIDATE_REVIEW_SHA256 = "434d1cf4947df39feb556f29ceda53ba0a36e36abc6d9a53d5d26dd85bceedfe";
+    private static final String PLATFORM_CANDIDATE = "tianji_platform_release_candidate";
+    private static final String PLATFORM_REVIEW = "tianji_platform_release_review";
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final String schema;
@@ -65,7 +69,7 @@ public final class ProcessApiSchemaVerifier {
         jdbc.setQueryTimeout(5);
         try {
             if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
-                    || laterMigrations().size() != 3) throw invalid();
+                    || laterMigrations().size() < 3) throw invalid();
             var audit = tableContracts(recoveryMigration(), Map.of(RECOVERY_RECEIPT, 32)).get(RECOVERY_RECEIPT);
             verifyCaseColumns(RECOVERY_RECEIPT, audit.columns());
             verifyCaseChecks(RECOVERY_RECEIPT, audit.checks(), false);
@@ -75,6 +79,28 @@ public final class ProcessApiSchemaVerifier {
             verifyRecoveryNativeStorage();
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Process Worker recovery storage schema verification failed", failure);
+        }
+    }
+
+    /** Explicit readiness for the immutable platform candidate and review only. */
+    public void verifyPlatformCandidateReviews() {
+        jdbc.setQueryTimeout(5);
+        try {
+            verifyHistory();
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
+                    || laterMigrations().size() < 4) throw invalid();
+            var contracts = tableContracts(candidateReviewMigration(), Map.of(PLATFORM_CANDIDATE, 23, PLATFORM_REVIEW, 12));
+            for (var entry : contracts.entrySet()) {
+                String table = entry.getKey();
+                var contract = entry.getValue();
+                verifyCaseColumns(table, contract.columns());
+                verifyCaseChecks(table, contract.checks(), false);
+                verifyCaseKeys(table, contract.keys());
+                verifyCaseIndexes(table, contract.indexes());
+                verifyCaseRole(table, false, true);
+            }
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Platform candidate review storage schema verification failed", failure);
         }
     }
 
@@ -206,8 +232,8 @@ public final class ProcessApiSchemaVerifier {
                         + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        var numbers = List.of("8", "9", "10");
-        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE);
+        var numbers = List.of("8", "9", "10", "11");
+        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE);
         if (versions.size() > numbers.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
@@ -218,6 +244,7 @@ public final class ProcessApiSchemaVerifier {
                 case "8" -> caseMigration();
                 case "9" -> cancellationMigration();
                 case "10" -> recoveryMigration();
+                case "11" -> candidateReviewMigration();
                 default -> throw invalid();
             }
         }
@@ -312,7 +339,13 @@ public final class ProcessApiSchemaVerifier {
         String columns = cancellation ? " AND NOT has_any_column_privilege(c.oid,'REFERENCES')"
                 + (mutable ? "" : " AND NOT has_any_column_privilege(c.oid,'UPDATE')") : "";
         String insert = requireInsert ? " AND has_table_privilege(c.oid,'INSERT')" : "";
-        String schemaOwnership = RECOVERY_RECEIPT.equals(table) ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
+        boolean platformReview = PLATFORM_CANDIDATE.equals(table) || PLATFORM_REVIEW.equals(table);
+        String schemaOwnership = RECOVERY_RECEIPT.equals(table) || platformReview ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
+        String immutableRelations = platformReview ? """
+                 AND NOT has_schema_privilege(n.oid,'CREATE')
+                 AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent=c.oid OR i.inhrelid=c.oid)
+                 AND NOT EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid)
+                """ : "";
         String update = mutable ? "has_table_privilege(c.oid,'UPDATE')" : "NOT has_table_privilege(c.oid,'UPDATE')";
         Boolean valid = jdbc.queryForObject("""
                 SELECT NOT c.relrowsecurity AND NOT c.relforcerowsecurity AND NOT c.relispartition AND c.relpersistence='p'
@@ -324,7 +357,7 @@ public final class ProcessApiSchemaVerifier {
                   AND NOT has_table_privilege(c.oid,'TRIGGER') AND NOT has_table_privilege(c.oid,'REFERENCES')
                   AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid
                     AND ((NOT tr.tgisinternal AND tr.tgenabled<>'D') OR (tr.tgisinternal AND tr.tgenabled<>'O')))
-                """ + columns + insert + schemaOwnership + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
+                """ + columns + insert + schemaOwnership + immutableRelations + " AND " + update + " FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=? AND c.relname=? AND c.relkind='r'",
                 Boolean.class, schema, table);
         if (!Boolean.TRUE.equals(valid)) throw invalid();
     }
@@ -341,7 +374,7 @@ public final class ProcessApiSchemaVerifier {
         while (tables.find()) {
             String table = tables.group(1); int open = tables.end() - 1; String body = sql.substring(open + 1, caseClosing(sql, open));
             var columns = new HashMap<String, CaseColumn>();
-            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
+            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
             while (fields.find()) {
                 String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(").replace("timestamptz(6)", "timestamp(6) with time zone");
                 if (columns.put(fields.group(1), new CaseColumn(type, fields.group(3).contains("NOT NULL"), fields.group(3).contains("COLLATE \"C\""), null)) != null) throw invalid();
@@ -397,6 +430,17 @@ public final class ProcessApiSchemaVerifier {
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {
             throw new IllegalStateException("Process Worker recovery migration resource is unavailable", failure);
+        }
+    }
+
+    private static String candidateReviewMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + CANDIDATE_REVIEW_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readAllBytes();
+            if (!CANDIDATE_REVIEW_SHA256.equals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("Platform candidate review migration resource is unavailable", failure);
         }
     }
 

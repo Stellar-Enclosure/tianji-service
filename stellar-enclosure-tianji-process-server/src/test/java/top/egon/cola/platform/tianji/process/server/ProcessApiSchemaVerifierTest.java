@@ -44,6 +44,9 @@ class ProcessApiSchemaVerifierTest {
     private static final String V8 = "V8__add_formal_cmmn_case_support.sql";
     private static final String V9 = "V9__add_process_cancellation_receipts.sql";
     private static final String V10 = "V10__add_process_worker_recovery_receipts.sql";
+    private static final String PLATFORM_CANDIDATE = "tianji_platform_release_candidate";
+    private static final String PLATFORM_REVIEW = "tianji_platform_release_review";
+    private static final String V11 = "V11__add_platform_release_candidate_reviews.sql";
     private static final String V10_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
     private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
     private static final String V9_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
@@ -54,7 +57,7 @@ class ProcessApiSchemaVerifierTest {
     private static final String DISPATCH = "tianji_process_agent_dispatch";
 
     @Test
-    void history_accepts_only_exact_v8_v9_v10_prefixes() throws Exception {
+    void history_accepts_only_exact_v8_through_v11_prefixes() throws Exception {
         assertFalse(assertDoesNotThrow(() -> checkHistory(List.of())));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8))))));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8)),
@@ -67,6 +70,8 @@ class ProcessApiSchemaVerifierTest {
         var v8 = history("8", V8, true, checksum(V8));
         var v9 = history("9", V9, true, checksum(V9));
         var v10 = history("10", V10, true, checksum(V10));
+        var v11 = history("11", V11, true, checksum(V11));
+        assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(v8, v9, v10, v11))));
         var wrongType = history("10", V10, true, checksum(V10));
         wrongType.put("type", "JDBC");
         for (List<Map<String, Object>> invalid : List.of(
@@ -76,6 +81,10 @@ class ProcessApiSchemaVerifierTest {
                 List.of(v8, v9, history("10", V10, true, checksum(V10) + 1)),
                 List.of(v8, v9, history("10", V10, true, null)),
                 List.of(v8, v9, wrongType),
+                List.of(v8, v9, v11),
+                List.of(v8, v9, v10, v11, v11),
+                List.of(v8, v9, v10, history("11", V11, true, checksum(V11) + 1)),
+                List.of(v8, v9, v10, history("11", V11, false, checksum(V11))),
                 List.of(v8, v9, v10, history("11", "V11__unknown.sql", true, 0)),
                 List.of(v8, v9, v10, history(null, "R__unknown.sql", true, 0)),
                 List.of(history("9", V9, true, checksum(V9))),
@@ -222,6 +231,62 @@ class ProcessApiSchemaVerifierTest {
         }
         assertFalse(catalog.roleSql.containsKey(RECOVERY_RECEIPT));
         assertTrue(catalog.nativeTables.isEmpty());
+    }
+
+    @Test
+    void v11_keeps_worker_recovery_readiness_without_candidate_review_grants() throws Exception {
+        var catalog = Catalog.recoveryReady();
+        var prefix = new ArrayList<>(recoveryHistory());
+        prefix.add(history("11", V11, true, checksum(V11)));
+        catalog.history = prefix;
+        verifyRecovery(catalog, false);
+        assertFalse(catalog.roleSql.containsKey("tianji_platform_release_candidate"));
+        assertFalse(catalog.roleSql.containsKey("tianji_platform_release_review"));
+    }
+
+    @Test
+    void candidate_review_requires_exact_v11_scoped_constraints_and_append_only_role() throws Exception {
+        var ready = Catalog.candidateReviewReady();
+        verifyCandidateReview(ready, false);
+        assertEquals("bytea", ready.column(PLATFORM_CANDIDATE, "envelope").get("type"));
+        assertEquals(Set.of(PLATFORM_CANDIDATE + "_pkey"), ready.names("keys:" + PLATFORM_CANDIDATE));
+        assertEquals(Set.of(PLATFORM_REVIEW + "_pkey", PLATFORM_REVIEW + "_candidate_fk"), ready.names("keys:" + PLATFORM_REVIEW));
+        assertEquals(Set.of(PLATFORM_REVIEW + "_pkey", PLATFORM_REVIEW + "_command_idx"), ready.names("indexes:" + PLATFORM_REVIEW));
+        for (String table : List.of(PLATFORM_CANDIDATE, PLATFORM_REVIEW)) {
+            String roleSql = ready.roleSql.get(table);
+            assertRoleSafety(roleSql);
+            assertColumnPrivilegeSafety(roleSql, false);
+            assertTrue(roleSql.contains("has_table_privilege(c.oid,'SELECT')"));
+            assertTrue(roleSql.contains("has_table_privilege(c.oid,'INSERT')"));
+            assertTrue(roleSql.contains("NOT has_table_privilege(c.oid,'UPDATE')"));
+            assertTrue(roleSql.contains("NOT pg_has_role(n.nspowner,'MEMBER')"));
+            assertTrue(roleSql.contains("NOT has_schema_privilege(n.oid,'CREATE')"));
+        }
+
+        var v10 = Catalog.candidateReviewReady();
+        v10.history = recoveryHistory();
+        verifyCandidateReview(v10, true);
+        var wrongScope = Catalog.candidateReviewReady();
+        wrongScope.named("keys:" + PLATFORM_REVIEW, PLATFORM_REVIEW + "_candidate_fk")
+                .put("target_fields", List.of("tenant_id", "candidate_sha256"));
+        verifyCandidateReview(wrongScope, true);
+        var missingIndex = Catalog.candidateReviewReady();
+        missingIndex.rows.get("indexes:" + PLATFORM_REVIEW).removeLast();
+        verifyCandidateReview(missingIndex, true);
+        var wrongType = Catalog.candidateReviewReady();
+        wrongType.column(PLATFORM_CANDIDATE, "sidecar").put("type", "text");
+        verifyCandidateReview(wrongType, true);
+        var privileged = Catalog.candidateReviewReady();
+        privileged.safeRole = false;
+        verifyCandidateReview(privileged, true);
+    }
+
+    private static void verifyCandidateReview(Catalog catalog, boolean rejected) {
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process");
+            if (rejected) assertThrows(IllegalStateException.class, verifier::verifyPlatformCandidateReviews);
+            else assertDoesNotThrow(verifier::verifyPlatformCandidateReviews);
+        }
     }
 
     @Test
@@ -437,6 +502,17 @@ class ProcessApiSchemaVerifierTest {
             return catalog;
         }
 
+        static Catalog candidateReviewReady() throws Exception {
+            var catalog = recoveryReady();
+            var history = new ArrayList<>(catalog.history);
+            history.add(history("11", V11, true, checksum(V11)));
+            catalog.history = history;
+            String migration = resource(V11);
+            catalog.parseTables(migration);
+            catalog.parseIndexes(migration);
+            return catalog;
+        }
+
         Map<String, Object> column(String table, String name) {
             return rows.get("columns:" + table).stream().filter(row -> name.equals(row.get("attname"))).findFirst().orElseThrow();
         }
@@ -479,6 +555,12 @@ class ProcessApiSchemaVerifierTest {
             }
             if (sql.contains("schema_history")) {
                 historySql = sql;
+                if (sql.contains("WHERE version IN ('1','2','3')")) {
+                    return map(invocation, List.of(
+                            history("1", "V1__create_process_release_store.sql", true, checksum("V1__create_process_release_store.sql")),
+                            history("2", "V2__add_decision_receipt_result.sql", true, checksum("V2__add_decision_receipt_result.sql")),
+                            history("3", "V3__bind_process_receipts_to_issuer.sql", true, checksum("V3__bind_process_receipts_to_issuer.sql"))));
+                }
                 return map(invocation, history);
             }
             if (sql.contains("attidentity")) return map(invocation, rows.getOrDefault("columns:" + table, List.of()));
@@ -507,7 +589,7 @@ class ProcessApiSchemaVerifierTest {
         }
 
         private static String table(String sql, Object[] args) {
-            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT,
+            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT, PLATFORM_CANDIDATE, PLATFORM_REVIEW,
                     "act_ru_execution", "act_ru_deadletter_job", "act_ru_external_job",
                     "act_ru_job", "act_ru_timer_job", "act_ru_suspended_job",
                     "tianji_process_release_definition", "tianji_human_task_receipt");
@@ -723,7 +805,7 @@ class ProcessApiSchemaVerifierTest {
                 String table = matcher.group(1); int open = matcher.end() - 1;
                 String body = sql.substring(open + 1, closing(sql, open));
                 var columns = new ArrayList<Map<String, Object>>();
-                var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
+                var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
                 while (fields.find()) {
                     String type = fields.group(2).replace("varchar(", "character varying(")
                             .replace("char(", "character(").replace("timestamptz(6)", "timestamp(6) with time zone");
