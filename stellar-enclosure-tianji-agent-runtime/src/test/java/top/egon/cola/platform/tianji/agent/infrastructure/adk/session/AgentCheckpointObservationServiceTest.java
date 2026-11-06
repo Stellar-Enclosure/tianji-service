@@ -131,6 +131,7 @@ class AgentCheckpointObservationServiceTest {
     @Test
     void rejects_stale_binding_and_malformed_or_unexpected_native_event() throws Exception {
         for (var condition : Map.of("engine_version", "1.12.0", "snapshot_sha256", "f".repeat(64),
+                "definition_version", 2L, "definition_sha256", "e".repeat(64),
                 "native_invocation_id", "different", "event_payload", "{}").entrySet()) {
             try (var fixture = new Fixture(true)) {
                 fixture.row.put(condition.getKey(), condition.getValue());

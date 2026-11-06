@@ -816,13 +816,13 @@ class AgentCheckpointCapturePostgresTest {
                 .target(version).cleanDisabled(true).lockRetryCount(0).load();
     }
 
-    private static AgentDefinitionSpecDTO definition(Duration deadline) {
+    private static AgentDefinitionSpecDTO definition(Duration deadline, long version, String instruction) {
         var dependencies = new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), ROUTE, POLICY);
         var policy = new ExecutionPolicyDTO(deadline, Duration.ofSeconds(8), Duration.ofSeconds(2),
                 1, 0, 100, 50, BigDecimal.ONE, "USD", 1, Set.of(), "checkpoint-fixture-retry", null);
-        return new AgentDefinitionSpecDTO(DEFINITION, 1, "CONFIG", null, "1", "1", dependencies, policy,
+        return new AgentDefinitionSpecDTO(DEFINITION, version, "CONFIG", null, "1", "1", dependencies, policy,
                 Map.of("chatModelBeanName", "fixtureModel", "modelName", MODEL, "rootAgentName", "writer",
-                        "agents", List.of(Map.of("name", "writer", "instruction", "Complete the disposable fixture."))));
+                        "agents", List.of(Map.of("name", "writer", "instruction", instruction))));
     }
 
     private static AgentModelBudgetEstimator estimator(Runnable beforeEstimate) {
@@ -867,7 +867,7 @@ class AgentCheckpointCapturePostgresTest {
             if (existingRun == null) {
                 assertNotNull(sessions.createSession(APP, sessions.adkUserId(), Map.of(), SESSION)
                         .timeout(5, TimeUnit.SECONDS).blockingGet());
-                setupLedger.publish(actor, definition(deadline));
+                setupLedger.publish(actor, definition(deadline, 1, "Complete the disposable fixture."));
                 var run = setupLedger.start(actor, new StartAgentRunCommand(DEFINITION, 1, SESSION, "first-input",
                         null, null, new AgentInputDTO(INPUT, List.of(), Map.of()), null));
                 this.query = new GetAgentRunQuery(run.runId());
@@ -1210,6 +1210,25 @@ class AgentCheckpointCapturePostgresTest {
             assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                     assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, stale, "checkpoint-worker")).code());
             assertEquals(0, decisions.get());
+
+            var original = ledger.snapshot(actor, query);
+            var newer = ledger.publish(actor, definition(original.definition().policy().totalTimeout(), 2,
+                    "Use the new definition only for newly started runs."));
+            assertEquals(1, suspended.definitionVersion());
+            assertEquals(2, newer.version());
+            assertNotEquals(original.definitionContentSha256(), newer.contentSha256());
+            var pinned = takeover.previewAuthorization(actor, command).orElseThrow();
+            assertEquals(authorization, pinned.execution());
+            assertEquals(original.definitionContentSha256(), pinned.execution().definitionSha256());
+
+            assertCheckpointDefinitionDriftRejected(takeover, command, newer.version(), original.definitionContentSha256());
+            assertCheckpointDefinitionDriftRejected(takeover, command, suspended.definitionVersion(), newer.contentSha256());
+            assertEquals(0, decisions.get());
+            assertEquals(0, resumeReceipts());
+            assertEquals(checkpoint, checkpointDigest());
+            assertReconciled(cut);
+            assertEquals(pinned, takeover.previewAuthorization(actor, command).orElseThrow());
+
             assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                     assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, expired, "checkpoint-worker")).code());
             assertEquals(1, decisions.get());
@@ -1238,6 +1257,34 @@ class AgentCheckpointCapturePostgresTest {
             assertEquals(0, database.observer().queryForObject("""
                     SELECT count(*) FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND origin_run_id=?
                     """, Integer.class, actor.tenantId(), query.runId()));
+        }
+
+        private void assertCheckpointDefinitionDriftRejected(AgentCheckpointTakeoverService takeover, ResumeCommand command,
+                                                               long driftVersion, String driftSha) {
+            long version = authorization.definitionVersion();
+            String sha = authorization.definitionSha256();
+            changeCheckpointDefinition(version, sha, driftVersion, driftSha);
+            try {
+                assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                        assertThrows(AgentLedgerException.class, () -> takeover.previewAuthorization(actor, command)).code());
+                assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
+                        assertThrows(AgentLedgerException.class, () -> takeover.takeOver(actor, command, "checkpoint-worker")).code());
+            } finally {
+                changeCheckpointDefinition(driftVersion, driftSha, version, sha);
+            }
+        }
+
+        private void changeCheckpointDefinition(long previousVersion, String previousSha, long replacementVersion,
+                                                String replacementSha) {
+            assertEquals(1, database.observer().update("""
+                    UPDATE ONLY tianji_agent.agent_checkpoint
+                    SET definition_version=?,definition_sha256=?
+                    WHERE tenant_id=? AND run_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?
+                      AND app_name=? AND session_id=? AND attempt=1 AND checkpoint_no=1
+                      AND safe_boundary='FIRST_DURABLE_INPUT_V1' AND definition_key=?
+                      AND definition_version=? AND definition_sha256=?
+                    """, replacementVersion, replacementSha, actor.tenantId(), query.runId(), actor.subjectType().name(),
+                    actor.issuerFingerprint(), actor.subjectId(), APP, SESSION, DEFINITION, previousVersion, previousSha));
         }
 
         void assertCheckpointResumeExecution(ForkCut cut, DriverManagerDataSource executionSource, boolean throughDispatcher) {
