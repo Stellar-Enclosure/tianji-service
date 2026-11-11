@@ -38,7 +38,9 @@ import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxPrope
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
+import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilotProperties;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.GovernedStartAuthority;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
@@ -55,6 +57,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuth
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
@@ -106,6 +109,94 @@ class ProcessApiConfigurationTest {
                     assertThat(context.getStartupFailure()).hasRootCauseMessage(
                             "Tianji Process API requires both identity and permission filters in its security chain");
                 });
+    }
+
+    @Test
+    void protected_start_pilots_bind_an_exact_route_and_reject_legacy_service_override() {
+        var web = runner.withPropertyValues("stellar.tianji.process.api.enabled=true")
+                .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
+                .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class))
+                .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
+                .withBean(ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean(ProcessExecutionService.class, () -> mock(ProcessExecutionService.class))
+                .withBean(ProcessDecisionService.class, () -> mock(ProcessDecisionService.class))
+                .withBean(ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class));
+
+        web.run(context -> {
+            assertThat(context).hasNotFailed();
+            assertThat(context.getBean(GovernedStartPilotProperties.class).pilots()).isEmpty();
+        });
+        var enabled = web.withPropertyValues("stellar.tianji.process.governed-start.pilots[0].tenant-id=20",
+                "stellar.tianji.process.governed-start.pilots[0].definition-key=expense",
+                "stellar.tianji.process.governed-start.pilots[0].channel=stable");
+        enabled.run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasMessage(
+                    "Governed Process START pilots require one explicit authority");
+        });
+        enabled.withBean(GovernedStartAuthority.class, () -> mock(GovernedStartAuthority.class)).run(context -> {
+            assertThat(context).hasFailed();
+            assertThat(context.getStartupFailure()).hasMessage(
+                    "Protected Process START does not enforce the configured pilots");
+        });
+    }
+
+    @Test
+    void protected_start_default_uses_legacy_constructor_and_pilots_require_exactly_one_authority() {
+        var configuration = new ProcessSecurityConfiguration();
+        var noPilots = new GovernedStartPilotProperties(java.util.List.of());
+        var pilots = new GovernedStartPilotProperties(java.util.List.of(new GovernedStartPilotProperties.Pilot(20, "expense", "stable")));
+        var validator = mock(ProcessModelValidator.class);
+        var engine = mock(ProcessEngine.class);
+        var process = mock(SpringProcessEngineConfiguration.class);
+        var dmnEngine = mock(DmnEngine.class);
+        var dmn = mock(SpringDmnEngineConfiguration.class);
+        when(engine.getProcessEngineConfiguration()).thenReturn(process);
+        when(dmnEngine.getDmnEngineConfiguration()).thenReturn(dmn);
+        var beans = new StaticListableBeanFactory();
+        var provider = beans.getBeanProvider(GovernedStartAuthority.class);
+
+        assertThatThrownBy(() -> configuration.processExecutionService(engine, dmnEngine, validator, pilots, provider))
+                .hasMessage("Governed Process START pilots require one explicit authority");
+        var authority = mock(GovernedStartAuthority.class);
+        beans.addBean("authorizedPilot", authority);
+        try (var construction = mockConstruction(ProcessExecutionService.class, (instance, context) -> {
+            if (context.getCount() == 1) assertThat(context.arguments()).isEqualTo(java.util.List.of(process, dmn, validator));
+            else assertThat(context.arguments()).isEqualTo(java.util.List.of(process, dmn, validator, pilots, authority));
+        })) {
+            configuration.processExecutionService(engine, dmnEngine, validator, noPilots, provider);
+            configuration.processExecutionService(engine, dmnEngine, validator, pilots, provider);
+            assertThat(construction.constructed()).hasSize(2);
+        }
+        var executions = new StaticListableBeanFactory();
+        var execution = mock(ProcessExecutionService.class);
+        executions.addBean("protectedStart", execution);
+        var guard = configuration.governedStartPilotGuard(pilots, executions.getBeanProvider(ProcessExecutionService.class), provider);
+        when(execution.enforcesGovernedStartPilots(pilots, authority)).thenReturn(true);
+        guard.afterSingletonsInstantiated();
+        when(execution.enforcesGovernedStartPilots(pilots, authority)).thenReturn(false);
+        assertThatThrownBy(guard::afterSingletonsInstantiated)
+                .hasMessage("Protected Process START does not enforce the configured pilots");
+        beans.addBean("competingPilot", mock(GovernedStartAuthority.class));
+        assertThatThrownBy(guard::afterSingletonsInstantiated)
+                .hasMessage("Governed Process START pilots require one explicit authority");
+        assertThatThrownBy(() -> configuration.processExecutionService(engine, dmnEngine, validator, pilots, provider))
+                .hasMessage("Governed Process START pilots require one explicit authority");
+    }
+
+    @Test
+    void protected_start_pilot_configuration_refuses_duplicate_tenant_and_definition() {
+        assertThatThrownBy(() -> new GovernedStartPilotProperties(java.util.List.of(
+                new GovernedStartPilotProperties.Pilot(20, "expense", "stable"),
+                new GovernedStartPilotProperties.Pilot(20, "expense", "other"))))
+                .hasMessage("Duplicate governed Process START pilot");
+        assertThatThrownBy(() -> new GovernedStartPilotProperties(java.util.List.of(
+                new GovernedStartPilotProperties.Pilot(20, "expense", "stable"),
+                new GovernedStartPilotProperties.Pilot(20, "different", "stable"))))
+                .hasMessage("Duplicate governed Process START pilot");
+        assertThatThrownBy(() -> new GovernedStartPilotProperties(java.util.stream.IntStream.rangeClosed(1, 257)
+                .mapToObj(tenant -> new GovernedStartPilotProperties.Pilot(tenant, "expense", "stable")).toList()))
+                .hasMessage("Too many governed Process START pilots");
     }
 
     @Test

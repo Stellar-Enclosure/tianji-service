@@ -54,9 +54,19 @@ final class GovernedProcessStartStore {
                 GovernedProcessStartStore::readPointer, tenantId, channel);
     }
 
+    /** A hint to avoid reopening current Worker evidence for an owned retry. The transaction still locks the receipt. */
+    boolean hasReceipt(ProcessActor actor, String commandId) {
+        Boolean present = jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + receipts
+                        + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
+                        + " AND command_type='START' AND command_id=?)", Boolean.class,
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId);
+        if (present == null) throw unavailable();
+        return present;
+    }
+
     Optional<Provenance> find(ProcessActor actor, String commandId) {
         return one("SELECT " + POINTER_COLUMNS + ",p.governed_request_sha256,p.resolved_request_sha256,p.instance_id"
-                        + " FROM " + provenance + " p JOIN " + activation + " a ON a.tenant_id=p.tenant_id"
+                        + " FROM " + provenance + " p LEFT JOIN " + activation + " a ON a.tenant_id=p.tenant_id"
                         + " AND a.channel=p.channel AND a.revision=p.activation_revision"
                         + " WHERE p.tenant_id=? AND p.subject_type=? AND p.subject_issuer=? AND p.subject_id=?"
                         + " AND p.command_type='START' AND p.command_id=?",

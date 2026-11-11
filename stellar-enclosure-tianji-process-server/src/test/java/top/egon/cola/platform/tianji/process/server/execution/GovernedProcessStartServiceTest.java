@@ -45,18 +45,21 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class GovernedProcessStartServiceTest {
@@ -74,6 +77,9 @@ class GovernedProcessStartServiceTest {
     private static final String CORRELATION = "corr-1";
     private static final String RELEASE = "ps-1";
     private static final String INSTANCE = "instance-1";
+    private static final GovernedStartPilotProperties NO_PILOTS = new GovernedStartPilotProperties(List.of());
+    private static final GovernedStartPilotProperties PILOT = new GovernedStartPilotProperties(List.of(
+            new GovernedStartPilotProperties.Pilot(CALLER.tenantId(), DEFINITION, CHANNEL)));
     private static final Instant NOW = Instant.parse("2026-11-11T04:00:00Z");
     private static final Instant EXPIRES = NOW.plusSeconds(10);
     private static final Map<String, Object> INPUTS = Map.of("amount", 7L);
@@ -189,6 +195,180 @@ class GovernedProcessStartServiceTest {
         }
     }
 
+    @Test
+    void protected_start_uses_the_same_receipt_digest_and_commits_governed_provenance() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            assertEquals(INSTANCE, fixture.service.start(CALLER, explicit(RELEASE, 7)).instanceId());
+            var order = inOrder(fixture.authority, fixture.store, fixture.receipts, fixture.builder, fixture.transactionManager);
+            order.verify(fixture.store).find(CALLER, COMMAND);
+            order.verify(fixture.authority).authorize(new StartAuthorizationQuery(CALLER, CHANNEL, DEFINITION, COMMAND));
+            order.verify(fixture.store).hasReceipt(CALLER, COMMAND);
+            order.verify(fixture.authority).currentWorker(fixture.workerQuery);
+            order.verify(fixture.store).begin(CALLER.tenantId());
+            order.verify(fixture.receipts).insert(CALLER, Kind.START, COMMAND, RESOLVED, RELEASE, CORRELATION);
+            order.verify(fixture.builder).start();
+            order.verify(fixture.receipts).apply(CALLER, Kind.START, COMMAND, INSTANCE, null);
+            order.verify(fixture.store).append(CALLER, COMMAND, CORRELATION, fixture.pointer, GOVERNED,
+                    RESOLVED, AUTHORIZATION, INSTANCE);
+            order.verify(fixture.transactionManager).commit(fixture.status);
+        }
+    }
+
+    @Test
+    void protected_start_rejects_an_explicit_release_mismatch_at_the_locked_pointer() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            assertThrows(ProcessVersionConflictException.class, () -> fixture.service.start(CALLER, explicit("other-release", 7)));
+            verify(fixture.store).begin(CALLER.tenantId());
+            verify(fixture.store, times(2)).current(CALLER.tenantId(), CHANNEL);
+            verify(fixture.authority, never()).currentWorker(any());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_replays_the_exact_historical_governed_release_after_pointer_movement() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            when(fixture.store.hasReceipt(CALLER, COMMAND)).thenReturn(true);
+            when(fixture.receipts.lockIfPresent(CALLER, Kind.START, COMMAND)).thenReturn(Optional.of(fixture.applied));
+            when(fixture.store.find(CALLER, COMMAND)).thenReturn(Optional.of(
+                    new Provenance(fixture.pointer, GOVERNED, RESOLVED, INSTANCE)));
+            when(fixture.store.current(CALLER.tenantId(), CHANNEL)).thenReturn(Optional.of(fixture.pointer(2)));
+
+            assertEquals(INSTANCE, fixture.service.start(CALLER, explicit(RELEASE, 7)).instanceId());
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit("other-release", 7)));
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 8)));
+            verify(fixture.authority, never()).currentWorker(any());
+            verify(fixture.store, never()).current(anyLong(), anyString());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_authorizes_the_original_channel_after_a_pilot_remap() {
+        var remapped = new GovernedStartPilotProperties(List.of(
+                new GovernedStartPilotProperties.Pilot(CALLER.tenantId(), DEFINITION, "canary")));
+        try (var fixture = new Fixture(true, remapped)) {
+            var prior = new Provenance(fixture.pointer, GOVERNED, RESOLVED, INSTANCE);
+            when(fixture.store.find(CALLER, COMMAND)).thenReturn(Optional.of(prior));
+            when(fixture.receipts.lockIfPresent(CALLER, Kind.START, COMMAND)).thenReturn(Optional.of(fixture.applied));
+            var historicalQuery = new StartAuthorizationQuery(CALLER, CHANNEL, DEFINITION, COMMAND);
+            when(fixture.authority.authorize(historicalQuery)).thenReturn(
+                    new StartGrant(historicalQuery, AUTHORIZATION, NOW, EXPIRES));
+
+            assertEquals(INSTANCE, fixture.service.start(CALLER, explicit(RELEASE, 7)).instanceId());
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 8)));
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit("other-release", 7)));
+            verify(fixture.authority, times(3)).authorize(historicalQuery);
+            verify(fixture.authority, never()).authorize(new StartAuthorizationQuery(CALLER, "canary", DEFINITION, COMMAND));
+            verify(fixture.authority, never()).currentWorker(any());
+            verify(fixture.store, never()).current(anyLong(), anyString());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_fails_closed_if_historical_provenance_changes_under_the_fence() {
+        var remapped = new GovernedStartPilotProperties(List.of(
+                new GovernedStartPilotProperties.Pilot(CALLER.tenantId(), DEFINITION, "canary")));
+        try (var fixture = new Fixture(true, remapped)) {
+            var prior = new Provenance(fixture.pointer, GOVERNED, RESOLVED, INSTANCE);
+            var changed = new Provenance(fixture.pointer(2, "canary"), GOVERNED, RESOLVED, INSTANCE);
+            when(fixture.store.find(CALLER, COMMAND)).thenReturn(Optional.of(prior), Optional.of(changed));
+            when(fixture.receipts.lockIfPresent(CALLER, Kind.START, COMMAND)).thenReturn(Optional.of(fixture.applied));
+
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 7)));
+            verify(fixture.authority).authorize(new StartAuthorizationQuery(CALLER, CHANNEL, DEFINITION, COMMAND));
+            verify(fixture.store).begin(CALLER.tenantId());
+            verify(fixture.authority, never()).currentWorker(any());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_execution_requires_the_exact_assembled_authority_instance() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            assertTrue(fixture.service.enforcesGovernedStartPilots(PILOT, fixture.authority));
+            assertFalse(fixture.service.enforcesGovernedStartPilots(PILOT, mock(GovernedStartAuthority.class)));
+            assertFalse(fixture.service.enforcesGovernedStartPilots(NO_PILOTS, fixture.authority));
+        }
+    }
+
+    @Test
+    void protected_start_replays_exact_existing_applied_explicit_receipt_without_writing_or_loading_worker() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            when(fixture.store.hasReceipt(CALLER, COMMAND)).thenReturn(true);
+            when(fixture.receipts.lockIfPresent(CALLER, Kind.START, COMMAND)).thenReturn(Optional.of(fixture.applied));
+
+            assertEquals(INSTANCE, fixture.service.start(CALLER, explicit(RELEASE, 7)).instanceId());
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 8)));
+            assertThrows(ProcessConflictException.class, () -> fixture.service.start(CALLER, explicit("other-release", 7)));
+            verify(fixture.store, never()).current(anyLong(), anyString());
+            verify(fixture.authority, never()).currentWorker(any());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_never_replays_unapplied_receipt_or_skips_current_caller_admission() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            when(fixture.store.hasReceipt(CALLER, COMMAND)).thenReturn(true);
+            when(fixture.receipts.lockIfPresent(CALLER, Kind.START, COMMAND)).thenReturn(Optional.of(
+                    new Receipt(RESOLVED, RELEASE, CORRELATION, "PENDING", null, NOW, null)));
+            assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 7)));
+
+            doReturn(null).when(fixture.authority).authorize(any());
+            assertThrows(AccessDeniedException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 7)));
+            verify(fixture.store).hasReceipt(CALLER, COMMAND);
+            verify(fixture.receipts).lockIfPresent(CALLER, Kind.START, COMMAND);
+            verify(fixture.authority, never()).currentWorker(any());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_refuses_missing_worker_without_falling_back_to_explicit_start() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            when(fixture.authority.currentWorker(fixture.workerQuery)).thenReturn(null);
+            assertThrows(AccessDeniedException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 7)));
+            verify(fixture.authority).currentWorker(fixture.workerQuery);
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_refuses_missing_activation_without_falling_back_to_explicit_start() {
+        try (var fixture = new Fixture(true, PILOT)) {
+            when(fixture.store.current(CALLER.tenantId(), CHANNEL)).thenReturn(Optional.empty());
+            assertThrows(ProcessResourceNotFoundException.class, () -> fixture.service.start(CALLER, explicit(RELEASE, 7)));
+            verify(fixture.authority, never()).currentWorker(any());
+            verifyNoStartWrites(fixture);
+        }
+    }
+
+    @Test
+    void protected_start_routes_only_the_exact_tenant_and_definition_pair() {
+        var otherScopes = new GovernedStartPilotProperties(List.of(
+                new GovernedStartPilotProperties.Pilot(CALLER.tenantId() + 1, DEFINITION, CHANNEL),
+                new GovernedStartPilotProperties.Pilot(CALLER.tenantId(), "anotherDefinition", CHANNEL)));
+        try (var fixture = new Fixture(true, otherScopes)) {
+            assertEquals(INSTANCE, fixture.service.start(CALLER, explicit(RELEASE, 7)).instanceId());
+            verify(fixture.receipts).insert(CALLER, Kind.START, COMMAND, RESOLVED, RELEASE, CORRELATION);
+            verify(fixture.builder).start();
+            verifyNoInteractions(fixture.authority, fixture.store);
+        }
+    }
+
+    private static void verifyNoStartWrites(Fixture fixture) {
+        verify(fixture.receipts, never()).insert(any(), any(), anyString(), anyString(), anyString(), anyString());
+        verify(fixture.receipts, never()).apply(any(), any(), anyString(), anyString(), any());
+        verify(fixture.store, never()).append(any(), anyString(), anyString(), any(), anyString(), anyString(), anyString(), anyString());
+        verify(fixture.builder, never()).start();
+    }
+
+    private static StartCommand explicit(String release, long amount) {
+        return new StartCommand(release, DEFINITION, BUSINESS, COMMAND, CORRELATION, Map.of("amount", amount));
+    }
+
     private static GovernedStartCommand command(long amount) {
         return new GovernedStartCommand(CHANNEL, DEFINITION, BUSINESS, COMMAND, CORRELATION, Map.of("amount", amount));
     }
@@ -215,6 +395,10 @@ class GovernedProcessStartServiceTest {
         private final GovernedProcessStartStore store;
 
         private Fixture(boolean enabled) {
+            this(enabled, NO_PILOTS);
+        }
+
+        private Fixture(boolean enabled, GovernedStartPilotProperties pilots) {
             var engine = mock(SpringProcessEngineConfiguration.class);
             var runtime = mock(RuntimeService.class);
             var query = mock(ProcessInstanceQuery.class, RETURNS_SELF);
@@ -236,8 +420,13 @@ class GovernedProcessStartServiceTest {
             when(instance.getTenantId()).thenReturn(Long.toString(CALLER.tenantId()));
             when(instance.getBusinessKey()).thenReturn(BUSINESS);
 
-            service = enabled ? new ProcessExecutionService(engine, null, null, authority)
-                    : new ProcessExecutionService(engine, null, null);
+            if (!enabled) {
+                service = new ProcessExecutionService(engine, null, null);
+            } else if (pilots.pilots().isEmpty()) {
+                service = new ProcessExecutionService(engine, null, null, authority);
+            } else {
+                service = new ProcessExecutionService(engine, null, null, pilots, authority);
+            }
             var releases = releaseConstruction.constructed().getFirst();
             when(releases.get(CALLER, RELEASE)).thenReturn(new Release(RELEASE, MANIFEST, NOW, List.of(definition)));
             receipts = receiptConstruction.constructed().getFirst();
@@ -258,7 +447,11 @@ class GovernedProcessStartServiceTest {
         }
 
         private Pointer pointer(long revision) {
-            return new Pointer(CALLER.tenantId(), CHANNEL, revision, CANDIDATE, RELEASE, MANIFEST, DEFINITION,
+            return pointer(revision, CHANNEL);
+        }
+
+        private Pointer pointer(long revision, String channel) {
+            return new Pointer(CALLER.tenantId(), channel, revision, CANDIDATE, RELEASE, MANIFEST, DEFINITION,
                     MODEL, binding.topic(), binding.schemaVersion(),
                     PlatformReleaseActivationService.workerFingerprint(binding, REGISTRATION));
         }

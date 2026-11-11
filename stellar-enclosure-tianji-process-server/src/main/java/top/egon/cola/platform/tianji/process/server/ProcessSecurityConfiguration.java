@@ -5,6 +5,7 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -39,7 +40,9 @@ import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
+import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilotProperties;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.GovernedStartAuthority;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
@@ -102,6 +105,7 @@ import java.util.function.BooleanSupplier;
 /** The process API is opt-in and requires both identity and authorization filters. */
 @Configuration(proxyBeanMethods = false)
 @EnableMethodSecurity
+@EnableConfigurationProperties(GovernedStartPilotProperties.class)
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 public class ProcessSecurityConfiguration {
     @Bean
@@ -313,8 +317,34 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnMissingBean(ProcessExecutionService.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessExecutionService processExecutionService(ProcessEngine process, DmnEngine dmn,
-                                                     ProcessModelValidator validator) {
-        return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator);
+                                                     ProcessModelValidator validator, GovernedStartPilotProperties pilots,
+                                                     ObjectProvider<GovernedStartAuthority> authorities) {
+        if (pilots.pilots().isEmpty()) {
+            return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator);
+        }
+        return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator,
+                pilots, requiredPilotAuthority(authorities));
+    }
+
+    private static GovernedStartAuthority requiredPilotAuthority(ObjectProvider<GovernedStartAuthority> authorities) {
+        var candidates = authorities.stream().limit(2).toList();
+        if (candidates.size() != 1) throw new IllegalStateException("Governed Process START pilots require one explicit authority");
+        return candidates.getFirst();
+    }
+
+    @Bean
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    SmartInitializingSingleton governedStartPilotGuard(GovernedStartPilotProperties pilots,
+                                                        ObjectProvider<ProcessExecutionService> executions,
+                                                        ObjectProvider<GovernedStartAuthority> authorities) {
+        return () -> {
+            if (pilots.pilots().isEmpty()) return;
+            var authority = requiredPilotAuthority(authorities);
+            var candidates = executions.stream().limit(2).toList();
+            if (candidates.size() != 1 || !candidates.getFirst().enforcesGovernedStartPilots(pilots, authority)) {
+                throw new IllegalStateException("Protected Process START does not enforce the configured pilots");
+            }
+        };
     }
 
     @Bean
