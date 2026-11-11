@@ -386,7 +386,7 @@ test -n "$S12_WORKER_RECEIPT_MANIFEST"
 "$s12_runner" 'S12WorkerReceiptAcceptanceIT#both_owned_worker_receipts_survive_the_committed_process_acknowledgement_replay' "-Dtianji.s12.worker-receipt.manifest=$S12_WORKER_RECEIPT_MANIFEST"
 ```
 
-仅有编译或跳过不产生 I1。Require one non-skipped Failsafe test and the fixed count marker.
+保留 PS owning module 的 Surefire XML，核对该方法实际执行且未跳过，并保留固定计数标记。
 
 ## 9. Migration, Compatibility, Rollout, and Rollback
 
