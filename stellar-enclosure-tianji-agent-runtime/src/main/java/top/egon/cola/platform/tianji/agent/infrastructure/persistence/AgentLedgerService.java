@@ -2,9 +2,11 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -428,6 +430,61 @@ public final class AgentLedgerService {
             }
             return definition(stored.specification(), stored.hash());
         });
+    }
+
+    /** Reads one committed publication from the owning primary after the host authorizes publication evidence for the tenant. */
+    public PublishedDefinitionEvidenceDTO publishedDefinitionEvidence(TrustedAgentActor actor, String definitionKey, long version) {
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Verified Agent owner is required");
+        }
+        if (definitionKey == null || definitionKey.isBlank() || definitionKey.length() > 128 || version <= 0
+                || !definitionKey.equals(definitionKey.strip()) || definitionKey.chars().anyMatch(Character::isISOControl)
+                || !StandardCharsets.UTF_8.newEncoder().canEncode(definitionKey)) {
+            throw invalid("Agent publication query is invalid");
+        }
+        if (Thread.currentThread().isInterrupted() || TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()
+                || TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw publicationUnavailable();
+        }
+
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        // Select the primary before switching the physical transaction to read-only mode.
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        read.setTimeout(2);
+        try {
+            return read.execute(status -> {
+                Instant observedAt = repository.beginPrimaryReadObservation();
+                if (observedAt == null) throw publicationUnavailable();
+                var row = repository.definition(actor.tenantId(), definitionKey, version).orElseThrow(AgentLedgerService::notFound);
+                var spec = row.specification();
+                if (spec == null || !definitionKey.equals(spec.definitionKey()) || version != spec.version()
+                        || !json.definitionHash(spec).equals(row.hash()) || Thread.currentThread().isInterrupted()) {
+                    throw publicationUnavailable();
+                }
+                var dependencies = spec.dependencies();
+                boolean optionalDependenciesPresent = !dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()
+                        || !dependencies.tools().isEmpty();
+                return new PublishedDefinitionEvidenceDTO(actor.tenantId(), definitionKey, version, row.hash(), spec.executionMode(),
+                        spec.inputSchemaVersion(), spec.outputSchemaVersion(), dependencies.modelRouteRef(),
+                        dependencies.policyVersionRef(), optionalDependenciesPresent, observedAt);
+            });
+        } catch (DataAccessException | TransactionException | IllegalArgumentException | IllegalStateException failure) {
+            throw publicationUnavailable();
+        }
+    }
+
+    /** Immutable owner evidence for the stored definition and its declared references. */
+    public record PublishedDefinitionEvidenceDTO(long tenantId, String definitionKey, long definitionVersion,
+                                                 String definitionContentSha256, String executionMode,
+                                                 String inputSchemaVersion, String outputSchemaVersion,
+                                                 String modelRouteRef, String policyVersionRef,
+                                                 boolean optionalDependenciesPresent, Instant observedAt) {
+        @Override public String toString() { return "PublishedDefinitionEvidenceDTO[redacted]"; }
+    }
+
+    private static AgentLedgerException publicationUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent publication evidence is unavailable");
     }
 
     /** Atomically records the queued run and its first event; no model is called in this transaction. */
