@@ -19,6 +19,7 @@ import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentModelUsagePriceVO;
+import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 
 import java.math.BigDecimal;
@@ -150,11 +151,23 @@ public final class JTokkitChatModelBudgetEstimator implements AgentModelBudgetEs
 
     private Bound require(AgentExecutionSnapshot snapshot, String modelName) {
         if (!"CONFIG".equals(snapshot.definition().executionMode()) || !Objects.equals(modelName, modelName(snapshot))) throw unsupported();
-        var dependencies = snapshot.definition().dependencies();
+        Bound bound = configBinding(snapshot.definition(), modelName, snapshot.effectivePolicy().currency());
+        current(bound);
+        return bound;
+    }
+
+    void requirePublishedConfigBinding(AgentDefinitionSpecDTO definition, String modelName, ChatModel selectedModel) {
+        Bound bound = configBinding(definition, modelName, definition.policy().currency());
+        if (bound.model() != selectedModel) throw unavailable();
+        current(bound);
+    }
+
+    private Bound configBinding(AgentDefinitionSpecDTO definition, String modelName, String currency) {
+        var dependencies = definition.dependencies();
         Bound bound = profiles.get(new Key(modelName, dependencies.modelRouteRef(), dependencies.policyVersionRef()));
-        if (bound == null || !bound.profile().modelBeanName().equals(snapshot.definition().configuration().get("chatModelBeanName"))
-                || !bound.profile().currency().equals(snapshot.effectivePolicy().currency())) throw unavailable();
-        current(bound); return bound;
+        if (bound == null || !bound.profile().modelBeanName().equals(definition.configuration().get("chatModelBeanName"))
+                || !bound.profile().currency().equals(currency)) throw unavailable();
+        return bound;
     }
     private final class NativeBoundEstimator implements AgentModelBudgetEstimator {
         private final AgentExecutionSnapshot boundSnapshot;

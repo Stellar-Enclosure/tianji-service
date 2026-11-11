@@ -8,6 +8,7 @@ import com.google.adk.agents.ParallelAgent;
 import com.google.adk.agents.RunConfig;
 import com.google.adk.agents.SequentialAgent;
 import com.google.adk.events.Event;
+import com.google.adk.models.Model;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.Session;
 import com.google.adk.tools.BaseTool;
@@ -29,6 +30,7 @@ import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.component.agentflow.runtime.AgentFlowInMemoryRunner;
 import top.egon.cola.component.agentflow.runtime.AgentFlowSchedulers;
 import top.egon.cola.component.agentflow.runtime.AgentFlowSessionRunner;
+import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -789,21 +791,90 @@ public final class AdkAgentRunExecutor {
         return new IllegalStateException("TIANJI_AGENT_CHECKPOINT_ENGINE_UNAVAILABLE");
     }
 
+    /** Checks local assembly using this executor's actual configuration and estimator. */
+    public void requirePublishedConfigReady(AgentDefinitionSpecDTO definition) {
+        if (!(budgetEstimator instanceof JTokkitChatModelBudgetEstimator estimator)
+                || !AgentFlowFactory.usesBuiltInModelFactory(flowFactory)
+                || flowValidator.getClass() != AgentFlowConfigValidator.class) {
+            throw publishedConfigUnavailable();
+        }
+        try {
+            requireSingleLeafPublication(definition);
+            ConfigFlow flow = configFlow(definition);
+            var config = flow.configuration();
+            if (!config.modelName().equals(definition.configuration().get("modelName"))
+                    || !config.chatModelBeanName().equals(definition.configuration().get("chatModelBeanName"))
+                    || !config.rootAgentName().equals(definition.configuration().get("rootAgentName"))) {
+                throw publishedConfigUnavailable();
+            }
+            BaseAgent root = compileConfigRoot(flow, List.of());
+            if (!(root instanceof LlmAgent leaf) || !leaf.subAgents().isEmpty()
+                    || !config.rootAgentName().equals(leaf.name())) {
+                throw publishedConfigUnavailable();
+            }
+            validateAgentTopology(root, new HashSet<>(), new HashSet<>());
+            requireGovernedTools(root, List.of());
+            var adapter = leaf.model().flatMap(Model::model).orElseThrow(AdkAgentRunExecutor::publishedConfigUnavailable);
+            if (!SpringAiModelAdapterFactory.matchesCompiledModel(adapter, config.modelName(), flow.model())) {
+                throw publishedConfigUnavailable();
+            }
+            estimator.requirePublishedConfigBinding(definition, config.modelName(), flow.model());
+            if (Thread.currentThread().isInterrupted()) throw publishedConfigUnavailable();
+        } catch (RuntimeException failure) {
+            throw publishedConfigUnavailable();
+        }
+    }
+
+    private static void requireSingleLeafPublication(AgentDefinitionSpecDTO definition) {
+        if (definition == null || !"CONFIG".equals(definition.executionMode()) || definition.codeRef() != null) {
+            throw publishedConfigUnavailable();
+        }
+        var dependencies = definition.dependencies();
+        var policy = definition.policy();
+        var configuration = definition.configuration();
+        if (!dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty() || !dependencies.tools().isEmpty()
+                || policy.maxToolCalls() != 0 || !policy.allowedToolVersions().isEmpty()
+                || !configuration.keySet().equals(Set.of("chatModelBeanName", "modelName", "rootAgentName", "agents"))
+                || !(configuration.get("agents") instanceof List<?> agents) || agents.size() != 1
+                || !(agents.getFirst() instanceof Map<?, ?> leaf) || !leaf.keySet().equals(Set.of("name", "instruction"))
+                || !(leaf.get("name") instanceof String name) || !name.equals(configuration.get("rootAgentName"))
+                || !(leaf.get("instruction") instanceof String instruction) || instruction.isBlank()) {
+            throw publishedConfigUnavailable();
+        }
+    }
+
+    private static AgentLedgerException publishedConfigUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Published Agent CONFIG readiness is unavailable");
+    }
+
+    private ConfigFlow configFlow(AgentDefinitionSpecDTO definition) {
+        AgentFlowConfigDTO config = mapper.convertValue(definition.configuration(), AgentFlowConfigDTO.class);
+        flowValidator.validate(new AgentFlowProperties(true, Duration.ofMinutes(2), Duration.ofSeconds(10),
+                Map.of("tianji", config)));
+        ChatModel model = chatModels.get(config.chatModelBeanName());
+        if (model == null) {
+            throw new IllegalArgumentException("configured ChatModel is unavailable");
+        }
+        if (model.getOptions() instanceof ToolCallingChatOptions options && options.getToolCallbacks() != null
+                && !options.getToolCallbacks().isEmpty()) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
+                    "model callbacks require governed tool execution");
+        }
+        return new ConfigFlow(config, model);
+    }
+
+    private BaseAgent compileConfigRoot(ConfigFlow flow, List<BaseTool> tools) {
+        return flowFactory.compileRoot("tianji", flow.configuration(), chatModels, tools);
+    }
+
+    private record ConfigFlow(AgentFlowConfigDTO configuration, ChatModel model) {
+        @Override public String toString() { return "ConfigFlow[redacted]"; }
+    }
+
     private BaseAgent buildRoot(AgentDefinitionSpecDTO definition, List<BaseTool> tools) {
         if ("CONFIG".equals(definition.executionMode())) {
-            AgentFlowConfigDTO config = mapper.convertValue(definition.configuration(), AgentFlowConfigDTO.class);
-            flowValidator.validate(new AgentFlowProperties(true, Duration.ofMinutes(2), Duration.ofSeconds(10),
-                    Map.of("tianji", config)));
-            ChatModel model = chatModels.get(config.chatModelBeanName());
-            if (model == null) {
-                throw new IllegalArgumentException("configured ChatModel is unavailable");
-            }
-            if (model.getOptions() instanceof ToolCallingChatOptions options && options.getToolCallbacks() != null
-                    && !options.getToolCallbacks().isEmpty()) {
-                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE,
-                        "model callbacks require governed tool execution");
-            }
-            return flowFactory.compileRoot("tianji", config, chatModels, tools);
+            return compileConfigRoot(configFlow(definition), tools);
         }
         if ("CODE_FIRST".equals(definition.executionMode()) && definition.codeRef() != null) {
             Function<Scheduler, ? extends BaseAgent> factory = codeFirstFactories.get(definition.codeRef());

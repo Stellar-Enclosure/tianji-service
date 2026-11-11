@@ -434,6 +434,10 @@ public final class AgentLedgerService {
 
     /** Reads one committed publication from the owning primary after the host authorizes publication evidence for the tenant. */
     public PublishedDefinitionEvidenceDTO publishedDefinitionEvidence(TrustedAgentActor actor, String definitionKey, long version) {
+        return readVerifiedPublication(actor, definitionKey, version).evidence();
+    }
+
+    VerifiedPublishedDefinition readVerifiedPublication(TrustedAgentActor actor, String definitionKey, long version) {
         if (actor == null || "LEGACY".equals(actor.issuerFingerprint())) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Verified Agent owner is required");
         }
@@ -465,9 +469,10 @@ public final class AgentLedgerService {
                 var dependencies = spec.dependencies();
                 boolean optionalDependenciesPresent = !dependencies.prompts().isEmpty() || !dependencies.skills().isEmpty()
                         || !dependencies.tools().isEmpty();
-                return new PublishedDefinitionEvidenceDTO(actor.tenantId(), definitionKey, version, row.hash(), spec.executionMode(),
+                var evidence = new PublishedDefinitionEvidenceDTO(actor.tenantId(), definitionKey, version, row.hash(), spec.executionMode(),
                         spec.inputSchemaVersion(), spec.outputSchemaVersion(), dependencies.modelRouteRef(),
                         dependencies.policyVersionRef(), optionalDependenciesPresent, observedAt);
+                return new VerifiedPublishedDefinition(evidence, spec);
             });
         } catch (DataAccessException | TransactionException | IllegalArgumentException | IllegalStateException failure) {
             throw publicationUnavailable();
@@ -481,6 +486,10 @@ public final class AgentLedgerService {
                                                  String modelRouteRef, String policyVersionRef,
                                                  boolean optionalDependenciesPresent, Instant observedAt) {
         @Override public String toString() { return "PublishedDefinitionEvidenceDTO[redacted]"; }
+    }
+
+    record VerifiedPublishedDefinition(PublishedDefinitionEvidenceDTO evidence, AgentDefinitionSpecDTO definition) {
+        @Override public String toString() { return "VerifiedPublishedDefinition[redacted]"; }
     }
 
     private static AgentLedgerException publicationUnavailable() {
