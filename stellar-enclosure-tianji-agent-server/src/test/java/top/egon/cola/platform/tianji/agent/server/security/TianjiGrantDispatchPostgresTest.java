@@ -1,5 +1,8 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
+import com.google.adk.models.LlmRequest;
+import com.google.adk.models.LlmResponse;
+
 import java.math.BigDecimal;
 import java.net.URI;
 import java.time.Clock;
@@ -22,9 +25,18 @@ import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.scheduling.TaskScheduler;
+import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
+import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
+import top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory;
+import top.egon.cola.component.agentflow.workflow.LoopAgentWorkflowBuilderStrategy;
+import top.egon.cola.component.agentflow.workflow.ParallelAgentWorkflowBuilderStrategy;
+import top.egon.cola.component.agentflow.workflow.SequentialAgentWorkflowBuilderStrategy;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionGrant;
+import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentExecutionGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.contract.agent.*;
@@ -55,12 +67,7 @@ class TianjiGrantDispatchPostgresTest {
         var ledger = new AgentLedgerService(source); var store = new AgentExecutionGrantStore(source, ledger);
         URI issuer = URI.create("https://idp.example/tenants/88"), resource = URI.create("https://api.example/tianji");
         var actor = TrustedAgentActor.verified(88, TrustedAgentActor.SubjectType.USER, "alice", issuer.toString());
-        var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(20), Duration.ofSeconds(10),
-                5, 0, 1000, 500, new BigDecimal("2.00"), "USD", 2, Set.of(), null, null);
-        ledger.publish(actor, new AgentDefinitionSpecDTO("model", 1, "CONFIG", null, "1", "1",
-                new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "model-route", "policy-v1"), policy,
-                Map.of("chatModelBeanName", "fixtureModel", "modelName", "fixture-model", "rootAgentName", "writer",
-                        "agents", List.of(Map.of("name", "writer", "instruction", "write")))));
+        ledger.publish(actor, fixtureDefinition());
         var run = ledger.start(actor, new StartAgentRunCommand("model", 1, null, "request", null, null,
                 new AgentInputDTO("input", List.of(), Map.of()), null));
         var reservation = store.reserve(actor, run.runId(), resource).orElseThrow();
@@ -80,41 +87,18 @@ class TianjiGrantDispatchPostgresTest {
                     expected.subject(), expected.resource().toString(), expected.purpose(), expected.intentId(), expected.bindingSha256(),
                     expected.sessionRequired(), expected.deadlineAt(), Instant.now().plusSeconds(20), 1, 1);
         });
-        var streams = new AtomicInteger(); var model = mock(org.springframework.ai.chat.model.ChatModel.class);
-        when(model.getOptions()).thenReturn(org.springframework.ai.model.tool.ToolCallingChatOptions.builder().model("fixture-model").build());
-        when(model.stream(any(org.springframework.ai.chat.prompt.Prompt.class))).thenAnswer(inv -> reactor.core.publisher.Flux.defer(() -> {
-            streams.incrementAndGet();
-            var generation = new org.springframework.ai.chat.model.Generation(new org.springframework.ai.chat.messages.AssistantMessage("done"),
-                    org.springframework.ai.chat.metadata.ChatGenerationMetadata.builder().finishReason("stop").build());
-            return reactor.core.publisher.Flux.just(new org.springframework.ai.chat.model.ChatResponse(List.of(generation),
-                    org.springframework.ai.chat.metadata.ChatResponseMetadata.builder().usage(new org.springframework.ai.chat.metadata.DefaultUsage(10, 5, 15)).build()));
-        }));
+        var streams = new AtomicInteger();
+        var model = fixtureModel(streams);
         var validators = jakarta.validation.Validation.buildDefaultValidatorFactory();
         var control = Executors.newScheduledThreadPool(2, task -> Thread.ofPlatform().daemon().name("dispatch-test-control").unstarted(task));
         var hostA = Executors.newSingleThreadExecutor(); var hostB = Executors.newSingleThreadExecutor();
         try (var authorizer = new TianjiExecutionGrantAuthorizer(ledger, store, resource, "tianji", registry,
                 Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(issuer, "88", rbac)),
                 Duration.ofSeconds(5), 4, Clock.systemUTC())) {
-            var flow = new top.egon.cola.component.agentflow.runtime.AgentFlowFactory(new top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory(),
-                    new top.egon.cola.component.agentflow.workflow.AgentWorkflowStrategyFactory(List.of(
-                            new top.egon.cola.component.agentflow.workflow.SequentialAgentWorkflowBuilderStrategy(),
-                            new top.egon.cola.component.agentflow.workflow.ParallelAgentWorkflowBuilderStrategy(),
-                            new top.egon.cola.component.agentflow.workflow.LoopAgentWorkflowBuilderStrategy())));
+            var flow = fixtureFlow();
             var validator = new top.egon.cola.component.agentflow.config.AgentFlowConfigValidator(
                     new top.egon.cola.component.common.core.validation.ValidationUtils(validators.getValidator()));
-            var estimator = new top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator() {
-                @Override public Estimate estimate(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmRequest request) {
-                    return new Estimate(20, 30, new BigDecimal("0.10"));
-                }
-                @Override public ContextWindow contextWindow(top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmRequest request) {
-                    return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
-                            snapshot.definition().dependencies().policyVersionRef(), 100_000, 10);
-                }
-                @Override public top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement actualUsage(
-                        top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot snapshot, com.google.adk.models.LlmResponse response) {
-                    return new top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05"));
-                }
-            };
+            var estimator = fixtureEstimator();
             var worker = new top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor(ledger, flow, validator,
                     Map.of("fixtureModel", model), Map.of(), control, estimator, null, false, authorizer);
             var dispatcherA = new AgentRunDispatcher(hostA, worker, ledger); var dispatcherB = new AgentRunDispatcher(hostB, worker, ledger);
@@ -189,5 +173,48 @@ class TianjiGrantDispatchPostgresTest {
         } finally {
             release.countDown(); hostA.shutdownNow(); hostB.shutdownNow(); control.shutdownNow(); validators.close();
         }
+    }
+
+    static AgentDefinitionSpecDTO fixtureDefinition() {
+        var policy = new ExecutionPolicyDTO(Duration.ofMinutes(1), Duration.ofSeconds(20), Duration.ofSeconds(10),
+                5, 0, 1000, 500, new BigDecimal("2.00"), "USD", 2, Set.of(), null, null);
+        return new AgentDefinitionSpecDTO("model", 1, "CONFIG", null, "1", "1",
+                new DefinitionDependenciesDTO(List.of(), List.of(), List.of(), "model-route", "policy-v1"), policy,
+                Map.of("chatModelBeanName", "fixtureModel", "modelName", "fixture-model", "rootAgentName", "writer",
+                        "agents", List.of(Map.of("name", "writer", "instruction", "write"))));
+    }
+
+    static org.springframework.ai.chat.model.ChatModel fixtureModel(AtomicInteger streams) {
+        var model = mock(org.springframework.ai.chat.model.ChatModel.class);
+        when(model.getOptions()).thenReturn(org.springframework.ai.model.tool.ToolCallingChatOptions.builder().model("fixture-model").build());
+        when(model.stream(any(org.springframework.ai.chat.prompt.Prompt.class))).thenAnswer(inv -> reactor.core.publisher.Flux.defer(() -> {
+            streams.incrementAndGet();
+            var generation = new org.springframework.ai.chat.model.Generation(new org.springframework.ai.chat.messages.AssistantMessage("done"),
+                    org.springframework.ai.chat.metadata.ChatGenerationMetadata.builder().finishReason("stop").build());
+            return reactor.core.publisher.Flux.just(new org.springframework.ai.chat.model.ChatResponse(List.of(generation),
+                    org.springframework.ai.chat.metadata.ChatResponseMetadata.builder().usage(new org.springframework.ai.chat.metadata.DefaultUsage(10, 5, 15)).build()));
+        }));
+        return model;
+    }
+
+    static AgentFlowFactory fixtureFlow() {
+        return new AgentFlowFactory(new SpringAiModelAdapterFactory(), new AgentWorkflowStrategyFactory(List.of(
+                new SequentialAgentWorkflowBuilderStrategy(), new ParallelAgentWorkflowBuilderStrategy(),
+                new LoopAgentWorkflowBuilderStrategy())));
+    }
+
+    static AgentModelBudgetEstimator fixtureEstimator() {
+        return new AgentModelBudgetEstimator() {
+            @Override public Estimate estimate(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new Estimate(20, 30, new BigDecimal("0.10"));
+            }
+            @Override public ContextWindow contextWindow(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
+                        snapshot.definition().dependencies().policyVersionRef(), 100_000, 10);
+            }
+            @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) {
+                return new AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05"));
+            }
+        };
     }
 }
