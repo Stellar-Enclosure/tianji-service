@@ -66,6 +66,21 @@ class AgentCheckpointForkHandoffTest {
     }
 
     @Test
+    void round_trips_output_projection_as_a_distinct_launch_without_a_digest() throws IOException {
+        for (boolean typed : new boolean[] {false, true}) {
+            var launch = new AgentCheckpointForkHandoff.Request(URL, SETUP, RUNTIME, VECTOR, typed, RUN,
+                    Phase.PROJECT_OUTPUT, null);
+            byte[] frame = send(launch);
+            assertEquals(3, frame[phaseOffset(frame)]);
+            assertEquals(phaseOffset(frame) + 1, frame.length);
+            assertEquals(launch, receive(frame));
+            assertThrows(IllegalArgumentException.class, () -> receive(Arrays.copyOf(frame, frame.length + 1)));
+        }
+        assertThrows(IllegalArgumentException.class, () -> new AgentCheckpointForkHandoff.Request(
+                URL, SETUP, RUNTIME, VECTOR, true, RUN, Phase.PROJECT_OUTPUT, DIGEST));
+    }
+
+    @Test
     void rejects_unscoped_or_ambiguous_requests_before_a_connection() {
         for (String url : new String[] {URL.replace("127.0.0.1", "localhost"), URL.replace("5432", "65536"),
                 URL.replace("tianji_it_checkpoint_disposable", "tianji_agent"), URL + "?user=other", URL + "\n"}) {
@@ -92,7 +107,7 @@ class AgentCheckpointForkHandoffTest {
         byte[] wrongCodec = exact.clone();
         wrongCodec[phaseOffset - RUN.length() - 3] = 2;
         byte[] wrongPhase = exact.clone();
-        wrongPhase[phaseOffset] = 3;
+        wrongPhase[phaseOffset] = 4;
         for (byte[] rejected : new byte[][] {wrongFormat, wrongCodec, wrongPhase, Arrays.copyOf(exact, exact.length - 1),
                 Arrays.copyOf(exact, exact.length + 1), new byte[513]}) {
             assertThrows(IllegalArgumentException.class, () -> receive(rejected));

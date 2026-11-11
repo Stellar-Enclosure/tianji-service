@@ -97,6 +97,7 @@ import java.util.regex.Pattern;
 import static org.junit.jupiter.api.Assertions.*;
 import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.CAPTURE;
 import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.NATIVE_RESUME;
+import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.PROJECT_OUTPUT;
 import static top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentCheckpointForkHandoff.Phase.RECONCILE;
 
 /** Explicit isolated PostgreSQL proof of first-input capture and its transaction failure boundary. */
@@ -108,6 +109,8 @@ class AgentCheckpointCapturePostgresTest {
     private static final String FORK_CHILD_SWITCH = "tianji.postgres.checkpoint.capture.fork.child";
     private static final String FORK_DIRECTORY_PREFIX = "tianji-checkpoint-fork-";
     private static final long FORK_CHILD_SECONDS = 16;
+    private static final int OUTPUT_CUT_LOCK_NAMESPACE = 703_503;
+    private static final int OUTPUT_CUT_LOCK_KEY = 11;
     private static final String APP = "tianji";
     private static final String SESSION = "checkpoint-probe-session";
     private static final String DEFINITION = "checkpoint-probe";
@@ -279,6 +282,151 @@ class AgentCheckpointCapturePostgresTest {
                 (fixture, cut) -> fixture.assertCheckpointResumeExecution(cut, executionSource, throughDispatcher));
     }
 
+    @Test
+    @Timeout(150)
+    @EnabledIfSystemProperty(named = "tianji.postgres.checkpoint.capture.output-projection-cut", matches = "true")
+    void rejects_first_input_takeover_after_native_output_commits_before_ledger_projection() throws Exception {
+        String role = System.getProperty("tianji.postgres.checkpoint.takeover.role", "");
+        if (!role.matches("tianji_it_checkpoint_takeover_[a-z0-9_]{1,24}")) {
+            throw new IllegalArgumentException("checkpoint output cut requires an exact disposable takeover role");
+        }
+        var database = provision(role);
+        var source = dataSource(database.setup().getUrl(), role);
+        assertCheckpointReaderPrivileges(new JdbcTemplate(source));
+        grantCheckpointTakeover(database.observer(), '"' + role + '"');
+        var observation = new AgentCheckpointObservationService(source);
+        var takeover = new AgentCheckpointTakeoverService(source, request ->
+                fail("an advanced native Session must not reach resume authority"));
+        var setupLedger = new AgentLedgerService(database.setup());
+        var reconciler = new AgentLedgerService(database.runtime());
+        String setupRole = database.observer().queryForObject("SELECT current_user", String.class);
+        String vectorVersion = System.getProperty("tianji.postgres.checkpoint.capture.vector.version");
+        for (boolean typed : List.of(false, true)) {
+            var fixture = new RunFixture(database, setupLedger, AgentCheckpointForkHandoff.tenant(typed),
+                    typed, Duration.ofMinutes(3), null);
+            var request = new AgentCheckpointForkHandoff.Request(database.setup().getUrl(), setupRole,
+                    database.runtime().getUsername(), vectorVersion, typed, fixture.query.runId(), PROJECT_OUTPUT, null);
+            var nativeRows = forceOutputProjectionCut(database, fixture, request);
+            fixture.assertNativeOutputAtProjectionCut(nativeRows);
+            fixture.assertProjectionAbsent();
+            String checkpoint = fixture.checkpointDigest();
+            var cut = fixture.forkCut();
+            fixture.expireForkRunLease(cut);
+            fixture.assertOnlyDueRun(cut);
+            assertEquals(1, reconciler.reconcileDue(1));
+            fixture.expireReconciledSessionLease(cut);
+            fixture.assertReconciledRun(cut);
+            var reconciled = fixture.forkCut();
+            assertEquals(Observation.NOT_AT_CAPTURE_FENCE, observation.observe(fixture.actor, fixture.query));
+            var command = new ResumeCommand(fixture.query.runId(), "checkpoint-native-output-cut", reconciled.revision());
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> takeover.previewAuthorization(fixture.actor, command)).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> takeover.takeOver(fixture.actor, command, "checkpoint-output-cut-worker")).code());
+            assertEquals(0, fixture.resumeReceipts());
+            assertEquals(reconciled, fixture.forkCut());
+            assertEquals(checkpoint, fixture.checkpointDigest());
+            fixture.assertNativeOutputAtProjectionCut(nativeRows);
+            fixture.assertProjectionAbsent();
+        }
+    }
+
+    private static List<NativeRow> forceOutputProjectionCut(Database database, RunFixture fixture,
+            AgentCheckpointForkHandoff.Request request) throws Exception {
+        var directory = Files.createTempDirectory(FORK_DIRECTORY_PREFIX,
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))).toRealPath();
+        var marker = directory.resolve(PROJECT_OUTPUT.markerName());
+        var observer = database.observer();
+        int waiter;
+        List<NativeRow> nativeRows;
+        try {
+            observer.execute("""
+                    CREATE FUNCTION tianji_agent.checkpoint_fixture_block_output() RETURNS trigger
+                    LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog AS $cut$
+                    BEGIN
+                      PERFORM pg_catalog.pg_advisory_xact_lock(%d, %d);
+                      RAISE EXCEPTION 'checkpoint fixture interrupted output projection';
+                    END;
+                    $cut$
+                    """.formatted(OUTPUT_CUT_LOCK_NAMESPACE, OUTPUT_CUT_LOCK_KEY));
+            observer.execute("""
+                    CREATE TRIGGER checkpoint_fixture_block_output BEFORE INSERT ON tianji_agent.agent_event
+                    FOR EACH ROW WHEN (NEW.tenant_id=%d AND NEW.run_id='%s' AND NEW.event_type='AGENT_OUTPUT')
+                    EXECUTE FUNCTION tianji_agent.checkpoint_fixture_block_output()
+                    """.formatted(AgentCheckpointForkHandoff.tenant(request.typed()), request.runId()));
+            try (var lock = database.setup().getConnection(); var statement = lock.createStatement()) {
+                lock.setAutoCommit(false);
+                statement.setQueryTimeout(3);
+                int blocker;
+                try (var backend = statement.executeQuery("SELECT pg_catalog.pg_backend_pid()")) {
+                    assertTrue(backend.next());
+                    blocker = backend.getInt(1);
+                }
+                try {
+                    statement.execute("SELECT pg_catalog.pg_advisory_xact_lock(%d, %d)"
+                            .formatted(OUTPUT_CUT_LOCK_NAMESPACE, OUTPUT_CUT_LOCK_KEY));
+                    var child = startForkChild(request, marker);
+                    try {
+                        assertNotEquals(ProcessHandle.current().pid(), child.pid());
+                        waiter = awaitOutputProjectionWaiter(observer, child, blocker, request.runtimeRole());
+                        nativeRows = fixture.nativeRows();
+                        assertTrue(nativeRows.size() > 1 && nativeRows.size() <= 8);
+                        fixture.assertProjectionAbsent();
+                        assertTrue(child.isAlive(), "product child must still be blocked in output projection");
+                    } finally {
+                        reapForkChild(child);
+                    }
+                    assertNotEquals(0, child.exitValue());
+                } finally {
+                    lock.rollback();
+                }
+            }
+            awaitOutputProjectionDisconnect(observer, waiter);
+            return nativeRows;
+        } finally {
+            try {
+                observer.execute("DROP TRIGGER IF EXISTS checkpoint_fixture_block_output ON tianji_agent.agent_event");
+                observer.execute("DROP FUNCTION IF EXISTS tianji_agent.checkpoint_fixture_block_output()");
+            } finally {
+                Files.deleteIfExists(marker);
+                Files.deleteIfExists(directory);
+            }
+        }
+    }
+
+    private static int awaitOutputProjectionWaiter(JdbcTemplate observer, Process child, int blocker, String runtimeRole)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(FORK_CHILD_SECONDS);
+        while (System.nanoTime() - deadline < 0 && child.isAlive()) {
+            var waiters = observer.queryForList("""
+                    SELECT waiting.pid FROM pg_catalog.pg_locks waiting
+                    JOIN pg_catalog.pg_stat_activity activity ON activity.pid=waiting.pid
+                    WHERE waiting.locktype='advisory' AND NOT waiting.granted AND waiting.objsubid=2
+                      AND waiting.classid::bigint=? AND waiting.objid::bigint=?
+                      AND activity.datname=current_database() AND activity.usename=?
+                      AND pg_catalog.pg_blocking_pids(waiting.pid)=ARRAY[?]::int[]
+                    LIMIT 2
+                    """, Integer.class, OUTPUT_CUT_LOCK_NAMESPACE, OUTPUT_CUT_LOCK_KEY, runtimeRole, blocker);
+            if (!waiters.isEmpty()) {
+                assertEquals(1, waiters.size());
+                return waiters.getFirst();
+            }
+            Thread.sleep(20);
+        }
+        return fail("product child did not reach the guarded output projection wait");
+    }
+
+    private static void awaitOutputProjectionDisconnect(JdbcTemplate observer, int waiter) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(FORK_CHILD_SECONDS);
+        while (System.nanoTime() - deadline < 0) {
+            if (Boolean.FALSE.equals(observer.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid=?)
+                    """, Boolean.class, waiter))) return;
+            Thread.sleep(20);
+        }
+        fail("output projection backend did not disconnect after the product child was reaped");
+    }
+
     private static void verifyProductCheckpointForks(Database database, AgentCheckpointForkHandoff.Phase replacementPhase,
                                                      BiConsumer<RunFixture, ForkCut> afterReconcile) throws Exception {
         var setupLedger = new AgentLedgerService(database.setup());
@@ -369,8 +517,8 @@ class AgentCheckpointCapturePostgresTest {
         var database = openForkDatabase(request);
         var fixture = new RunFixture(database, new AgentLedgerService(database.setup()),
                 AgentCheckpointForkHandoff.tenant(request.typed()), request.typed(), Duration.ZERO, request.runId());
-        if (request.phase() == CAPTURE) {
-            captureForkCut(database, fixture, request.typed(), marker);
+        if (request.phase() == CAPTURE || request.phase() == PROJECT_OUTPUT) {
+            runOriginalFork(database, fixture, request.typed(), request.phase() == CAPTURE ? marker : null);
             return;
         }
         fixture.assertCommittedCut();
@@ -390,7 +538,7 @@ class AgentCheckpointCapturePostgresTest {
         writeForkMarker(marker, "RECONCILED", cut.sha256());
     }
 
-    private static void captureForkCut(Database database, RunFixture fixture, boolean typed, Path marker) {
+    private static void runOriginalFork(Database database, RunFixture fixture, boolean typed, Path captureMarker) {
         fixture.assertEmptySession();
         var runtime = new AgentLedgerService(database.runtime());
         assertEquals(AgentRunStatusEnum.QUEUED, runtime.get(fixture.actor, fixture.query).status());
@@ -402,13 +550,14 @@ class AgentCheckpointCapturePostgresTest {
                     task -> Thread.ofPlatform().daemon().name("checkpoint-fork-control").unstarted(task));
             try {
                 var cutEstimator = estimator(() -> {
+                    if (captureMarker == null) return;
                     assertEquals(0, model.streams.get());
                     assertEquals(0, model.calls.get());
                     fixture.assertCommittedCut();
                     fixture.assertNoExecutionEvidence();
                     var cut = fixture.forkCut();
                     try {
-                        writeForkMarker(marker, "CAPTURE", cut.sha256());
+                        writeForkMarker(captureMarker, "CAPTURE", cut.sha256());
                         new CountDownLatch(1).await(FORK_CHILD_SECONDS * 2, TimeUnit.SECONDS);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
@@ -506,6 +655,12 @@ class AgentCheckpointCapturePostgresTest {
                 "checksum", -415542202, "success", true), history.getLast());
         flyway(setup, "16").validate();
         var runtime = dataSource(request.url(), request.runtimeRole());
+        if (request.phase() == PROJECT_OUTPUT) {
+            var limits = runtime.getConnectionProperties();
+            limits.setProperty("socketTimeout", "23");
+            limits.setProperty("options", "-c statement_timeout=20000 -c lock_timeout=18000");
+            runtime.setConnectionProperties(limits);
+        }
         assertForkConnection(new JdbcTemplate(runtime), database, request.runtimeRole());
         new AgentStorageVerifier(runtime).verifyCheckpointCapture();
         return new Database(setup, runtime, observer, '"' + request.runtimeRole() + '"');
@@ -1088,7 +1243,45 @@ class AgentCheckpointCapturePostgresTest {
                     """, Boolean.class, actor.tenantId(), query.runId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId())));
         }
 
+        void assertProjectionAbsent() {
+            assertTrue(Boolean.TRUE.equals(database.observer().queryForObject("""
+                    SELECT r.result IS NULL AND r.finished_at IS NULL AND NOT EXISTS (
+                        SELECT 1 FROM tianji_agent.agent_event e WHERE e.tenant_id=r.tenant_id
+                          AND e.run_id=r.run_id AND e.event_type='AGENT_OUTPUT')
+                    FROM tianji_agent.agent_run r
+                    WHERE r.tenant_id=? AND r.run_id=? AND r.subject_type=? AND r.subject_issuer=? AND r.subject_id=?
+                    """, Boolean.class, actor.tenantId(), query.runId(), actor.subjectType().name(),
+                    actor.issuerFingerprint(), actor.subjectId())));
+        }
+
+        void assertNativeOutputAtProjectionCut(List<NativeRow> expected) {
+            var rows = nativeRows();
+            assertEquals(expected, rows);
+            assertEquals(1, checkpoints());
+            assertEquals(1, reservations());
+            var session = sessions.getSession(APP, sessions.adkUserId(), SESSION, Optional.empty())
+                    .timeout(5, TimeUnit.SECONDS).blockingGet();
+            assertNotNull(session);
+            var history = session.immutableEvents();
+            assertEquals(rows.size(), history.size());
+            var firstInput = history.getFirst();
+            assertEquals("user", firstInput.author());
+            assertEquals(1L, history.stream().filter(event -> "user".equals(event.author())).count());
+            var outputs = history.stream().filter(AgentCheckpointCapturePostgresTest::hasNativeOutput).toList();
+            assertEquals(1, outputs.size());
+            assertEquals("writer", outputs.getFirst().author());
+            assertEquals(firstInput.invocationId(), outputs.getFirst().invocationId());
+            assertTrue(rows.stream().anyMatch(row -> row.sequence() > 1 && outputs.getFirst().id().equals(row.eventId())));
+        }
+
         void assertReconciled(ForkCut original) {
+            assertReconciledRun(original);
+            assertEquals(1, database.observer().queryForObject(
+                    "SELECT count(*) FROM tianji_agent.agent_session_event " + SESSION_SCOPE, Integer.class, scope()));
+            assertNoExecutionEvidence();
+        }
+
+        void assertReconciledRun(ForkCut original) {
             var ledger = new AgentLedgerService(database.setup());
             var run = ledger.get(actor, query);
             assertEquals(AgentRunStatusEnum.SUSPENDED, run.status());
@@ -1108,9 +1301,6 @@ class AgentCheckpointCapturePostgresTest {
             assertEquals(original.epoch() + 1, cut.epoch());
             assertNull(cut.leaseOwner());
             assertEquals(1, checkpoints());
-            assertEquals(1, database.observer().queryForObject(
-                    "SELECT count(*) FROM tianji_agent.agent_session_event " + SESSION_SCOPE, Integer.class, scope()));
-            assertNoExecutionEvidence();
         }
 
         void assertCheckpointObservation(ForkCut cut, AgentCheckpointObservationService service,

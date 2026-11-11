@@ -45,7 +45,7 @@ final class AgentCheckpointForkHandoff {
             out.writeBoolean(request.typed());
             out.writeUTF(request.runId());
             out.writeByte(request.phase().code);
-            if (request.phase() != Phase.CAPTURE) out.writeUTF(request.cutSha256());
+            if (request.phase().requiresDigest) out.writeUTF(request.cutSha256());
         }
         if (bytes.size() > MAX_BYTES) throw invalid();
         bytes.writeTo(pipe);
@@ -67,10 +67,11 @@ final class AgentCheckpointForkHandoff {
                 case 0 -> Phase.CAPTURE;
                 case 1 -> Phase.RECONCILE;
                 case 2 -> Phase.NATIVE_RESUME;
+                case 3 -> Phase.PROJECT_OUTPUT;
                 default -> throw invalid();
             };
             var request = new Request(url, setupRole, runtimeRole, vectorVersion, typed, runId, phase,
-                    phase == Phase.CAPTURE ? null : input.readUTF());
+                    phase.requiresDigest ? input.readUTF() : null);
             if (input.read() != -1) throw invalid();
             return request;
         } catch (IOException malformed) {
@@ -89,14 +90,19 @@ final class AgentCheckpointForkHandoff {
     }
 
     enum Phase {
-        CAPTURE(0, "capture"), RECONCILE(1, "reconcile"), NATIVE_RESUME(2, "resume");
+        CAPTURE(0, "capture", false),
+        RECONCILE(1, "reconcile", true),
+        NATIVE_RESUME(2, "resume", true),
+        PROJECT_OUTPUT(3, "project-output", false);
 
         private final int code;
         private final String markerName;
+        private final boolean requiresDigest;
 
-        Phase(int code, String markerName) {
+        Phase(int code, String markerName, boolean requiresDigest) {
             this.code = code;
             this.markerName = markerName;
+            this.requiresDigest = requiresDigest;
         }
 
         String markerName() { return markerName; }
@@ -110,7 +116,7 @@ final class AgentCheckpointForkHandoff {
                     || runtimeRole == null || !RUNTIME_ROLE.matcher(runtimeRole).matches() || setupRole.equals(runtimeRole)
                     || vectorVersion == null || !VECTOR.matcher(vectorVersion).matches()
                     || runId == null || !UUID.matcher(runId).matches()
-                    || phase == null || (phase == Phase.CAPTURE) != (cutSha256 == null)
+                    || phase == null || phase.requiresDigest != (cutSha256 != null)
                     || cutSha256 != null && !DIGEST.matcher(cutSha256).matches()) throw invalid();
         }
 
