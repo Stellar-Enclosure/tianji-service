@@ -30,7 +30,6 @@ import static top.egon.cola.platform.tianji.process.server.release.PlatformRelea
 
 /** Owning ProcessDB append-only history; its latest channel revision is the active pointer. */
 final class PlatformReleaseActivationStore {
-    static final String TENANT_FENCE_PREFIX = "tianji-platform-release-activation-v1:";
     private static final String CLOCK = "SELECT CASE WHEN NOT pg_catalog.pg_is_in_recovery()"
             + " AND pg_catalog.current_setting('session_replication_role')='origin'";
     private static final String CLOCK_RESULT = " THEN pg_catalog.clock_timestamp() END";
@@ -93,8 +92,7 @@ final class PlatformReleaseActivationStore {
         jdbc.execute("SET LOCAL statement_timeout='5s'");
         jdbc.execute("SET LOCAL lock_timeout='5s'");
         // READ COMMITTED obtains a fresh snapshot for the following command and pointer statements.
-        jdbc.query("SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(?, 0))",
-                rs -> { }, TENANT_FENCE_PREFIX + scope.tenantId());
+        PlatformReleaseTenantFence.acquireExclusive(jdbc, scope.tenantId());
         requireCurrent(window);
 
         var existing = findCommand(scope, proposal.actor(), command.commandId());

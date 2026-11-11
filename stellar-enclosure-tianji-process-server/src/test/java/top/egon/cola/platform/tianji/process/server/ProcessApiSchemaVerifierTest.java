@@ -49,6 +49,8 @@ class ProcessApiSchemaVerifierTest {
     private static final String V11 = "V11__add_platform_release_candidate_reviews.sql";
     private static final String PLATFORM_ACTIVATION = "tianji_platform_release_activation";
     private static final String V12 = "V12__add_platform_release_activations.sql";
+    private static final String GOVERNED_START = "tianji_governed_process_start";
+    private static final String V13 = "V13__add_governed_process_start_provenance.sql";
     private static final String V10_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
     private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
     private static final String V9_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
@@ -343,6 +345,56 @@ class ProcessApiSchemaVerifierTest {
         verifyActivation(catalog, true);
     }
 
+    @Test
+    void governed_start_requires_v13_and_uses_read_only_v12_and_append_only_v13() throws Exception {
+        var ready = Catalog.governedStartReady();
+        ready.activationReadWrite = false;
+        verifyGovernedStart(ready, false);
+
+        assertEquals(Set.of(GOVERNED_START + "_pkey", GOVERNED_START + "_receipt_fk", GOVERNED_START + "_activation_fk"),
+                ready.names("keys:" + GOVERNED_START));
+        var activationRole = ready.roleSql.get(PLATFORM_ACTIVATION);
+        var provenanceRole = ready.roleSql.get(GOVERNED_START);
+        for (String role : List.of(activationRole, provenanceRole)) {
+            assertRoleSafety(role);
+            assertColumnPrivilegeSafety(role, false);
+            assertTrue(role.contains("has_table_privilege(c.oid,'SELECT')"));
+            assertTrue(role.contains("NOT has_table_privilege(c.oid,'UPDATE')"));
+        }
+        assertFalse(activationRole.contains("has_table_privilege(c.oid,'INSERT')"));
+        assertTrue(provenanceRole.contains("has_table_privilege(c.oid,'INSERT')"));
+        assertFalse(ready.roleSql.containsKey(PLATFORM_CANDIDATE));
+        assertFalse(ready.roleSql.containsKey(PLATFORM_REVIEW));
+
+        verifyGovernedStart(Catalog.activationReady(), true);
+        var missingInsert = Catalog.governedStartReady();
+        missingInsert.governedReadWrite = false;
+        verifyGovernedStart(missingInsert, true);
+        var wrongRevisionScope = Catalog.governedStartReady();
+        wrongRevisionScope.named("keys:" + GOVERNED_START, GOVERNED_START + "_activation_fk")
+                .put("target_fields", List.of("tenant_id", "revision", "channel"));
+        verifyGovernedStart(wrongRevisionScope, true);
+        var wrongV13 = Catalog.governedStartReady();
+        wrongV13.history.set(5, history("13", V13, true, checksum(V13) + 1));
+        verifyGovernedStart(wrongV13, true);
+
+        var legacyActivation = Catalog.governedStartReady();
+        legacyActivation.governedReadWrite = false;
+        verifyActivation(legacyActivation, false);
+        assertFalse(legacyActivation.roleSql.containsKey(GOVERNED_START));
+    }
+
+    private static void verifyGovernedStart(Catalog catalog, boolean rejected) {
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = spy(new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process"));
+            // The ordinary schema readiness is covered separately. Keep the real migration history checks.
+            doNothing().when(verifier).verify();
+            if (rejected) assertThrows(IllegalStateException.class, verifier::verifyGovernedProcessStart);
+            else assertDoesNotThrow(verifier::verifyGovernedProcessStart);
+            verify(verifier).verify();
+        }
+    }
+
     private static void verifyActivation(Catalog catalog, boolean rejected) {
         try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
             var verifier = new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process");
@@ -536,6 +588,7 @@ class ProcessApiSchemaVerifierTest {
         private boolean rejectRecoveryQueries;
         private boolean recoveryReadWrite = true;
         private boolean activationReadWrite = true;
+        private boolean governedReadWrite = true;
         private boolean counterfeitActivationCollation;
         private String badNativeTable;
         private boolean provenanceSelect = true;
@@ -594,6 +647,13 @@ class ProcessApiSchemaVerifierTest {
             return catalog;
         }
 
+        static Catalog governedStartReady() throws Exception {
+            var catalog = activationReady();
+            catalog.history.add(history("13", V13, true, checksum(V13)));
+            catalog.parseTables(resource(V13));
+            return catalog;
+        }
+
         Map<String, Object> column(String table, String name) {
             return rows.get("columns:" + table).stream().filter(row -> name.equals(row.get("attname"))).findFirst().orElseThrow();
         }
@@ -632,7 +692,10 @@ class ProcessApiSchemaVerifierTest {
                 if (CANCEL_RECEIPT.equals(table)) return auditReadWrite;
                 if (DISPATCH.equals(table)) return dispatchReadWrite;
                 if (RECOVERY_RECEIPT.equals(table)) return recoveryReadWrite;
-                if (PLATFORM_ACTIVATION.equals(table)) return activationReadWrite;
+                if (PLATFORM_ACTIVATION.equals(table)) {
+                    return !sql.contains("AND has_table_privilege(c.oid,'INSERT')") || activationReadWrite;
+                }
+                if (GOVERNED_START.equals(table)) return governedReadWrite;
                 return true;
             }
             if (sql.contains("schema_history")) {
@@ -679,7 +742,7 @@ class ProcessApiSchemaVerifierTest {
         }
 
         private static String table(String sql, Object[] args) {
-            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT, PLATFORM_CANDIDATE, PLATFORM_REVIEW, PLATFORM_ACTIVATION,
+            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT, PLATFORM_CANDIDATE, PLATFORM_REVIEW, PLATFORM_ACTIVATION, GOVERNED_START,
                     "act_ru_execution", "act_ru_deadletter_job", "act_ru_external_job",
                     "act_ru_job", "act_ru_timer_job", "act_ru_suspended_job",
                     "tianji_process_release_definition", "tianji_human_task_receipt");

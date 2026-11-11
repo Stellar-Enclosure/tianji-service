@@ -92,7 +92,7 @@ public final class PlatformReleaseActivationService {
                 || !binding.topic().equals(link.topic()) || !binding.schemaVersion().equals(link.schemaVersion())) throw denied();
     }
 
-    private static String workerFingerprint(AgentDispatchBinding worker, String registrationSha256) {
+    public static String workerFingerprint(AgentDispatchBinding worker, String registrationSha256) {
         return OrchestrationRequestDigests.hash(List.of("TIANJI_ACTIVATION_WORKER_V1",
                 Long.toString(worker.actor().tenantId()), worker.actor().issuerFingerprint(), worker.actor().subjectId(),
                 worker.sourceId(), worker.topic(), worker.schemaVersion(), worker.definitionKey(),

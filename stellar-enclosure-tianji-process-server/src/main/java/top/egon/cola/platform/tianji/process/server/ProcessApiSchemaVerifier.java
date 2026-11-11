@@ -46,6 +46,9 @@ public final class ProcessApiSchemaVerifier {
     private static final String PLATFORM_ACTIVATION_FILE = "V12__add_platform_release_activations.sql";
     private static final String PLATFORM_ACTIVATION_SHA256 = "0bff65b5bffdd16aed9de166d1a8491251c222baeae2622a1a90a6397c2ff7e1";
     private static final String PLATFORM_ACTIVATION = "tianji_platform_release_activation";
+    private static final String GOVERNED_START_FILE = "V13__add_governed_process_start_provenance.sql";
+    private static final String GOVERNED_START_SHA256 = "e58af97ce341c41f79a8d79a1aa7b9da430e8b72cbe244ae1508c034180c6e21";
+    private static final String GOVERNED_START = "tianji_governed_process_start";
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final String schema;
@@ -112,15 +115,33 @@ public final class ProcessApiSchemaVerifier {
         verifyPlatformCandidateReviews();
         try {
             if (laterMigrations().size() < 5) throw invalid();
-            var contract = tableContracts(platformActivationMigration(), Map.of(PLATFORM_ACTIVATION, 21)).get(PLATFORM_ACTIVATION);
-            verifyCaseColumns(PLATFORM_ACTIVATION, contract.columns());
-            verifyCaseChecks(PLATFORM_ACTIVATION, contract.checks(), false);
-            verifyCaseKeys(PLATFORM_ACTIVATION, contract.keys());
-            verifyCaseIndexes(PLATFORM_ACTIVATION, contract.indexes());
-            verifyCaseRole(PLATFORM_ACTIVATION, false, true);
+            verifyPlatformAuditTable(PLATFORM_ACTIVATION, platformActivationMigration(), 21, true);
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Platform activation storage schema verification failed", failure);
         }
+    }
+
+    /** Verifies a governed START role that can read the activation journal and append provenance. */
+    public void verifyGovernedProcessStart() {
+        jdbc.setQueryTimeout(5);
+        verify();
+        try {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))
+                    || laterMigrations().size() < 6) throw invalid();
+            verifyPlatformAuditTable(PLATFORM_ACTIVATION, platformActivationMigration(), 21, false);
+            verifyPlatformAuditTable(GOVERNED_START, governedStartMigration(), 13, true);
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Governed Process START storage schema verification failed", failure);
+        }
+    }
+
+    private void verifyPlatformAuditTable(String table, String migration, int columns, boolean requireInsert) {
+        var contract = tableContracts(migration, Map.of(table, columns)).get(table);
+        verifyCaseColumns(table, contract.columns());
+        verifyCaseChecks(table, contract.checks(), false);
+        verifyCaseKeys(table, contract.keys());
+        verifyCaseIndexes(table, contract.indexes());
+        verifyCaseRole(table, false, requireInsert);
     }
 
     private void verifyRecoveryNativeStorage() {
@@ -251,8 +272,8 @@ public final class ProcessApiSchemaVerifier {
                         + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        var numbers = List.of("8", "9", "10", "11", "12");
-        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE);
+        var numbers = List.of("8", "9", "10", "11", "12", "13");
+        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE, GOVERNED_START_FILE);
         if (versions.size() > numbers.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
@@ -265,6 +286,7 @@ public final class ProcessApiSchemaVerifier {
                 case "10" -> recoveryMigration();
                 case "11" -> candidateReviewMigration();
                 case "12" -> platformActivationMigration();
+                case "13" -> governedStartMigration();
                 default -> throw invalid();
             }
         }
@@ -360,7 +382,8 @@ public final class ProcessApiSchemaVerifier {
         String columns = cancellation ? " AND NOT has_any_column_privilege(c.oid,'REFERENCES')"
                 + (mutable ? "" : " AND NOT has_any_column_privilege(c.oid,'UPDATE')") : "";
         String insert = requireInsert ? " AND has_table_privilege(c.oid,'INSERT')" : "";
-        boolean platformAudit = PLATFORM_CANDIDATE.equals(table) || PLATFORM_REVIEW.equals(table) || PLATFORM_ACTIVATION.equals(table);
+        boolean platformAudit = PLATFORM_CANDIDATE.equals(table) || PLATFORM_REVIEW.equals(table) || PLATFORM_ACTIVATION.equals(table)
+                || GOVERNED_START.equals(table);
         String schemaOwnership = RECOVERY_RECEIPT.equals(table) || platformAudit ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
         String immutableRelations = platformAudit ? """
                  AND NOT has_schema_privilege(n.oid,'CREATE')
@@ -473,6 +496,17 @@ public final class ProcessApiSchemaVerifier {
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {
             throw new IllegalStateException("Platform activation migration resource is unavailable", failure);
+        }
+    }
+
+    private static String governedStartMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + GOVERNED_START_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readAllBytes();
+            if (!GOVERNED_START_SHA256.equals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("Governed Process START migration resource is unavailable", failure);
         }
     }
 

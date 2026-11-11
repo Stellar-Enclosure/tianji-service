@@ -18,10 +18,15 @@ import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstances
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO.ReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
+import top.egon.cola.platform.tianji.process.server.execution.GovernedProcessStartStore.Pointer;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.CorrelationReceipt;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.Receipt;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
@@ -32,6 +37,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.Base64;
@@ -44,6 +50,7 @@ import java.util.Objects;
 /** Internal process entry point; the caller must authenticate and authorize the supplied actor. */
 public final class ProcessExecutionService {
     private static final int CORRELATION_PAGE_SIZE = ProcessInstanceCorrelationPageDTO.PAGE_SIZE;
+    private static final Duration MAX_GOVERNED_PROOF_WINDOW = Duration.ofSeconds(30);
     private final SpringProcessEngineConfiguration engine;
     private final VerifiedProcessModels models;
     private final ProcessReleaseService releases;
@@ -51,9 +58,17 @@ public final class ProcessExecutionService {
     private final TransactionTemplate write;
     private final TransactionTemplate read;
     private final TransactionTemplate receiptRead;
+    private final GovernedStartAuthority governedAuthority;
+    private final GovernedProcessStartStore governed;
+    private final TransactionTemplate governedWrite;
 
     public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                    ProcessModelValidator validator) {
+        this(engine, dmn, validator, null);
+    }
+
+    public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
+                                   ProcessModelValidator validator, GovernedStartAuthority governedAuthority) {
         this.engine = Objects.requireNonNull(engine, "engine");
         this.models = new VerifiedProcessModels(engine, dmn, validator);
         this.releases = new ProcessReleaseService(engine, dmn, validator);
@@ -73,12 +88,49 @@ public final class ProcessExecutionService {
         this.receiptRead.setReadOnly(false);
         this.receiptRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         this.receiptRead.setTimeout(2);
+        this.governedAuthority = governedAuthority;
+        if (governedAuthority == null) {
+            this.governed = null;
+            this.governedWrite = null;
+        } else {
+            this.governed = new GovernedProcessStartStore(manager.getDataSource(), engine.getDatabaseSchema());
+            this.governedWrite = new TransactionTemplate(manager);
+            this.governedWrite.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+            this.governedWrite.setTimeout(10);
+        }
     }
 
     public Snapshot start(ProcessActor actor, StartCommand command) {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(command, "command");
         return Objects.requireNonNull(write.execute(status -> startInTransaction(actor, command)));
+    }
+
+    /** Starts a BPMN instance at the active channel revision and pins its provenance with the native instance. */
+    public GovernedStartResult startGoverned(ProcessActor actor, GovernedStartCommand command) {
+        if (governed == null) throw unavailable();
+        if (actor == null || "LEGACY".equals(actor.issuerFingerprint()) || command == null) throw governedDenied();
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive() || Thread.currentThread().isInterrupted()) {
+            throw new IllegalStateException("Governed Process START requires an independent transaction boundary");
+        }
+        var query = new StartAuthorizationQuery(actor, command.channel(), command.definitionKey(), command.commandId());
+        var grant = governedAuthority.authorize(query);
+        if (grant == null || !query.equals(grant.query())) throw governedDenied();
+        requireCurrent(grant.observedAt(), grant.validUntil(), governed.now());
+
+        Pointer observed = null;
+        WorkerRouteProof proof = null;
+        if (governed.find(actor, command.commandId()).isEmpty()) {
+            observed = governed.current(actor.tenantId(), command.channel()).orElse(null);
+            if (observed != null && command.definitionKey().equals(observed.definitionKey())) {
+                proof = governedAuthority.currentWorker(workerQuery(observed));
+            }
+        }
+        var observedPointer = observed;
+        var workerProof = proof;
+        return Objects.requireNonNull(governedWrite.execute(status ->
+                governedStartInTransaction(actor, command, grant, observedPointer, workerProof)));
     }
 
     public Snapshot get(ProcessActor actor, String instanceId) {
@@ -228,8 +280,8 @@ public final class ProcessExecutionService {
         Definition binding = release.definitions().stream().filter(item -> item.type() == Type.BPMN
                 && item.definitionKey().equals(command.definitionKey())).findFirst().orElseThrow(ProcessExecutionService::unavailable);
         Map<String, Object> inputs = ProcessValues.inputs(binding.inputs(), command.variables());
-        String requestHash = ProcessRequestDigest.hash(List.of(command.releaseKey(), command.definitionKey(),
-                command.businessKey(), command.correlationId()), inputs);
+        String requestHash = resolvedStartHash(command.releaseKey(), command.definitionKey(),
+                command.businessKey(), command.correlationId(), inputs);
         if (!receipts.insert(actor, ProcessCommandReceiptStore.Kind.START, command.commandId(), requestHash,
                 command.releaseKey(), command.correlationId())) {
             var existing = receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, command.commandId());
@@ -239,19 +291,126 @@ public final class ProcessExecutionService {
                     || !command.correlationId().equals(existing.correlationId())) throw unavailable();
             return snapshot(actor, existing);
         }
+        var applied = startClaimed(actor, binding, command.businessKey(), command.commandId(), inputs);
+        return snapshot(actor, applied);
+    }
+
+    private GovernedStartResult governedStartInTransaction(ProcessActor actor, GovernedStartCommand command, StartGrant grant,
+                                                           Pointer observed, WorkerRouteProof proof) {
+        governed.begin(actor.tenantId());
+        requireCurrent(grant.observedAt(), grant.validUntil(), governed.transactionTime());
+        var existing = receipts.lockIfPresent(actor, ProcessCommandReceiptStore.Kind.START, command.commandId());
+        if (existing.isPresent()) return replayGoverned(actor, command, grant, existing.orElseThrow());
+
+        var pointer = governed.current(actor.tenantId(), command.channel()).orElseThrow(ProcessExecutionService::unavailable);
+        if (!pointer.equals(observed)) throw new ProcessVersionConflictException();
+        if (!command.definitionKey().equals(pointer.definitionKey())) throw unavailable();
+        requireWorker(pointer, proof);
+        var binding = governedDefinition(actor, pointer);
+        var inputs = ProcessValues.inputs(binding.inputs(), command.variables());
+        String resolvedHash = resolvedStartHash(pointer.releaseKey(), command.definitionKey(),
+                command.businessKey(), command.correlationId(), inputs);
+        if (!receipts.insert(actor, ProcessCommandReceiptStore.Kind.START, command.commandId(), resolvedHash,
+                pointer.releaseKey(), command.correlationId())) {
+            return replayGoverned(actor, command, grant,
+                    receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, command.commandId()));
+        }
+
+        requireAdmission(grant, proof);
+        var applied = startClaimed(actor, binding, command.businessKey(), command.commandId(), inputs);
+        governed.append(actor, command.commandId(), command.correlationId(), pointer, governedHash(command, inputs),
+                resolvedHash, grant.auditSha256(), applied.resourceId());
+        var result = governedResult(actor, command, pointer, applied);
+        requireAdmission(grant, proof);
+        return result;
+    }
+
+    private GovernedStartResult replayGoverned(ProcessActor actor, GovernedStartCommand command, StartGrant grant, Receipt receipt) {
+        var source = governed.find(actor, command.commandId()).orElseThrow(ProcessExecutionService::conflict);
+        var pointer = source.pointer();
+        if (!command.channel().equals(pointer.channel()) || !command.definitionKey().equals(pointer.definitionKey())
+                || !command.correlationId().equals(receipt.correlationId())) throw conflict();
+        if (!source.instanceId().equals(receipt.resourceId()) || !source.resolvedHash().equals(receipt.requestHash())
+                || !pointer.releaseKey().equals(receipt.releaseKey())) throw unavailable();
+        var inputs = ProcessValues.inputs(governedDefinition(actor, pointer).inputs(), command.variables());
+        if (!source.governedHash().equals(governedHash(command, inputs))
+                || !source.resolvedHash().equals(resolvedStartHash(pointer.releaseKey(), command.definitionKey(),
+                command.businessKey(), command.correlationId(), inputs))) throw conflict();
+        var result = governedResult(actor, command, pointer, receipt);
+        requireCurrent(grant.observedAt(), grant.validUntil(), governed.transactionTime());
+        return result;
+    }
+
+    private GovernedStartResult governedResult(ProcessActor actor, GovernedStartCommand command, Pointer pointer, Receipt receipt) {
+        var instance = snapshot(actor, receipt);
+        if (!pointer.definitionKey().equals(instance.definitionKey()) || !command.businessKey().equals(instance.businessKey())
+                || !command.correlationId().equals(instance.correlationId())) throw unavailable();
+        return new GovernedStartResult(instance, pointer.channel(), pointer.revision(), pointer.candidateHash());
+    }
+
+    private Definition governedDefinition(ProcessActor actor, Pointer pointer) {
+        var release = releases.get(actor, pointer.releaseKey());
+        if (pointer.tenantId() != actor.tenantId() || !pointer.manifestHash().equals(release.manifestSha256())) throw unavailable();
+        return release.definitions().stream().filter(definition -> definition.type() == Type.BPMN
+                && pointer.definitionKey().equals(definition.definitionKey()) && pointer.modelHash().equals(definition.modelSha256()))
+                .findFirst().orElseThrow(ProcessExecutionService::unavailable);
+    }
+
+    private void requireAdmission(StartGrant grant, WorkerRouteProof proof) {
+        Instant now = governed.transactionTime();
+        requireCurrent(grant.observedAt(), grant.validUntil(), now);
+        requireCurrent(proof.observedAt(), proof.validUntil(), now);
+    }
+
+    private static void requireWorker(Pointer pointer, WorkerRouteProof proof) {
+        if (proof == null || !workerQuery(pointer).equals(proof.query())) throw governedDenied();
+        var binding = proof.binding();
+        if (binding.actor().tenantId() != pointer.tenantId() || !binding.topic().equals(pointer.workerTopic())
+                || !binding.schemaVersion().equals(pointer.workerSchemaVersion())
+                || !pointer.workerBindingHash().equals(PlatformReleaseActivationService.workerFingerprint(
+                        binding, proof.registrationSha256()))) throw governedDenied();
+    }
+
+    private static WorkerRouteQuery workerQuery(Pointer pointer) {
+        return new WorkerRouteQuery(pointer.tenantId(), pointer.channel(), pointer.revision(), pointer.candidateHash(),
+                pointer.workerTopic(), pointer.workerSchemaVersion());
+    }
+
+    private static void requireCurrent(Instant observedAt, Instant validUntil, Instant now) {
+        if (observedAt.isAfter(now) || !now.isBefore(validUntil)
+                || Duration.between(observedAt, validUntil).compareTo(MAX_GOVERNED_PROOF_WINDOW) > 0
+                || Thread.currentThread().isInterrupted()) throw governedDenied();
+    }
+
+    private static AccessDeniedException governedDenied() {
+        return new AccessDeniedException("Current governed Process START authority is required");
+    }
+
+    private static String governedHash(GovernedStartCommand command, Map<String, Object> inputs) {
+        return ProcessRequestDigest.hash(List.of("TIANJI_GOVERNED_PROCESS_START_V1", command.channel(),
+                command.definitionKey(), command.businessKey(), command.correlationId()), inputs);
+    }
+
+    private static String resolvedStartHash(String release, String definition, String business, String correlation,
+                                            Map<String, Object> inputs) {
+        return ProcessRequestDigest.hash(List.of(release, definition, business, correlation), inputs);
+    }
+
+    private Receipt startClaimed(ProcessActor actor, Definition binding, String businessKey, String commandId,
+                                 Map<String, Object> inputs) {
         models.process(actor.tenantId(), binding);
         ProcessInstance instance = engine.getRuntimeService().createProcessInstanceBuilder()
                 .processDefinitionId(binding.engineDefinitionId()).tenantId(Long.toString(actor.tenantId()))
-                .businessKey(command.businessKey()).variables(new HashMap<>(inputs)).start();
+                .businessKey(businessKey).variables(new HashMap<>(inputs)).start();
         if (instance == null || !binding.engineDefinitionId().equals(instance.getProcessDefinitionId())
                 || !Long.toString(actor.tenantId()).equals(instance.getTenantId()) || !validId(instance.getId(), 255)) {
             throw new IllegalStateException("Process instance does not match its release");
         }
-        receipts.apply(actor, ProcessCommandReceiptStore.Kind.START, command.commandId(), instance.getId(), null);
-        return snapshot(actor, receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, command.commandId()));
+        receipts.apply(actor, ProcessCommandReceiptStore.Kind.START, commandId, instance.getId(), null);
+        return receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, commandId);
     }
 
-    private Snapshot snapshot(ProcessActor actor, ProcessCommandReceiptStore.Receipt receipt) {
+    private Snapshot snapshot(ProcessActor actor, Receipt receipt) {
         if (!"APPLIED".equals(receipt.state()) || receipt.resourceId() == null) throw unavailable();
         Release release = releases.get(actor, receipt.releaseKey());
         String tenant = Long.toString(actor.tenantId());
@@ -295,15 +454,63 @@ public final class ProcessExecutionService {
     public record StartCommand(String releaseKey, String definitionKey, String businessKey, String commandId,
                                String correlationId, Map<String, Object> variables) {
         public StartCommand {
-            if (releaseKey == null || !releaseKey.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-                    || definitionKey == null || !definitionKey.matches("[A-Za-z_][A-Za-z0-9_.-]{0,127}")
-                    || !validId(businessKey, 255) || commandId == null || !commandId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-                    || correlationId == null || !correlationId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
-                    || variables == null) throw invalid();
-            try { variables = Map.copyOf(variables); }
-            catch (RuntimeException failure) { throw invalid(); }
+            if (releaseKey == null || !releaseKey.matches("[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")) throw invalid();
+            variables = checkedStartVariables(definitionKey, businessKey, commandId, correlationId, variables);
         }
     }
+
+    public record GovernedStartCommand(String channel, String definitionKey, String businessKey, String commandId,
+                                       String correlationId, Map<String, Object> variables) {
+        public GovernedStartCommand {
+            if (channel == null || !channel.matches("[a-z][a-z0-9._-]{0,63}")) throw invalid();
+            variables = checkedStartVariables(definitionKey, businessKey, commandId, correlationId, variables);
+        }
+    }
+
+    private static Map<String, Object> checkedStartVariables(String definitionKey, String businessKey, String commandId,
+                                                             String correlationId, Map<String, Object> variables) {
+        if (definitionKey == null || !definitionKey.matches("[A-Za-z_][A-Za-z0-9_.-]{0,127}")
+                || !validId(businessKey, 255) || commandId == null || !commandId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+                || correlationId == null || !correlationId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+                || variables == null) throw invalid();
+        try { return Map.copyOf(variables); }
+        catch (RuntimeException failure) { throw invalid(); }
+    }
+
+    public record StartAuthorizationQuery(ProcessActor actor, String channel, String definitionKey, String commandId) { }
+
+    public record StartGrant(StartAuthorizationQuery query, String auditSha256, Instant observedAt, Instant validUntil) {
+        public StartGrant {
+            if (query == null || !GovernedProcessStartStore.hash(auditSha256) || observedAt == null || validUntil == null
+                    || !validUntil.isAfter(observedAt)) throw invalid();
+        }
+    }
+
+    public record WorkerRouteQuery(long tenantId, String channel, long revision, String candidateSha256,
+                                   String topic, String schemaVersion) { }
+
+    public record WorkerRouteProof(WorkerRouteQuery query, AgentDispatchBinding binding, String registrationSha256,
+                                   Instant observedAt, Instant validUntil) {
+        public WorkerRouteProof {
+            if (query == null || binding == null || !GovernedProcessStartStore.hash(registrationSha256)
+                    || observedAt == null || validUntil == null || !validUntil.isAfter(observedAt)) throw invalid();
+        }
+    }
+
+    public interface GovernedStartAuthority {
+        /** Grants the exact authenticated caller current access to start in the selected channel. */
+        StartGrant authorize(StartAuthorizationQuery query);
+
+        /**
+         * Provides authoritative current evidence for one effective registration and dispatch binding
+         * across all Worker actors able to acquire the tenant/topic/schema tuple. The authority must
+         * keep earlier bindings usable for their existing instances and deny missing, ambiguous, or
+         * unverifiable routes. A binding read scoped only to the selected actor is insufficient.
+         */
+        WorkerRouteProof currentWorker(WorkerRouteQuery query);
+    }
+
+    public record GovernedStartResult(Snapshot instance, String channel, long activationRevision, String candidateSha256) { }
 
     public record Snapshot(String instanceId, String releaseKey, String definitionKey, String businessKey,
                            String correlationId, State state, Instant submittedAt, Instant finishedAt) { }
