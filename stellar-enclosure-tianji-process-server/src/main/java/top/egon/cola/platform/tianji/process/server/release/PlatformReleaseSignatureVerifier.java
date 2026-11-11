@@ -7,6 +7,11 @@ import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessModelTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.AgentPublication;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ArtifactRef;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ContractRef;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.DeploymentManifest;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ProcessLink;
 
 import java.io.IOException;
 import java.math.BigInteger;
@@ -158,12 +163,35 @@ final class PlatformReleaseSignatureVerifier {
             var process = candidate.get("process");
             return new VerifiedCandidate(candidateSha, envelopeSha, field(candidate, "sourceRevision"), tenantText,
                     channel, trust.scope().get("keyId"), expectedTrustSha, claims.issuedAt(), claims.expiresAt(),
-                    field(process, "releaseVersion"), field(process, "manifestSha256"), models(process.get("models"), "modelSha256"));
+                    field(process, "releaseVersion"), field(process, "manifestSha256"), models(process.get("models"), "modelSha256"),
+                    deployment(candidate));
         } catch (PlatformReleaseArtifactValidator.ValidationFailure | IllegalArgumentException malformed) {
             throw invalid();
         } catch (UnsupportedOperationException | SecurityException | ProviderException unavailable) {
             throw unavailable();
         }
+    }
+
+    private static DeploymentManifest deployment(JsonNode candidate) {
+        var agent = candidate.get("agent");
+        var link = candidate.get("agentLink");
+        var packages = candidate.get("packages");
+        return new DeploymentManifest(
+                new AgentPublication(field(agent, "definitionKey"), integer(agent, "definitionVersion"),
+                        field(agent, "definitionArtifactSha256"), field(agent, "definitionContentSha256"),
+                        field(agent, "modelRouteRef"), field(agent, "policyVersionRef"),
+                        contractRef(agent.get("inputContract")), contractRef(agent.get("outputContract"))),
+                new ProcessLink(field(link, "processDefinitionKey"), field(link, "workerElementId"),
+                        field(link, "topic"), field(link, "schemaVersion")),
+                artifactRef(packages.get("agent")), artifactRef(packages.get("process")));
+    }
+
+    private static ContractRef contractRef(JsonNode contract) {
+        return new ContractRef(field(contract, "version"), field(contract, "artifactSha256"));
+    }
+
+    private static ArtifactRef artifactRef(JsonNode artifact) {
+        return new ArtifactRef(field(artifact, "archiveSha256"), field(artifact, "manifestEntrySha256"));
     }
 
     private static boolean bounded(byte[] bytes, int maximum) {
@@ -481,7 +509,11 @@ final class PlatformReleaseSignatureVerifier {
                                             Instant notAfter) { }
     record VerifiedCandidate(String candidateSha, String envelopeSha, String revision, String tenant, String channel,
                              String keyId, String trustSha, Instant issuedAt, Instant expiresAt, String releaseVersion,
-                             String manifestSha, List<ProcessModelDTO> processModels) {
+                             String manifestSha, List<ProcessModelDTO> processModels, DeploymentManifest deployment) {
+        VerifiedCandidate {
+            processModels = List.copyOf(processModels);
+        }
+
         boolean matchesProcess(String version, String digest, List<ProcessModelDTO> models) {
             return releaseVersion.equals(version) && manifestSha.equals(digest)
                     && Set.copyOf(processModels).equals(Set.copyOf(models));

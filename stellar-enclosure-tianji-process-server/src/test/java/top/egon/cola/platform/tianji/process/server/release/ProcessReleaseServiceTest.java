@@ -1,10 +1,14 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
+import org.flowable.dmn.api.DmnDecision;
+import org.flowable.dmn.api.DmnDecisionQuery;
 import org.flowable.dmn.api.DmnRepositoryService;
 import org.flowable.dmn.api.DmnHistoryService;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.RepositoryService;
 import org.flowable.engine.HistoryService;
+import org.flowable.engine.repository.ProcessDefinition;
+import org.flowable.engine.repository.ProcessDefinitionQuery;
 import org.flowable.common.engine.impl.history.HistoryLevel;
 import org.flowable.job.service.impl.asyncexecutor.AsyncExecutor;
 import org.flowable.job.service.impl.asyncexecutor.AsyncJobExecutorConfiguration;
@@ -13,6 +17,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ProcessLink;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
@@ -49,6 +54,7 @@ import java.security.MessageDigest;
 
 import javax.sql.DataSource;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.time.Duration;
@@ -396,6 +402,66 @@ class ProcessReleaseServiceTest {
     }
 
     private static final class SourceChecked extends RuntimeException { }
+    @Test
+    void activation_checks_the_owning_primary_the_full_native_bundle_and_the_link() throws Exception {
+        try (var fixture = new CaseFixture()) {
+            byte[] bpmn = fixture("agent-dispatch-wait.bpmn20.xml");
+            byte[] dmn = fixture("baseline.dmn");
+            var processRepository = fixture.process.getRepositoryService();
+            var processQuery = mock(ProcessDefinitionQuery.class, RETURNS_SELF);
+            var processDefinition = mock(ProcessDefinition.class);
+            when(processRepository.createProcessDefinitionQuery()).thenReturn(processQuery);
+            when(processQuery.singleResult()).thenReturn(processDefinition);
+            when(processDefinition.getKey()).thenReturn("agentDispatch");
+            when(processDefinition.getResourceName()).thenReturn("agentDispatch.bpmn20.xml");
+            when(processDefinition.getVersion()).thenReturn(3);
+            when(processRepository.getResourceAsStream("bpmn-deployment", "agentDispatch.bpmn20.xml"))
+                    .thenAnswer(i -> new ByteArrayInputStream(bpmn));
+            var decisionRepository = fixture.dmn.getDmnRepositoryService();
+            var decisionQuery = mock(DmnDecisionQuery.class, RETURNS_SELF);
+            when(decisionRepository.createDecisionQuery()).thenReturn(decisionQuery);
+            when(decisionQuery.singleResult()).thenReturn(mock(DmnDecision.class));
+            when(decisionRepository.getDmnResource("dmn-definition")).thenAnswer(i -> new ByteArrayInputStream(dmn));
+
+            var inputs = Map.of("amount", ValueType.INTEGER);
+            var expected = List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "agentDispatch", bpmn, inputs),
+                    new ProcessReleaseService.ModelResource(Type.DMN, "baselineDecision", dmn, inputs),
+                    fixture.resource(Map.of()));
+            fixture.manifest = ProcessReleaseService.manifestHash(expected);
+            for (var resource : expected) {
+                var type = resource.type().name().toLowerCase(Locale.ROOT);
+                fixture.definitions.add(Map.of("model_type", resource.type().name(), "definition_key", resource.definitionKey(),
+                        "engine_definition_id", type.equals("cmmn") ? "case-definition" : type + "-definition",
+                        "engine_deployment_id", type.equals("cmmn") ? "case-deployment" : type + "-deployment",
+                        "engine_version", 3, "model_sha256",
+                        HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(resource.xml())),
+                        "input_schema", resource.inputs().isEmpty() ? "{}" : "{\"amount\":\"INTEGER\"}"));
+            }
+            var service = fixture.publisher(false, false);
+            var jdbc = fixture.jdbc.constructed().getFirst();
+            var primarySql = "SELECT NOT pg_catalog.pg_is_in_recovery()";
+            when(jdbc.queryForObject(primarySql, Boolean.class)).thenReturn(true);
+            var link = new ProcessLink("agentDispatch", "worker", "agentStart", "1");
+            assertEquals(fixture.manifest, service.getForActivation(fixture.actor, "release", link).manifestSha256());
+            verify(fixture.connection).setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            verify(processQuery).processDefinitionTenantId("20");
+            verify(decisionQuery).decisionTenantId("20");
+            verify(fixture.caseQuery).caseDefinitionTenantId("20");
+            var wrongLink = new ProcessLink("agentDispatch", "worker", "another", "1");
+            assertThrows(ProcessResourceNotFoundException.class, () -> service.getForActivation(fixture.actor, "release", wrongLink));
+            String correct = fixture.manifest;
+            fixture.manifest = "0".repeat(64);
+            assertThrows(ProcessResourceNotFoundException.class, () -> service.getForActivation(fixture.actor, "release", link));
+            fixture.manifest = correct;
+            dmn[0] = 'x';
+            assertThrows(ProcessResourceNotFoundException.class, () -> service.getForActivation(fixture.actor, "release", link));
+            when(jdbc.queryForObject(primarySql, Boolean.class)).thenReturn(false);
+            clearInvocations(processRepository, decisionRepository, fixture.repository);
+            assertThrows(ProcessResourceNotFoundException.class, () -> service.getForActivation(fixture.actor, "release", link));
+            verifyNoInteractions(processRepository, decisionRepository, fixture.repository);
+        }
+    }
+
     private static List<ProcessReleaseService.ModelResource> sourceBundle(CaseFixture f) throws Exception {
         return List.of(new ProcessReleaseService.ModelResource(Type.BPMN, "linkedProcess", fixture("formal-case-linked.bpmn20.xml"), Map.of()), f.resource(Map.of()));
     }
@@ -411,7 +477,7 @@ class ProcessReleaseServiceTest {
     private static void configureLinkedProcess(CaseFixture f) {
         var repository = f.process.getRepositoryService();
         var builder = mock(org.flowable.engine.repository.DeploymentBuilder.class, RETURNS_SELF); var deployment = mock(org.flowable.engine.repository.Deployment.class);
-        var query = mock(org.flowable.engine.repository.ProcessDefinitionQuery.class, RETURNS_SELF); var definition = mock(org.flowable.engine.repository.ProcessDefinition.class);
+        var query = mock(ProcessDefinitionQuery.class, RETURNS_SELF); var definition = mock(ProcessDefinition.class);
         when(repository.createDeployment()).thenReturn(builder); when(builder.deploy()).thenReturn(deployment); when(deployment.getId()).thenReturn("parent-deployment");
         when(repository.createProcessDefinitionQuery()).thenReturn(query); when(query.list()).thenReturn(List.of(definition));
         when(definition.getId()).thenReturn("parent-definition"); when(definition.getKey()).thenReturn("linkedProcess"); when(definition.getVersion()).thenReturn(1);

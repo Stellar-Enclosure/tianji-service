@@ -26,6 +26,7 @@ import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehav
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskTimerAvailability;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ProcessLink;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
@@ -177,6 +178,55 @@ public final class ProcessReleaseService {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
         return Objects.requireNonNull(read.execute(status -> load(actor.tenantId(), releaseKey, false)));
+    }
+
+    /** Observe the published bundle and deployed model bytes in one owning ProcessDB snapshot. */
+    Release getForActivation(ProcessActor actor, String releaseKey, ProcessLink link) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(link, "link");
+        requireReleaseKey(releaseKey);
+        if (TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()) throw unavailable();
+        return Objects.requireNonNull(read.execute(status -> {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_catalog.pg_is_in_recovery()", Boolean.class))) {
+                throw unavailable();
+            }
+            var release = load(actor.tenantId(), releaseKey, false);
+            verifyActivationBundle(actor.tenantId(), release, link);
+            return release;
+        }));
+    }
+
+    private void verifyActivationBundle(long tenantId, Release release, ProcessLink link) {
+        var verifier = new VerifiedProcessModels(process, cmmn, dmn, validator);
+        var resources = new ArrayList<ModelResource>(release.definitions().size());
+        int messageWaits = 0;
+        boolean exactLink = false;
+        int bundleBytes = 0;
+        for (var definition : release.definitions()) {
+            byte[] xml;
+            switch (definition.type()) {
+                case BPMN -> {
+                    var model = verifier.process(tenantId, definition);
+                    messageWaits += model.messageWaits().size();
+                    if (definition.definitionKey().equals(link.processDefinitionKey())) {
+                        var worker = model.workerTasks().get(link.workerElementId());
+                        exactLink = worker != null && link.topic().equals(worker.topic())
+                                && link.schemaVersion().equals(worker.schemaVersion())
+                                && worker.effectSafety() == ValidatedProcessModel.WorkerEffect.EXTERNAL_IDEMPOTENT
+                                && model.messageWaits().values().stream().anyMatch(wait -> wait.workerElementId().equals(link.workerElementId()));
+                    }
+                    xml = model.xml();
+                }
+                case DMN -> xml = verifier.decision(tenantId, definition).xml();
+                case CMMN -> xml = verifier.caseModel(tenantId, definition).xml();
+                default -> throw unavailable();
+            }
+            bundleBytes += xml.length;
+            if (bundleBytes > MAX_BUNDLE_BYTES) throw unavailable();
+            resources.add(new ModelResource(definition.type(), definition.definitionKey(), xml, definition.inputs()));
+        }
+        if (messageWaits != 1 || !exactLink || !release.manifestSha256().equals(manifestHash(resources))) throw unavailable();
     }
 
     /** Read within an existing owner snapshot without marking it rollback-only for an absent release. */

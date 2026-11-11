@@ -3,6 +3,7 @@ package top.egon.cola.platform.tianji.process.server.release;
 import org.junit.jupiter.api.Test;
 import org.springframework.security.access.AccessDeniedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 
@@ -145,6 +146,39 @@ final class PlatformReleaseCandidateReviewServiceTest {
         when(fixture.store.findReview(SCOPE)).thenReturn(Optional.of(winning));
         assertEquals(winning, fixture.service.review(REVIEWER, SCOPE, ACCEPT));
         assertTrue(fixture.window.get().contains(NOW));
+    }
+
+    @Test
+    void activation_checks_the_accepted_receipt_both_current_authorities_and_native_release() {
+        var fixture = new Fixture();
+        fixture.service.submit(SUBMITTER, SCOPE, SIGNED);
+        assertThrows(ProcessResourceNotFoundException.class,
+                () -> fixture.service.revalidateForActivation(REVIEWER, SCOPE));
+        fixture.service.review(REVIEWER, SCOPE, ACCEPT);
+        var accepted = fixture.review.get();
+        fixture.review.set(new ReviewReceipt(SCOPE, REVIEWER, new ReviewCommand("review-reject", 0, Decision.REJECT),
+                accepted.reviewAuditSha256(), accepted.independenceAuditSha256(), accepted.ownerReadAuditSha256(),
+                accepted.ownerObservedAt(), accepted.decidedAt()));
+        assertThrows(AccessDeniedException.class, () -> fixture.service.revalidateForActivation(REVIEWER, SCOPE));
+        fixture.review.set(accepted);
+
+        fixture.refused.add(Action.READ_CANDIDATE);
+        assertThrows(AccessDeniedException.class, () -> fixture.service.revalidateForActivation(REVIEWER, SCOPE));
+        fixture.refused.clear();
+        fixture.refused.add(Action.READ_PROCESS_RELEASE);
+        assertThrows(AccessDeniedException.class, () -> fixture.service.revalidateForActivation(REVIEWER, SCOPE));
+        fixture.refused.clear();
+        fixture.trust.set(lease(2, NOW.plusSeconds(60)));
+        assertThrows(AccessDeniedException.class, () -> fixture.service.revalidateForActivation(REVIEWER, SCOPE));
+        fixture.trust.set(lease(1, NOW.plusSeconds(60)));
+        verify(fixture.releases, never()).getForActivation(any(), any(), any());
+
+        when(fixture.releases.getForActivation(REVIEWER, "expense-v1", PROOF.deployment().link())).thenReturn(ownerRelease());
+        var result = fixture.service.revalidateForActivation(REVIEWER, SCOPE);
+        assertEquals(PROOF, result.signature());
+        assertEquals(1L, result.trustGeneration());
+        assertEquals(new AdmissionWindow(NOW, AUTH_DEADLINE), result.window());
+        verify(fixture.releases).getForActivation(REVIEWER, "expense-v1", PROOF.deployment().link());
     }
 
     private static TrustLease lease(long generation, Instant expiry) {

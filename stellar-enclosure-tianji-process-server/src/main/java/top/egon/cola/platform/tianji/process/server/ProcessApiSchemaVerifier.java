@@ -43,6 +43,9 @@ public final class ProcessApiSchemaVerifier {
     private static final String CANDIDATE_REVIEW_SHA256 = "434d1cf4947df39feb556f29ceda53ba0a36e36abc6d9a53d5d26dd85bceedfe";
     private static final String PLATFORM_CANDIDATE = "tianji_platform_release_candidate";
     private static final String PLATFORM_REVIEW = "tianji_platform_release_review";
+    private static final String PLATFORM_ACTIVATION_FILE = "V12__add_platform_release_activations.sql";
+    private static final String PLATFORM_ACTIVATION_SHA256 = "0bff65b5bffdd16aed9de166d1a8491251c222baeae2622a1a90a6397c2ff7e1";
+    private static final String PLATFORM_ACTIVATION = "tianji_platform_release_activation";
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final String schema;
@@ -101,6 +104,22 @@ public final class ProcessApiSchemaVerifier {
             }
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Platform candidate review storage schema verification failed", failure);
+        }
+    }
+
+    /** Explicit readiness for the activation journal and its reviewed candidate source. */
+    public void verifyPlatformActivation() {
+        verifyPlatformCandidateReviews();
+        try {
+            if (laterMigrations().size() < 5) throw invalid();
+            var contract = tableContracts(platformActivationMigration(), Map.of(PLATFORM_ACTIVATION, 21)).get(PLATFORM_ACTIVATION);
+            verifyCaseColumns(PLATFORM_ACTIVATION, contract.columns());
+            verifyCaseChecks(PLATFORM_ACTIVATION, contract.checks(), false);
+            verifyCaseKeys(PLATFORM_ACTIVATION, contract.keys());
+            verifyCaseIndexes(PLATFORM_ACTIVATION, contract.indexes());
+            verifyCaseRole(PLATFORM_ACTIVATION, false, true);
+        } catch (DataAccessException failure) {
+            throw new IllegalStateException("Platform activation storage schema verification failed", failure);
         }
     }
 
@@ -232,8 +251,8 @@ public final class ProcessApiSchemaVerifier {
                         + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        var numbers = List.of("8", "9", "10", "11");
-        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE);
+        var numbers = List.of("8", "9", "10", "11", "12");
+        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE);
         if (versions.size() > numbers.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
@@ -245,6 +264,7 @@ public final class ProcessApiSchemaVerifier {
                 case "9" -> cancellationMigration();
                 case "10" -> recoveryMigration();
                 case "11" -> candidateReviewMigration();
+                case "12" -> platformActivationMigration();
                 default -> throw invalid();
             }
         }
@@ -255,7 +275,8 @@ public final class ProcessApiSchemaVerifier {
         var actual = new HashMap<String, CaseColumn>();
         jdbc.query("""
                 SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,a.attidentity,a.attgenerated,
-                       co.collname,pg_get_expr(d.adbin,d.adrelid) AS default_value
+                       CASE WHEN co.oid = 'pg_catalog."C"'::pg_catalog.regcollation THEN co.collname END AS collname,
+                       pg_get_expr(d.adbin,d.adrelid) AS default_value
                 FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
                 JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
                 LEFT JOIN pg_collation co ON co.oid=a.attcollation
@@ -339,9 +360,9 @@ public final class ProcessApiSchemaVerifier {
         String columns = cancellation ? " AND NOT has_any_column_privilege(c.oid,'REFERENCES')"
                 + (mutable ? "" : " AND NOT has_any_column_privilege(c.oid,'UPDATE')") : "";
         String insert = requireInsert ? " AND has_table_privilege(c.oid,'INSERT')" : "";
-        boolean platformReview = PLATFORM_CANDIDATE.equals(table) || PLATFORM_REVIEW.equals(table);
-        String schemaOwnership = RECOVERY_RECEIPT.equals(table) || platformReview ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
-        String immutableRelations = platformReview ? """
+        boolean platformAudit = PLATFORM_CANDIDATE.equals(table) || PLATFORM_REVIEW.equals(table) || PLATFORM_ACTIVATION.equals(table);
+        String schemaOwnership = RECOVERY_RECEIPT.equals(table) || platformAudit ? " AND NOT pg_has_role(n.nspowner,'MEMBER')" : "";
+        String immutableRelations = platformAudit ? """
                  AND NOT has_schema_privilege(n.oid,'CREATE')
                  AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent=c.oid OR i.inhrelid=c.oid)
                  AND NOT EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid)
@@ -441,6 +462,17 @@ public final class ProcessApiSchemaVerifier {
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {
             throw new IllegalStateException("Platform candidate review migration resource is unavailable", failure);
+        }
+    }
+
+    private static String platformActivationMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + PLATFORM_ACTIVATION_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readAllBytes();
+            if (!PLATFORM_ACTIVATION_SHA256.equals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("Platform activation migration resource is unavailable", failure);
         }
     }
 

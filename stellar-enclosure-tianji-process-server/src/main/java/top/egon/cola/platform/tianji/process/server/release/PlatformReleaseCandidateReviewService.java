@@ -77,17 +77,11 @@ public final class PlatformReleaseCandidateReviewService {
         var candidate = store.findCandidate(scope).orElseThrow(ProcessResourceNotFoundException::new);
         var submission = candidate.submission();
         var trusted = loadTrust(scope);
-        if (!submission.trust().equals(trusted.reference()) || actor.equals(trusted.reference().signer())) throw denied();
+        requireStoredTrust(scope, submission, trusted);
+        if (actor.equals(trusted.reference().signer())) throw denied();
         var independent = authorize(new Authorization(actor, scope, Action.REVIEW_INDEPENDENT,
                 submission.releaseVersion(), trusted.reference().signer(), submission.submittedBy()));
-        var signature = verify(scope, candidate.material(), trusted);
-        if (!submission.envelopeSha256().equals(signature.envelopeSha())
-                || !submission.sidecarSha256().equals(PlatformReleaseArtifactValidator.hash(candidate.material().sidecar()))
-                || !submission.sourceRevision().equals(signature.revision())
-                || !submission.signatureIssuedAt().equals(signature.issuedAt())
-                || !submission.signatureExpiresAt().equals(signature.expiresAt())
-                || !submission.releaseVersion().equals(signature.releaseVersion())
-                || !submission.manifestSha256().equals(signature.manifestSha())) throw denied();
+        var signature = verifyStoredCandidate(scope, candidate, trusted);
         var owner = observeProcess(actor, scope, signature);
         var receipt = new ReviewReceipt(scope, actor, command, admission.auditSha256(), independent.auditSha256(),
                 owner.grant().auditSha256(), owner.observedAt(), null);
@@ -104,6 +98,25 @@ public final class PlatformReleaseCandidateReviewService {
         var review = store.findReview(scope);
         requireCurrent(grant, store.now());
         return new CandidateView(candidate.submission(), candidate.material(), review);
+    }
+
+    ActivationVerification revalidateForActivation(ProcessActor actor, Scope scope) {
+        requireEntry(actor, scope);
+        if (actor.subjectType() != USER) throw denied();
+        var read = authorizeRead(actor, scope);
+        var candidate = store.findCandidate(scope).orElseThrow(ProcessResourceNotFoundException::new);
+        var review = store.findReview(scope).orElseThrow(ProcessResourceNotFoundException::new);
+        if (!scope.equals(review.scope()) || review.command().decision() != Decision.ACCEPT || review.decidedAt() == null) throw denied();
+
+        var trusted = loadTrust(scope);
+        requireStoredTrust(scope, candidate.submission(), trusted);
+        var signature = verifyStoredCandidate(scope, candidate, trusted);
+        var grant = authorize(new Authorization(actor, scope, Action.READ_PROCESS_RELEASE, signature.releaseVersion(), null, null));
+        var release = releases.getForActivation(actor, signature.releaseVersion(), signature.deployment().link());
+        var owner = observeProcess(grant, signature, release);
+        var window = admissionWindow(signature, trusted, owner, read);
+        if (!window.contains(owner.observedAt())) throw denied();
+        return new ActivationVerification(signature, window, trusted.reference().generation());
     }
 
     private SubmissionReceipt submissionReplay(ProcessActor actor, Scope scope, SignedMaterial material, CandidateRecord prior) {
@@ -139,10 +152,32 @@ public final class PlatformReleaseCandidateReviewService {
         return verified;
     }
 
+    private static void requireStoredTrust(Scope scope, SubmissionReceipt submission, TrustLease trusted) {
+        if (!scope.equals(submission.scope()) || !submission.trust().equals(trusted.reference())) throw denied();
+    }
+
+    private PlatformReleaseSignatureVerifier.VerifiedCandidate verifyStoredCandidate(Scope scope, CandidateRecord candidate,
+                                                                                    TrustLease trusted) {
+        var submission = candidate.submission();
+        var signature = verify(scope, candidate.material(), trusted);
+        if (!submission.envelopeSha256().equals(signature.envelopeSha())
+                || !submission.sidecarSha256().equals(PlatformReleaseArtifactValidator.hash(candidate.material().sidecar()))
+                || !submission.sourceRevision().equals(signature.revision())
+                || !submission.signatureIssuedAt().equals(signature.issuedAt())
+                || !submission.signatureExpiresAt().equals(signature.expiresAt())
+                || !submission.releaseVersion().equals(signature.releaseVersion())
+                || !submission.manifestSha256().equals(signature.manifestSha())) throw denied();
+        return signature;
+    }
+
     private OwnerObservation observeProcess(ProcessActor actor, Scope scope,
                                              PlatformReleaseSignatureVerifier.VerifiedCandidate signature) {
         var grant = authorize(new Authorization(actor, scope, Action.READ_PROCESS_RELEASE, signature.releaseVersion(), null, null));
-        var release = releases.get(actor, signature.releaseVersion());
+        return observeProcess(grant, signature, releases.get(actor, signature.releaseVersion()));
+    }
+
+    private OwnerObservation observeProcess(Grant grant, PlatformReleaseSignatureVerifier.VerifiedCandidate signature,
+                                             ProcessReleaseService.Release release) {
         var models = release.definitions().stream().map(definition -> new ProcessModelDTO(
                 ProcessModelTypeEnum.valueOf(definition.type().name()), definition.definitionKey(), definition.modelSha256(),
                 definition.inputs().entrySet().stream().collect(Collectors.toUnmodifiableMap(Map.Entry::getKey,
@@ -279,6 +314,9 @@ public final class PlatformReleaseCandidateReviewService {
     }
 
     public record CandidateView(SubmissionReceipt submission, SignedMaterial material, Optional<ReviewReceipt> review) { }
+
+    record ActivationVerification(PlatformReleaseSignatureVerifier.VerifiedCandidate signature, AdmissionWindow window,
+                                  long trustGeneration) { }
 
     record CandidateRecord(SubmissionReceipt submission, SignedMaterial material) { }
 

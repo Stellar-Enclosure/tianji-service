@@ -47,6 +47,8 @@ class ProcessApiSchemaVerifierTest {
     private static final String PLATFORM_CANDIDATE = "tianji_platform_release_candidate";
     private static final String PLATFORM_REVIEW = "tianji_platform_release_review";
     private static final String V11 = "V11__add_platform_release_candidate_reviews.sql";
+    private static final String PLATFORM_ACTIVATION = "tianji_platform_release_activation";
+    private static final String V12 = "V12__add_platform_release_activations.sql";
     private static final String V10_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
     private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
     private static final String V9_SHA256 = "dd07ea808cb19f85e983f99a38950add4229208e66dc3c10a60970c1ffc0711b";
@@ -57,7 +59,7 @@ class ProcessApiSchemaVerifierTest {
     private static final String DISPATCH = "tianji_process_agent_dispatch";
 
     @Test
-    void history_accepts_only_exact_v8_through_v11_prefixes() throws Exception {
+    void history_accepts_only_exact_v8_through_v12_prefixes() throws Exception {
         assertFalse(assertDoesNotThrow(() -> checkHistory(List.of())));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8))))));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(history("8", V8, true, checksum(V8)),
@@ -72,6 +74,8 @@ class ProcessApiSchemaVerifierTest {
         var v10 = history("10", V10, true, checksum(V10));
         var v11 = history("11", V11, true, checksum(V11));
         assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(v8, v9, v10, v11))));
+        var v12 = history("12", V12, true, checksum(V12));
+        assertTrue(assertDoesNotThrow(() -> checkHistory(List.of(v8, v9, v10, v11, v12))));
         var wrongType = history("10", V10, true, checksum(V10));
         wrongType.put("type", "JDBC");
         for (List<Map<String, Object>> invalid : List.of(
@@ -82,6 +86,11 @@ class ProcessApiSchemaVerifierTest {
                 List.of(v8, v9, history("10", V10, true, null)),
                 List.of(v8, v9, wrongType),
                 List.of(v8, v9, v11),
+                List.of(v8, v9, v10, v12),
+                List.of(v8, v9, v10, v11, v12, v12),
+                List.of(v8, v9, v10, v11, history("12", V12, true, checksum(V12) + 1)),
+                List.of(v8, v9, v10, v11, history("12", V12, false, checksum(V12))),
+                List.of(v8, v9, v10, v11, history("12", "V12__unknown.sql", true, 0)),
                 List.of(v8, v9, v10, v11, v11),
                 List.of(v8, v9, v10, history("11", V11, true, checksum(V11) + 1)),
                 List.of(v8, v9, v10, history("11", V11, false, checksum(V11))),
@@ -281,6 +290,67 @@ class ProcessApiSchemaVerifierTest {
         verifyCandidateReview(privileged, true);
     }
 
+    @Test
+    void v12_preserves_a3_and_recovery_readiness_without_activation_grants() throws Exception {
+        var ready = Catalog.candidateReviewReady();
+        ready.history.add(history("12", V12, true, checksum(V12)));
+        verifyCandidateReview(ready, false);
+        assertFalse(ready.roleSql.containsKey(PLATFORM_ACTIVATION));
+        verifyActivation(ready, true);
+        var recovery = Catalog.recoveryReady();
+        var prefix = new ArrayList<>(recovery.history);
+        prefix.add(history("11", V11, true, checksum(V11)));
+        prefix.add(history("12", V12, true, checksum(V12)));
+        recovery.history = prefix;
+        verifyRecovery(recovery, false);
+        assertFalse(recovery.roleSql.containsKey(PLATFORM_ACTIVATION));
+    }
+
+    @Test
+    void activation_requires_exact_v12_review_keys_route_index_and_append_only_role() throws Exception {
+        var ready = Catalog.activationReady();
+        verifyActivation(ready, false);
+        assertEquals(Set.of(PLATFORM_ACTIVATION + "_pkey", PLATFORM_ACTIVATION + "_review_fk",
+                PLATFORM_ACTIVATION + "_previous_fk"), ready.names("keys:" + PLATFORM_ACTIVATION));
+        assertEquals(Set.of(PLATFORM_ACTIVATION + "_pkey", PLATFORM_ACTIVATION + "_command_idx",
+                PLATFORM_ACTIVATION + "_route_idx"), ready.names("indexes:" + PLATFORM_ACTIVATION));
+        var roleSql = ready.roleSql.get(PLATFORM_ACTIVATION);
+        assertRoleSafety(roleSql);
+        assertColumnPrivilegeSafety(roleSql, false);
+        assertTrue(roleSql.contains("has_table_privilege(c.oid,'INSERT')"));
+        assertTrue(roleSql.contains("NOT has_table_privilege(c.oid,'UPDATE')"));
+        assertTrue(roleSql.contains("NOT pg_has_role(n.nspowner,'MEMBER')"));
+        assertTrue(roleSql.contains("NOT has_schema_privilege(n.oid,'CREATE')"));
+
+        var old = Catalog.candidateReviewReady();
+        verifyActivation(old, true);
+        var wrongReviewScope = Catalog.activationReady();
+        wrongReviewScope.named("keys:" + PLATFORM_ACTIVATION, PLATFORM_ACTIVATION + "_review_fk")
+                .put("target_fields", List.of("tenant_id", "candidate_sha256"));
+        verifyActivation(wrongReviewScope, true);
+        var missingRouteIndex = Catalog.activationReady();
+        missingRouteIndex.rows.get("indexes:" + PLATFORM_ACTIVATION).removeLast();
+        verifyActivation(missingRouteIndex, true);
+        var roleDrift = Catalog.activationReady();
+        roleDrift.activationReadWrite = false;
+        verifyActivation(roleDrift, true);
+    }
+
+    @Test
+    void activation_rejects_a_same_named_non_system_collation() throws Exception {
+        var catalog = Catalog.activationReady();
+        catalog.counterfeitActivationCollation = true;
+        verifyActivation(catalog, true);
+    }
+
+    private static void verifyActivation(Catalog catalog, boolean rejected) {
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process");
+            if (rejected) assertThrows(IllegalStateException.class, verifier::verifyPlatformActivation);
+            else assertDoesNotThrow(verifier::verifyPlatformActivation);
+        }
+    }
+
     private static void verifyCandidateReview(Catalog catalog, boolean rejected) {
         try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
             var verifier = new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process");
@@ -465,6 +535,8 @@ class ProcessApiSchemaVerifierTest {
         private final Map<String, String> nativeSql = new HashMap<>();
         private boolean rejectRecoveryQueries;
         private boolean recoveryReadWrite = true;
+        private boolean activationReadWrite = true;
+        private boolean counterfeitActivationCollation;
         private String badNativeTable;
         private boolean provenanceSelect = true;
         private boolean auditReadWrite = true;
@@ -513,6 +585,15 @@ class ProcessApiSchemaVerifierTest {
             return catalog;
         }
 
+        static Catalog activationReady() throws Exception {
+            var catalog = candidateReviewReady();
+            catalog.history.add(history("12", V12, true, checksum(V12)));
+            String migration = resource(V12);
+            catalog.parseTables(migration);
+            catalog.parseIndexes(migration);
+            return catalog;
+        }
+
         Map<String, Object> column(String table, String name) {
             return rows.get("columns:" + table).stream().filter(row -> name.equals(row.get("attname"))).findFirst().orElseThrow();
         }
@@ -551,6 +632,7 @@ class ProcessApiSchemaVerifierTest {
                 if (CANCEL_RECEIPT.equals(table)) return auditReadWrite;
                 if (DISPATCH.equals(table)) return dispatchReadWrite;
                 if (RECOVERY_RECEIPT.equals(table)) return recoveryReadWrite;
+                if (PLATFORM_ACTIVATION.equals(table)) return activationReadWrite;
                 return true;
             }
             if (sql.contains("schema_history")) {
@@ -563,7 +645,15 @@ class ProcessApiSchemaVerifierTest {
                 }
                 return map(invocation, history);
             }
-            if (sql.contains("attidentity")) return map(invocation, rows.getOrDefault("columns:" + table, List.of()));
+            if (sql.contains("attidentity")) {
+                var columns = rows.getOrDefault("columns:" + table, List.of());
+                if (counterfeitActivationCollation && PLATFORM_ACTIVATION.equals(table)
+                        && sql.contains("CASE WHEN co.oid = 'pg_catalog.\"C\"'::pg_catalog.regcollation")) {
+                    // A different collation OID with name C projects as null for the guarded column.
+                    column(table, "worker_topic").put("collname", null);
+                }
+                return map(invocation, columns);
+            }
             if (sql.contains("c.contype='c'")) return map(invocation, rows.getOrDefault("checks:" + table, List.of()));
             if (sql.contains("c.contype IN ('p','u','f')")) return map(invocation, rows.getOrDefault("keys:" + table, List.of()));
             if (sql.contains("FROM pg_index")) return map(invocation, rows.getOrDefault("indexes:" + table, List.of()));
@@ -589,7 +679,7 @@ class ProcessApiSchemaVerifierTest {
         }
 
         private static String table(String sql, Object[] args) {
-            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT, PLATFORM_CANDIDATE, PLATFORM_REVIEW,
+            Set<String> known = Set.of(PROVENANCE, PLAN_RECEIPT, CASE_INBOX, CANCEL_RECEIPT, DISPATCH, RECOVERY_RECEIPT, PLATFORM_CANDIDATE, PLATFORM_REVIEW, PLATFORM_ACTIVATION,
                     "act_ru_execution", "act_ru_deadletter_job", "act_ru_external_job",
                     "act_ru_job", "act_ru_timer_job", "act_ru_suspended_job",
                     "tianji_process_release_definition", "tianji_human_task_receipt");
