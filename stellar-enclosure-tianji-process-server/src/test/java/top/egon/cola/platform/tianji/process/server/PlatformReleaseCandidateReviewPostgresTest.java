@@ -10,6 +10,7 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseCandidateReviewPostgresScenarios;
 
 import javax.sql.DataSource;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -42,11 +43,12 @@ class PlatformReleaseCandidateReviewPostgresTest {
             throw new IllegalStateException("candidate review acceptance requires a fresh database without the Process schema");
         }
 
+        owner.execute("CREATE SCHEMA " + SCHEMA);
         var v10 = flyway(ownerSource, "10");
-        v10.baseline();
         assertEquals(10, v10.migrate().migrationsExecuted);
         v10.validate();
         assertEquals("10", v10.info().current().getVersion().getVersion());
+        assertSqlHistory(owner, 10);
         var baseline = owner.queryForList("SELECT * FROM " + HISTORY + " ORDER BY installed_rank");
 
         String role = ProcessServerPostgresTest.explicitRuntimeRole(owner);
@@ -72,6 +74,7 @@ class PlatformReleaseCandidateReviewPostgresTest {
         assertEquals(1, v11.migrate().migrationsExecuted);
         v11.validate();
         assertEquals("11", v11.info().current().getVersion().getVersion());
+        assertSqlHistory(owner, 11);
         assertEquals(baseline, owner.queryForList("SELECT * FROM " + HISTORY + " WHERE version IS DISTINCT FROM '11' ORDER BY installed_rank"));
         assertTrue(verifier.hasCaseMigration(), "recognizing V11 must not require candidate grants");
         assertThrows(IllegalStateException.class, verifier::verifyPlatformCandidateReviews, "candidate tables are still inaccessible");
@@ -98,8 +101,15 @@ class PlatformReleaseCandidateReviewPostgresTest {
 
     private static Flyway flyway(DataSource source, String target) {
         return Flyway.configure().dataSource(source).schemas(SCHEMA).defaultSchema(SCHEMA)
-                .table("tianji_process_schema_history").baselineVersion("0").locations("classpath:db/tianji-process")
+                .table("tianji_process_schema_history").createSchemas(false).baselineOnMigrate(false)
+                .locations("classpath:db/tianji-process")
                 .target(target).cleanDisabled(true).load();
+    }
+
+    private static void assertSqlHistory(JdbcTemplate owner, int target) {
+        var expected = IntStream.rangeClosed(1, target).mapToObj(version -> version + ":SQL").toList();
+        assertEquals(expected, owner.queryForList("SELECT concat(version,':',type) FROM " + HISTORY
+                + " ORDER BY installed_rank", String.class));
     }
 
     private static void rejectColumnGrant(JdbcTemplate owner, ProcessApiSchemaVerifier verifier,
