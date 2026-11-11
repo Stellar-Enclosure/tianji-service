@@ -815,12 +815,13 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     enum Suite {
         BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S12_OWNER_OBSERVATION, S12_MODEL_USAGE,
-        S07_GOVERNED_START, S07_APPROVED_START, S11_HISTORICAL_START_CUT;
+        S07_GOVERNED_START, S07_APPROVED_START, S11_HISTORICAL_START_CUT, S12_TOOL_EVIDENCE;
 
         boolean collectsMetrics() { return this == S12_METRICS || this == S12_OWNER_OBSERVATION; }
 
         boolean isS07() {
-            return this == S07_GOVERNED_START || this == S07_APPROVED_START || this == S11_HISTORICAL_START_CUT;
+            return this == S07_GOVERNED_START || this == S07_APPROVED_START
+                    || this == S11_HISTORICAL_START_CUT || this == S12_TOOL_EVIDENCE;
         }
 
         boolean observesReceiveLinks() {

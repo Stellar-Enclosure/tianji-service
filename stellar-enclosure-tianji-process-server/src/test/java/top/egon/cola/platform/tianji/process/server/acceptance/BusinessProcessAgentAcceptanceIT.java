@@ -15,6 +15,8 @@ import top.egon.cola.platform.tianji.client.AgentClientException;
 import top.egon.cola.platform.tianji.client.HttpAgentClient;
 import top.egon.cola.platform.tianji.client.HttpProcessClient;
 import top.egon.cola.platform.tianji.client.ProcessClientException;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsByCorrelationQuery;
 import top.egon.cola.platform.tianji.contract.agent.ListAgentRunsQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.*;
@@ -171,6 +173,7 @@ class BusinessProcessAgentAcceptanceIT {
                 case RECEIVE_LINK -> "tianji.s12.receive-link.manifest";
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
                 case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
+                case S12_TOOL_EVIDENCE -> "tianji.s12.tool-evidence.manifest";
                 case S07_APPROVED_START -> "tianji.s07.approved-start.manifest";
                 case S11_HISTORICAL_START_CUT -> "tianji.s11.historical-start-cut.manifest";
                 case S12_OWNER_OBSERVATION -> "tianji.s12.owner-observation.manifest";
@@ -193,6 +196,9 @@ class BusinessProcessAgentAcceptanceIT {
                             tenant.processResource(), "USER", ProcessControlClient.READ_SCOPE);
                     S12OwnerObservationEvidence.requireReadToken(agentRead, tenant, value(settings, "identity.bridge-subject"),
                             tenant.agentResource(), "SERVICE", "tianji:agent:read");
+                }
+                if (suite == Suite.S12_TOOL_EVIDENCE) {
+                    S12ToolEvidence.requireReadToken(value(settings, S12ToolEvidence.TOKEN), tenant);
                 }
                 tenantSettings.put(tenant.tenantId(), settings);
             }
@@ -418,8 +424,10 @@ class BusinessProcessAgentAcceptanceIT {
                     """, Long.toString(tenant.tenantId()), instance));
         }
 
-        void verifyGovernedStart() {
-            require(manifest.suite() == Suite.S07_GOVERNED_START, "Exact S07 suite");
+        void verifyGovernedStart() throws InterruptedException {
+            boolean toolEvidence = manifest.suite() == Suite.S12_TOOL_EVIDENCE;
+            require(manifest.suite() == Suite.S07_GOVERNED_START || toolEvidence, "Exact governed START fixture suite");
+            var observedRuns = new ArrayList<String>(2);
             for (var tenant : tenants()) {
                 long id = tenant.tenantId();
                 String ownerIssuer = issuerSha(tenant);
@@ -431,6 +439,13 @@ class BusinessProcessAgentAcceptanceIT {
                 var firstResult = client.getResult(new top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery(first.runId()));
                 String instance = governedInstance(firstResult);
                 var action = governedAction(tenant, businessKey, first.runId(), instance);
+                if (toolEvidence) {
+                    var events = S12ToolEvidence.read(toolOwner(tenant).events(new AgentEventsQuery(first.runId(), 0,
+                            S12ToolEvidence.MAX_EVENTS)));
+                    S12ToolEvidence.verify(first.runId(), first.lastEventSequence(), "s07-first", action.invocationId(),
+                            action.tool(), events);
+                    observedRuns.add(first.runId());
+                }
                 var replay = startGovernedRun(client, businessKey, "s07-replay");
                 assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.COMPLETED, replay.status());
                 assertNotEquals(first.runId(), replay.runId());
@@ -467,6 +482,26 @@ class BusinessProcessAgentAcceptanceIT {
             assertEquals((long) tenants().size(), count(db(StoreOwner.PROCESS), """
                     SELECT count(*) FROM tianji_process.act_ru_task WHERE task_def_key_='review'
                     """));
+            if (toolEvidence) {
+                require(observedRuns.size() == 2 && !observedRuns.getFirst().equals(observedRuns.getLast()),
+                        "Two disjoint original USER Tool runs");
+                for (int index = 0; index < tenants().size(); index++) {
+                    var foreign = new AgentEventsQuery(observedRuns.get(1 - index), 0, S12ToolEvidence.MAX_EVENTS);
+                    var client = toolOwner(tenants().get(index));
+                    var denied = assertThrows(AgentClientException.class, () -> S12ToolEvidence.read(client.events(foreign)));
+                    assertEquals(404, denied.httpStatus());
+                    assertEquals("TIANJI_RESOURCE_NOT_FOUND", denied.code());
+                }
+            }
+        }
+
+        private HttpAgentClient toolOwner(TenantBindingDTO tenant) {
+            return new HttpAgentClient(URI.create(manifest.endpoints().agent()), http,
+                    () -> {
+                        String bearer = value(privateProperties(tenant.credentialFile()), S12ToolEvidence.TOKEN);
+                        S12ToolEvidence.requireReadToken(bearer, tenant);
+                        return bearer;
+                    }, NETWORK, 0, Duration.ZERO);
         }
 
         void verifyApprovedStart() {
@@ -580,7 +615,8 @@ class BusinessProcessAgentAcceptanceIT {
             String issuer = issuerSha(tenant);
             String executor = setting(tenant, "s07.service-subject");
             var action = one(db(StoreOwner.AGENT), """
-                    SELECT a.intent_id,a.revision FROM tianji_agent.agent_tool_action_intent a
+                    SELECT a.intent_id,a.revision,i.invocation_id,i.tool_key,i.tool_version,i.tool_sha256,a.business_receipt_id
+                    FROM tianji_agent.agent_tool_action_intent a
                     JOIN tianji_agent.agent_tool_invocation i
                       ON (a.tenant_id,a.dispatch_run_id,a.dispatch_invocation_id)=(i.tenant_id,i.run_id,i.invocation_id)
                     JOIN tianji_agent.agent_budget_reservation b
@@ -591,7 +627,10 @@ class BusinessProcessAgentAcceptanceIT {
                       AND i.state='SUCCEEDED' AND i.business_receipt_id=a.business_receipt_id AND i.intent_id=a.intent_id
                       AND i.authorization_audit->>'boundary'='DISPATCH' AND i.authorization_audit->>'decision'='ALLOW'
                       AND b.state='SETTLED'
-                    """, (rs, row) -> new GovernedActionVO(rs.getObject("intent_id", UUID.class), rs.getLong("revision")),
+                    """, (rs, row) -> new GovernedActionVO(rs.getObject("intent_id", UUID.class), rs.getLong("revision"),
+                        rs.getObject("invocation_id", UUID.class),
+                        new DefinitionResourceRef(rs.getString("tool_key"), rs.getLong("tool_version"), rs.getString("tool_sha256")),
+                        rs.getString("business_receipt_id")),
                     id, issuer, tenant.ownerSubject(), businessKey, Long.toString(S07GovernedStartFixture.BUSINESS_VERSION),
                     originRun, dispatchRun, issuer, executor).orElseThrow();
             String commandId = action.intentId().toString();
@@ -608,10 +647,14 @@ class BusinessProcessAgentAcceptanceIT {
                     SELECT count(*) FROM tianji_process.act_ru_task
                     WHERE tenant_id_=? AND proc_inst_id_=? AND task_def_key_='review'
                     """, Long.toString(id), instance));
+            if (manifest.suite() == Suite.S12_TOOL_EVIDENCE) {
+                S12ToolEvidence.verifyReceipt(tenant, issuer, executor, command, instance, action.tool(), action.businessReceiptId());
+            }
             return action;
         }
 
-        private record GovernedActionVO(UUID intentId, long revision) { }
+        private record GovernedActionVO(UUID intentId, long revision, UUID invocationId, DefinitionResourceRef tool,
+                                        String businessReceiptId) { }
 
         List<TenantBindingDTO> tenants() { return manifest.tenants(); }
         ExpenseAcceptanceHarness harness() { return harness; }
