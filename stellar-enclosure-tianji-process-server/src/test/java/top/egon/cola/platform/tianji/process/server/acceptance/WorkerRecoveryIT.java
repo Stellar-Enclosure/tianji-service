@@ -131,7 +131,7 @@ class WorkerRecoveryIT {
         }
     }
 
-    private static void forwardedAcknowledgement(Driver driver, RunDTO run) {
+    static void forwardedAcknowledgement(Driver driver, RunDTO run) {
         var relay = driver.relay();
         String job = driver.await(run, () -> driver.workerJob(run));
         arm(driver, run, DROP_COMMITTED_WORKER_COMPLETE_200, job, job, null, null);

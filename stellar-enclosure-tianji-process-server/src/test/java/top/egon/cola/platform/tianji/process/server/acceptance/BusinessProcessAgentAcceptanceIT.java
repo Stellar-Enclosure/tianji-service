@@ -27,6 +27,7 @@ import top.egon.cola.platform.tianji.process.server.acceptance.ExpenseAcceptance
 import top.egon.cola.platform.tianji.process.server.compensation.ExpenseBusinessWorkerFixture;
 import top.egon.cola.platform.tianji.process.server.compensation.ExpenseBusinessWorkerFixture.EffectsVO;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 import top.egon.cola.platform.tianji.worker.RemoteWorkerPoller;
 
@@ -158,6 +159,8 @@ class BusinessProcessAgentAcceptanceIT {
         private final Map<String, RemoteWorkerPoller> pollers = new HashMap<>();
         private final Map<String, PhaseDeadlineDTO> deadlines = new HashMap<>();
         private final Map<String, CompleteWorkerTaskCommand> dropped = new ConcurrentHashMap<>();
+        private final Map<String, S12WorkerReceiptCorrelationEvidence.WorkerRow> firstWorkerReceipts = new ConcurrentHashMap<>();
+        private final boolean workerReceiptEvidence;
         private final Map<String, ChildIdentityDTO> outboxDropAgent = new ConcurrentHashMap<>();
         private final RenderedRelease release;
         private final S12ChildLogPrivacy logs;
@@ -182,6 +185,14 @@ class BusinessProcessAgentAcceptanceIT {
                         ? "tianji.s12.metrics.manifest" : "tianji.s12.metrics.log-privacy.manifest";
                 default -> "tianji.expense.e2e.manifest";
             };
+            return open(suite, logs, property, false);
+        }
+
+        static Driver openWorkerReceiptEvidence() throws Exception {
+            return open(Suite.RECOVERY, null, "tianji.s12.worker-receipt.manifest", true);
+        }
+
+        private static Driver open(Suite suite, S12ChildLogPrivacy logs, String property, boolean workerReceiptEvidence) throws Exception {
             var permit = ExpenseAcceptanceHarness.readManifest(System.getProperty(property));
             assumeTrue(permit.isPresent(), "Explicit isolated expense acceptance manifest is required");
             var manifest = permit.orElseThrow();
@@ -215,7 +226,8 @@ class BusinessProcessAgentAcceptanceIT {
                     var listener = ssl(manifest.tls().trustStore(), manifest.tls().relayKeyStore(), password);
                     var http = HttpClient.newBuilder().sslContext(trust).connectTimeout(NETWORK)
                             .followRedirects(HttpClient.Redirect.NEVER).build();
-                    driver = new Driver(manifest, harness, stores, tenantSettings, http, suite.isS07() ? null : renderRelease(manifest), logs);
+                    driver = new Driver(manifest, harness, stores, tenantSettings, http, suite.isS07() ? null : renderRelease(manifest),
+                            logs, workerReceiptEvidence);
                     driver.boot(listener, trust, password);
                     return driver;
                 } finally {
@@ -229,8 +241,10 @@ class BusinessProcessAgentAcceptanceIT {
         }
 
         private Driver(ExpenseAcceptanceManifestDTO manifest, ExpenseAcceptanceHarness harness, Map<StoreOwner, StoreAccess> stores,
-                       Map<Long, Properties> tenantSettings, HttpClient http, RenderedRelease release, S12ChildLogPrivacy logs) {
+                       Map<Long, Properties> tenantSettings, HttpClient http, RenderedRelease release, S12ChildLogPrivacy logs,
+                       boolean workerReceiptEvidence) {
             this.logs = logs;
+            this.workerReceiptEvidence = workerReceiptEvidence;
             this.manifest = manifest;
             this.harness = harness;
             this.stores = Map.copyOf(stores);
@@ -1149,6 +1163,44 @@ class BusinessProcessAgentAcceptanceIT {
                     .orElseThrow();
         }
 
+        private Optional<S12WorkerReceiptCorrelationEvidence.WorkerRow> workerBusinessReceipt(RunDTO run, String taskId) {
+            String idempotencyKey = FlowableWorkerService.workerOccurrenceKey(run.tenant().tenantId(), taskId);
+            return one(db(StoreOwner.BUSINESS), """
+                    SELECT source_id,tenant_id,idempotency_key,task_id,occurrence_id,topic,schema_version,effect_safety,
+                           handler_version,input_sha256,result_sha256,business_receipt_id,output_json='{}'::jsonb,committed_at
+                    FROM tianji_worker.tianji_worker_execution_receipt
+                    WHERE source_id=? AND tenant_id=? AND idempotency_key=? LIMIT 2
+                    """, (rs, row) -> new S12WorkerReceiptCorrelationEvidence.WorkerRow(rs.getString(1), rs.getLong(2),
+                    rs.getString(3), rs.getString(4), rs.getString(5), rs.getString(6), rs.getString(7), rs.getString(8),
+                    rs.getString(9), rs.getString(10), rs.getString(11), rs.getString(12), rs.getBoolean(13),
+                    rs.getObject(14, OffsetDateTime.class).toInstant()), sourceId(run), run.tenant().tenantId(), idempotencyKey);
+        }
+
+        void verifyWorkerReceiptCorrelation(RunDTO run) {
+            require(workerReceiptEvidence && runs.get(run.instance().instanceId()) == run, "Exact S12 Worker receipt fixture scope");
+            var command = droppedComplete(run).orElseThrow();
+            var first = firstWorkerReceipts.get(run.instance().instanceId());
+            var after = workerBusinessReceipt(run, command.taskId()).orElseThrow();
+            String issuer = issuerSha(run.tenant());
+            String subject = setting(run.tenant(), "identity.worker-subject");
+            var completed = one(db(StoreOwner.PROCESS), """
+                    SELECT tenant_id,subject_issuer,subject_id,scope_id,job_id,occurrence_id,idempotency_key,topic,schema_version,
+                           state,business_receipt_id,result_sha256,decided_at
+                    FROM tianji_process.tianji_worker_lease_receipt
+                    WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND scope_type='BPMN' AND scope_id=?
+                      AND release_key=? AND model_sha256=? AND element_id='reserveExpense' AND token_sha256=?
+                      AND state='COMPLETED' LIMIT 2
+                    """, (rs, row) -> new S12WorkerReceiptCorrelationEvidence.ProcessRow(rs.getLong(1), rs.getString(2),
+                    rs.getString(3), rs.getString(4), rs.getString(5), rs.getString(6), rs.getString(7), rs.getString(8),
+                    rs.getString(9), rs.getString(10), rs.getString(11), rs.getString(12), rs.getObject(13, OffsetDateTime.class).toInstant()),
+                    run.tenant().tenantId(), issuer, subject, run.instance().instanceId(), RELEASE, release.bpmnSha(),
+                    WorkerLeaseStore.tokenHash(command.leaseToken())).orElseThrow();
+            var scope = new S12WorkerReceiptCorrelationEvidence.Scope(run.tenant().tenantId(), sourceId(run),
+                    run.instance().instanceId(), issuer, subject);
+            S12WorkerReceiptCorrelationEvidence.verify(scope, command, effects(run).originalReceiptId(), first, after,
+                    completed, nativeActivityCount(run, "reserveExpense"));
+        }
+
         private Optional<String> agentStatus(RunDTO run, String agentRunId) {
             return ownedAgentRun(run, agentRunId).map(OwnedAgentRunDTO::status);
         }
@@ -1243,6 +1295,11 @@ class BusinessProcessAgentAcceptanceIT {
                     || leaseRows(run, "reserveExpense").stream().noneMatch(row -> row.jobId().equals(request.jobId())
                     && row.occurrenceId().equals(window.occurrenceId()) && "LEASED".equals(row.state()) && row.tokenSha256().equals(WorkerLeaseStore.tokenHash(token)))) {
                 return false;
+            }
+            if (workerReceiptEvidence && window.phase() == FaultPhase.DROP_COMMITTED_WORKER_COMPLETE_200) {
+                var first = workerBusinessReceipt(run, request.jobId()).orElseThrow();
+                var previous = firstWorkerReceipts.putIfAbsent(window.instanceId(), first);
+                if (previous != null && !previous.equals(first)) return false;
             }
             var old = new CompleteWorkerTaskCommand(request.jobId(), window.occurrenceId(), token, receiptId, Map.of());
             var previous = dropped.putIfAbsent(window.instanceId(), old);
@@ -1350,6 +1407,7 @@ class BusinessProcessAgentAcceptanceIT {
             }
             http.close();
             dropped.clear();
+            firstWorkerReceipts.clear();
             if (failed) throw new IllegalStateException("Expense fixture could not stop an owned resource");
         }
 
