@@ -17,6 +17,7 @@ import top.egon.cola.platform.tianji.agent.application.tool.HistoricalToolReceip
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolReceiptCutForkHandoff.Cut;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetSettlement;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -36,6 +37,8 @@ import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
@@ -49,7 +52,14 @@ import top.egon.cola.platform.tianji.contract.orchestration.StartProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
 
+import java.io.IOException;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.math.BigDecimal;
 import java.sql.Timestamp;
 import java.time.Duration;
@@ -75,6 +85,11 @@ import static org.junit.jupiter.api.Assertions.*;
 @EnabledIfSystemProperty(named = "tianji.tool.journal.postgres.test.url", matches = ".+")
 @Timeout(120)
 class ToolExecutionJournalPostgresTest {
+    private static final String RECEIPT_CUT_CHILD = "tianji.tool.journal.postgres.start-receipt-cut.child";
+    private static final String RECEIPT_CUT_DIRECTORY = "tianji-tool-receipt-cut-";
+    private static final String RECEIPT_CUT_MARKER = "committed";
+    private static final int RECEIPT_CUT_MARKER_BYTES = 111;
+    private static final long RECEIPT_CUT_SECONDS = 16;
     private static final URI RESOURCE = URI.create("https://agent.example/api");
     private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER,
             "reviewer" + "界".repeat(248), "https://idp.example/20");
@@ -325,6 +340,298 @@ class ToolExecutionJournalPostgresTest {
             return applied ? Optional.of(new ObservationVO(target, EXECUTOR,
                     new ProcessStartReceiptDTO(instanceId, ProcessStartReceiptDTO.StatusEnum.APPLIED, processRecordedAt),
                     "tianji:ps-start:v1:" + "d".repeat(64), deadlineAt)) : Optional.empty();
+        }
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "tianji.tool.journal.postgres.start-receipt-cut", matches = "true")
+    void preserves_a_committed_local_start_receipt_after_forced_exit_before_accounting() throws Exception {
+        String url = System.getProperty("tianji.tool.journal.postgres.test.url");
+        String databaseName = ToolReceiptCutForkHandoff.databaseName(url);
+        var database = disposableDatabase();
+        var jdbc = database.jdbc();
+        String setupRole = jdbc.queryForObject("SELECT current_user", String.class);
+        var request = new ToolReceiptCutForkHandoff(url, setupRole,
+                System.getProperty("tianji.tool.journal.postgres.vector.version"));
+        assertReceiptCutDatabase(jdbc, databaseName, request);
+        var migrations = flyway(database.source(), "13");
+        assertEquals(13, migrations.migrate().migrationsExecuted);
+        migrations.validate();
+
+        var ledger = new AgentLedgerService(database.source());
+        var directory = Files.createTempDirectory(RECEIPT_CUT_DIRECTORY,
+                PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"))).toRealPath();
+        var marker = directory.resolve(RECEIPT_CUT_MARKER);
+        Cut cut;
+        ReceiptProof recorded;
+        AgentRunDTO active;
+        try {
+            var child = startReceiptCutChild(request, marker);
+            try {
+                assertNotEquals(ProcessHandle.current().pid(), child.pid());
+                cut = awaitReceiptCut(child, marker);
+                recorded = readCommittedReceipt(jdbc, cut);
+                active = ledger.get(ACTOR, new GetAgentRunQuery(cut.runId()));
+                assertEquals(AgentRunStatusEnum.RUNNING, active.status());
+                assertEquals(1, active.attempt());
+                assertEquals("RESERVED", recorded.budgetState());
+                assertNotNull(recorded.leaseExpiresAt());
+                assertTrue(ledger.getResult(ACTOR, new GetAgentRunQuery(cut.runId())).isEmpty());
+                assertTrue(child.isAlive(), "original recorder must still be parked before accounting");
+            } finally {
+                reapReceiptCutChild(child);
+            }
+            assertNotEquals(0, child.exitValue());
+        } finally {
+            Files.deleteIfExists(marker);
+            Files.deleteIfExists(directory);
+        }
+
+        assertEquals(recorded, readCommittedReceipt(jdbc, cut));
+        var replacementSource = receiptCutDataSource(url, setupRole);
+        var replacementJdbc = new JdbcTemplate(replacementSource);
+        replacementJdbc.setQueryTimeout(5);
+        assertReceiptCutDatabase(replacementJdbc, databaseName, request);
+        var replacement = new AgentLedgerService(replacementSource);
+        var query = new GetAgentRunQuery(cut.runId());
+        var previousLease = new AgentRunLease(cut.runId(), recorded.leaseOwner(), recorded.leaseEpoch(), recorded.leaseExpiresAt());
+        assertEquals(1, replacementJdbc.update("""
+                UPDATE ONLY tianji_agent.agent_run SET lease_expires_at=clock_timestamp()-interval '1 second'
+                WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?
+                  AND status='RUNNING' AND revision=? AND last_event_sequence=? AND lease_owner=? AND lease_epoch=?
+                  AND lease_expires_at=? AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()
+                """, ACTOR.tenantId(), ACTOR.subjectType().name(), ACTOR.issuerFingerprint(), ACTOR.subjectId(), cut.runId(),
+                active.revision(), active.lastEventSequence(), previousLease.owner(), previousLease.epoch(),
+                Timestamp.from(previousLease.expiresAt())));
+        assertEquals(1, replacement.reconcileDue(1));
+        assertEquals(0, replacement.reconcileDue(1));
+        var suspended = replacement.get(ACTOR, query);
+        assertEquals(AgentRunStatusEnum.SUSPENDED, suspended.status());
+        assertEquals("LEASE_EXPIRED", suspended.waitReason());
+        assertEquals(active.attempt(), suspended.attempt());
+        assertEquals(active.revision() + 1, suspended.revision());
+        assertEquals(active.lastEventSequence() + 1, suspended.lastEventSequence());
+        var events = replacement.events(ACTOR, new AgentEventsQuery(cut.runId(), active.lastEventSequence(), 2));
+        assertEquals(1, events.size());
+        assertEquals("RUN_STATUS_CHANGED", events.getFirst().type());
+        assertEquals(Map.of("from", "RUNNING", "status", "SUSPENDED", "reason", "LEASE_EXPIRED"), events.getFirst().payload());
+        assertEquals(LeaseHeartbeat.LEASE_LOST, replacement.heartbeat(ACTOR, previousLease, Duration.ofSeconds(5)));
+        assertTrue(replacement.pendingRuns(1).isEmpty());
+        assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> replacement.claim(ACTOR, query, suspended.revision(), "tool-cut-replacement", Duration.ofSeconds(5))).code());
+        assertTrue(replacement.getResult(ACTOR, query).isEmpty());
+
+        var retained = readCommittedReceipt(replacementJdbc, cut);
+        assertEquals(recorded.facts(), retained.facts());
+        assertEquals("UNKNOWN", retained.budgetState());
+        assertEquals(recorded.leaseEpoch() + 1, retained.leaseEpoch());
+        assertNull(retained.leaseOwner());
+        assertNull(retained.leaseExpiresAt());
+        var disposition = replacement.inspectRecovery(ACTOR, query);
+        assertEquals(AgentLedgerService.AgentRecoveryLifecycleEnum.STALLED, disposition.lifecycle());
+        assertEquals(AgentLedgerService.AgentRecoveryReasonEnum.LEASE_EXPIRED, disposition.reason());
+        assertEquals(AgentLedgerService.AgentRecoveryEffectEnum.UNVERIFIED, disposition.agentEffect());
+        assertEquals(new AgentLedgerService.AgentRecoveryToolEvidenceDTO(
+                AgentLedgerService.AgentRecoveryToolCoverageEnum.COMPLETE, false, false, false, true), disposition.toolEvidence());
+        assertEquals(suspended, replacement.get(ACTOR, query));
+        assertEquals(retained, readCommittedReceipt(replacementJdbc, cut));
+    }
+
+    public static void main(String[] arguments) throws Exception {
+        if (!Boolean.getBoolean(RECEIPT_CUT_CHILD) || arguments.length != 1) {
+            throw new IllegalArgumentException("Disposable Tool receipt cut child is disabled");
+        }
+        var request = ToolReceiptCutForkHandoff.receive(System.in);
+        var marker = Path.of(arguments[0]);
+        var directory = marker.getParent();
+        if (!marker.isAbsolute() || directory == null || !directory.equals(directory.toRealPath())
+                || !directory.getFileName().toString().startsWith(RECEIPT_CUT_DIRECTORY)
+                || !Files.getPosixFilePermissions(directory, LinkOption.NOFOLLOW_LINKS)
+                        .equals(PosixFilePermissions.fromString("rwx------"))
+                || !RECEIPT_CUT_MARKER.equals(marker.getFileName().toString())
+                || Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("Invalid disposable Tool receipt cut marker");
+        }
+        var source = receiptCutDataSource(request.url(), request.setupRole());
+        var jdbc = new JdbcTemplate(source);
+        jdbc.setQueryTimeout(5);
+        assertReceiptCutDatabase(jdbc, ToolReceiptCutForkHandoff.databaseName(request.url()), request);
+        flyway(source, "13").validate();
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run", Integer.class));
+        var ledger = new AgentLedgerService(source);
+        var capabilities = new ToolCapabilityStore(source, ledger);
+        capabilities.verifyStorage();
+        var fixture = new StartRecorderFixture(source, jdbc, ledger, capabilities);
+        var cut = new Cut(fixture.run.runId(), fixture.request.invocationId(),
+                UUID.fromString(fixture.request.action().intentId()));
+        var calls = new AtomicInteger();
+        var transport = controlledStartTransport(operation -> {
+            assertEquals(1, calls.incrementAndGet());
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals("DISPATCHING", invocationState(jdbc, fixture.request));
+            var action = writeActionFacts(jdbc, fixture.request.action());
+            assertEquals("DISPATCHING", action.get("state"));
+            assertEquals("UNKNOWN", action.get("side_effect_outcome"));
+            assertNull(action.get("business_receipt_id"));
+            assertEquals("RESERVED", startBudgetState(jdbc, fixture.request));
+            return startObservation();
+        }, false);
+        fixture.recorder.executeIdempotentStart(transport, fixture.request, status -> {
+            assertEquals(ToolExecutionOutcome.Status.SUCCEEDED, status);
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals(1, calls.get());
+            assertEquals("RESERVED", readCommittedReceipt(jdbc, cut).budgetState());
+            try {
+                Files.createFile(marker, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
+                Files.writeString(marker, cut.encode(), StandardCharsets.US_ASCII, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS);
+                new CountDownLatch(1).await(RECEIPT_CUT_SECONDS * 2, TimeUnit.SECONDS);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("Tool receipt cut child was interrupted before force-stop", interrupted);
+            } catch (IOException failure) {
+                throw new AssertionError("Tool receipt cut child could not write its acknowledgement", failure);
+            }
+            fail("Tool receipt cut child exceeded its wait before force-stop");
+        });
+        fail("original Tool recorder returned before force-stop");
+    }
+
+    private static ReceiptProof readCommittedReceipt(JdbcTemplate jdbc, Cut cut) {
+        return jdbc.queryForObject("""
+                SELECT to_jsonb(i)::text AS invocation,to_jsonb(a)::text AS action,b.reservation_id,
+                       b.lease_epoch AS budget_epoch,b.state AS budget_state,r.lease_epoch,r.lease_owner,r.lease_expires_at
+                FROM ONLY tianji_agent.agent_tool_invocation i
+                JOIN ONLY tianji_agent.agent_tool_action_intent a
+                  ON (a.tenant_id,a.intent_id,a.dispatch_run_id,a.dispatch_invocation_id,a.dispatch_epoch,
+                      a.dispatch_nonce_sha256,a.executor_issuer,a.executor_id)=
+                     (i.tenant_id,i.intent_id,i.run_id,i.invocation_id,i.dispatch_epoch,
+                      i.dispatch_nonce_sha256,i.executor_issuer,i.executor_id)
+                JOIN ONLY tianji_agent.agent_run r ON (r.tenant_id,r.run_id)=(i.tenant_id,i.run_id)
+                JOIN ONLY tianji_agent.agent_budget_reservation b
+                  ON (b.tenant_id,b.run_id,b.reservation_id)=(i.tenant_id,i.run_id,i.reservation_id)
+                WHERE i.tenant_id=? AND i.run_id=? AND i.invocation_id=? AND i.intent_id=?
+                  AND (r.subject_type,r.subject_issuer,r.subject_id)=(?,?,?)
+                  AND (i.owner_type,i.owner_issuer,i.owner_id)=(r.subject_type,r.subject_issuer,r.subject_id)
+                  AND (a.owner_type,a.owner_issuer,a.owner_id)=(r.subject_type,r.subject_issuer,r.subject_id)
+                  AND a.origin_run_id=r.run_id AND i.tool_key='process.recordedStart' AND i.tool_version=1
+                  AND i.risk='IDEMPOTENT_WRITE' AND i.executor_issuer=? AND i.executor_id=?
+                  AND i.dispatch_epoch=1 AND i.state='SUCCEEDED' AND a.state='APPLIED'
+                  AND i.side_effect_outcome='CONFIRMED' AND a.side_effect_outcome='CONFIRMED'
+                  AND i.business_receipt_id=? AND a.business_receipt_id=i.business_receipt_id
+                  AND i.outcome=a.result AND i.outcome->'output'->>'instanceId'=?
+                  AND i.finished_at IS NOT NULL AND a.closed_at IS NOT NULL AND b.kind='TOOL'
+                  AND b.actual_cost IS NULL AND b.actual_input_tokens IS NULL AND b.actual_output_tokens IS NULL
+                  AND ((b.state='RESERVED' AND b.settled_at IS NULL AND r.active_tool_calls=1)
+                    OR (b.state='UNKNOWN' AND b.settled_at IS NOT NULL AND r.active_tool_calls=0))
+                  AND r.result IS NULL AND r.finished_at IS NULL AND r.tool_calls_reserved=1 AND r.model_calls_reserved=0
+                  AND NOT EXISTS (SELECT 1 FROM ONLY tianji_agent.agent_event e
+                        WHERE (e.tenant_id,e.run_id)=(r.tenant_id,r.run_id)
+                          AND e.event_type IN ('TOOL_FINISHED','AGENT_OUTPUT'))
+                  AND (SELECT count(*) FROM ONLY tianji_agent.agent_tool_invocation x
+                        WHERE (x.tenant_id,x.run_id)=(r.tenant_id,r.run_id))=1
+                  AND (SELECT count(*) FROM ONLY tianji_agent.agent_budget_reservation x
+                        WHERE (x.tenant_id,x.run_id)=(r.tenant_id,r.run_id))=1
+                """, (row, index) -> {
+                    var expiration = row.getTimestamp("lease_expires_at");
+                    return new ReceiptProof(new ReceiptFacts(row.getString("invocation"), row.getString("action"),
+                            row.getString("reservation_id"), row.getLong("budget_epoch")), row.getString("budget_state"),
+                            row.getLong("lease_epoch"), row.getString("lease_owner"), expiration == null ? null : expiration.toInstant());
+                }, ACTOR.tenantId(), cut.runId(), cut.invocationId(), cut.intentId(), ACTOR.subjectType().name(),
+                ACTOR.issuerFingerprint(), ACTOR.subjectId(), EXECUTOR.issuerFingerprint(), EXECUTOR.subjectId(),
+                startObservation().hostReceiptReference(), startObservation().instanceId());
+    }
+
+    private record ReceiptFacts(String invocation, String action, String reservationId, long budgetEpoch) {
+        @Override public String toString() { return "ReceiptFacts[redacted]"; }
+    }
+
+    private record ReceiptProof(ReceiptFacts facts, String budgetState, long leaseEpoch, String leaseOwner,
+                                Instant leaseExpiresAt) {
+        @Override public String toString() { return "ReceiptProof[redacted]"; }
+    }
+
+    private static void assertReceiptCutDatabase(JdbcTemplate jdbc, String databaseName, ToolReceiptCutForkHandoff request) {
+        assertTrue(Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT current_database()=? AND current_user=? AND inet_server_addr()=inet '127.0.0.1'
+                  AND NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8'
+                  AND current_setting('session_replication_role')='origin' AND current_setting('transaction_read_only')='off'
+                """, Boolean.class, databaseName, request.setupRole())));
+        assertEquals(request.vectorVersion(), jdbc.queryForObject("""
+                SELECT e.extversion FROM pg_catalog.pg_extension e
+                JOIN pg_catalog.pg_namespace n ON n.oid=e.extnamespace
+                WHERE e.extname='vector' AND n.nspname='public'
+                """, String.class));
+    }
+
+    private static DriverManagerDataSource receiptCutDataSource(String url, String role) {
+        var source = new DriverManagerDataSource(url);
+        source.setUsername(role);
+        var limits = new Properties();
+        limits.setProperty("connectTimeout", "3");
+        limits.setProperty("loginTimeout", "3");
+        limits.setProperty("socketTimeout", "8");
+        limits.setProperty("options", "-c statement_timeout=6000 -c lock_timeout=2000");
+        source.setConnectionProperties(limits);
+        return source;
+    }
+
+    private static Process startReceiptCutChild(ToolReceiptCutForkHandoff request, Path marker) throws IOException {
+        String classpath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
+        if (classpath == null || classpath.isBlank()) throw new IllegalStateException("Tool receipt cut child classpath is missing");
+        var java = Path.of(System.getProperty("java.home"), "bin", "java").toRealPath();
+        var builder = new ProcessBuilder(java.toString(), "-D" + RECEIPT_CUT_CHILD + "=true",
+                "-Dotel.traces.exporter=none", "-Dotel.metrics.exporter=none", "-Dotel.logs.exporter=none",
+                "-cp", classpath, ToolExecutionJournalPostgresTest.class.getName(), marker.toString())
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
+        builder.environment().clear();
+        builder.environment().put("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "false");
+        var child = builder.start();
+        try {
+            try (var pipe = child.getOutputStream()) {
+                request.send(pipe);
+            }
+            return child;
+        } catch (IOException | RuntimeException failure) {
+            try { reapReceiptCutChild(child); }
+            catch (RuntimeException | AssertionError cleanup) { failure.addSuppressed(cleanup); }
+            throw failure;
+        }
+    }
+
+    private static Cut awaitReceiptCut(Process child, Path marker) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(RECEIPT_CUT_SECONDS);
+        while (System.nanoTime() - deadline < 0 && child.isAlive()) {
+            if (Files.isRegularFile(marker, LinkOption.NOFOLLOW_LINKS)) {
+                assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(marker, LinkOption.NOFOLLOW_LINKS));
+                try (var stream = Files.newInputStream(marker, LinkOption.NOFOLLOW_LINKS)) {
+                    byte[] bytes = stream.readNBytes(RECEIPT_CUT_MARKER_BYTES + 1);
+                    assertTrue(bytes.length <= RECEIPT_CUT_MARKER_BYTES);
+                    if (bytes.length == RECEIPT_CUT_MARKER_BYTES) {
+                        return Cut.decode(new String(bytes, StandardCharsets.US_ASCII));
+                    }
+                }
+            }
+            Thread.sleep(20);
+        }
+        return fail("original recorder did not acknowledge the committed local Tool receipt");
+    }
+
+    private static void reapReceiptCutChild(Process child) {
+        if (child.isAlive()) child.destroyForcibly();
+        boolean interrupted = Thread.interrupted();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(RECEIPT_CUT_SECONDS);
+        try {
+            while (child.isAlive()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) fail("Tool receipt cut child was not reaped");
+                try {
+                    assertTrue(child.waitFor(remaining, TimeUnit.NANOSECONDS), "Tool receipt cut child was not reaped");
+                } catch (InterruptedException waitInterrupted) {
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
     }
 
