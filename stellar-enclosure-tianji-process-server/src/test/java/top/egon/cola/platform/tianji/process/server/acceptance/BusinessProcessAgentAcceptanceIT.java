@@ -172,6 +172,7 @@ class BusinessProcessAgentAcceptanceIT {
                 case RECEIVE_LINK_REPLAY -> "tianji.s12.receive-link-replay.manifest";
                 case S07_GOVERNED_START -> "tianji.s07.governed-start.manifest";
                 case S07_APPROVED_START -> "tianji.s07.approved-start.manifest";
+                case S11_HISTORICAL_START_CUT -> "tianji.s11.historical-start-cut.manifest";
                 case S12_OWNER_OBSERVATION -> "tianji.s12.owner-observation.manifest";
                 case S12_MODEL_USAGE -> "tianji.s12.model-usage.manifest";
                 case S12_METRICS -> logs == null
@@ -296,6 +297,17 @@ class BusinessProcessAgentAcceptanceIT {
             put(agent, fixture + "observer-password", value(privateProperties(businessStore.credentialFile()), "observer.password"));
             put(agent, fixture + "bpmn-sha256", S07GovernedStartFixture.BPMN_SHA);
             put(agent, fixture + "dmn-sha256", S07GovernedStartFixture.DMN_SHA);
+            if (manifest.suite() == Suite.S11_HISTORICAL_START_CUT) {
+                String prefix = "tianji.expense.fixture.s11-cut.";
+                put(agent, prefix + "marker", historicalStartCutMarker().toString());
+                for (var owner : List.of(StoreOwner.AGENT, StoreOwner.PROCESS)) {
+                    var store = binding(owner);
+                    String observer = prefix + owner.name().toLowerCase(Locale.ROOT) + "-observer-";
+                    put(agent, observer + "url", store.jdbcUrl());
+                    put(agent, observer + "role", store.observerRole());
+                    put(agent, observer + "password", value(privateProperties(store.credentialFile()), "observer.password"));
+                }
+            }
             if (approved) {
                 var processStore = binding(StoreOwner.PROCESS);
                 put(agent, fixture + "approval-observer-url", processStore.jdbcUrl());
@@ -338,6 +350,72 @@ class BusinessProcessAgentAcceptanceIT {
             }
             configs.put(ChildRole.AGENT, Map.copyOf(agent));
             startChild(ChildRole.AGENT);
+        }
+
+        private Path historicalStartCutMarker() {
+            return Path.of(manifest.outputDirectory()).resolve("s11-start-cut-" + manifest.runId() + ".txt");
+        }
+
+        void verifyHistoricalStartCut() throws IOException {
+            require(manifest.suite() == Suite.S11_HISTORICAL_START_CUT, "Exact S11 historical START cut suite");
+            var tenant = tenants().getFirst();
+            String businessKey = S07GovernedStartFixture.businessKey(tenant.tenantId());
+            var client = new HttpAgentClient(URI.create(manifest.endpoints().agent()), http,
+                    token(tenant, "token.agent-owner"), NETWORK, 0, Duration.ZERO);
+            var run = startGovernedRun(client, businessKey, "s11-start-cut");
+            assertEquals(top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum.FAILED, run.status());
+            var marker = historicalStartCutMarker();
+            harness.await(Phase.STANDARD_PATH, () -> Files.isRegularFile(marker, java.nio.file.LinkOption.NOFOLLOW_LINKS)
+                    ? Optional.of(marker) : Optional.empty());
+            var attrs = Files.readAttributes(marker, java.nio.file.attribute.PosixFileAttributes.class,
+                    java.nio.file.LinkOption.NOFOLLOW_LINKS);
+            require(attrs.isRegularFile() && attrs.size() <= 512
+                    && attrs.owner().getName().equals(System.getProperty("user.name"))
+                    && attrs.permissions().equals(java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")),
+                    "Private committed START cut marker");
+            List<String> fields = Files.readAllLines(marker, java.nio.charset.StandardCharsets.UTF_8);
+            require(fields.size() == 4 && run.runId().equals(fields.getFirst()), "Exact observed Agent run");
+            UUID intent = UUID.fromString(fields.get(1));
+            String instance = new GetProcessInstanceQuery(fields.get(2)).instanceId();
+            var command = new StartProcessCommand(S07GovernedStartFixture.BPMN, S07GovernedStartFixture.RELEASE,
+                    businessKey, intent.toString(), intent.toString(), Map.of("amount", S07GovernedStartFixture.AMOUNT));
+            require(OrchestrationRequestDigests.start(command).equals(fields.get(3)), "Exact Process START digest");
+            String issuer = issuerSha(tenant);
+            String executor = setting(tenant, "s07.service-subject");
+            harness.await(Phase.STANDARD_PATH, () -> one(db(StoreOwner.AGENT), """
+                    SELECT true FROM tianji_agent.agent_tool_action_intent a
+                    JOIN tianji_agent.agent_tool_invocation i
+                      ON (i.tenant_id,i.run_id,i.invocation_id,i.intent_id)=(a.tenant_id,a.dispatch_run_id,a.dispatch_invocation_id,a.intent_id)
+                    JOIN tianji_agent.agent_budget_reservation b
+                      ON (b.tenant_id,b.run_id,b.reservation_id)=(i.tenant_id,i.run_id,i.reservation_id)
+                    JOIN tianji_agent.agent_run r ON (r.tenant_id,r.run_id,r.subject_type,r.subject_issuer,r.subject_id)=
+                      (a.tenant_id,a.dispatch_run_id,a.owner_type,a.owner_issuer,a.owner_id)
+                    WHERE a.tenant_id=? AND a.owner_type='USER' AND a.owner_issuer=? AND a.owner_id=?
+                      AND a.intent_id=? AND a.business_key=? AND a.origin_run_id=? AND a.dispatch_run_id=?
+                      AND a.executor_issuer=? AND a.executor_id=? AND a.dispatch_epoch=1
+                      AND i.executor_issuer=a.executor_issuer AND i.executor_id=a.executor_id
+                      AND i.dispatch_epoch=a.dispatch_epoch AND i.dispatch_nonce_sha256=a.dispatch_nonce_sha256
+                      AND a.state='UNKNOWN' AND i.state='UNKNOWN' AND a.side_effect_outcome='UNKNOWN' AND i.side_effect_outcome='UNKNOWN'
+                      AND b.state='UNKNOWN' AND i.error_code='OUTCOME_UNKNOWN'
+                      AND a.business_receipt_id IS NULL AND i.business_receipt_id IS NULL
+                      AND r.status='FAILED' AND r.lease_owner IS NULL AND r.lease_expires_at IS NULL
+                      AND i.dispatch_not_after<=pg_catalog.clock_timestamp()
+                    """, (rs, row) -> rs.getBoolean(1), tenant.tenantId(), issuer, tenant.ownerSubject(), intent, businessKey,
+                    run.runId(), run.runId(), issuer, executor));
+            assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.tianji_process_command_receipt
+                    WHERE tenant_id=? AND subject_type='SERVICE' AND subject_issuer=? AND subject_id=?
+                      AND command_type='START' AND command_id=? AND request_sha256=? AND release_key=?
+                      AND correlation_id=? AND state='APPLIED' AND resource_id=?
+                    """, tenant.tenantId(), issuer, executor, command.commandId(), fields.get(3), command.releaseVersion(),
+                    command.correlationId(), instance));
+            assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.act_hi_procinst WHERE tenant_id_=? AND business_key_=?
+                    """, Long.toString(tenant.tenantId()), businessKey));
+            assertEquals(1L, count(db(StoreOwner.PROCESS), """
+                    SELECT count(*) FROM tianji_process.act_ru_task
+                    WHERE tenant_id_=? AND proc_inst_id_=? AND task_def_key_='review'
+                    """, Long.toString(tenant.tenantId()), instance));
         }
 
         void verifyGovernedStart() {

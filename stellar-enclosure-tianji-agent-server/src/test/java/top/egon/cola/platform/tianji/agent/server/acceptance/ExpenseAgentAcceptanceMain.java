@@ -87,7 +87,9 @@ public final class ExpenseAgentAcceptanceMain {
         try {
             Properties settings = privateChildSettings(args, "AGENT");
             boolean s07 = "true".equals(settings.getProperty(FIXTURE + "s07-governed-start"));
-            if ("true".equals(settings.getProperty(FIXTURE + "s07-approved-start")) && !s07) throw unavailable();
+            boolean historicalCut = "true".equals(settings.getProperty(FIXTURE + "s11-historical-start-cut"));
+            boolean approved = "true".equals(settings.getProperty(FIXTURE + "s07-approved-start"));
+            if (approved && !s07 || historicalCut && (!s07 || approved)) throw unavailable();
             boolean modelUsage = "true".equals(settings.getProperty(FIXTURE + "s12-model-usage"));
             String usageEnabled = settings.getProperty("stellar.tianji.agent.storage.model-usage-enabled", "false");
             String usageRoute = settings.getProperty("stellar.tianji.agent.storage.model-usage-cumulative-route-refs[0]");
@@ -115,6 +117,11 @@ public final class ExpenseAgentAcceptanceMain {
                                     "s07BoundToolFixture", plan.properties()));
                             ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
                                     "s07FixturePlan", S07GovernedStartAgentFixtureConfiguration.FixturePlan.class, () -> plan);
+                            if (historicalCut) {
+                                ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
+                                        "s11HistoricalStartLoss", S11HistoricalStartLoss.class,
+                                        () -> S11HistoricalStartLoss.create(settings, plan));
+                            }
                             if (plan.approvals() != null) {
                                 ((org.springframework.context.support.GenericApplicationContext) context).registerBean(
                                         "tianjiToolApprovalReceiptResolver",

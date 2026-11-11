@@ -458,6 +458,9 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
             values.setProperty(prefix + "s07-governed-start", "true");
             if (manifest.suite() == Suite.S07_APPROVED_START) values.setProperty(prefix + "s07-approved-start", "true");
         }
+        if (role == ChildRole.AGENT && manifest.suite() == Suite.S11_HISTORICAL_START_CUT) {
+            values.setProperty(prefix + "s11-historical-start-cut", "true");
+        }
         if (role == ChildRole.AGENT && manifest.suite() == Suite.S12_MODEL_USAGE) {
             values.setProperty(prefix + "s12-model-usage", "true");
         }
@@ -812,11 +815,13 @@ final class ExpenseAcceptanceHarness implements AutoCloseable {
 
     enum Suite {
         BUSINESS, RECOVERY, RECEIVE_LINK, RECEIVE_LINK_REPLAY, S12_METRICS, S12_OWNER_OBSERVATION, S12_MODEL_USAGE,
-        S07_GOVERNED_START, S07_APPROVED_START;
+        S07_GOVERNED_START, S07_APPROVED_START, S11_HISTORICAL_START_CUT;
 
         boolean collectsMetrics() { return this == S12_METRICS || this == S12_OWNER_OBSERVATION; }
 
-        boolean isS07() { return this == S07_GOVERNED_START || this == S07_APPROVED_START; }
+        boolean isS07() {
+            return this == S07_GOVERNED_START || this == S07_APPROVED_START || this == S11_HISTORICAL_START_CUT;
+        }
 
         boolean observesReceiveLinks() {
             return this == RECEIVE_LINK || this == RECEIVE_LINK_REPLAY;
