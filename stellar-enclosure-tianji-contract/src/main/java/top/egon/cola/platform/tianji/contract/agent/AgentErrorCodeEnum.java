@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.contract.agent;
 
+import com.fasterxml.jackson.annotation.JsonValue;
+
 /** Stable external codes; transport status and retry policy are supplied by the service. */
 public enum AgentErrorCodeEnum {
     TIANJI_INVALID_COMMAND,
@@ -25,5 +27,11 @@ public enum AgentErrorCodeEnum {
     TIANJI_RUN_INTERRUPTED,
     TIANJI_SIDE_EFFECT_UNKNOWN,
     TIANJI_DISPATCH_EXPIRED,
-    TIANJI_DISPATCH_CLOSED
+    TIANJI_DISPATCH_CLOSED,
+    TIANJI_INTERNAL_ERROR;
+
+    @JsonValue
+    public String wire() {
+        return name();
+    }
 }
