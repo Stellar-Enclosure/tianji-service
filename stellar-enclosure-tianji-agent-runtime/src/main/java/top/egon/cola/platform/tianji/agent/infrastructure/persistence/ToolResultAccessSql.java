@@ -59,6 +59,7 @@ final class ToolResultAccessSql {
         var action = request.descriptor().policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
                 ? intents.lockForApproval(request.action(), request.descriptor(), deadline)
                 : intents.lockForWrite(request.action(), request.descriptor(), deadline);
+        if (action.profile() != ToolExecutionJsonCodec.ActionProfile.LEGACY_V1) throw unavailable();
         if (!action.action().requestSha256().equals(request.action().requestSha256()) || !action.action().intentId().equals(request.action().intentId())
                 || !action.descriptor().equals(request.descriptor())) throw conflict();
         var outcome = action.outcome();
@@ -70,7 +71,7 @@ final class ToolResultAccessSql {
         } catch (AgentLedgerException scopedFailure) { throw scopedFailure; }
         catch (RuntimeException privateSource) { throw unavailable(); }
         String fingerprint = OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_RESULT_ACCESS_SOURCE_V1", action.action().intentId(), Long.toString(action.revision()),
-                action.action().requestSha256(), codec.outcome(request.descriptor(), outcome)), Map.of());
+                action.action().requestSha256(), codec.outcome(action.profile(), request.descriptor(), outcome)), Map.of());
         if (existing.isPresent()) {
             var stored = read(request, deadline, true).orElseThrow(ToolResultAccessSql::unavailable);
             sameSource(stored, action.revision(), fingerprint); requireRun(request, expectedToolTimeout, deadline);

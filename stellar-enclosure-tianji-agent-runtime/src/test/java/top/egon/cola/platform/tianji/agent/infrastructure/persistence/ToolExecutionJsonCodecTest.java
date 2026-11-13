@@ -70,6 +70,34 @@ class ToolExecutionJsonCodecTest {
         assertSanitized(() -> codec.outcome(json.replace("\"businessReceiptId\":\"process-1\"", "\"businessReceiptId\":null"), descriptor));
     }
 
+    @Test void outcome_profile_selects_only_its_closed_shape_and_preserves_legacy_bytes() throws Exception {
+        var result = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("reference", "process-1"), "process-1", null, null);
+        String legacy = "{\"actualCost\":null,\"businessReceiptId\":\"process-1\",\"errorCode\":null,\"output\":{\"reference\":\"process-1\"},\"status\":\"SUCCEEDED\"}";
+        String runtime = legacy.replace("\"actualCost\":null,", "");
+        var old = ToolExecutionJsonCodec.ActionProfile.LEGACY_V1;
+        var current = ToolExecutionJsonCodec.ActionProfile.RUNTIME_V2;
+        assertEquals(legacy, codec.outcome(old, descriptor, result));
+        assertEquals(result, codec.outcome(old, legacy, descriptor));
+        assertEquals(result, codec.outcome(current, runtime, descriptor));
+        assertEquals(runtime, codec.outcome(current, descriptor, result));
+        assertSanitized(() -> codec.outcome(old, runtime, descriptor));
+        assertSanitized(() -> codec.outcome(current, legacy, descriptor));
+        assertSanitized(() -> codec.outcome(null, runtime, descriptor));
+        assertSanitized(() -> codec.outcome(current, descriptor, new ToolExecutionOutcome(
+                result.status(), result.output(), result.businessReceiptId(), null, BigDecimal.ZERO)));
+        for (var key : List.of("status", "output", "businessReceiptId", "errorCode")) {
+            var value = (ObjectNode) AUDIT_JSON.readTree(runtime); value.remove(key);
+            assertSanitized(() -> codec.outcome(current, value.toString(), descriptor));
+        }
+        for (var invalid : List.of(runtime + "{}", runtime.replace("\"errorCode\":null", "\"errorCode\":false"),
+                runtime.replace("\"errorCode\":null", "\"errorCode\":null,\"errorCode\":null"),
+                runtime.replace("\"errorCode\":null", "\"errorCode\":null,\"private\":true"),
+                runtime.replace("\"businessReceiptId\":\"process-1\"", "\"businessReceiptId\":null"),
+                runtime.replace("\"SUCCEEDED\"", "\"FAILED_KNOWN\""))) {
+            assertSanitized(() -> codec.outcome(current, invalid, descriptor));
+        }
+    }
+
     @Test void null_or_invalid_private_content_is_rejected_consistently_at_every_writer_boundary() {
         var missingReceipt = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("reference", "private result"), null, null, null);
         var wrongOutput = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("reference", 20L), "process-1", null, null);

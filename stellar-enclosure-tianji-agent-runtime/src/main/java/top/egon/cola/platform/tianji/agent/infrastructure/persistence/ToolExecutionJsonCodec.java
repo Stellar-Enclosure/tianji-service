@@ -40,6 +40,7 @@ final class ToolExecutionJsonCodec {
     static final int MAX_APPROVAL_BYTES = 16 * 1024;
     private static final Set<String> AUDIT_FIELDS = Set.of("schemaVersion", "localCheckId", "boundary", "decision", "subjectType", "grantId",
             "authVersion", "catalogVersion", "policyVersion", "checkedAt", "expiresAt");
+    private static final Set<String> RUNTIME_OUTCOME_FIELDS = Set.of("status", "output", "businessReceiptId", "errorCode");
     private static final Set<String> OUTCOME_FIELDS = Set.of("status", "output", "businessReceiptId", "errorCode", "actualCost");
     private static final Set<String> PROOF_FIELDS = Set.of("schemaVersion", "source", "binding", "approval");
     private static final Set<String> SOURCE_FIELDS = Set.of("sourceId", "tenantId", "issuer", "resource");
@@ -75,6 +76,32 @@ final class ToolExecutionJsonCodec {
         try { return descriptor.input().values(mapper.readValue(bytes(json), VALUES)); }
         catch (RuntimeException | java.io.IOException malformed) { throw invalid(); }
     }
+    enum ActionProfile { LEGACY_V1, RUNTIME_V2 }
+
+    String outcome(ActionProfile profile, ToolDescriptor descriptor, ToolExecutionOutcome value) {
+        if (profile == ActionProfile.LEGACY_V1) return outcome(descriptor, value);
+        try {
+            if (profile != ActionProfile.RUNTIME_V2 || value.actualCost() != null) throw invalid();
+            var validated = value.validated(descriptor);
+            var object = mapper.createObjectNode().put("businessReceiptId", validated.businessReceiptId()).put("errorCode", validated.errorCode());
+            object.set("output", mapper.valueToTree(validated.output()));
+            object.put("status", validated.status().name());
+            return write(object);
+        } catch (RuntimeException malformed) { throw invalid(); }
+    }
+
+    ToolExecutionOutcome outcome(ActionProfile profile, String json, ToolDescriptor descriptor) {
+        if (profile == ActionProfile.LEGACY_V1) return outcome(json, descriptor);
+        try {
+            if (profile != ActionProfile.RUNTIME_V2) throw invalid();
+            var tree = fields(mapper.readTree(bytes(json)), RUNTIME_OUTCOME_FIELDS);
+            if (!tree.get("status").isTextual() || !tree.get("output").isObject()) throw invalid();
+            return new ToolExecutionOutcome(ToolExecutionOutcome.Status.valueOf(tree.get("status").textValue()),
+                    mapper.convertValue(tree.get("output"), VALUES), auditText(tree.get("businessReceiptId")),
+                    auditText(tree.get("errorCode")), null).validated(descriptor);
+        } catch (RuntimeException | java.io.IOException malformed) { throw invalid(); }
+    }
+
     String outcome(ToolDescriptor descriptor, ToolExecutionOutcome value) {
         try { return write(value.validated(descriptor)); }
         catch (RuntimeException malformed) { throw invalid(); }

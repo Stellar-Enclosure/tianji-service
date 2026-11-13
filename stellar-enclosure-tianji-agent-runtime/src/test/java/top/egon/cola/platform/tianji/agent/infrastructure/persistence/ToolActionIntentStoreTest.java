@@ -206,6 +206,74 @@ class ToolActionIntentStoreTest {
         }
     }
 
+    @Test void readiness_publishes_only_a_verified_profile_and_clears_it_after_failed_reverification() throws Exception {
+        try (var fixture = new Fixture()) {
+            fixture.seed("PREPARED");
+            var authority = mock(ToolExecutionAuthorization.class);
+            var store = fixture.store(authority);
+            assertTrue(store.historical(fixture.action, fixture.tool).isPresent());
+            fixture.storageProfile.set(ToolExecutionStorageVerifier.SchemaProfile.V17);
+            store.verifyStorage();
+            assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool));
+            fixture.row.get().put("stored_action_profile", "\"LEGACY_V1\"");
+            fixture.row.get().put("stored_dispatch_call_id", "null");
+            assertTrue(store.historical(fixture.action, fixture.tool).isPresent());
+            fixture.storageProfile.set(null);
+            assertThrows(AgentLedgerException.class, store::verifyStorage);
+            assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool));
+            verifyNoInteractions(authority);
+        }
+    }
+
+    @Test void v17_history_reads_one_exact_runtime_receipt_and_preserves_legacy_boundaries() throws Exception {
+        try (var fixture = new Fixture(RESULT_TOOL)) {
+            var stored = fixture.seed("APPLIED");
+            var runtime = ToolExecutionJsonCodec.ActionProfile.RUNTIME_V2;
+            stored.put("stored_action_profile", "\"RUNTIME_V2\"");
+            stored.put("stored_dispatch_call_id", "\"" + DISPATCH_INVOCATION + "\"");
+            stored.remove("dispatch_invocation_id");
+            stored.put("origin_runtime_snapshot_sha256", HASH);
+            stored.put("dispatch_runtime_snapshot_sha256", HASH);
+            stored.put("runtime_dispatch_matches", true);
+            stored.put("runtime_call_state", "SUCCEEDED");
+            stored.put("runtime_input_sha256", fixture.tool.parametersSha256(fixture.action.arguments()));
+            stored.put("runtime_result_sha256", HASH);
+            stored.put("dispatch_identity_matches", false);
+            stored.put("dispatch_fact_matches", false);
+            var outcome = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED,
+                    Map.of("instanceId", "private-instance"), "business-receipt-1", null, null);
+            stored.put("result", new ToolExecutionJsonCodec().outcome(runtime, fixture.tool, outcome));
+            var authority = mock(ToolExecutionAuthorization.class);
+            var store = fixture.store(authority);
+            assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool));
+            assertTrue(fixture.queries.stream().noneMatch(sql -> sql.contains("agent_runtime_call_receipt")));
+            fixture.storageProfile.set(ToolExecutionStorageVerifier.SchemaProfile.V17);
+            store.verifyStorage();
+            var row = store.historical(fixture.action, fixture.tool).orElseThrow();
+            assertEquals(runtime, row.profile());
+            assertEquals(outcome, row.outcome());
+            assertEquals(DISPATCH_INVOCATION, row.dispatch().callId());
+            assertNull(row.dispatch().invocationId());
+            assertEquals(1L, fixture.queries.stream().filter(sql -> sql.contains("agent_runtime_call_receipt")).count());
+            for (var drift : Map.of(
+                    "stored_action_profile", "\"UNKNOWN\"",
+                    "stored_dispatch_call_id", "null",
+                    "dispatch_invocation_id", DISPATCH_INVOCATION,
+                    "origin_runtime_snapshot_sha256", "0".repeat(64),
+                    "dispatch_runtime_snapshot_sha256", "0".repeat(64),
+                    "runtime_dispatch_matches", false,
+                    "runtime_input_sha256", "0".repeat(64),
+                    "runtime_call_state", "FAILED",
+                    "runtime_result_sha256", "malformed").entrySet()) {
+                Object previous = stored.put(drift.getKey(), drift.getValue());
+                assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool), drift.getKey());
+                if (previous == null) stored.remove(drift.getKey()); else stored.put(drift.getKey(), previous);
+            }
+            verifyNoInteractions(authority);
+            verify(fixture.jdbc.get(), never()).update(anyString(), any(Object[].class));
+        }
+    }
+
     @Test void historical_rows_cover_all_eight_states_without_current_authority_or_mutations() throws Exception {
         for (String state : List.of("PREPARED", "AWAITING_APPROVAL", "DISPATCHING", "APPLIED", "REJECTED", "FAILED_KNOWN", "UNKNOWN", "EXPIRED")) {
             try (var fixture = new Fixture(state.equals("AWAITING_APPROVAL") ? APPROVAL_TOOL : RESULT_TOOL)) {
@@ -472,6 +540,8 @@ class ToolActionIntentStoreTest {
         final List<String> queries = new ArrayList<>();
         final MockedConstruction<JdbcTemplate> templates;
         final MockedConstruction<ToolExecutionStorageVerifier> verifiers;
+        final AtomicReference<ToolExecutionStorageVerifier.SchemaProfile> storageProfile =
+                new AtomicReference<>(ToolExecutionStorageVerifier.SchemaProfile.LEGACY);
 
         Fixture() throws Exception { this(TOOL); }
         Fixture(ToolDescriptor selected) throws Exception {
@@ -508,7 +578,8 @@ class ToolActionIntentStoreTest {
                     row.set(stored); inserts.incrementAndGet(); return 1;
                 }).when(template).update(startsWith("INSERT INTO tianji_agent.agent_tool_action_intent"), any(Object[].class));
             });
-            verifiers = mockConstruction(ToolExecutionStorageVerifier.class);
+            verifiers = mockConstruction(ToolExecutionStorageVerifier.class, (verifier, context) ->
+                    when(verifier.verifyAndReturnProfile()).thenAnswer(call -> storageProfile.get()));
         }
 
         private Map<String, Object> matching(org.mockito.invocation.InvocationOnMock call) {

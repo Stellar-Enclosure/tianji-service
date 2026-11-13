@@ -10,6 +10,8 @@ import java.util.Optional;
 import java.util.Set;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockSettings;
+import org.mockito.MockedConstruction;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -72,14 +74,14 @@ class TianjiToolAuthorityConfigurationTest {
     @Test void both_real_stores_independently_verify_the_exact_ledger_source() {
         var source = mock(DataSource.class); var ledger = mock(AgentLedgerService.class); var pdp = mock(TianjiToolGrantAuthorizer.class);
         when(ledger.usesDataSource(source)).thenReturn(true); var checkedSources = new ArrayList<Object>();
-        try (var verifiers = mockConstruction(ToolExecutionStorageVerifier.class, (value, context) -> checkedSources.add(context.arguments().getFirst()))) {
+        try (var verifiers = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings(), (value, context) -> checkedSources.add(context.arguments().getFirst()))) {
             var capabilities = configuration.toolCapabilityStore(source, ledger, prerequisites());
             var intents = configuration.toolActionIntentStore(source, ledger, pdp, prerequisites());
             assertNotNull(capabilities); assertNotNull(intents);
             assertTrue(capabilities.usesDataSource(source)); assertTrue(capabilities.usesLedger(ledger));
             assertTrue(intents.usesDataSource(source)); assertTrue(intents.usesLedger(ledger));
             assertEquals(List.of(source, source), checkedSources); assertEquals(2, verifiers.constructed().size());
-            verifiers.constructed().forEach(value -> verify(value).verify());
+            assertBothToolReadinessChecks(verifiers);
         }
         verifyNoInteractions(source, pdp);
     }
@@ -89,7 +91,7 @@ class TianjiToolAuthorityConfigurationTest {
         assertThrows(IllegalArgumentException.class, () -> configuration.toolCapabilityStore(source, ledger, prerequisites()));
         assertThrows(IllegalArgumentException.class, () -> configuration.toolActionIntentStore(source, ledger, pdp, prerequisites()));
         when(ledger.usesDataSource(source)).thenReturn(true);
-        try (var ignored = mockConstruction(ToolExecutionStorageVerifier.class, (value, context) -> doThrow(new IllegalStateException("catalog unavailable")).when(value).verify())) {
+        try (var ignored = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings(new IllegalStateException("catalog unavailable")))) {
             assertThrows(IllegalStateException.class, () -> configuration.toolCapabilityStore(source, ledger, prerequisites()));
             assertThrows(IllegalStateException.class, () -> configuration.toolActionIntentStore(source, ledger, pdp, prerequisites()));
         }
@@ -141,7 +143,7 @@ class TianjiToolAuthorityConfigurationTest {
 
     @Test void actual_user_factories_share_one_authority_in_a_queue_only_context() {
         var fixture = new Fixture();
-        try (var oldStorage = mockConstruction(AgentStorageVerifier.class); var toolStorage = mockConstruction(ToolExecutionStorageVerifier.class)) {
+        try (var oldStorage = mockConstruction(AgentStorageVerifier.class); var toolStorage = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings())) {
             fixture.runner(false).run(context -> {
                 assertNull(context.getStartupFailure());
                 assertFalse(context.getEnvironment().getProperty("stellar.tianji.agent.runtime.enabled", Boolean.class, false));
@@ -153,7 +155,7 @@ class TianjiToolAuthorityConfigurationTest {
                 assertTrue(issuer.usesLedger(fixture.ledger)); assertTrue(issuer.usesBindings(bindings)); assertTrue(issuer.usesIssuerRegistry(fixture.issuers)); assertTrue(issuer.usesResource(RESOURCE));
                 assertTrue(pdp.usesLedger(fixture.ledger)); assertTrue(pdp.usesBindings(bindings)); assertTrue(pdp.usesIssuerRegistry(fixture.issuers)); assertTrue(pdp.usesResource(RESOURCE));
                 assertTrue(store.usesLedger(fixture.ledger)); assertNotNull(context.getBean("toolActionIntentStore", ToolActionIntentStore.class));
-                assertEquals(2, toolStorage.constructed().size()); toolStorage.constructed().forEach(value -> verify(value).verify());
+                assertEquals(2, toolStorage.constructed().size()); assertBothToolReadinessChecks(toolStorage);
                 assertEquals(1, oldStorage.constructed().size());
             });
         }
@@ -162,7 +164,7 @@ class TianjiToolAuthorityConfigurationTest {
 
     @Test void actual_service_factories_preserve_the_existing_source_and_connect_both_roots() {
         var fixture = new Fixture();
-        try (var ignored = mockConstruction(AgentStorageVerifier.class); var toolStorage = mockConstruction(ToolExecutionStorageVerifier.class)) {
+        try (var ignored = mockConstruction(AgentStorageVerifier.class); var toolStorage = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings())) {
             fixture.runner(true).run(context -> {
                 assertNull(context.getStartupFailure());
                 assertEquals(1, context.getBeansOfType(TianjiToolGrantIssuer.class).size());
@@ -179,7 +181,7 @@ class TianjiToolAuthorityConfigurationTest {
 
     @Test void user_only_tools_coexist_with_enabled_existing_service_execution() {
         var fixture = new Fixture();
-        try (var ignored = mockConstruction(AgentStorageVerifier.class); var storage = mockConstruction(ToolExecutionStorageVerifier.class)) {
+        try (var ignored = mockConstruction(AgentStorageVerifier.class); var storage = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings())) {
             fixture.runner(false).withUserConfiguration(TianjiServiceExecutionConfiguration.class, LinkedMetadata.class).withPropertyValues(serviceValues()).run(context -> {
                 assertNull(context.getStartupFailure());
                 var issuer = context.getBean("tianjiToolGrantIssuer", TianjiToolGrantIssuer.class);
@@ -193,7 +195,7 @@ class TianjiToolAuthorityConfigurationTest {
 
     @Test void eager_proof_rejects_missing_or_disconnected_roots_even_with_lazy_beans() {
         var fixture = new Fixture();
-        try (var ignored = mockConstruction(ToolExecutionStorageVerifier.class)) {
+        try (var ignored = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings())) {
             fixture.dependencies(new ApplicationContextRunner().withUserConfiguration(TianjiToolAuthorityConfiguration.class, LazyBeans.class))
                     .withPropertyValues(values(false)).run(context -> assertNotNull(context.getStartupFailure()));
             var user = mock(TianjiExecutionGrantIssuer.class); var runs = mock(TianjiExecutionGrantAuthorizer.class);
@@ -207,12 +209,12 @@ class TianjiToolAuthorityConfigurationTest {
     @Test void eager_chain_initializes_both_store_readiness_checks_under_global_lazy() {
         var fixture = new Fixture(); var user = mock(TianjiExecutionGrantIssuer.class); var runs = mock(TianjiExecutionGrantAuthorizer.class);
         when(user.usesToolIssuer(any())).thenReturn(true); when(runs.usesToolAuthorization(any())).thenReturn(true);
-        try (var issuer = mockConstruction(TianjiToolGrantIssuer.class); var storage = mockConstruction(ToolExecutionStorageVerifier.class)) {
+        try (var issuer = mockConstruction(TianjiToolGrantIssuer.class); var storage = mockConstruction(ToolExecutionStorageVerifier.class, toolVerifierSettings())) {
             fixture.dependencies(new ApplicationContextRunner().withUserConfiguration(TianjiToolAuthorityConfiguration.class, LazyBeans.class))
                     .withPropertyValues(values(false)).withBean(TianjiExecutionGrantIssuer.class, () -> user).withBean(TianjiExecutionGrantAuthorizer.class, () -> runs)
                     .run(context -> {
                         assertNull(context.getStartupFailure()); assertEquals(1, issuer.constructed().size());
-                        assertEquals(2, storage.constructed().size()); storage.constructed().forEach(value -> verify(value).verify());
+                        assertEquals(2, storage.constructed().size()); assertBothToolReadinessChecks(storage);
                     });
         }
         verifyNoInteractions(fixture.source); fixture.noOwnerCalls();
@@ -260,6 +262,31 @@ class TianjiToolAuthorityConfigurationTest {
             return service ? runner.withUserConfiguration(TianjiServiceExecutionConfiguration.class, LinkedMetadata.class).withPropertyValues(serviceValues()) : runner;
         }
         void noOwnerCalls() { verify(oauth, never()).authorize(any()); verify(oauth, never()).authorizeBounded(any(), anyString(), any()); }
+    }
+
+    private static MockSettings toolVerifierSettings() {
+        return toolVerifierSettings(null);
+    }
+
+    private static MockSettings toolVerifierSettings(IllegalStateException failure) {
+        return withSettings().defaultAnswer(invocation -> {
+            String method = invocation.getMethod().getName();
+            if (failure != null && Set.of("verify", "verifyAndReturnProfile").contains(method)) throw failure;
+            if (method.equals("verifyAndReturnProfile")) {
+                // The selected schema is package-private to the runtime; the host only calls the store factory.
+                for (Object profile : invocation.getMethod().getReturnType().getEnumConstants()) {
+                    if (((Enum<?>) profile).name().equals("LEGACY")) return profile;
+                }
+                throw new AssertionError("The runtime verifier must expose its internal legacy schema to the store");
+            }
+            return RETURNS_DEFAULTS.answer(invocation);
+        });
+    }
+
+    private static void assertBothToolReadinessChecks(MockedConstruction<ToolExecutionStorageVerifier> verifiers) {
+        var checks = verifiers.constructed().stream().flatMap(verifier -> mockingDetails(verifier).getInvocations().stream())
+                .map(invocation -> invocation.getMethod().getName()).sorted().toList();
+        assertEquals(List.of("verify", "verifyAndReturnProfile"), checks);
     }
 
     private static MockEnvironment prerequisites() {

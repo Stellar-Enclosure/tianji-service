@@ -33,7 +33,11 @@ import static org.mockito.Mockito.*;
 
 class ToolExecutionStorageVerifierTest {
     private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation",
-            ACCESS = "agent_tool_result_access";
+            ACCESS = "agent_tool_result_access", RUNTIME_CALL = "agent_runtime_call_receipt";
+    private static final String V15 = "V15__add_agent_model_usage.sql";
+    private static final String V16 = "V16__add_agent_checkpoint.sql";
+    private static final String V17 = "V17__add_runtime_safety_receipts.sql";
+    private static final String RUNTIME_MIGRATION = "-- V17 fixture; catalog rows independently model the action ALTER.\n";
 
     @Test void the_result_access_companion_is_one_closed_insert_only_table_without_a_result_copy() throws Exception {
         String sql = resultAccessSql(); var contract = ToolExecutionStorageVerifier.resultAccessContract(sql);
@@ -182,8 +186,62 @@ class ToolExecutionStorageVerifierTest {
         assertRejected(catalog -> catalog.history.add(new HashMap<>(catalog.history.getLast())));
         assertRejected(catalog -> catalog.history.removeFirst());
         assertRejected(catalog -> catalog.history.add(new HashMap<>(Map.of("version", "14", "success", false))));
-        var catalog = new Catalog(); catalog.history.add(new HashMap<>(Map.of("version", "14", "success", true)));
+        var catalog = new Catalog(); catalog.history.add(new HashMap<>(Map.of("version", "18", "success", true)));
         try (var templates = templates(source(), catalog, new AtomicReference<>(), new ArrayList<>())) { new ToolExecutionStorageVerifier(catalog.source).verify(); }
+    }
+
+    @Test void verified_history_selects_only_the_matching_action_catalog() throws Exception {
+        var legacy = new Catalog(true); legacy.installThroughV16();
+        assertEquals(ToolExecutionStorageVerifier.SchemaProfile.LEGACY, selectedProfile(legacy, false));
+        var runtime = new Catalog(true); runtime.installThroughV16(); runtime.installRuntime();
+        assertEquals(ToolExecutionStorageVerifier.SchemaProfile.V17, selectedProfile(runtime, true));
+        assertRuntimeRejected(catalog -> catalog.history.removeLast());
+        assertRuntimeRejected(catalog -> catalog.history.removeIf(row -> "16".equals(row.get("version"))));
+        assertRuntimeRejected(catalog -> catalog.history.getLast().put("checksum", 1));
+        assertRuntimeRejected(catalog -> catalog.history.getLast().put("script", "other.sql"));
+        assertRuntimeRejected(catalog -> catalog.history.getLast().put("success", false));
+        assertRuntimeRejected(catalog -> catalog.history.add(new HashMap<>(catalog.history.getLast())));
+        assertRuntimeRejected(catalog -> catalog.history.add(new HashMap<>(Map.of("version", "18", "success", true))));
+        assertRuntimeRejected(catalog -> java.util.Collections.swap(catalog.history, 15, 16));
+        assertRuntimeRejected(catalog -> catalog.columns.get(INTENT).removeIf(row -> "dispatch_call_id".equals(row.get("attname"))));
+        assertRuntimeRejected(catalog -> find(catalog.columns.get(INTENT), "attname", "action_profile").put("default_value", "'RUNTIME_V2'::character varying"));
+        assertRuntimeRejected(catalog -> find(catalog.checks.get(INTENT), "conname", "tool_action_profile").put("expression", "true"));
+        assertRuntimeRejected(catalog -> find(catalog.checks.get(INTENT), "conname", "tool_action_outcome").put("expression", "true"));
+        assertRuntimeRejected(catalog -> find(catalog.checks.get(INTENT), "conname", "tool_action_dispatch_group").put("expression", "true"));
+        assertRuntimeRejected(catalog -> catalog.keys.get(INTENT).removeIf(row -> RUNTIME_CALL.equals(row.get("target"))));
+        assertRuntimeRejected(catalog -> find(catalog.keys.get(INTENT), "target", RUNTIME_CALL).put("confmatchtype", "f"));
+        assertRuntimeRejected(catalog -> catalog.indexes.get(INTENT).removeLast());
+    }
+
+    @Test void v17_profile_uses_the_same_complete_history_at_the_result_access_boundary() throws Exception {
+        var runtime = new Catalog(true); runtime.installThroughV16(); runtime.installRuntime();
+        try (var templates = templates(source(), runtime, new AtomicReference<>(), new ArrayList<>())) {
+            assertDoesNotThrow(() -> new ToolExecutionStorageVerifier(runtime.source, () -> RUNTIME_MIGRATION).verifyResultAccess());
+        }
+    }
+
+    @Test void v17_history_without_the_bundled_sql_fails_closed() throws Exception {
+        var runtime = new Catalog(true); runtime.installThroughV16(); runtime.installRuntime();
+        try (var templates = templates(source(), runtime, new AtomicReference<>(), new ArrayList<>())) {
+            assertThrows(AgentLedgerException.class, () -> new ToolExecutionStorageVerifier(runtime.source, () -> null).verifyAndReturnProfile());
+        }
+    }
+
+    private static void assertRuntimeRejected(Consumer<Catalog> mutation) throws Exception {
+        var catalog = new Catalog(true); catalog.installThroughV16(); catalog.installRuntime();
+        mutation.accept(catalog);
+        var failure = assertThrows(AgentLedgerException.class, () -> selectedProfile(catalog, true));
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
+        verify(catalog.source.getConnection()).rollback();
+    }
+
+    private static ToolExecutionStorageVerifier.SchemaProfile selectedProfile(Catalog catalog, boolean provideRuntimeSql) throws Exception {
+        try (var templates = templates(source(), catalog, new AtomicReference<>(), new ArrayList<>())) {
+            return new ToolExecutionStorageVerifier(catalog.source, () -> {
+                assertTrue(provideRuntimeSql, "V17 SQL must only be read for V17 history");
+                return RUNTIME_MIGRATION;
+            }).verifyAndReturnProfile();
+        }
     }
 
     @Test void exact_columns_defaults_collations_and_table_kind_are_required() throws Exception {
@@ -349,6 +407,49 @@ class ToolExecutionStorageVerifierTest {
             while (alter.find()) foreignKeys(alter.group(2), keys.get(alter.group(1)));
             var index = Pattern.compile("CREATE (UNIQUE )?INDEX [a-z0-9_]+ ON tianji_agent\\.([a-z0-9_]+) \\(([^)]+)\\)(?: WHERE ([^;]+))?;").matcher(sql);
             while (index.find()) indexes.get(index.group(2)).add(index(shape.get(index.group(2)), index.group(3), index.group(1) != null, false, index.group(4) == null ? "" : index.group(4)));
+        }
+
+        void installThroughV16() throws Exception {
+            addMigration("15", V15, new String(resource(V15), StandardCharsets.UTF_8));
+            addMigration("16", V16, new String(resource(V16), StandardCharsets.UTF_8));
+        }
+
+        void installRuntime() {
+            addMigration("17", V17, RUNTIME_MIGRATION);
+            columns.get(INTENT).add(runtimeColumn("action_profile", "character varying(16)", true, "C", "'LEGACY_V1'::character varying"));
+            columns.get(INTENT).add(runtimeColumn("dispatch_call_id", "uuid", false, null, null));
+            var actionChecks = checks.get(INTENT);
+            actionChecks.add(new HashMap<>(Map.of("conname", "tool_action_profile", "convalidated", true, "enforced", true,
+                    "expression", "action_profile = ANY (ARRAY['LEGACY_V1','RUNTIME_V2'])")));
+            var dispatch = find(actionChecks, "conname", "tool_action_dispatch_group");
+            dispatch.put("expression", dispatch.get("expression").toString()
+                    .replace("dispatch_invocation_id IS NULL AND executor_issuer", "dispatch_invocation_id IS NULL AND dispatch_call_id IS NULL AND executor_issuer")
+                    .replace("AND dispatch_invocation_id IS NOT NULL", """
+                            AND ((action_profile='LEGACY_V1' AND dispatch_invocation_id IS NOT NULL AND dispatch_call_id IS NULL)
+                            OR (action_profile='RUNTIME_V2' AND dispatch_invocation_id IS NULL AND dispatch_call_id IS NOT NULL))"""));
+            var outcome = find(actionChecks, "conname", "tool_action_outcome");
+            String legacyOutcome = outcome.get("expression").toString().trim();
+            String legacyBody = legacyOutcome.substring("result IS NULL OR ".length());
+            int cost = legacyBody.lastIndexOf(" AND (result->'actualCost'");
+            String runtimeBody = legacyBody.substring(0, cost).replace(",'actualCost'", "") + ")";
+            outcome.put("expression", "result IS NULL OR (action_profile='LEGACY_V1' AND " + legacyBody
+                    + ") OR (action_profile='RUNTIME_V2' AND " + runtimeBody + ")");
+            keys.get(INTENT).add(key("f", "tenant_id,dispatch_run_id,dispatch_call_id,intent_id,dispatch_epoch,dispatch_nonce_sha256,executor_issuer,executor_id",
+                    RUNTIME_CALL, "tenant_id,run_id,call_id,intent_id,dispatch_epoch,dispatch_nonce_sha256,executor_issuer,executor_id"));
+        }
+
+        private void addMigration(String version, String script, String sql) {
+            history.add(new HashMap<>(Map.of("version", version, "type", "SQL", "script", script, "success", true,
+                    "checksum", MemoryStorageVerifier.checksum(sql))));
+        }
+
+        private static Map<String, Object> runtimeColumn(String name, String type, boolean required, String collation, String defaultValue) {
+            var row = new HashMap<String, Object>();
+            row.putAll(Map.of("attname", name, "type", type, "attnotnull", required, "attgenerated", "", "attidentity", "", "atthasdef", defaultValue != null,
+                    "relkind", "r", "relpersistence", "p", "relispartition", false, "no_inheritance", true));
+            row.put("collname", collation);
+            row.put("default_value", defaultValue);
+            return row;
         }
 
         private static void foreignKeys(String sql, List<Map<String, Object>> rows) {

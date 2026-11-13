@@ -22,13 +22,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /** Read-only readiness of the independent tool journal; never provisions or repairs storage. */
 public final class ToolExecutionStorageVerifier {
     static final String FILE = "V13__add_tool_execution_journal.sql";
     static final String RESULT_ACCESS_FILE = "V14__add_tool_result_access_journal.sql";
+    private static final String RUNTIME_FILE = "V17__add_runtime_safety_receipts.sql";
     private static final String CAPABILITY = "agent_tool_capability", INTENT = "agent_tool_action_intent", INVOCATION = "agent_tool_invocation",
-            ACCESS = "agent_tool_result_access";
+            ACCESS = "agent_tool_result_access", RUNTIME_CALL = "agent_runtime_call_receipt";
     private static final Set<String> TABLES = Set.of(CAPABILITY, INTENT, INVOCATION);
     private static final Set<String> RESULT_ACCESS_TABLES = Set.of(CAPABILITY, INTENT, INVOCATION, ACCESS);
     private static final Set<String> RESULT_ACCESS_CHECKS = Set.of("tool_result_access_identity", "tool_result_access_source",
@@ -50,38 +52,93 @@ public final class ToolExecutionStorageVerifier {
     private static final List<String> MIGRATIONS = List.of("V1__create_agent_ledger.sql", "V2__add_run_governance.sql", "V3__add_adk_session_store.sql",
             "V4__add_adk_session_codec_versions.sql", "V5__bind_agent_ownership_to_issuer.sql", "V6__add_execution_grant_evidence.sql",
             "V7__add_process_dispatch_fence.sql", "V8__add_service_execution_grant.sql", "V9__add_context_snapshots.sql",
-            "V10__add_memory_facts_and_index.sql", "V11__bind_memory_grant_ticket_to_principal.sql", "V12__add_memory_preference_intent.sql", FILE);
-    private static final List<String> RESULT_ACCESS_MIGRATIONS = resultAccessMigrations();
+            "V10__add_memory_facts_and_index.sql", "V11__bind_memory_grant_ticket_to_principal.sql", "V12__add_memory_preference_intent.sql", FILE,
+            RESULT_ACCESS_FILE, "V15__add_agent_model_usage.sql", "V16__add_agent_checkpoint.sql", RUNTIME_FILE);
+    private static final String RUNTIME_DISPATCH_CHECK = """
+            (dispatch_epoch=0 AND dispatch_nonce_sha256 IS NULL AND dispatch_run_id IS NULL AND dispatch_invocation_id IS NULL
+                AND dispatch_call_id IS NULL AND executor_issuer IS NULL AND executor_id IS NULL)
+            OR (dispatch_epoch>0 AND dispatch_nonce_sha256 IS NOT NULL AND dispatch_nonce_sha256 ~ '^[0-9a-f]{64}$'
+                AND dispatch_run_id IS NOT NULL
+                AND ((action_profile='LEGACY_V1' AND dispatch_invocation_id IS NOT NULL AND dispatch_call_id IS NULL)
+                    OR (action_profile='RUNTIME_V2' AND dispatch_invocation_id IS NULL AND dispatch_call_id IS NOT NULL))
+                AND executor_issuer IS NOT NULL AND executor_issuer ~ '^[0-9a-f]{64}$' AND executor_id IS NOT NULL
+                AND (executor_id <> '' AND executor_id = btrim(executor_id) AND executor_id !~ '[[:cntrl:]]')
+                AND (risk<>'APPROVAL_REQUIRED' OR approval_proof IS NOT NULL))
+            """;
+    private static final String RESULT_CONTENT = """
+            AND jsonb_typeof(result->'status')='string' AND result->>'status'=CASE WHEN state='APPLIED' THEN 'SUCCEEDED' ELSE state END
+            AND jsonb_typeof(result->'output')='object' AND octet_length(result::text)<=131072
+            AND ((business_receipt_id IS NULL AND result->'businessReceiptId'='null'::jsonb) OR
+                (business_receipt_id IS NOT NULL AND jsonb_typeof(result->'businessReceiptId')='string' AND result->>'businessReceiptId'=business_receipt_id))
+            AND ((last_error_code IS NULL AND result->'errorCode'='null'::jsonb) OR
+                (last_error_code IS NOT NULL AND jsonb_typeof(result->'errorCode')='string' AND result->>'errorCode'=last_error_code))
+            AND (result->>'status'='SUCCEEDED' OR result->'output'='{}'::jsonb)
+            """;
+    private static final String RUNTIME_OUTCOME_CHECK = """
+            result IS NULL OR (action_profile='LEGACY_V1' AND
+                ((jsonb_typeof(result)='object' AND result ?& ARRAY['status','output','businessReceiptId','errorCode','actualCost']
+                    AND result - ARRAY['status','output','businessReceiptId','errorCode','actualCost'] = '{}'::jsonb)
+                %1$s
+                AND (result->'actualCost'='null'::jsonb OR (jsonb_typeof(result->'actualCost')='number'
+                    AND (result->>'actualCost')::numeric>=0::numeric AND (result->>'actualCost')::numeric<10000000000000000::numeric
+                    AND scale((result->>'actualCost')::numeric)<=8))))
+            OR (action_profile='RUNTIME_V2' AND
+                ((jsonb_typeof(result)='object' AND result ?& ARRAY['status','output','businessReceiptId','errorCode']
+                    AND result - ARRAY['status','output','businessReceiptId','errorCode'] = '{}'::jsonb)
+                %1$s))
+            """.formatted(RESULT_CONTENT);
     private final DataSource source;
+    private final Supplier<String> runtimeMigration;
 
-    public ToolExecutionStorageVerifier(DataSource source) { this.source = Objects.requireNonNull(source, "source"); }
+    public ToolExecutionStorageVerifier(DataSource source) { this(source, () -> migration(RUNTIME_FILE)); }
 
-    public void verify() {
-        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool journal verification requires its own transaction");
-        verify(contract(migration()), TABLES, MIGRATIONS);
+    ToolExecutionStorageVerifier(DataSource source, Supplier<String> runtimeMigration) {
+        this.source = Objects.requireNonNull(source, "source");
+        this.runtimeMigration = Objects.requireNonNull(runtimeMigration, "runtimeMigration");
     }
 
-    public void verifyResultAccess() {
-        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool journal verification requires its own transaction");
-        var expected = new HashMap<>(contract(migration())); expected.putAll(resultAccessContract(migration(RESULT_ACCESS_FILE)));
-        verify(Map.copyOf(expected), RESULT_ACCESS_TABLES, RESULT_ACCESS_MIGRATIONS);
-    }
+    enum SchemaProfile { LEGACY, V17 }
 
-    private void verify(Map<String, MemoryStorageVerifier.Table> expected, Set<String> tables, List<String> migrations) {
+    public void verify() { verifyAndReturnProfile(); }
+
+    SchemaProfile verifyAndReturnProfile() { return verify(false); }
+
+    public void verifyResultAccess() { verify(true); }
+
+    private SchemaProfile verify(boolean resultAccess) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool journal verification requires its own transaction");
         var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5);
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(15);
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ); transaction.setReadOnly(false);
         try {
-            transaction.executeWithoutResult(status -> {
+            var profile = transaction.execute(status -> {
                 if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_is_in_recovery() AND current_setting('server_encoding')='UTF8' AND current_setting('session_replication_role')='origin'", Boolean.class))) throw invalid();
                 jdbc.queryForObject("SELECT set_config('search_path','pg_catalog,tianji_agent,public',true)", String.class);
-                history(jdbc, migrations);
-                for (String table : tables) {
-                    columns(jdbc, table, expected.get(table)); checks(jdbc, table, expected.get(table));
-                    keys(jdbc, table); indexes(jdbc, table, expected.get(table)); privileges(jdbc, table, !ACCESS.equals(table));
+                var selected = history(jdbc, resultAccess ? 14 : 13);
+                var expected = new HashMap<>(contract(migration()));
+                if (resultAccess) expected.putAll(resultAccessContract(migration(RESULT_ACCESS_FILE)));
+                if (selected == SchemaProfile.V17) expected.put(INTENT, runtimeAction(expected.get(INTENT)));
+                for (String table : resultAccess ? RESULT_ACCESS_TABLES : TABLES) {
+                    boolean runtime = selected == SchemaProfile.V17 && INTENT.equals(table);
+                    columns(jdbc, table, expected.get(table), runtime); checks(jdbc, table, expected.get(table));
+                    keys(jdbc, table, runtime); indexes(jdbc, table, expected.get(table)); privileges(jdbc, table, !ACCESS.equals(table));
                 }
+                return selected;
             });
+            if (profile == null) throw invalid();
+            return profile;
         } catch (DataAccessException | TransactionException failed) { throw invalid(); }
+    }
+
+    private static MemoryStorageVerifier.Table runtimeAction(MemoryStorageVerifier.Table legacy) {
+        var columns = new HashMap<>(legacy.columns());
+        columns.put("action_profile", column("character varying(16)", true));
+        columns.put("dispatch_call_id", new MemoryStorageVerifier.Column("uuid", false, false));
+        var checks = new HashMap<>(legacy.checks());
+        checks.put("tool_action_profile", MemoryStorageVerifier.booleanSignature("action_profile = ANY (ARRAY['LEGACY_V1','RUNTIME_V2'])"));
+        checks.put("tool_action_dispatch_group", MemoryStorageVerifier.booleanSignature(RUNTIME_DISPATCH_CHECK));
+        checks.put("tool_action_outcome", MemoryStorageVerifier.booleanSignature(RUNTIME_OUTCOME_CHECK));
+        return new MemoryStorageVerifier.Table(Map.copyOf(columns), Map.copyOf(checks));
     }
 
     static Map<String, MemoryStorageVerifier.Table> contract(String sql) {
@@ -100,25 +157,37 @@ public final class ToolExecutionStorageVerifier {
         return Map.copyOf(tables);
     }
 
-    private static void history(JdbcTemplate jdbc, List<String> migrations) {
-        var expected = new HashMap<String, Integer>(); var scripts = new HashMap<String, String>();
-        for (int index = 0; index < migrations.size(); index++) {
-            String version = Integer.toString(index + 1), file = migrations.get(index);
-            expected.put(version, MemoryStorageVerifier.checksum(migration(file))); scripts.put(version, file);
-        }
-        var actual = new HashMap<String, Integer>();
-        jdbc.query("SELECT version,type,script,checksum,success FROM tianji_agent.flyway_schema_history", rs -> {
+    private SchemaProfile history(JdbcTemplate jdbc, int minimum) {
+        var installed = new ArrayList<String>();
+        var unknownVersion = new ArrayList<String>();
+        jdbc.query("SELECT version,type,script,checksum,success FROM tianji_agent.flyway_schema_history ORDER BY installed_rank", rs -> {
             if (!rs.getBoolean("success")) throw invalid();
             String version = rs.getString("version");
-            if (version != null && expected.containsKey(version)) {
-                if (!"SQL".equals(rs.getString("type")) || !scripts.get(version).equals(rs.getString("script")) || rs.getObject("checksum") == null
-                        || actual.put(version, rs.getInt("checksum")) != null) throw invalid();
+            if (version == null) return;
+            String script = rs.getString("script");
+            if (RUNTIME_FILE.equals(script) && !"17".equals(version)) throw invalid();
+            int index = installed.size();
+            if (index >= MIGRATIONS.size() || !Integer.toString(index + 1).equals(version)) {
+                // A later successful migration never substitutes for any known version.
+                if (!version.matches("[1-9][0-9]{0,8}") || Integer.parseInt(version) <= MIGRATIONS.size()) throw invalid();
+                unknownVersion.add(version);
+                return;
             }
+            String expected = MIGRATIONS.get(index);
+            if (!"SQL".equals(rs.getString("type")) || !expected.equals(script) || rs.getObject("checksum") == null) throw invalid();
+            String sql = RUNTIME_FILE.equals(expected) ? runtimeMigration.get() : migration(expected);
+            if (sql == null || sql.isBlank() || MemoryStorageVerifier.checksum(sql) != rs.getInt("checksum")) throw invalid();
+            installed.add(expected);
         });
-        if (!expected.equals(actual)) throw invalid();
+        if (installed.size() < minimum) throw invalid();
+        if (installed.size() == MIGRATIONS.size()) {
+            if (!unknownVersion.isEmpty()) throw invalid();
+            return SchemaProfile.V17;
+        }
+        return SchemaProfile.LEGACY;
     }
 
-    private static void columns(JdbcTemplate jdbc, String table, MemoryStorageVerifier.Table expected) {
+    private static void columns(JdbcTemplate jdbc, String table, MemoryStorageVerifier.Table expected, boolean runtime) {
         var actual = new HashMap<String, MemoryStorageVerifier.Column>();
         jdbc.query("""
                 SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,co.collname,a.attgenerated,a.attidentity,
@@ -129,10 +198,13 @@ public final class ToolExecutionStorageVerifier {
                 LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
                 WHERE n.nspname='tianji_agent' AND t.relname=? AND a.attnum>0 AND NOT a.attisdropped
                 """, rs -> {
-            String name = rs.getString("attname"); boolean defaulted = !CAPABILITY.equals(table) && "dispatch_epoch".equals(name);
+            String name = rs.getString("attname");
+            String defaultValue = !CAPABILITY.equals(table) && "dispatch_epoch".equals(name) ? "0"
+                    : runtime && "action_profile".equals(name) ? "'LEGACY_V1'::character varying" : null;
             if (!"r".equals(rs.getString("relkind")) || !"p".equals(rs.getString("relpersistence")) || rs.getBoolean("relispartition")
                     || !rs.getBoolean("no_inheritance") || !rs.getString("attgenerated").isEmpty() || !rs.getString("attidentity").isEmpty()
-                    || rs.getBoolean("atthasdef") != defaulted || defaulted && !"0".equals(rs.getString("default_value"))) throw invalid();
+                    || rs.getBoolean("atthasdef") != (defaultValue != null)
+                    || defaultValue != null && !defaultValue.equals(rs.getString("default_value"))) throw invalid();
             if (actual.put(name, new MemoryStorageVerifier.Column(rs.getString("type"), rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname")))) != null) throw invalid();
         }, table);
         if (!expected.columns().equals(actual)) throw invalid();
@@ -152,7 +224,7 @@ public final class ToolExecutionStorageVerifier {
         if (!expected.checks().equals(actual)) throw invalid();
     }
 
-    private static void keys(JdbcTemplate jdbc, String table) {
+    private static void keys(JdbcTemplate jdbc, String table, boolean runtime) {
         var actual = jdbc.query("""
                 SELECT c.contype,c.convalidated,COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced,
                        c.condeferrable,c.condeferred,c.confdeltype,c.confupdtype,c.confmatchtype,COALESCE(tn.nspname,'') AS target_schema,
@@ -169,7 +241,9 @@ public final class ToolExecutionStorageVerifier {
                     foreign ? array(rs.getArray("target_columns")) : List.of(), foreign ? rs.getString("confdeltype") : "",
                     foreign ? rs.getString("confupdtype") : "", foreign ? rs.getString("confmatchtype") : "");
         }, table);
-        var expected = expectedKeys(table);
+        var expected = new HashSet<>(expectedKeys(table));
+        if (runtime) expected.add(foreign("tenant_id,dispatch_run_id,dispatch_call_id,intent_id,dispatch_epoch,dispatch_nonce_sha256,executor_issuer,executor_id", RUNTIME_CALL,
+                "tenant_id,run_id,call_id,intent_id,dispatch_epoch,dispatch_nonce_sha256,executor_issuer,executor_id"));
         if (actual.size() != expected.size() || !Set.copyOf(actual).equals(expected)) throw invalid();
     }
 
@@ -264,7 +338,6 @@ public final class ToolExecutionStorageVerifier {
     }
     private static List<String> array(java.sql.Array value) throws SQLException { return value == null ? List.of() : List.copyOf(Arrays.asList((String[]) value.getArray())); }
     private static MemoryStorageVerifier.Column column(String type, boolean cCollation) { return new MemoryStorageVerifier.Column(type, true, cCollation); }
-    private static List<String> resultAccessMigrations() { var migrations = new ArrayList<>(MIGRATIONS); migrations.add(RESULT_ACCESS_FILE); return List.copyOf(migrations); }
     private static List<String> columns(String value) { return List.of(value.split(",")); }
     private static Key key(String type, String fields) { return new Key(type, columns(fields), "", "", List.of(), "", "", ""); }
     private static Key foreign(String fields, String target, String targetFields) { return new Key("f", columns(fields), "tianji_agent", target, columns(targetFields), "a", "a", "s"); }

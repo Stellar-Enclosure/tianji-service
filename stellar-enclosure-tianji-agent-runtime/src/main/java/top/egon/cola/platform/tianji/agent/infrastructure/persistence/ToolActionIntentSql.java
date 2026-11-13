@@ -5,6 +5,8 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolExecutionJsonCodec.ActionProfile;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolExecutionStorageVerifier.SchemaProfile;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -48,7 +50,9 @@ final class ToolActionIntentSql {
                   (a.dispatch_epoch=0 OR (i.state=CASE a.state WHEN 'APPLIED' THEN 'SUCCEEDED' ELSE a.state END
                     AND a.result IS NOT DISTINCT FROM i.outcome AND a.business_receipt_id IS NOT DISTINCT FROM i.business_receipt_id
                     AND a.last_error_code IS NOT DISTINCT FROM i.error_code AND a.side_effect_outcome=i.side_effect_outcome)) AS dispatch_fact_matches,
-                  i.parameters_sha256 AS dispatch_parameters_sha256
+                  i.parameters_sha256 AS dispatch_parameters_sha256,
+                  (pg_catalog.to_jsonb(a)->'action_profile')::text AS stored_action_profile,
+                  (pg_catalog.to_jsonb(a)->'dispatch_call_id')::text AS stored_dispatch_call_id
                 """;
     private static final String OWNER_ROW_JOINS = """
                 FROM %1$stianji_agent.agent_tool_action_intent a
@@ -60,6 +64,23 @@ final class ToolActionIntentSql {
                 WHERE a.tenant_id=? AND a.owner_type=? AND a.owner_issuer=? AND a.owner_id=? AND a.intent_id=?
                 """;
     private static final String OWNER_ROW_READ = OWNER_ROW_PROJECTION + OWNER_ROW_JOINS.formatted("") + OWNER_ROW_KEY;
+    private static final String RUNTIME_OWNER_ROW_READ = OWNER_ROW_PROJECTION + """
+                , rb.snapshot_sha256 AS origin_runtime_snapshot_sha256,
+                  db.snapshot_sha256 AS dispatch_runtime_snapshot_sha256,
+                  (r.call_id IS NOT NULL AND r.kind='TOOL' AND r.intent_id=a.intent_id
+                    AND r.owner_type=a.owner_type AND r.owner_issuer=a.owner_issuer AND r.owner_id=a.owner_id
+                    AND r.tool_key=a.tool_key AND r.tool_version=a.tool_version AND r.tool_sha256=a.tool_sha256
+                    AND r.backend_binding_sha256=a.binding_sha256 AND r.risk=a.risk
+                    AND r.dispatch_epoch=a.dispatch_epoch AND r.dispatch_nonce_sha256=a.dispatch_nonce_sha256
+                    AND r.executor_issuer=a.executor_issuer AND r.executor_id=a.executor_id
+                    AND r.dispatched_at IS NOT NULL AND r.source_action_revision IS NULL AND r.source_result_sha256 IS NULL) AS runtime_dispatch_matches,
+                  r.input_sha256 AS runtime_input_sha256, r.state AS runtime_call_state,
+                  r.result_sha256 AS runtime_result_sha256, r.error_code AS runtime_error_code
+                """ + OWNER_ROW_JOINS.formatted("") + """
+                LEFT JOIN tianji_agent.agent_runtime_binding rb ON rb.tenant_id=a.tenant_id AND rb.run_id=a.origin_run_id AND rb.runtime_profile='RUNTIME_V2'
+                LEFT JOIN tianji_agent.agent_runtime_binding db ON db.tenant_id=a.tenant_id AND db.run_id=a.dispatch_run_id AND db.runtime_profile='RUNTIME_V2'
+                LEFT JOIN tianji_agent.agent_runtime_call_receipt r ON r.tenant_id=a.tenant_id AND r.run_id=a.dispatch_run_id AND r.call_id=a.dispatch_call_id
+                """ + OWNER_ROW_KEY;
     private static final int ACTION_STAMP_BYTES = 524_288;
     private static final int INVOCATION_STAMP_BYTES = 262_144;
     private static final int RUN_STAMP_BYTES = 8_388_608;
@@ -102,14 +123,24 @@ final class ToolActionIntentSql {
         return prepareWithStatus(run, lease, action, descriptor, requestedExpiry, authorityDeadline).row();
     }
 
+    Row prepare(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
+                Instant requestedExpiry, Instant authorityDeadline, SchemaProfile schema) {
+        return prepareWithStatus(run, lease, action, descriptor, requestedExpiry, authorityDeadline, schema).row();
+    }
+
     PreparationResultVO prepareWithStatus(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
                                           Instant requestedExpiry, Instant authorityDeadline) {
+        return prepareWithStatus(run, lease, action, descriptor, requestedExpiry, authorityDeadline, null);
+    }
+
+    private PreparationResultVO prepareWithStatus(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
+                                                  Instant requestedExpiry, Instant authorityDeadline, SchemaProfile schema) {
         binding(run, lease, action, descriptor); requireRun(run, lease, descriptor, authorityDeadline);
         UUID id = UUID.fromString(action.intentId());
         // Serialize first insertion even when distinct request bodies race the same stable business identity.
         jdbc.query("SELECT pg_advisory_xact_lock(?)", rs -> { }, id.getMostSignificantBits() ^ id.getLeastSignificantBits());
         requireRun(run, lease, descriptor, authorityDeadline);
-        var existing = read(run.actor(), id, true, authorityDeadline);
+        var existing = read(run.actor(), id, true, authorityDeadline, schema, false);
         if (existing.isPresent()) {
             same(existing.orElseThrow(), action); requireRun(run, lease, descriptor, authorityDeadline);
             return new PreparationResultVO(existing.orElseThrow(), false);
@@ -127,7 +158,7 @@ final class ToolActionIntentSql {
                 descriptor.key(), descriptor.version(), descriptor.reference().contentSha256(), descriptor.policy().bindingSha256(), action.requestSha256(), logicalIdentity(action), codec.descriptor(descriptor), codec.arguments(descriptor, action.arguments()),
                 run.runId(), run.snapshotSha256(), descriptor.policy().risk().name(), descriptor.policy().approvalPolicyRef(), state, Timestamp.from(now), Timestamp.from(now), Timestamp.from(expiry));
         if (inserted != 1) throw unavailable();
-        var row = read(run.actor(), id, true, authorityDeadline).orElseThrow(ToolActionIntentSql::unavailable);
+        var row = read(run.actor(), id, true, authorityDeadline, schema, false).orElseThrow(ToolActionIntentSql::unavailable);
         same(row, action); requireRun(run, lease, descriptor, authorityDeadline);
         return new PreparationResultVO(row, true);
     }
@@ -139,15 +170,24 @@ final class ToolActionIntentSql {
 
     Optional<Row> current(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action,
                           ToolDescriptor descriptor, Instant authorityDeadline) {
+        return current(run, lease, action, descriptor, authorityDeadline, null);
+    }
+
+    Optional<Row> current(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action,
+                          ToolDescriptor descriptor, Instant authorityDeadline, SchemaProfile schema) {
         binding(run, lease, action, descriptor); requireRun(run, lease, descriptor, authorityDeadline);
-        var found = read(run.actor(), UUID.fromString(action.intentId()), false, authorityDeadline);
+        var found = read(run.actor(), UUID.fromString(action.intentId()), false, authorityDeadline, schema, false);
         found.ifPresent(row -> same(row, action)); requireRun(run, lease, descriptor, authorityDeadline); return found;
     }
 
     Optional<Row> historical(ToolActionRequest action, ToolDescriptor descriptor, Instant storageDeadline) {
+        return historical(action, descriptor, storageDeadline, null);
+    }
+
+    Optional<Row> historical(ToolActionRequest action, ToolDescriptor descriptor, Instant storageDeadline, SchemaProfile schema) {
         if (action == null || descriptor == null || !descriptor.reference().equals(action.tool())) throw invalid();
         sameAction(new ToolActionRequest(action.owner(), descriptor, action.businessKey(), action.businessVersion(), action.arguments()), action);
-        var found = read(action.owner(), UUID.fromString(action.intentId()), false, storageDeadline);
+        var found = read(action.owner(), UUID.fromString(action.intentId()), false, storageDeadline, schema, schema == SchemaProfile.V17);
         found.ifPresent(row -> same(row, action)); return found;
     }
 
@@ -160,7 +200,7 @@ final class ToolActionIntentSql {
         now(deadline);
         try {
             var rows = jdbc.query(HISTORICAL_START, (rs, number) -> {
-                var verified = verifiedRow(rs, owner, intentId, deadline);
+                var verified = verifiedRow(rs, owner, intentId, deadline, null, false);
                 return new HistoricalStartReceiptVO(verified.action(), verified.dispatchRun(), rs.getLong("invocation_revision"),
                         time(rs, "dispatch_not_after"), rs.getString("dispatch_parameters_sha256"),
                         rs.getString("action_stamp"), rs.getString("invocation_stamp"), rs.getString("origin_stamp"), rs.getString("dispatch_stamp"));
@@ -180,7 +220,7 @@ final class ToolActionIntentSql {
                                     Instant dispatchNotAfter, String parametersSha256, String actionStamp,
                                     String invocationStamp, String originRunStamp, String dispatchRunStamp) {
         HistoricalStartReceiptVO {
-            if (action == null || action.dispatch() == null || dispatchRun == null
+            if (action == null || action.profile() != ActionProfile.LEGACY_V1 || action.dispatch() == null || dispatchRun == null
                     || !Set.of("DISPATCHING", "UNKNOWN", "APPLIED").contains(action.state())
                     || !action.action().owner().equals(dispatchRun.actor()) || !action.dispatch().runId().equals(dispatchRun.runId())
                     || invocationRevision < 1 || dispatchNotAfter == null || !hash(parametersSha256)
@@ -207,7 +247,7 @@ final class ToolActionIntentSql {
     void beginApprovedWrite(Row expected, ApprovedObservation approval, DispatchVO dispatch, Instant consumedAndDispatchedAt, Instant deadline) {
         Instant checked = now(deadline); requireApproval(expected);
         if (!"AWAITING_APPROVAL".equals(expected.state()) || expected.approval() != null || expected.dispatch() != null || approval == null
-                || dispatch == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
+                || dispatch == null || dispatch.invocationId() == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
         if (expected.revision() == Long.MAX_VALUE) throw unavailable();
         writeTime(expected, consumedAndDispatchedAt, checked);
         if (!expected.expiresAt().isAfter(consumedAndDispatchedAt) || !expected.expiresAt().isAfter(checked)) throw invalid();
@@ -227,6 +267,10 @@ final class ToolActionIntentSql {
                         approval_approved=TRUE,approval_consumed_at=?,approval_expires_at=?,dispatch_epoch=1,dispatch_nonce_sha256=?,dispatch_run_id=?,dispatch_invocation_id=?,
                         executor_issuer=?,executor_id=?,updated_at=?,side_effect_outcome='UNKNOWN'
                     WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND ((pg_catalog.to_jsonb(agent_tool_action_intent)->'action_profile' IS NULL
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id' IS NULL)
+                           OR (pg_catalog.to_jsonb(agent_tool_action_intent)->>'action_profile'='LEGACY_V1'
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id'='null'::jsonb))
                       AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
                       AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='APPROVAL_REQUIRED' AND approval_policy_ref=?
                       AND state='AWAITING_APPROVAL' AND revision=? AND dispatch_epoch=0
@@ -267,6 +311,10 @@ final class ToolActionIntentSql {
                     UPDATE tianji_agent.agent_tool_action_intent
                     SET state=?,side_effect_outcome=?,result=CAST(? AS jsonb),business_receipt_id=?,last_error_code=?,closed_at=?,updated_at=?,revision=revision+1
                     WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND ((pg_catalog.to_jsonb(agent_tool_action_intent)->'action_profile' IS NULL
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id' IS NULL)
+                           OR (pg_catalog.to_jsonb(agent_tool_action_intent)->>'action_profile'='LEGACY_V1'
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id'='null'::jsonb))
                       AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
                       AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='APPROVAL_REQUIRED' AND approval_policy_ref=?
                       AND state=? AND revision=? AND dispatch_epoch=? AND dispatch_nonce_sha256=? AND dispatch_run_id=? AND dispatch_invocation_id=? AND executor_issuer=? AND executor_id=?
@@ -284,7 +332,7 @@ final class ToolActionIntentSql {
     }
 
     private static void requireApproval(Row expected) {
-        if (expected == null) throw invalid(); requireApproval(expected.action(), expected.descriptor());
+        if (expected == null || expected.profile() != ActionProfile.LEGACY_V1) throw invalid(); requireApproval(expected.action(), expected.descriptor());
     }
     private static void requireApproval(ToolActionRequest action, ToolDescriptor descriptor) {
         if (action == null || descriptor == null || descriptor.policy().risk() != ToolPolicy.Risk.APPROVAL_REQUIRED
@@ -303,7 +351,7 @@ final class ToolActionIntentSql {
     void beginWrite(Row expected, DispatchVO dispatch, Instant dispatchedAt, Instant deadline) {
         Instant checked = now(deadline); requireIdempotentWrite(expected);
         if (!"PREPARED".equals(expected.state()) || expected.dispatch() != null || expected.approval() != null
-                || dispatch == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
+                || dispatch == null || dispatch.invocationId() == null || dispatch.epoch() != 1 || dispatch.executor().tenantId() != expected.action().owner().tenantId()) throw invalid();
         if (expected.revision() == Long.MAX_VALUE) throw unavailable();
         writeTime(expected, dispatchedAt, checked);
         if (!expected.expiresAt().isAfter(dispatchedAt) || !expected.expiresAt().isAfter(checked)) throw invalid();
@@ -314,6 +362,10 @@ final class ToolActionIntentSql {
                     SET state='DISPATCHING',revision=revision+1,dispatch_epoch=1,dispatch_nonce_sha256=?,dispatch_run_id=?,dispatch_invocation_id=?,
                         executor_issuer=?,executor_id=?,updated_at=?,side_effect_outcome='UNKNOWN'
                     WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND ((pg_catalog.to_jsonb(agent_tool_action_intent)->'action_profile' IS NULL
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id' IS NULL)
+                           OR (pg_catalog.to_jsonb(agent_tool_action_intent)->>'action_profile'='LEGACY_V1'
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id'='null'::jsonb))
                       AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
                       AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='IDEMPOTENT_WRITE'
                       AND revision=? AND state='PREPARED' AND dispatch_epoch=0
@@ -349,6 +401,10 @@ final class ToolActionIntentSql {
                     UPDATE tianji_agent.agent_tool_action_intent
                     SET state=?,side_effect_outcome=?,result=CAST(? AS jsonb),business_receipt_id=?,last_error_code=?,closed_at=?,updated_at=?,revision=revision+1
                     WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=?
+                      AND ((pg_catalog.to_jsonb(agent_tool_action_intent)->'action_profile' IS NULL
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id' IS NULL)
+                           OR (pg_catalog.to_jsonb(agent_tool_action_intent)->>'action_profile'='LEGACY_V1'
+                            AND pg_catalog.to_jsonb(agent_tool_action_intent)->'dispatch_call_id'='null'::jsonb))
                       AND action_key=? AND business_key=? AND business_version=? AND request_sha256=? AND logical_identity_sha256=?
                       AND tool_key=? AND tool_version=? AND tool_sha256=? AND binding_sha256=? AND risk='IDEMPOTENT_WRITE'
                       AND state=? AND revision=? AND dispatch_epoch=? AND dispatch_nonce_sha256=? AND dispatch_run_id=? AND dispatch_invocation_id=? AND executor_issuer=? AND executor_id=?
@@ -365,7 +421,7 @@ final class ToolActionIntentSql {
     }
 
     private static void requireIdempotentWrite(Row expected) {
-        if (expected == null) throw invalid(); requireIdempotentWrite(expected.action(), expected.descriptor());
+        if (expected == null || expected.profile() != ActionProfile.LEGACY_V1) throw invalid(); requireIdempotentWrite(expected.action(), expected.descriptor());
     }
     private static void requireIdempotentWrite(ToolActionRequest action, ToolDescriptor descriptor) {
         if (action == null || descriptor == null || descriptor.policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE
@@ -378,6 +434,10 @@ final class ToolActionIntentSql {
     }
 
     private Optional<Row> read(TrustedAgentActor owner, UUID id, boolean lock, Instant deadline) {
+        return read(owner, id, lock, deadline, null, false);
+    }
+
+    private Optional<Row> read(TrustedAgentActor owner, UUID id, boolean lock, Instant deadline, SchemaProfile schema, boolean allowRuntime) {
         now(deadline);
         if (lock) {
             var locked = jdbc.query("SELECT intent_id FROM tianji_agent.agent_tool_action_intent WHERE tenant_id=? AND owner_type=? AND owner_issuer=? AND owner_id=? AND intent_id=? FOR UPDATE",
@@ -385,8 +445,8 @@ final class ToolActionIntentSql {
             now(deadline); if (locked.size() > 1) throw unavailable(); if (locked.isEmpty()) return Optional.empty();
             if (!id.equals(locked.getFirst())) throw unavailable();
         }
-        var rows = jdbc.query(OWNER_ROW_READ,
-                (rs, number) -> verifiedRow(rs, owner, id, deadline).action(),
+        var rows = jdbc.query(allowRuntime ? RUNTIME_OWNER_ROW_READ : OWNER_ROW_READ,
+                (rs, number) -> verifiedRow(rs, owner, id, deadline, schema, allowRuntime).action(),
                 owner.tenantId(), owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), id);
         now(deadline); if (rows.size() > 1) throw unavailable();
         if (lock && rows.isEmpty()) throw unavailable();
@@ -430,7 +490,8 @@ final class ToolActionIntentSql {
         @Override public String toString() { return "ToolActionIntentVerifiedRow[redacted]"; }
     }
 
-    private VerifiedRow verifiedRow(ResultSet rs, TrustedAgentActor expectedOwner, UUID expectedId, Instant deadline) throws SQLException {
+    private VerifiedRow verifiedRow(ResultSet rs, TrustedAgentActor expectedOwner, UUID expectedId, Instant deadline,
+                                    SchemaProfile schema, boolean allowRuntime) throws SQLException {
         try {
             var owner = new TrustedAgentActor(rs.getLong("tenant_id"), TrustedAgentActor.SubjectType.valueOf(rs.getString("owner_type")), rs.getString("owner_id"), rs.getString("owner_issuer"));
             if (!owner.equals(expectedOwner) || !expectedId.equals(rs.getObject("intent_id", UUID.class))) throw unavailable();
@@ -441,21 +502,76 @@ final class ToolActionIntentSql {
                     || !action.requestSha256().equals(rs.getString("request_sha256")) || !action.actionKey().equals(rs.getString("action_key"))
                     || !descriptor.policy().bindingSha256().equals(rs.getString("binding_sha256")) || !descriptor.policy().risk().name().equals(rs.getString("risk"))
                     || !Objects.equals(descriptor.policy().approvalPolicyRef(), rs.getString("approval_policy_ref"))) throw unavailable();
+            String storedProfile = rs.getString("stored_action_profile"), storedCallId = rs.getString("stored_dispatch_call_id");
+            var profile = actionProfile(storedProfile, storedCallId, schema);
+            if (profile == ActionProfile.RUNTIME_V2 && !allowRuntime) throw unavailable();
             Instant created = time(rs, "created_at");
-            var approval = approval(rs, action, created); var dispatch = dispatch(rs, owner);
-            String encoded = rs.getString("result"); var outcome = encoded == null ? null : codec.outcome(encoded, descriptor);
+            var approval = approval(rs, action, created);
+            var dispatch = dispatch(rs, owner, dispatchCallId(storedCallId));
+            String encoded = rs.getString("result"); var outcome = encoded == null ? null : codec.outcome(profile, encoded, descriptor);
             if (!Objects.equals(rs.getString("business_receipt_id"), outcome == null ? null : outcome.businessReceiptId())
                     || outcome != null && !Objects.equals(rs.getString("last_error_code"), outcome.errorCode())) throw unavailable();
-            var stored = new Row(action, descriptor, rs.getString("origin_run_id"), rs.getString("origin_snapshot_sha256"), rs.getString("state"), rs.getLong("revision"),
+            var origin = new OriginVO(rs.getString("origin_run_id"), rs.getString("origin_snapshot_sha256"));
+            var stored = new Row(action, descriptor, origin, profile, rs.getString("state"), rs.getLong("revision"),
                     created, time(rs, "updated_at"), time(rs, "expires_at"), approval, dispatch, rs.getString("side_effect_outcome"), outcome, rs.getString("last_error_code"), time(rs, "closed_at"));
-            for (String name : List.of("origin_owner_matches", "dispatch_owner_matches", "dispatch_identity_matches", "dispatch_fact_matches")) {
-                if (!Boolean.TRUE.equals(rs.getObject(name, Boolean.class))) throw unavailable();
-            }
-            if (dispatch != null && !descriptor.parametersSha256(action.arguments()).equals(rs.getString("dispatch_parameters_sha256"))) throw unavailable();
+            if (!Boolean.TRUE.equals(rs.getObject("origin_owner_matches", Boolean.class))
+                    || !Boolean.TRUE.equals(rs.getObject("dispatch_owner_matches", Boolean.class))) throw unavailable();
+            if (profile == ActionProfile.LEGACY_V1) {
+                if (allowRuntime && (rs.getString("origin_runtime_snapshot_sha256") != null
+                        || rs.getString("dispatch_runtime_snapshot_sha256") != null)) throw unavailable();
+                verifyLegacyDispatch(rs, stored);
+            } else verifyRuntimeDispatch(rs, stored);
             requireHistoricalSource(owner, stored.originRunId(), descriptor, stored.originSnapshotSha256(), deadline);
-            var dispatchRun = dispatch == null ? null : requireHistoricalSource(owner, dispatch.runId(), descriptor, null, deadline);
+            String dispatchSnapshot = profile == ActionProfile.RUNTIME_V2 ? rs.getString("dispatch_runtime_snapshot_sha256") : null;
+            var dispatchRun = dispatch == null ? null : requireHistoricalSource(owner, dispatch.runId(), descriptor, dispatchSnapshot, deadline);
             return new VerifiedRow(stored, dispatchRun);
         } catch (RuntimeException malformed) { throw unavailable(); }
+    }
+
+    private static ActionProfile actionProfile(String profile, String callId, SchemaProfile schema) {
+        if (profile == null && callId == null && schema != SchemaProfile.V17) return ActionProfile.LEGACY_V1;
+        if (profile == null || callId == null || schema == SchemaProfile.LEGACY) throw unavailable();
+        return switch (profile) {
+            case "\"LEGACY_V1\"" -> ActionProfile.LEGACY_V1;
+            case "\"RUNTIME_V2\"" -> ActionProfile.RUNTIME_V2;
+            default -> throw unavailable();
+        };
+    }
+
+    private static UUID dispatchCallId(String encoded) {
+        if (encoded == null || "null".equals(encoded)) return null;
+        if (encoded.length() != 38 || encoded.charAt(0) != '"' || encoded.charAt(37) != '"') throw unavailable();
+        String value = encoded.substring(1, 37);
+        var id = UUID.fromString(value);
+        if (!value.equals(id.toString())) throw unavailable();
+        return id;
+    }
+
+    private static void verifyLegacyDispatch(ResultSet rs, Row row) throws SQLException {
+        if (!Boolean.TRUE.equals(rs.getObject("dispatch_identity_matches", Boolean.class))
+                || !Boolean.TRUE.equals(rs.getObject("dispatch_fact_matches", Boolean.class))
+                || row.dispatch() != null && !row.descriptor().parametersSha256(row.action().arguments()).equals(rs.getString("dispatch_parameters_sha256"))) {
+            throw unavailable();
+        }
+    }
+
+    private static void verifyRuntimeDispatch(ResultSet rs, Row row) throws SQLException {
+        if (!row.originSnapshotSha256().equals(rs.getString("origin_runtime_snapshot_sha256"))) throw unavailable();
+        if (row.dispatch() == null) return;
+        if (!hash(rs.getString("dispatch_runtime_snapshot_sha256"))
+                || !Boolean.TRUE.equals(rs.getObject("runtime_dispatch_matches", Boolean.class))
+                || !row.descriptor().parametersSha256(row.action().arguments()).equals(rs.getString("runtime_input_sha256"))) throw unavailable();
+        String state = switch (row.state()) {
+            case "DISPATCHING" -> "DISPATCHED";
+            case "APPLIED" -> "SUCCEEDED";
+            case "REJECTED", "FAILED_KNOWN" -> "FAILED";
+            case "UNKNOWN" -> "UNKNOWN";
+            default -> throw unavailable();
+        };
+        String result = rs.getString("runtime_result_sha256");
+        if (!state.equals(rs.getString("runtime_call_state")) || !Objects.equals(row.lastErrorCode(), rs.getString("runtime_error_code"))
+                || "SUCCEEDED".equals(state) && !hash(result) || "DISPATCHED".equals(state) && result != null
+                || result != null && !hash(result)) throw unavailable();
     }
 
     private ApprovalConsumptionVO approval(ResultSet rs, ToolActionRequest action, Instant created) throws SQLException {
@@ -470,15 +586,15 @@ final class ToolActionIntentSql {
         return new ApprovalConsumptionVO(proof, sha, consumed);
     }
 
-    private static DispatchVO dispatch(ResultSet rs, TrustedAgentActor owner) throws SQLException {
+    private static DispatchVO dispatch(ResultSet rs, TrustedAgentActor owner, UUID callId) throws SQLException {
         Long epoch = rs.getObject("dispatch_epoch", Long.class); String run = rs.getString("dispatch_run_id"), nonce = rs.getString("dispatch_nonce_sha256");
         UUID invocation = rs.getObject("dispatch_invocation_id", UUID.class); String issuer = rs.getString("executor_issuer"), id = rs.getString("executor_id");
         if (epoch == null || epoch < 0) throw unavailable();
         if (epoch == 0) {
-            if (run != null || nonce != null || invocation != null || issuer != null || id != null) throw unavailable(); return null;
+            if (run != null || nonce != null || invocation != null || callId != null || issuer != null || id != null) throw unavailable(); return null;
         }
-        if (run == null || nonce == null || invocation == null || issuer == null || !issuer.matches("[0-9a-f]{64}") || id == null) throw unavailable();
-        return new DispatchVO(run, invocation, epoch, nonce, new TrustedAgentActor(owner.tenantId(), TrustedAgentActor.SubjectType.SERVICE, id, issuer));
+        if (run == null || nonce == null || (invocation == null) == (callId == null) || !hash(issuer) || id == null) throw unavailable();
+        return new DispatchVO(run, invocation, callId, epoch, nonce, new TrustedAgentActor(owner.tenantId(), TrustedAgentActor.SubjectType.SERVICE, id, issuer));
     }
 
     private AgentRunAuthorization.Request requireHistoricalSource(TrustedAgentActor owner, String id, ToolDescriptor descriptor,
@@ -520,22 +636,37 @@ final class ToolActionIntentSql {
         return OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_ACTION_LOGICAL_IDENTITY_V1", action.owner().identityFingerprint(), action.actionKey(), action.businessKey(), action.businessVersion()), Map.of());
     }
 
-    record Row(ToolActionRequest action, ToolDescriptor descriptor, String originRunId, String originSnapshotSha256, String state, long revision,
+    record OriginVO(String runId, String snapshotSha256) {
+        OriginVO { if (!ToolActionIntentSql.runId(runId) || !hash(snapshotSha256)) throw invalid(); }
+        @Override public String toString() { return "ToolActionIntentOrigin[redacted]"; }
+    }
+
+    record Row(ToolActionRequest action, ToolDescriptor descriptor, OriginVO origin, ActionProfile profile, String state, long revision,
                Instant createdAt, Instant updatedAt, Instant expiresAt, ApprovalConsumptionVO approval, DispatchVO dispatch,
                String sideEffectOutcome, ToolExecutionOutcome outcome, String lastErrorCode, Instant closedAt) {
+        Row(ToolActionRequest action, ToolDescriptor descriptor, String originRunId, String originSnapshotSha256, String state, long revision,
+            Instant createdAt, Instant updatedAt, Instant expiresAt, ApprovalConsumptionVO approval, DispatchVO dispatch,
+            String sideEffectOutcome, ToolExecutionOutcome outcome, String lastErrorCode, Instant closedAt) {
+            this(action, descriptor, new OriginVO(originRunId, originSnapshotSha256), ActionProfile.LEGACY_V1, state, revision,
+                    createdAt, updatedAt, expiresAt, approval, dispatch, sideEffectOutcome, outcome, lastErrorCode, closedAt);
+        }
+        String originRunId() { return origin.runId(); }
+        String originSnapshotSha256() { return origin.snapshotSha256(); }
         Row {
-            if (action == null || descriptor == null || !descriptor.reference().equals(action.tool()) || !descriptor.policy().equals(action.policy()) || !runId(originRunId)
-                    || originSnapshotSha256 == null || !originSnapshotSha256.matches("[0-9a-f]{64}") || state == null || !STATES.contains(state) || revision < 1
+            if (action == null || descriptor == null || !descriptor.reference().equals(action.tool()) || !descriptor.policy().equals(action.policy())
+                    || origin == null || profile == null || state == null || !STATES.contains(state) || revision < 1
                     || createdAt == null || updatedAt == null || expiresAt == null || updatedAt.isBefore(createdAt)
                     || !expiresAt.isAfter(createdAt) || expiresAt.isAfter(createdAt.plus(Duration.ofDays(7)))
                     || closedAt != null && (closedAt.isBefore(createdAt) || updatedAt.isBefore(closedAt))
                     || lastErrorCode != null && !lastErrorCode.matches("[A-Z][A-Z0-9_]{0,63}")) throw invalid();
             var risk = descriptor.policy().risk();
             if (approval != null && (risk != ToolPolicy.Risk.APPROVAL_REQUIRED || approval.consumedAt().isBefore(createdAt))
-                    || dispatch != null && (dispatch.executor().tenantId() != action.owner().tenantId() || risk == ToolPolicy.Risk.APPROVAL_REQUIRED && approval == null)) throw invalid();
+                    || dispatch != null && (dispatch.executor().tenantId() != action.owner().tenantId() || risk == ToolPolicy.Risk.APPROVAL_REQUIRED && approval == null
+                    || (profile == ActionProfile.LEGACY_V1) != (dispatch.invocationId() != null))) throw invalid();
             if (approval != null) approval.proof().binding().requireApproved(action, approval.proof().approval(), approval.proof().approval().verifiedAt());
             if (outcome != null) {
                 outcome = outcome.validated(descriptor);
+                if (profile == ActionProfile.RUNTIME_V2 && outcome.actualCost() != null) throw invalid();
                 if (!(state.equals("APPLIED") ? "SUCCEEDED" : state).equals(outcome.status().name()) || !Objects.equals(lastErrorCode, outcome.errorCode())) throw invalid();
             }
             switch (state) {
@@ -574,9 +705,12 @@ final class ToolActionIntentSql {
         }
         @Override public String toString() { return "ToolActionIntentApprovalConsumption[redacted]"; }
     }
-    record DispatchVO(String runId, UUID invocationId, long epoch, String nonceSha256, TrustedAgentActor executor) {
+    record DispatchVO(String runId, UUID invocationId, UUID callId, long epoch, String nonceSha256, TrustedAgentActor executor) {
+        DispatchVO(String runId, UUID invocationId, long epoch, String nonceSha256, TrustedAgentActor executor) {
+            this(runId, invocationId, null, epoch, nonceSha256, executor);
+        }
         DispatchVO {
-            if (!ToolActionIntentSql.runId(runId) || invocationId == null || epoch < 1 || !hash(nonceSha256) || executor == null
+            if (!ToolActionIntentSql.runId(runId) || (invocationId == null) == (callId == null) || epoch < 1 || !hash(nonceSha256) || executor == null
                     || executor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || !hash(executor.issuerFingerprint())) throw invalid();
         }
         @Override public String toString() { return "ToolActionIntentDispatch[redacted]"; }
