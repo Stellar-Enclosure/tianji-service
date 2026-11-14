@@ -25,6 +25,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorkerCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.CompleteEngineHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.ActivationCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.CreateProcessDraftCommand;
@@ -57,6 +58,8 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     private static final int MAX_DRAFT_COMMAND_BYTES = 4 * 1024;
     private static final int MAX_ACTIVATION_COMMAND_BYTES = 4 * 1024;
     private static final int MAX_AUTOMATION_START_BYTES = 384 * 1024;
+    private static final int MAX_ENGINE_TASK_COMPLETION_BYTES = 68 * 1024;
+    private static final Set<String> ENGINE_TASK_COMPLETION_FIELDS = Set.of("commandId", "expectedVersion", "result");
     private static final Set<String> ACTIVATION_FIELDS = Set.of("releaseVersion", "expectedActivationRevision", "commandId");
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
@@ -85,13 +88,14 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
                 || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
                 || type == RecoverProcessWorkerCommand.class || draftCommand(type) || type == ActivationCommand.class
-                || type == AutomationStartCommand.class;
+                || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class;
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
-        if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class) {
+        if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class
+                || type == CompleteEngineHumanTaskCommand.class) {
             var contentType = input.getHeaders().getContentType();
             if (contentType != null && contentType.getCharset() != null
                     && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
@@ -101,6 +105,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         int maxBytes = type == SaveProcessDraftCommand.class ? MAX_DRAFT_SAVE_BYTES
                 : draftCommand(type) ? MAX_DRAFT_COMMAND_BYTES
                 : type == AutomationStartCommand.class ? MAX_AUTOMATION_START_BYTES
+                : type == CompleteEngineHumanTaskCommand.class ? MAX_ENGINE_TASK_COMPLETION_BYTES
                 : type == ActivationCommand.class ? MAX_ACTIVATION_COMMAND_BYTES
                 : type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
                 : type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
@@ -118,6 +123,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (type == PublishProcessDraftCommand.class || type == ValidateProcessDraftQuery.class) validatePublicationBody(body, type);
         if (type == ActivationCommand.class) validateActivationBody(body);
         if (type == AutomationStartCommand.class) validateAutomationStartBody(body);
+        if (type == CompleteEngineHumanTaskCommand.class) validateEngineTaskCompletionBody(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -188,6 +194,24 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             if (((String) wire.get("commandId")).startsWith("evt-v2-")) throw new IllegalArgumentException();
         } catch (CharacterCodingException | RuntimeException invalid) {
             throw new IllegalArgumentException("Invalid process automation START request");
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void validateEngineTaskCompletionBody(byte[] body) {
+        try {
+            String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var wire = STRICT_AUTOMATION_START_JSON.readValue(json, Map.class);
+            if (wire == null || !wire.keySet().equals(ENGINE_TASK_COMPLETION_FIELDS)
+                    || !(wire.get("commandId") instanceof String command) || !command.matches("[A-Za-z][A-Za-z0-9_.:-]{0,127}")
+                    || !(wire.get("expectedVersion") instanceof String version)
+                    || version.length() > 128 || version.isBlank() || !version.matches("[^\\p{Cc}]{1,128}")
+                    || !(wire.get("result") instanceof Map<?, ?> result)
+                    || !new CompleteEngineHumanTaskCommand(command, version, (Map<String, Object>) result).isScalarResultValid()) {
+                throw new IllegalArgumentException();
+            }
+        } catch (CharacterCodingException | RuntimeException invalid) {
+            throw new IllegalArgumentException("Invalid automation task completion request");
         }
     }
 

@@ -42,6 +42,8 @@ import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.EngineTaskController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessNodeExecutionController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessDraftController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessActivationController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
@@ -141,12 +143,17 @@ public class ProcessSecurityConfiguration {
     private static final List<RequestMatcher> AUTOMATION_INSTANCE_ROUTES = List.of(
             MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.INSTANCES_PATH),
             MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.INSTANCE_PATH));
+    private static final RequestMatcher AUTOMATION_NODE_ROUTE = MATCHER.matcher(HttpMethod.GET, ProcessNodeExecutionController.PATH);
+    private static final List<RequestMatcher> AUTOMATION_ACTION_ROUTES = List.of(
+            MATCHER.matcher(HttpMethod.GET, EngineTaskController.TASK_PATH),
+            MATCHER.matcher(HttpMethod.POST, EngineTaskController.COMPLETION_PATH));
 
     @Bean("processActivationMediaErrors")
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     HandlerExceptionResolver processActivationMediaErrors() {
         return ProcessApiErrors.closedJsonMediaErrors(request -> ACTIVATION_ROUTES.stream().anyMatch(route -> route.matches(request))
-                || AUTOMATION_INSTANCE_ROUTES.stream().anyMatch(route -> route.matches(request)));
+                        || AUTOMATION_INSTANCE_ROUTES.stream().anyMatch(route -> route.matches(request)),
+                request -> AUTOMATION_NODE_ROUTE.matches(request) || AUTOMATION_ACTION_ROUTES.stream().anyMatch(route -> route.matches(request)));
     }
 
     @Bean
@@ -191,10 +198,12 @@ public class ProcessSecurityConfiguration {
                             .requestMatchers(HttpMethod.HEAD, ProcessStartReceiptController.PATH).authenticated();
                     if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
-                            .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
+                            .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
+                            .requestMatchers(AUTOMATION_NODE_ROUTE).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
-                    if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
+                    if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated()
+                            .requestMatchers(AUTOMATION_ACTION_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (approvalVerificationEnabled) authorize.requestMatchers(ApprovalClient.PATH).authenticated();
                     if (casesEnabled) authorize.requestMatchers("/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get", "/api/tianji/v1/cases/act-plan-item").authenticated();
                     authorize.anyRequest().denyAll();
@@ -248,6 +257,8 @@ public class ProcessSecurityConfiguration {
             selected.addAll(DRAFT_ROUTES);
             selected.addAll(ACTIVATION_ROUTES);
             selected.addAll(AUTOMATION_INSTANCE_ROUTES);
+            selected.add(AUTOMATION_NODE_ROUTE);
+            selected.addAll(AUTOMATION_ACTION_ROUTES);
             routes = List.copyOf(selected);
         }
 
@@ -305,7 +316,8 @@ public class ProcessSecurityConfiguration {
                         ProcessDraftController.DISCARD_PATH, ProcessAutomationController.VALIDATE_PATH,
                         ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH,
                         ProcessActivationController.PATH, ProcessAutomationController.INSTANCES_PATH,
-                        ProcessAutomationController.INSTANCE_PATH), true);
+                        ProcessAutomationController.INSTANCE_PATH, ProcessNodeExecutionController.PATH,
+                        EngineTaskController.TASK_PATH, EngineTaskController.COMPLETION_PATH), true);
     }
 
     @Bean
@@ -550,22 +562,38 @@ public class ProcessSecurityConfiguration {
             var store = new HumanTaskReceiptStore(manager.getDataSource(), configuration.getDatabaseSchema()); store.verifyStorage(); return store;
         }
 
-        @Bean
+        @Bean("flowableHumanTaskService")
         @ConditionalOnMissingBean(FlowableHumanTaskService.class)
+        FlowableHumanTaskService flowableHumanTaskServiceWithAutomation(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts,
+                Environment environment, ObjectProvider<CmmnEngine> caseEngines, ObjectProvider<CaseStartProvenanceStore> provenance,
+                ObjectProvider<MeterRegistry> registries,
+                @Qualifier("automationTaskParticipants") ObjectProvider<FlowableHumanTaskService.AutomationTaskParticipants> automation) {
+            return flowableHumanTaskService(process, dmn, validator, receipts, environment, caseEngines, provenance, registries, automation.getIfAvailable());
+        }
+
         FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator, HumanTaskReceiptStore receipts,
                 Environment environment, ObjectProvider<CmmnEngine> caseEngines, ObjectProvider<CaseStartProvenanceStore> provenance,
                 ObjectProvider<MeterRegistry> registries) {
+            return flowableHumanTaskService(process, dmn, validator, receipts, environment, caseEngines, provenance, registries, null);
+        }
+
+        private FlowableHumanTaskService flowableHumanTaskService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator,
+                HumanTaskReceiptStore receipts, Environment environment, ObjectProvider<CmmnEngine> caseEngines,
+                ObjectProvider<CaseStartProvenanceStore> provenance, ObjectProvider<MeterRegistry> registries,
+                FlowableHumanTaskService.AutomationTaskParticipants automation) {
             var completion = environment.getProperty(COMPLETION_METRICS_ENABLED, Boolean.class, false)
                     ? HumanTaskCompletionObservation.enabled(registries::getIfUnique)
                     : HumanTaskCompletionObservation.disabled();
-            if (environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)) {
-                var cmmn = caseEngines.getIfAvailable();
-                if (cmmn == null) throw new IllegalStateException("Case tasks require the initialized CMMN engine");
-                return new FlowableHumanTaskService(processConfiguration(process), caseConfiguration(cmmn),
-                        decisionConfiguration(dmn), validator, receipts, provenance.getObject(), completion);
-            }
-            return new FlowableHumanTaskService(processConfiguration(process), null,
-                    decisionConfiguration(dmn), validator, receipts, null, completion);
+            boolean cases = environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false);
+            var cmmn = cases ? caseEngines.getIfAvailable() : null;
+            if (cases && cmmn == null) throw new IllegalStateException("Case tasks require the initialized CMMN engine");
+            var processConfiguration = processConfiguration(process);
+            var dmnConfiguration = decisionConfiguration(dmn);
+            var cmmnConfiguration = cases ? caseConfiguration(cmmn) : null;
+            var caseProvenance = cases ? provenance.getObject() : null;
+            return automation == null
+                    ? new FlowableHumanTaskService(processConfiguration, cmmnConfiguration, dmnConfiguration, validator, receipts, caseProvenance, completion)
+                    : new FlowableHumanTaskService(processConfiguration, cmmnConfiguration, dmnConfiguration, validator, receipts, caseProvenance, completion, automation);
         }
 
         @Bean
@@ -744,7 +772,8 @@ public class ProcessSecurityConfiguration {
         @ConditionalOnMissingBean(ProcessControlService.class)
         ProcessControlService processControlService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator,
                 ProcessReleaseService releases, ProcessControlNativeAccess nativeAccess, ProcessCancellationReceiptStore cancellations,
-                ObjectProvider<AgentDispatchStore> dispatch) {
+                ObjectProvider<AgentDispatchStore> dispatch,
+                @Qualifier("automationControlParticipants") ObjectProvider<ProcessControlService.AutomationControlParticipants> automation) {
             var configuration = processConfiguration(process);
             DataSource source = caseDataSource(configuration);
             var manager = (DataSourceTransactionManager) configuration.getTransactionManager();
@@ -756,7 +785,10 @@ public class ProcessSecurityConfiguration {
             var selected = dispatch.getIfAvailable();
             if (selected == null) selected = new AgentDispatchStore(source, manager, schema);
             selected.requireStorage(source, manager, schema);
-            return new ProcessControlService(configuration, decisionConfiguration(dmn), validator, releases, nativeAccess, cancellations, selected);
+            var participants = automation.getIfAvailable();
+            return participants == null
+                    ? new ProcessControlService(configuration, decisionConfiguration(dmn), validator, releases, nativeAccess, cancellations, selected)
+                    : new ProcessControlService(configuration, decisionConfiguration(dmn), validator, releases, nativeAccess, cancellations, selected, participants);
         }
     }
 

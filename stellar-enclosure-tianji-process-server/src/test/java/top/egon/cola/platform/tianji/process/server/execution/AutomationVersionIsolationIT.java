@@ -430,11 +430,14 @@ class AutomationVersionIsolationIT {
     static class NativeTestConfiguration {
         @Bean
         org.flowable.spring.boot.EngineConfigurationConfigurer<SpringProcessEngineConfiguration> bootstrap() {
-            return config -> AutomationBootstrapBehavior.register(config, () -> {
+            return config -> {
                 var source = ((DataSourceTransactionManager) config.getTransactionManager()).getDataSource();
                 var jdbc = new JdbcTemplate(source);
-                return new AutomationBootstrapBehavior(new ProcessInstanceBindingStore(jdbc, SCHEMA), new AutomationReleaseStore(jdbc, SCHEMA));
-            });
+                var bindings = new ProcessInstanceBindingStore(jdbc, SCHEMA);
+                config.setCustomPostCommandInterceptors(List.of(new AutomationInstanceGuardCommandInterceptor(jdbc, SCHEMA, bindings)));
+                AutomationInstanceGuardCommandInterceptor.registerFailedJobHandling(config);
+                AutomationBootstrapBehavior.register(config, () -> new AutomationBootstrapBehavior(bindings, new AutomationReleaseStore(jdbc, SCHEMA)));
+            };
         }
     }
 }

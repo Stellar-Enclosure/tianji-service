@@ -76,6 +76,12 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Start an instance from the active process release"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.instance.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read an authorized automation instance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.node.execution.list", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "List executions in an authorized automation instance"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.engine.task.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an authorized automation action task"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.engine.task.complete", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Complete an assigned automation action task"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.create", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Create an owned process draft"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.get", defaultLocale = "en-US",
@@ -217,6 +223,9 @@ public final class TianjiProcessPermissions {
     public static final String AUTOMATION_ACTIVATION_LIST_API = "tianji.api.process.activation.list.v2";
     public static final String AUTOMATION_INSTANCE_START_API = "tianji.api.process.instance.start.v2";
     public static final String AUTOMATION_INSTANCE_GET_API = "tianji.api.process.instance.get.v2";
+    public static final String AUTOMATION_NODE_EXECUTION_LIST_API = "tianji.api.process.node.execution.list.v2";
+    public static final String ENGINE_TASK_GET_API = "tianji.api.process.task.get.v2";
+    public static final String ENGINE_TASK_COMPLETE_API = "tianji.api.process.task.complete.v2";
     public static final String DRAFT_CREATE_API = "tianji.api.process.draft.create.v2";
     public static final String DRAFT_GET_API = "tianji.api.process.draft.get.v2";
     public static final String DRAFT_SAVE_API = "tianji.api.process.draft.save.v2";

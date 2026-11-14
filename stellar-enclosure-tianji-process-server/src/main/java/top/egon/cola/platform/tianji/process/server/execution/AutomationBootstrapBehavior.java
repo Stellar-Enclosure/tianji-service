@@ -60,7 +60,8 @@ public final class AutomationBootstrapBehavior {
         catch (NumberFormatException invalid) { throw unavailable(); }
 
         var instanceId = execution.getProcessInstanceId();
-        var binding = bindings.lockRoot(tenant, instanceId);
+        AutomationInstanceGuardCommandInterceptor.requireHeld(tenant, instanceId);
+        var binding = bindings.find(tenant, instanceId).orElseThrow(AutomationBootstrapBehavior::unavailable);
         if (!instanceId.equals(execution.getVariable(ProcessReleaseService.AUTOMATION_BINDING_REF))) throw unavailable();
         var definition = bindings.nativeDefinition(tenant, binding.getReleaseKey(), binding.getDefinitionKey())
                 .orElseThrow(AutomationBootstrapBehavior::unavailable);

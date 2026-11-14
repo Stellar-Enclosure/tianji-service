@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.parallel.Isolated;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.util.LinkedMultiValueMap;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessMigrationPreflightDTO;
@@ -53,8 +54,7 @@ class ProcessMigrationPreflightPostgresTest {
     @EnabledIfSystemProperty(named = "tianji.process.postgres.migration-preflight", matches = "true")
     void validates_one_owned_native_timer_without_moving_it() {
         assertEquals(ZoneOffset.UTC, ZoneId.systemDefault().normalized(), "run the fixture with -Duser.timezone=UTC");
-        var database = ProcessServerPostgresTest.formalCaseDatabase();
-        prepareMigrationObservationSchema(database);
+        var database = prepareMigrationObservationSchema();
 
         // Both the fixture JVM and the actual Process JDBC sessions use UTC for native timer timestamps.
         String scopedUtcUrl = database.scopedUrl() + "&options=-c%20TimeZone%3DUTC";
@@ -131,23 +131,53 @@ class ProcessMigrationPreflightPostgresTest {
         }
     }
 
-    private static void prepareMigrationObservationSchema(ProcessServerPostgresTest.CaseDatabase database) {
-        var source = database.bootstrap().getDataSource();
+    private static ProcessServerPostgresTest.CaseDatabase prepareMigrationObservationSchema() {
+        String url = ProcessServerPostgresTest.explicitTestUrl();
+        var source = new DriverManagerDataSource(url);
+        var jdbc = new JdbcTemplate(source);
+        jdbc.setQueryTimeout(5);
+        if (jdbc.queryForObject("SELECT count(*) FROM pg_namespace WHERE nspname=?", Integer.class, SCHEMA) != 0) {
+            throw new IllegalStateException("integration tests require a fresh database without the process schema");
+        }
+        jdbc.execute("CREATE SCHEMA " + SCHEMA);
         var platform = Flyway.configure().dataSource(source).schemas(SCHEMA).defaultSchema(SCHEMA)
-                .table("tianji_process_schema_history").baselineVersion("0").locations("classpath:db/tianji-process")
+                .table("tianji_process_schema_history").createSchemas(false).baselineOnMigrate(false).locations("classpath:db/tianji-process")
                 .target("10").cleanDisabled(true).load();
-        assertEquals(2, platform.migrate().migrationsExecuted);
+        assertEquals(10, platform.migrate().migrationsExecuted);
         platform.validate();
+        assertEquals(List.of("1", "2", "3", "4", "5", "6", "7", "8", "9", "10"), jdbc.queryForList(
+                "SELECT version FROM " + SCHEMA + ".tianji_process_schema_history ORDER BY installed_rank", String.class));
+        var outbox = Flyway.configure().dataSource(source).schemas(SCHEMA).defaultSchema(SCHEMA)
+                .baselineOnMigrate(true).baselineVersion("0").locations("classpath:db/transactional-outbox/postgresql")
+                .cleanDisabled(true).load();
+        outbox.migrate();
+        outbox.validate();
+        String scoped = url + "?currentSchema=" + SCHEMA;
+        try (var installing = ProcessServerPostgresTest.context(ProcessServerPostgresTest.Provisioner.class, scoped,
+                System.getProperty("user.name"), "--flowable.database-schema-update=true",
+                "--egon.cola.component.transactional-outbox.enabled=false")) {
+            assertNotNull(installing.getBean(ProcessEngine.class));
+        }
 
-        // The reused V8 fixture already checked the runtime role name and privileges. B1 needs only a new read.
-        var jdbc = database.bootstrap();
+        String configuredRole = System.getProperty("tianji.process.postgres.test.runtime-user", "");
+        if (!configuredRole.matches("tianji_it_runtime_[0-9a-f]{12}")) {
+            throw new IllegalArgumentException("integration tests require a dedicated temporary runtime role");
+        }
+        jdbc.execute("GRANT USAGE ON SCHEMA " + SCHEMA + " TO \"" + configuredRole + "\"");
         String role = ProcessServerPostgresTest.explicitRuntimeRole(jdbc);
-        assertEquals(database.runtimeUser(), role);
-        jdbc.execute("GRANT SELECT ON " + RECOVERY_RECEIPT + " TO \"" + role + "\"");
+        String quoted = "\"" + role + "\"";
+        jdbc.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA " + SCHEMA + " TO " + quoted);
+        jdbc.execute("GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA " + SCHEMA + " TO " + quoted);
+        jdbc.execute("REVOKE INSERT, UPDATE, DELETE ON " + SCHEMA + ".flyway_schema_history, " + SCHEMA
+                + ".tianji_process_schema_history, " + RECOVERY_RECEIPT + " FROM " + quoted);
+        jdbc.execute("REVOKE UPDATE, DELETE ON " + SCHEMA + ".tianji_case_start_provenance, " + SCHEMA
+                + ".tianji_case_plan_item_receipt FROM " + quoted);
+        jdbc.execute("REVOKE DELETE ON " + SCHEMA + ".tianji_case_completion_inbox FROM " + quoted);
         assertEquals(Boolean.TRUE, jdbc.queryForObject("SELECT has_table_privilege(?, ?, 'SELECT')", Boolean.class,
                 role, RECOVERY_RECEIPT));
         assertEquals(Boolean.FALSE, jdbc.queryForObject("SELECT has_table_privilege(?, ?, 'INSERT, UPDATE, DELETE, TRUNCATE')",
                 Boolean.class, role, RECOVERY_RECEIPT));
+        return new ProcessServerPostgresTest.CaseDatabase(scoped, role, jdbc);
     }
 
     private static ProcessReleaseService.ModelResource timerModel(String name) {

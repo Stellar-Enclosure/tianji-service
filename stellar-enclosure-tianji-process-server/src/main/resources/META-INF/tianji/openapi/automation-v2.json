@@ -2677,8 +2677,7 @@
         ],
         "x-resource-key": "tianji.api.process.task.get.v2",
         "x-allowed-principals": [
-          "USER",
-          "SERVICE"
+          "USER"
         ],
         "parameters": [
           {
@@ -3013,8 +3012,7 @@
         ],
         "x-resource-key": "tianji.api.process.task.complete.v2",
         "x-allowed-principals": [
-          "USER",
-          "SERVICE"
+          "USER"
         ],
         "parameters": [
           {

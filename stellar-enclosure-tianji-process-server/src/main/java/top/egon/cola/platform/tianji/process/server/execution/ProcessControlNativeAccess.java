@@ -25,6 +25,7 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflict
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
+import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
 import javax.sql.DataSource;
 import java.sql.ResultSet;
@@ -167,6 +168,72 @@ public final class ProcessControlNativeAccess {
         return result;
     }
 
+    public boolean automationStoragePresent() {
+        return Boolean.TRUE.equals(jdbc.queryForObject("SELECT pg_catalog.to_regclass(?) IS NOT NULL", Boolean.class,
+                recoveryTablePrefix + "tianji_process_instance_binding"));
+    }
+
+    public boolean hasAutomationRelease(long tenantId, String releaseKey) {
+        requireTransaction();
+        var receipts = new ProcessCommandReceiptStore(jdbc, engine.getDatabaseSchema());
+        return receipts.hasAutomationRelease(tenantId, releaseKey);
+    }
+
+    public boolean hasAutomationRootInput(long tenantId, String releaseKey) {
+        requireTransaction();
+        var receipts = new ProcessCommandReceiptStore(jdbc, engine.getDatabaseSchema());
+        return receipts.hasAutomationRootInput(tenantId, releaseKey);
+    }
+
+    public ProcessReleaseService.Definition automationDefinition(AutomationInstanceBindingBO binding) {
+        requireTransaction();
+        List<ProcessReleaseService.Definition> definitions = jdbc.query("""
+                SELECT d.engine_definition_id, d.engine_deployment_id, d.engine_version, d.model_sha256
+                FROM %1$stianji_process_release_definition d
+                JOIN %1$stianji_process_release r ON r.tenant_id=d.tenant_id AND r.release_key=d.release_key
+                WHERE d.tenant_id=? AND d.release_key=? AND d.model_type='BPMN' AND d.definition_key=?
+                    AND d.input_schema=jsonb_build_object(CAST(? AS text),'STRING') AND r.state='ACTIVE'
+                """.formatted(recoveryTablePrefix),
+                (row, index) -> new ProcessReleaseService.Definition(Type.BPMN, binding.getDefinitionKey(),
+                        row.getString("engine_definition_id"), row.getString("engine_deployment_id"),
+                        row.getInt("engine_version"), row.getString("model_sha256"),
+                        Map.of(ProcessReleaseService.AUTOMATION_BINDING_REF, ValueType.STRING)),
+                binding.getTenantId(), binding.getReleaseKey(), binding.getDefinitionKey(), ProcessReleaseService.AUTOMATION_BINDING_REF);
+        if (definitions.size() != 1) throw unavailable();
+        return definitions.getFirst();
+    }
+
+    Optional<LockedRoot> readAutomationRoot(AutomationInstanceBindingBO binding,
+                                            ProcessReleaseService.Definition definition) {
+        requireTransaction();
+        return readRoot(automationScope(binding, definition), false);
+    }
+
+    Optional<LockedRoot> lockAutomationRoot(AutomationInstanceBindingBO binding,
+                                            ProcessReleaseService.Definition definition) {
+        requireTransaction();
+        AutomationInstanceGuardCommandInterceptor.requireHeld(binding.getTenantId(), binding.getInstanceId());
+        return readRoot(automationScope(binding, definition), true);
+    }
+
+    TerminalFacts automationTerminalHistory(AutomationInstanceBindingBO binding,
+                                             ProcessReleaseService.Definition definition, String businessKey,
+                                             boolean requireOwnCancellation) {
+        requireTransaction();
+        if (businessKey != null && !textValue(businessKey, 255)) throw invalid();
+        return terminal(automationScope(binding, definition), businessKey, requireOwnCancellation);
+    }
+
+    private static Scope automationScope(AutomationInstanceBindingBO binding,
+                                         ProcessReleaseService.Definition definition) {
+        if (!binding.getDefinitionKey().equals(definition.definitionKey())
+                || !textValue(binding.getInstanceId(), 255) || !textValue(definition.engineDefinitionId(), 255)) {
+            throw unavailable();
+        }
+        return new Scope(binding.getTenantId(), Long.toString(binding.getTenantId()), binding.getInstanceId(),
+                definition.engineDefinitionId());
+    }
+
     public TerminalFacts terminalHistory(ProcessCommandReceiptStore.TaskOrigin start,
                                          ProcessReleaseService.Definition definition,
                                          String expectedBusinessKey,
@@ -288,7 +355,10 @@ public final class ProcessControlNativeAccess {
                     AND element_id_= ? AND rev_>0 AND type_='timer' AND handler_type_= ? AND handler_cfg_= ?
                     AND repeat_ IS NULL AND lock_owner_ IS NULL AND lock_exp_time_ IS NULL AND exception_msg_ IS NULL
                     AND scope_id_ IS NULL AND sub_scope_id_ IS NULL AND scope_type_ IS NULL
-                    AND scope_definition_id_ IS NULL AND correlation_id_ IS NULL
+                    AND scope_definition_id_ IS NULL
+                    AND (correlation_id_ IS NULL OR (correlation_id_ ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$'
+                        AND correlation_id_ <> id_ AND correlation_id_ <> execution_id_
+                        AND correlation_id_ <> process_instance_id_))
                     AND duedate_ AT TIME ZONE 'UTC' > ? AS exact_timer
                 FROM %sact_ru_timer_job
                 WHERE process_instance_id_=? OR execution_id_ IN (?,?) LIMIT 2

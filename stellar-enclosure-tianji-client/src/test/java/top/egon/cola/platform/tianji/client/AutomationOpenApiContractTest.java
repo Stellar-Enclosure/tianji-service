@@ -118,6 +118,8 @@ class AutomationOpenApiContractTest {
         assertEquals(Set.of(Set.of("tianji:process:release:read", "tianji:process:activate")),
                 oauth(operation(doc, "activateAutomationRelease")));
         assertEquals(Set.of("USER"), values(operation(doc, "activateAutomationRelease").path("x-allowed-principals")));
+        assertEquals(Set.of("USER"), values(operation(doc, "getEngineHumanTask").path("x-allowed-principals")));
+        assertEquals(Set.of("USER"), values(operation(doc, "completeEngineHumanTask").path("x-allowed-principals")));
         for (String id : List.of("receiveProcessEvent", "acquireAutomationWorkerTask",
                 "completeAutomationWorkerTask", "failAutomationWorkerTask")) {
             assertEquals(Set.of("SERVICE"), values(operation(doc, id).path("x-allowed-principals")), id);

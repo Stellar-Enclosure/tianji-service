@@ -29,13 +29,19 @@ import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.execution.AutomationBootstrapBehavior;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
 import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
 
 import javax.sql.DataSource;
 import java.util.Collections;
+import java.util.List;
 
 /** Keeps Flowable and the JDBC Outbox on the same pre-provisioned local transaction. */
 @Configuration(proxyBeanMethods = false)
@@ -142,11 +148,50 @@ public class ProcessStorageConfiguration {
         return new ProcessInstanceBindingStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
     }
 
+    @Bean("processNodeExecutionStore")
+    ProcessNodeExecutionStore processNodeExecutionStore(OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
+        return new ProcessNodeExecutionStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
+    }
+
+    @Bean("automationInstanceGuardCommandInterceptor")
+    AutomationInstanceGuardCommandInterceptor automationInstanceGuardCommandInterceptor(OutboxInfrastructure outbox,
+            TransactionalOutboxProperties properties, @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings) {
+        return new AutomationInstanceGuardCommandInterceptor(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema(), bindings);
+    }
+
+    @Bean("processNodeLifecycleListener")
+    ProcessNodeLifecycleListener processNodeLifecycleListener(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
+            @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
+            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes,
+            @Qualifier("automationHumanCandidateDirectory") ObjectProvider<ProcessNodeLifecycleListener.HumanCandidateDirectory> candidates) {
+        return new ProcessNodeLifecycleListener(bindings, nodes, nativeAutomationReleases(outbox, properties), candidates);
+    }
+
     @Bean("automationBootstrapBehavior")
     AutomationBootstrapBehavior automationBootstrapBehavior(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
             @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings) {
-        var releaseStore = new AutomationReleaseStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
-        return new AutomationBootstrapBehavior(bindings, releaseStore);
+        return new AutomationBootstrapBehavior(bindings, nativeAutomationReleases(outbox, properties));
+    }
+
+    @Bean("automationTaskParticipants")
+    FlowableHumanTaskService.AutomationTaskParticipants automationTaskParticipants(OutboxInfrastructure outbox,
+            TransactionalOutboxProperties properties, @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
+            @Qualifier("automationInstanceGuardCommandInterceptor") AutomationInstanceGuardCommandInterceptor guard,
+            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes,
+            @Qualifier("processNodeLifecycleListener") ProcessNodeLifecycleListener lifecycle) {
+        return new FlowableHumanTaskService.AutomationTaskParticipants(bindings, nativeAutomationReleases(outbox, properties), guard, nodes, lifecycle);
+    }
+
+    @Bean("automationControlParticipants")
+    ProcessControlService.AutomationControlParticipants automationControlParticipants(OutboxInfrastructure outbox,
+            TransactionalOutboxProperties properties, @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
+            @Qualifier("automationInstanceGuardCommandInterceptor") AutomationInstanceGuardCommandInterceptor guard,
+            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes) {
+        return new ProcessControlService.AutomationControlParticipants(bindings, nativeAutomationReleases(outbox, properties), guard, nodes);
+    }
+
+    private static AutomationReleaseStore nativeAutomationReleases(OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
+        return new AutomationReleaseStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
     }
 
     @Bean("processStorageGuard")
@@ -155,11 +200,22 @@ public class ProcessStorageConfiguration {
             OutboxInfrastructure outbox, TransactionalOutboxProperties properties, Environment environment,
             ObjectProvider<FlowableCaseService> services,
             ObjectProvider<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> registries,
-            @Qualifier("automationBootstrapBehavior") ObjectProvider<AutomationBootstrapBehavior> bootstrap) {
+            @Qualifier("automationBootstrapBehavior") ObjectProvider<AutomationBootstrapBehavior> bootstrap,
+            @Qualifier("automationInstanceGuardCommandInterceptor") AutomationInstanceGuardCommandInterceptor guard,
+            @Qualifier("processNodeLifecycleListener") ObjectProvider<ProcessNodeLifecycleListener> lifecycle) {
         var pinnedStorage = processStorageGuard(outbox, properties, environment, services, registries);
         return config -> {
             pinnedStorage.configure(config);
+            var earlier = config.getCustomPreCommandInterceptors();
+            var later = config.getCustomPostCommandInterceptors();
+            if ((earlier != null && !earlier.isEmpty()) || (later != null && !later.isEmpty())) {
+                throw new IllegalStateException("Process automation requires its pinned native command interceptor chain");
+            }
+            // Flowable 8 appends custom post interceptors after the owning transaction and before CommandInvoker.
+            config.setCustomPostCommandInterceptors(List.of(guard));
+            AutomationInstanceGuardCommandInterceptor.registerFailedJobHandling(config);
             AutomationBootstrapBehavior.register(config, bootstrap::getObject);
+            ProcessNodeLifecycleListener.register(config, lifecycle::getObject);
         };
     }
 

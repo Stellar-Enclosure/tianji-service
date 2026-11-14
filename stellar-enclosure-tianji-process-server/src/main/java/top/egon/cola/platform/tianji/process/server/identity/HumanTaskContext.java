@@ -12,7 +12,8 @@ import java.util.stream.Collectors;
 /** Internal current-user facts from the trusted task adapter. Constructing this value is not authentication or IAM evidence. */
 public record HumanTaskContext(ProcessActor actor, String resourceKey, Set<String> roleIds, Instant deadlineAt, long authVersion, long policyVersion) {
     private static final Set<String> RESOURCES = Set.of("tianji.api.process.task.get", "tianji.api.process.task.query", "tianji.api.process.task.adminQuery", "tianji.api.process.task.claim",
-            "tianji.api.process.task.unclaim", "tianji.api.process.task.transfer", "tianji.api.process.task.complete");
+            "tianji.api.process.task.unclaim", "tianji.api.process.task.transfer", "tianji.api.process.task.complete",
+            "tianji.api.process.task.get.v2", "tianji.api.process.task.complete.v2");
     public HumanTaskContext {
         actor = Objects.requireNonNull(actor, "actor"); roleIds = Set.copyOf(roleIds); deadlineAt = Objects.requireNonNull(deadlineAt, "deadlineAt");
         if (actor.subjectType() != ProcessActor.SubjectType.USER || "LEGACY".equals(actor.issuerFingerprint()) || !RESOURCES.contains(resourceKey) || roleIds.size() > 256 || authVersion < 0 || policyVersion < 0) throw invalid();

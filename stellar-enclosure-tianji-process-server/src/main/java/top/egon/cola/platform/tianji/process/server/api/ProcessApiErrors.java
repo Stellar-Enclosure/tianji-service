@@ -82,12 +82,18 @@ public final class ProcessApiErrors {
 
     /** Media selection can fail before MVC has selected a controller for package-scoped advice. */
     public static HandlerExceptionResolver closedJsonMediaErrors(RequestMatcher route) {
+        return closedJsonMediaErrors(route, request -> false);
+    }
+
+    public static HandlerExceptionResolver closedJsonMediaErrors(RequestMatcher route, RequestMatcher acceptOnlyRoute) {
         return new AbstractHandlerExceptionResolver() {
             @Override
             protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,
                                                       Object handler, Exception failure) {
-                if (!(failure instanceof HttpMediaTypeNotSupportedException || failure instanceof HttpMediaTypeNotAcceptableException)
-                        || !route.matches(request) || response.isCommitted()) return null;
+                boolean unsupportedAccept = failure instanceof HttpMediaTypeNotAcceptableException
+                        && (route.matches(request) || acceptOnlyRoute.matches(request));
+                boolean unsupportedType = failure instanceof HttpMediaTypeNotSupportedException && route.matches(request);
+                if ((!unsupportedAccept && !unsupportedType) || response.isCommitted()) return null;
                 response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
                 response.setContentType(MediaType.APPLICATION_JSON_VALUE);
                 response.setCharacterEncoding(StandardCharsets.UTF_8.name());
@@ -126,6 +132,11 @@ public final class ProcessApiErrors {
     @ExceptionHandler(RuntimeException.class)
     ResponseEntity<OrchestrationErrorDTO> unexpected(RuntimeException failure, HttpServletRequest request) {
         if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler) {
+            if (failure instanceof RejectedExecutionException
+                    && (EngineTaskController.class.isAssignableFrom(handler.getBeanType())
+                        || ProcessNodeExecutionController.class.isAssignableFrom(handler.getBeanType()))) {
+                return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
+            }
             if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())
                     || ProcessAutomationController.class.isAssignableFrom(handler.getBeanType())
                     && "startAutomationProcess".equals(handler.getMethod().getName())) {

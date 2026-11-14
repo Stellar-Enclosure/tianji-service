@@ -23,6 +23,7 @@ import java.util.Objects;
 import java.util.Set;
 
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_INSTANCE_GET_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_NODE_EXECUTION_LIST_API;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DATA_READ;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DATA_READ_SCOPE;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DIAGNOSTIC_READ;
@@ -43,12 +44,20 @@ public final class TianjiProcessAccess {
     }
 
     public AutomationInstanceAccessVO observeAutomationInstance() {
-        var actor = require(AUTOMATION_INSTANCE_GET_API);
+        return observeAutomation(AUTOMATION_INSTANCE_GET_API);
+    }
+
+    public AutomationInstanceAccessVO observeAutomationNodes() {
+        return observeAutomation(AUTOMATION_NODE_EXECUTION_LIST_API);
+    }
+
+    private AutomationInstanceAccessVO observeAutomation(String resourceKey) {
+        var actor = require(resourceKey);
         var current = SecurityContextHolder.getContext().getAuthentication();
         if (current instanceof Rbac3AuthenticationToken user) {
             var snapshot = user.getPrincipal().snapshot();
             if (!snapshot.expiresAt().isAfter(clock.instant())
-                    || !snapshot.resourceCodes().contains(AUTOMATION_INSTANCE_GET_API)) {
+                    || !snapshot.resourceCodes().contains(resourceKey)) {
                 throw new IllegalStateException("Current instance authorization is unavailable");
             }
             Set<String> scopes = UserPermissionScopePolicy.currentScopes();

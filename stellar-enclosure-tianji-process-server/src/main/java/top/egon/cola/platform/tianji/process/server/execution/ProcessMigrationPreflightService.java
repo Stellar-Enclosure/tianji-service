@@ -49,6 +49,9 @@ import static top.egon.cola.platform.tianji.process.server.release.ValidatedProc
 public final class ProcessMigrationPreflightService {
     private static final List<Class<?>> PINNED_COMMAND_CHAIN = List.of(LogInterceptor.class, SpringTransactionInterceptor.class,
             CommandContextInterceptor.class, TransactionContextInterceptor.class, BpmnOverrideContextInterceptor.class, CommandInvoker.class);
+    private static final List<Class<?>> PINNED_AUTOMATION_COMMAND_CHAIN = List.of(LogInterceptor.class, SpringTransactionInterceptor.class,
+            CommandContextInterceptor.class, TransactionContextInterceptor.class, BpmnOverrideContextInterceptor.class,
+            AutomationInstanceGuardCommandInterceptor.class, CommandInvoker.class);
     private final ProcessEngine process;
     private final SpringProcessEngineConfiguration engine;
     private final ProcessReleaseService releases;
@@ -203,10 +206,16 @@ public final class ProcessMigrationPreflightService {
         var migrationManager = engine.getProcessInstanceMigrationManager();
         var command = engine.getDefaultCommandConfig();
         var interceptors = engine.getCommandInterceptors();
+        var customPost = engine.getCustomPostCommandInterceptors();
+        boolean guarded = present(customPost);
+        boolean exactGuard = !guarded || customPost.size() == 1 && customPost.getFirst() != null
+                && customPost.getFirst().getClass() == AutomationInstanceGuardCommandInterceptor.class;
         if (migrationManager == null || migrationManager.getClass() != ProcessInstanceMigrationManagerImpl.class
                 || command == null || command.getTransactionPropagation() != TransactionPropagation.REQUIRED
-                || interceptors == null || !interceptors.stream().map(Object::getClass).toList().equals(PINNED_COMMAND_CHAIN)
-                || present(engine.getCustomPreCommandInterceptors()) || present(engine.getCustomPostCommandInterceptors())
+                || !exactGuard || interceptors == null || !interceptors.stream().map(Object::getClass).toList()
+                        .equals(guarded ? PINNED_AUTOMATION_COMMAND_CHAIN : PINNED_COMMAND_CHAIN)
+                || guarded && interceptors.get(interceptors.size() - 2) != customPost.getFirst()
+                || present(engine.getCustomPreCommandInterceptors())
                 || present(engine.getCustomMybatisInterceptors())) throw unavailable();
     }
 

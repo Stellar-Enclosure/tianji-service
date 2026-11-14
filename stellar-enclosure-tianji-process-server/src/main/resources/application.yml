@@ -46,7 +46,7 @@ egon:
           register-filter: false
         jianshen:
           register-filter: false
-          service-any-scope-resources: ["tianji.api.process.instance.get.v2"]
+          service-any-scope-resources: ["tianji.api.process.instance.get.v2", "tianji.api.process.node.execution.list.v2"]
           user-scope-policy:
             enabled: true
             permission-scopes:

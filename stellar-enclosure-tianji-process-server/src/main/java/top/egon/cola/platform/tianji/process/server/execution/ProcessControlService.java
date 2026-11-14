@@ -16,12 +16,15 @@ import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessResult;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessActiveWaitDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessActiveWaitKindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessControlSnapshotDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessControlActionEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessControlBlockReasonEnum;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessCancellationBlockedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -36,16 +39,21 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.ControlFacts;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.LockedRoot;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.TerminalFacts;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 
 import javax.sql.DataSource;
 import java.sql.SQLException;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 
 /** Owner-only query and cancellation command. Remote Agent closure is never performed in this transaction. */
 public final class ProcessControlService {
@@ -63,17 +71,27 @@ public final class ProcessControlService {
     private final AgentDispatchStore dispatch;
     private final TransactionTemplate read;
     private final TransactionTemplate write;
+    private final AutomationControlParticipants automation;
+    private final ProcessApiSchemaVerifier automationVerifier;
 
     public ProcessControlService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, ProcessReleaseService releases,
                                  ProcessControlNativeAccess nativeAccess, ProcessCancellationReceiptStore cancellations,
                                  AgentDispatchStore dispatch) {
+        this(engine, dmn, validator, releases, nativeAccess, cancellations, dispatch, null);
+    }
+
+    public ProcessControlService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, ProcessReleaseService releases,
+                                 ProcessControlNativeAccess nativeAccess, ProcessCancellationReceiptStore cancellations,
+                                 AgentDispatchStore dispatch, AutomationControlParticipants automation) {
         this.engine = Objects.requireNonNull(engine, "engine");
         Objects.requireNonNull(dmn, "dmn"); Objects.requireNonNull(validator, "validator");
         this.releases = Objects.requireNonNull(releases, "releases");
         this.nativeAccess = Objects.requireNonNull(nativeAccess, "nativeAccess");
         this.cancellations = Objects.requireNonNull(cancellations, "cancellations");
         this.dispatch = Objects.requireNonNull(dispatch, "dispatch");
+        this.automation = automation;
         if (!(engine.getTransactionManager() instanceof DataSourceTransactionManager manager)
                 || manager.getDataSource() == null || configured(engine.getDataSource()) != manager.getDataSource()
                 || dmn.getTransactionManager() != manager || configured(dmn.getDataSource()) != manager.getDataSource()
@@ -83,6 +101,7 @@ public final class ProcessControlService {
                 || engine.getHistoryLevel() == null || !engine.getHistoryLevel().isAtLeast(HistoryLevel.INSTANCE)
                 || engine.isAsyncHistoryEnabled()) throw invalidStorage();
         source = manager.getDataSource(); schema = engine.getDatabaseSchema();
+        automationVerifier = automation == null ? null : new ProcessApiSchemaVerifier(source, schema);
         if (!nativeAccess.usesDataSource(source) || !nativeAccess.usesEngine(engine) || !cancellations.usesDataSource(source)) throw invalidStorage();
         dispatch.requireStorage(source, manager, schema);
         jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(10);
@@ -96,7 +115,10 @@ public final class ProcessControlService {
     public ProcessControlSnapshotDTO control(ProcessActor actor, GetProcessInstanceQuery query) {
         actor(actor); Objects.requireNonNull(query, "query"); noAmbientTransaction();
         try {
+            boolean automationReady = verifyAutomationStorage();
             return Objects.requireNonNull(read.execute(status -> {
+                var binding = automationBinding(actor, query.instanceId(), automationReady);
+                if (binding.isPresent()) return controlAutomation(actor, binding.orElseThrow());
                 TaskOrigin start = readStart(actor, query.instanceId());
                 Release release = release(start);
                 Definition definition = discoverDefinition(start, release);
@@ -110,7 +132,8 @@ public final class ProcessControlService {
     public CancelProcessResult cancel(ProcessActor actor, CancelProcessCommand command) {
         actor(actor); Objects.requireNonNull(command, "command"); noAmbientTransaction();
         try {
-            CancelProcessResult result = Objects.requireNonNull(write.execute(status -> cancelInTransaction(actor, command)));
+            boolean automationReady = verifyAutomationStorage();
+            CancelProcessResult result = Objects.requireNonNull(write.execute(status -> cancelInTransaction(actor, command, automationReady)));
             log.info("Process cancellation: tenant={} instanceHash={} commandHash={} accepted={} status={}", actor.tenantId(),
                     safeHash(command.instanceId()), safeHash(command.commandId()), result.accepted(), result.status());
             return result;
@@ -122,8 +145,10 @@ public final class ProcessControlService {
         }
     }
 
-    private CancelProcessResult cancelInTransaction(ProcessActor actor, CancelProcessCommand command) {
+    private CancelProcessResult cancelInTransaction(ProcessActor actor, CancelProcessCommand command, boolean automationReady) {
         jdbc.execute("SET LOCAL lock_timeout = '5s'");
+        var binding = automationBinding(actor, command.instanceId(), automationReady);
+        if (binding.isPresent()) return cancelAutomation(actor, command, binding.orElseThrow());
         TaskOrigin start = receipts.lockStartByInstance(actor, command.instanceId());
         validateStart(start, actor, command.instanceId());
         String hash = ProcessRequestDigest.hash(List.of("TIANJI_PROCESS_CANCEL_V1", command.instanceId(), command.commandId(), command.expectedVersion(), command.reason()), Map.of());
@@ -174,6 +199,128 @@ public final class ProcessControlService {
         return result;
     }
 
+    private boolean verifyAutomationStorage() {
+        boolean present = automation != null && nativeAccess.automationStoragePresent();
+        if (present) automationVerifier.verifyAutomationV14();
+        return present;
+    }
+
+    private Optional<AutomationInstanceBindingBO> automationBinding(ProcessActor actor, String instanceId, boolean automationReady) {
+        if (!automationReady) return Optional.empty();
+        var owner = automation.bindings().findOwner(actor.tenantId(), instanceId);
+        if (owner.isEmpty()) return Optional.empty();
+        if (!actor.equals(owner.orElseThrow())) throw new ProcessResourceNotFoundException();
+        var binding = automation.bindings().find(actor.tenantId(), instanceId).orElseThrow(ProcessControlService::unavailable);
+        if (!actor.equals(binding.getOwner())) throw unavailable();
+        return Optional.of(binding);
+    }
+
+    private ProcessControlSnapshotDTO controlAutomation(ProcessActor actor, AutomationInstanceBindingBO binding) {
+        var start = automationStart(actor, binding, false);
+        var definition = automationDefinition(binding);
+        var root = nativeAccess.readAutomationRoot(binding, definition);
+        if (root.isPresent()) return automationSnapshot(start, definition, root.orElseThrow(), binding);
+        var terminal = nativeAccess.automationTerminalHistory(binding, definition, null, false);
+        validateTerminal(start, definition, terminal);
+        return new ProcessControlSnapshotDTO(process(start, definition, terminal.businessKey(), terminal.status(), terminal.finishedAt()),
+                List.of(), Set.of(), ProcessControlBlockReasonEnum.PROCESS_TERMINAL,
+                terminalVersion(start, definition, terminal), nativeAccess.now());
+    }
+
+    private CancelProcessResult cancelAutomation(ProcessActor actor, CancelProcessCommand command, AutomationInstanceBindingBO binding) {
+        var lockedBinding = automation.guard().lockKnownRoot(binding.getTenantId(), binding.getInstanceId());
+        if (!binding.equals(lockedBinding)) throw unavailable();
+        var definition = automationDefinition(lockedBinding);
+        var root = nativeAccess.lockAutomationRoot(lockedBinding, definition);
+        var start = automationStart(actor, lockedBinding, true);
+        String hash = ProcessRequestDigest.hash(List.of("TIANJI_PROCESS_CANCEL_V1", command.instanceId(),
+                command.commandId(), command.expectedVersion(), command.reason()), Map.of());
+        var previous = receipts.lockIfPresent(actor, ProcessCommandReceiptStore.Kind.PROCESS_CANCEL, command.commandId());
+        if (previous.isPresent()) {
+            var generic = previous.orElseThrow();
+            if (!hash.equals(generic.requestHash())) throw new ProcessConflictException();
+            if (!"APPLIED".equals(generic.state()) || !command.instanceId().equals(generic.resourceId())
+                    || !start.releaseKey().equals(generic.releaseKey()) || !start.correlationId().equals(generic.correlationId())) throw unavailable();
+            var detail = cancellations.find(actor, command.commandId(), hash).orElseThrow(ProcessControlService::unavailable);
+            if (!detail.actor().equals(actor) || !detail.command().equals(command) || !detail.start().equals(start)
+                    || !detail.engineDefinitionId().equals(definition.engineDefinitionId())
+                    || !detail.definitionSha256().equals(definition.modelSha256())) throw unavailable();
+            return detail.result();
+        }
+        TerminalFacts terminal;
+        boolean accepted = root.isPresent();
+        boolean scheduled = false;
+        if (accepted) {
+            var current = root.orElseThrow();
+            var snapshot = automationSnapshot(start, definition, current, lockedBinding);
+            if (!command.expectedVersion().equals(snapshot.version())) throw new ProcessVersionConflictException();
+            reserve(actor, start, command, hash);
+            try { engine.getRuntimeService().deleteProcessInstance(command.instanceId(), DELETE_REASON); }
+            catch (FlowableObjectNotFoundException missing) { throw new DeleteStageMissing(missing); }
+            terminal = nativeAccess.automationTerminalHistory(lockedBinding, definition, current.businessKey(), true);
+            int count = dispatch.scheduleProcessClosure(new AgentDispatchStore.ProcessClosureScope(actor, start.instanceId(),
+                    start.releaseKey(), definition.engineDefinitionId(), definition.modelSha256(), current.businessKey(), start.correlationId()));
+            scheduled = count > 0;
+            automation.nodes().cancelOpen(actor.tenantId(), command.instanceId());
+        } else {
+            terminal = nativeAccess.automationTerminalHistory(lockedBinding, definition, null, false);
+            reserve(actor, start, command, hash);
+        }
+        validateTerminal(start, definition, terminal);
+        var result = new CancelProcessResult(start.instanceId(), command.commandId(), accepted, terminal.status(),
+                terminalVersion(start, definition, terminal), terminal.finishedAt(), nativeAccess.now(), scheduled);
+        cancellations.insert(new ProcessCancellationReceiptStore.Entry(actor, hash, command, start, definition.definitionKey(),
+                definition.engineDefinitionId(), definition.modelSha256(), terminal.businessKey(), result));
+        receipts.apply(actor, ProcessCommandReceiptStore.Kind.PROCESS_CANCEL, command.commandId(), start.instanceId(), null);
+        return result;
+    }
+
+    private TaskOrigin automationStart(ProcessActor actor, AutomationInstanceBindingBO binding, boolean lock) {
+        var start = lock ? receipts.lockStartByInstance(actor, binding.getInstanceId()) : readStart(actor, binding.getInstanceId());
+        validateStart(start, actor, binding.getInstanceId());
+        if (!binding.getSourceCommandId().equals(start.commandId()) || !binding.getReleaseKey().equals(start.releaseKey())
+                || !binding.getResolvedStartSha256().equals(start.requestHash()) || !binding.getSubmittedAt().equals(start.createdAt())) {
+            throw unavailable();
+        }
+        return start;
+    }
+
+    private Definition automationDefinition(AutomationInstanceBindingBO binding) {
+        var descriptor = automation.releases().find(binding.getTenantId(), binding.getReleaseKey()).orElseThrow(ProcessControlService::unavailable);
+        if (!binding.getDefinitionKey().equals(descriptor.rootDefinitionKey())) throw unavailable();
+        releases.requireVerifiedAutomation(descriptor);
+        return nativeAccess.automationDefinition(binding);
+    }
+
+    private ProcessControlSnapshotDTO automationSnapshot(TaskOrigin start, Definition definition, LockedRoot root,
+                                                        AutomationInstanceBindingBO binding) {
+        var open = automation.nodes().open(binding.getTenantId(), binding.getInstanceId(), 257);
+        if (open.size() > 256) throw unavailable();
+        var groups = new TreeMap<AutomationWait, Integer>(Comparator.comparing((AutomationWait wait) -> wait.kind().name())
+                .thenComparing(AutomationWait::nodeId));
+        for (var row : open) {
+            var kind = switch (row.getKind()) {
+                case HUMAN -> ProcessActiveWaitKindEnum.HUMAN_TASK;
+                case SERVICE -> ProcessActiveWaitKindEnum.EXTERNAL_WORKER;
+                case AGENT -> ProcessActiveWaitKindEnum.AGENT_RESULT_WAIT;
+                case TIMER -> ProcessActiveWaitKindEnum.TIMER;
+                default -> null;
+            };
+            if (kind != null) {
+                String activityKey = row.getNodeId();
+                if (!activityKey.matches("[A-Za-z_][A-Za-z0-9_.-]{0,127}")) {
+                    activityKey = "node-" + ProcessRequestDigest.hash(List.of(activityKey), Map.of());
+                }
+                groups.merge(new AutomationWait(kind, activityKey), 1, Integer::sum);
+            }
+        }
+        var waits = groups.entrySet().stream()
+                .map(group -> new ProcessActiveWaitDTO(group.getKey().nodeId(), group.getKey().kind(), group.getValue()))
+                .toList();
+        return activeSnapshot(start, definition, new ControlFacts(root, null, waits), ProcessControlBlockReasonEnum.NONE,
+                nativeAccess.now());
+    }
+
     private void reserve(ProcessActor actor, TaskOrigin start, CancelProcessCommand command, String hash) {
         if (receipts.insert(actor, ProcessCommandReceiptStore.Kind.PROCESS_CANCEL, command.commandId(), hash, start.releaseKey(), start.correlationId())) return;
         var current = receipts.lock(actor, ProcessCommandReceiptStore.Kind.PROCESS_CANCEL, command.commandId());
@@ -213,6 +360,9 @@ public final class ProcessControlService {
 
     private Release release(TaskOrigin start) {
         try {
+            if (automation != null && (receipts.hasAutomationRelease(start.requester().tenantId(), start.releaseKey())
+                    || receipts.hasAutomationRootInput(start.requester().tenantId(), start.releaseKey())
+                        && releases.readMigrationRelease(start.requester(), start.releaseKey()).isEmpty())) throw unavailable();
             var result = releases.get(start.requester(), start.releaseKey());
             if (result == null || !start.releaseKey().equals(result.releaseKey())) throw unavailable();
             return result;
@@ -234,12 +384,17 @@ public final class ProcessControlService {
             return new ProcessControlSnapshotDTO(process(start, definition, terminal.businessKey(), terminal.status(), terminal.finishedAt()),
                     List.of(), Set.of(), ProcessControlBlockReasonEnum.PROCESS_TERMINAL, terminalVersion(start, definition, terminal), observedAt);
         }
+        var block = model.caseSources().isEmpty() ? ProcessControlBlockReasonEnum.NONE : ProcessControlBlockReasonEnum.MODEL_CONTAINS_CASE_SOURCE;
+        return activeSnapshot(start, definition, facts, block, observedAt);
+    }
+
+    private ProcessControlSnapshotDTO activeSnapshot(TaskOrigin start, Definition definition, ControlFacts facts,
+                                                     ProcessControlBlockReasonEnum block, Instant observedAt) {
         var root = facts.liveRoot();
         if (root == null || root.tenantId() != start.requester().tenantId() || !start.instanceId().equals(root.instanceId())
                 || !definition.engineDefinitionId().equals(root.engineDefinitionId()) || root.revision() < 0
                 || root.suspensionState() != 1 && root.suspensionState() != 2) throw unavailable();
         var status = root.suspensionState() == 1 ? ProcessInstanceStatusEnum.ACTIVE : ProcessInstanceStatusEnum.SUSPENDED;
-        var block = model.caseSources().isEmpty() ? ProcessControlBlockReasonEnum.NONE : ProcessControlBlockReasonEnum.MODEL_CONTAINS_CASE_SOURCE;
         var fields = identity("TIANJI_PROCESS_CONTROL_V1", start, definition, root.businessKey());
         fields.add(Integer.toString(root.revision())); fields.add(Integer.toString(root.suspensionState())); fields.add(status.name()); fields.add(block.name());
         for (var wait : facts.activeWaits()) { fields.add(wait.kind().name()); fields.add(wait.activityKey()); fields.add(Integer.toString(wait.occurrences())); }
@@ -345,6 +500,17 @@ public final class ProcessControlService {
     private static String safeHash(String value) { return ProcessRequestDigest.hash(List.of(value), Map.of()); }
     private static IllegalArgumentException invalidStorage() { return new IllegalArgumentException("Process control requires its exact owning synchronous JDBC engine"); }
     private static IllegalStateException unavailable() { return new IllegalStateException("Process control source or dependency is unavailable"); }
+
+    public record AutomationControlParticipants(ProcessInstanceBindingStore bindings, AutomationReleaseStore releases,
+            AutomationInstanceGuardCommandInterceptor guard, ProcessNodeExecutionStore nodes) {
+        public AutomationControlParticipants {
+            Objects.requireNonNull(bindings, "bindings");
+            Objects.requireNonNull(releases, "releases");
+            Objects.requireNonNull(guard, "guard");
+            Objects.requireNonNull(nodes, "nodes");
+        }
+    }
+    private record AutomationWait(ProcessActiveWaitKindEnum kind, String nodeId) { }
     private static final class DeleteStageMissing extends RuntimeException {
         private static final long serialVersionUID = 1L;
         private DeleteStageMissing(FlowableObjectNotFoundException cause) { super("Process changed during native cancellation", cause); }
