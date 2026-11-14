@@ -431,6 +431,15 @@ public class ProcessSecurityConfiguration {
         };
     }
 
+    @Bean("processEventStorageReadiness")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
+    EventStorageReadiness processEventStorageReadiness(ProcessEngine engine) {
+        engineSchemaVerifier(engine).verifyEventsV15();
+        return new EventStorageReadiness();
+    }
+
+    static final class EventStorageReadiness { }
+
     @Bean("processApiSchemaVerifier")
     @ConditionalOnMissingBean(ProcessApiSchemaVerifier.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")

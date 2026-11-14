@@ -56,14 +56,20 @@ public final class ProcessApiSchemaVerifier {
     private static final String GOVERNED_START = "tianji_governed_process_start";
     private static final String AUTOMATION_FILE = "V14__add_automation_execution_bindings.sql";
     private static final String AUTOMATION_SHA256 = "8347e8909e893f7b83ea4adf5c9bcfd213ed5044e2419dd0d250da884fe9f4b7";
+    private static final String EVENT_FILE = "V15__add_process_event_inbox.sql";
+    private static final String EVENT_SHA256 = "b57d04a92bfe086810addf724ca889c943b383225c211be186de086cacb960bc";
+    private static final String INSTANCE_BINDING = "tianji_process_instance_binding";
+    private static final String EVENT_INBOX = "tianji_process_event_inbox";
+    private static final String EVENT_SUBSCRIPTION = "tianji_process_event_subscription";
     private static final List<String> BASE_MIGRATION_FILES = List.of("V1__create_process_release_store.sql",
             "V2__add_decision_receipt_result.sql", "V3__bind_process_receipts_to_issuer.sql", "V4__add_worker_lease_receipts.sql",
             "V5__add_agent_dispatch_intent.sql", "V6__add_agent_result_inbox.sql", "V7__add_human_task_receipts.sql");
     private static final Map<String, Integer> AUTOMATION_TABLES = Map.of(
             "tianji_process_automation_release", 13, "tianji_process_draft", 20, "tianji_process_draft_command", 10,
-            "tianji_process_automation_activation", 21, "tianji_process_instance_binding", 20, "tianji_process_node_execution", 37);
+            "tianji_process_automation_activation", 21, INSTANCE_BINDING, 20, "tianji_process_node_execution", 37);
+    private static final Map<String, Integer> EVENT_TABLES = Map.of(EVENT_INBOX, 30, EVENT_SUBSCRIPTION, 17);
     private static final Set<String> AUTOMATION_MUTABLE_TABLES = Set.of(
-            "tianji_process_draft", "tianji_process_node_execution");
+            "tianji_process_draft", "tianji_process_node_execution", EVENT_INBOX, EVENT_SUBSCRIPTION);
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
     private final DataSource source;
@@ -87,8 +93,17 @@ public final class ProcessApiSchemaVerifier {
         }
     }
 
-    /** Checks a pre-provisioned exact V14 catalog using the same role as the Process engine. */
+    /** Checks the automation catalog on either verified migration prefix. */
     public void verifyAutomationV14() {
+        verifyAutomationStorage(false);
+    }
+
+    /** Checks the event writer’s pre-provisioned storage and exact V15 catalog. */
+    public void verifyEventsV15() {
+        verifyAutomationStorage(true);
+    }
+
+    private void verifyAutomationStorage(boolean requireEvents) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
         transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
@@ -104,25 +119,50 @@ public final class ProcessApiSchemaVerifier {
                         """, Boolean.class))) throw invalid();
                 jdbc.queryForObject("SELECT pg_catalog.set_config('search_path', ?, true)", String.class,
                         "pg_catalog," + schema + ",pg_temp");
-                verifyAutomationHistory();
+                boolean eventsInstalled = verifyAutomationHistory(requireEvents);
                 verify();
                 var catalogs = tableContracts(automationMigration(), AUTOMATION_TABLES, true);
                 for (var entry : catalogs.entrySet()) {
                     String table = entry.getKey();
                     var expected = entry.getValue();
-                    verifyCaseColumns(table, expected.columns(), true);
-                    verifyCaseChecks(table, expected.checks(), false, true);
-                    verifyCaseKeys(table, expected.keys(), true);
-                    verifyCaseIndexes(table, expected.indexes(), true, true);
-                    verifyAutomationRole(table);
+                    if (eventsInstalled && INSTANCE_BINDING.equals(table)) {
+                        var keys = new HashSet<>(expected.keys());
+                        appendEventSourceKey(keys);
+                        verifyAutomationCatalog(table, expected, keys);
+                    } else {
+                        verifyAutomationCatalog(table, expected, expected.keys());
+                    }
+                }
+                if (requireEvents) {
+                    for (var entry : tableContracts(eventMigration(), EVENT_TABLES, true).entrySet()) {
+                        verifyAutomationCatalog(entry.getKey(), entry.getValue(), entry.getValue().keys());
+                    }
                 }
             });
         } catch (DataAccessException | TransactionException failure) {
-            throw new IllegalStateException("Process automation storage schema verification failed", failure);
+            throw new IllegalStateException(requireEvents ? "Process event storage schema verification failed"
+                    : "Process automation storage schema verification failed", failure);
         }
     }
 
-    private void verifyAutomationHistory() {
+    private void verifyAutomationCatalog(String table, CaseTable expected, Set<CaseKey> keys) {
+        verifyCaseColumns(table, expected.columns(), true);
+        verifyCaseChecks(table, expected.checks(), false, true);
+        verifyCaseKeys(table, keys, true);
+        verifyCaseIndexes(table, expected.indexes(), true, true);
+        verifyAutomationRole(table);
+    }
+
+    private void appendEventSourceKey(Set<CaseKey> keys) {
+        var constraint = Pattern.compile("ALTER TABLE " + INSTANCE_BINDING + " ADD ([^;]+);").matcher(eventMigration());
+        var indexes = new HashMap<String, CaseIndex>();
+        int previousSize = keys.size();
+        if (!constraint.find()) throw invalid();
+        addCatalogKeys(constraint.group(1), keys, indexes);
+        if (constraint.find() || !indexes.isEmpty() || keys.size() != previousSize + 1) throw invalid();
+    }
+
+    private boolean verifyAutomationHistory(boolean requireEvents) {
         var installed = jdbc.query("SELECT installed_rank,version,type,script,success,checksum FROM ONLY \"" + schema + "\".tianji_process_schema_history "
                         + "ORDER BY installed_rank",
                 (rs, row) -> new AutomationHistoryRowVO(rs.getInt("installed_rank"), new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"),
@@ -130,7 +170,9 @@ public final class ProcessApiSchemaVerifier {
         var expected = new ArrayList<>(BASE_MIGRATION_FILES);
         expected.addAll(List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE,
                 GOVERNED_START_FILE, AUTOMATION_FILE));
-        if (installed.size() != expected.size()) throw invalid();
+        boolean eventsInstalled = installed.size() == expected.size() + 1;
+        if (eventsInstalled) expected.add(EVENT_FILE);
+        if (installed.size() != expected.size() || requireEvents && !eventsInstalled) throw invalid();
         for (int index = 0; index < installed.size(); index++) {
             var migration = installed.get(index);
             if (migration.installedRank() != index + 1) throw invalid();
@@ -142,6 +184,7 @@ public final class ProcessApiSchemaVerifier {
         candidateReviewMigration();
         platformActivationMigration();
         governedStartMigration();
+        if (eventsInstalled) eventMigration();
         if (!Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
                     AND NOT pg_has_role(c.relowner,'MEMBER')
@@ -155,6 +198,7 @@ public final class ProcessApiSchemaVerifier {
                 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                 WHERE n.nspname=? AND c.relname='tianji_process_schema_history' AND c.relkind='r'
                 """, Boolean.class, schema))) throw invalid();
+        return eventsInstalled;
     }
 
     private void verifyAutomationRole(String table) {
@@ -390,7 +434,7 @@ public final class ProcessApiSchemaVerifier {
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
         var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE,
-                GOVERNED_START_FILE, AUTOMATION_FILE);
+                GOVERNED_START_FILE, AUTOMATION_FILE, EVENT_FILE);
         if (versions.size() > files.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
@@ -404,6 +448,7 @@ public final class ProcessApiSchemaVerifier {
                 case "12" -> platformActivationMigration();
                 case "13" -> governedStartMigration();
                 case "14" -> automationMigration();
+                case "15" -> eventMigration();
                 default -> throw invalid();
             }
         }
@@ -415,11 +460,15 @@ public final class ProcessApiSchemaVerifier {
                 || !version.success() || version.checksum() == null || version.checksum() != checksum(file)) throw invalid();
     }
 
-    private static String automationMigration() {
-        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + AUTOMATION_FILE)) {
+    private static String automationMigration() { return exactAutomationMigration(AUTOMATION_FILE, AUTOMATION_SHA256); }
+
+    private static String eventMigration() { return exactAutomationMigration(EVENT_FILE, EVENT_SHA256); }
+
+    private static String exactAutomationMigration(String file, String sha256) {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + file)) {
             if (input == null) throw invalid();
             byte[] bytes = input.readNBytes(32_769);
-            if (bytes.length > 32_768 || !AUTOMATION_SHA256.equals(
+            if (bytes.length > 32_768 || !sha256.equals(
                     HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {
@@ -587,7 +636,7 @@ public final class ProcessApiSchemaVerifier {
         while (tables.find()) {
             String table = tables.group(1); int open = tables.end() - 1; String body = sql.substring(open + 1, caseClosing(sql, open));
             var columns = new HashMap<String, CaseColumn>();
-            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|jsonb|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz(?:\\(6\\))?)([^\\n]*)").matcher(body);
+            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|jsonb|uuid|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz(?:\\(6\\))?)([^\\n]*)").matcher(body);
             while (fields.find()) {
                 String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(")
                         .replace("timestamptz(6)", "timestamp(6) with time zone").replace("timestamptz", "timestamp with time zone");

@@ -5,6 +5,11 @@
       "version": 14,
       "file": "V14__add_automation_execution_bindings.sql",
       "sha256": "8347e8909e893f7b83ea4adf5c9bcfd213ed5044e2419dd0d250da884fe9f4b7"
+    },
+    {
+      "version": 15,
+      "file": "V15__add_process_event_inbox.sql",
+      "sha256": "b57d04a92bfe086810addf724ca889c943b383225c211be186de086cacb960bc"
     }
   ]
 }

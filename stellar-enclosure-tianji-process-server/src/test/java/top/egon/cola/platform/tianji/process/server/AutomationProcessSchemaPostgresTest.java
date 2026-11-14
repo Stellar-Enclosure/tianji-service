@@ -3,7 +3,9 @@ package top.egon.cola.platform.tianji.process.server;
 import org.flywaydb.core.Flyway;
 import org.flowable.cmmn.api.CmmnRepositoryService;
 import org.flowable.dmn.api.DmnRepositoryService;
+import org.flowable.engine.ProcessEngine;
 import org.flowable.engine.RepositoryService;
+import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
@@ -20,6 +22,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -27,6 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @Isolated("Owns one explicitly provisioned, empty Process database")
 @Timeout(120)
@@ -34,6 +39,7 @@ class AutomationProcessSchemaPostgresTest {
     private static final String SCHEMA = "tianji_process";
     private static final String HISTORY = SCHEMA + ".tianji_process_schema_history";
     private static final String V14 = "V14__add_automation_execution_bindings.sql";
+    private static final String V15 = "V15__add_process_event_inbox.sql";
     private static final String RELEASE = "tianji_process_automation_release";
     private static final String DRAFT = "tianji_process_draft";
     private static final String DRAFT_COMMAND = "tianji_process_draft_command";
@@ -42,7 +48,7 @@ class AutomationProcessSchemaPostgresTest {
     private static final String NODE = "tianji_process_node_execution";
 
     @Test
-    void adds_v14_without_rewriting_history_and_gates_the_runtime_catalog_and_role() throws Exception {
+    void upgrades_through_v15_without_rewriting_history_and_gates_event_writes() throws Exception {
         String url = ProcessServerPostgresTest.explicitTestUrl();
         var ownerSource = source(url, null);
         var owner = new JdbcTemplate(ownerSource);
@@ -83,6 +89,12 @@ class AutomationProcessSchemaPostgresTest {
 
         var runtime = source(scopedUrl, role);
         var verifier = new ProcessApiSchemaVerifier(runtime, SCHEMA);
+        var processEngine = mock(ProcessEngine.class);
+        var nativeConfiguration = new SpringProcessEngineConfiguration();
+        nativeConfiguration.setDataSource(runtime);
+        nativeConfiguration.setDatabaseSchema(SCHEMA);
+        when(processEngine.getProcessEngineConfiguration()).thenReturn(nativeConfiguration);
+        var processSecurity = new ProcessSecurityConfiguration();
         verifier.verify();
         verifier.verifyGovernedProcessStart();
         assertTrue(verifier.hasCaseMigration());
@@ -96,7 +108,6 @@ class AutomationProcessSchemaPostgresTest {
         assertEquals(1, v14.migrate().migrationsExecuted);
         v14.validate();
         assertEquals(original, owner.queryForList("SELECT * FROM " + HISTORY + " WHERE version<>'14' ORDER BY installed_rank"));
-        assertManifest();
         verifier.verify();
         verifier.verifyGovernedProcessStart();
         assertTrue(verifier.hasCaseMigration());
@@ -177,6 +188,46 @@ class AutomationProcessSchemaPostgresTest {
         owner.execute("ALTER TABLE " + SCHEMA + "." + BINDING + " DROP CONSTRAINT instance_binding_admission_check");
         owner.execute("ALTER TABLE " + SCHEMA + "." + BINDING + " ADD CONSTRAINT instance_binding_admission_check " + admissionCheck);
         verifier.verifyAutomationV14();
+
+        var v14History = owner.queryForList("SELECT * FROM " + HISTORY + " ORDER BY installed_rank");
+        var directBindings = owner.queryForList("SELECT * FROM " + SCHEMA + "." + BINDING + " ORDER BY tenant_id,instance_id");
+        assertThrows(IllegalStateException.class, () -> processSecurity.processEventStorageReadiness(processEngine));
+        var v15 = process(ownerSource, "15");
+        assertEquals(1, v15.migrate().migrationsExecuted, "V15 is required after the original verified V14 baseline");
+        v15.validate();
+        assertEquals(v14History, owner.queryForList("SELECT * FROM " + HISTORY + " WHERE version<>'15' ORDER BY installed_rank"));
+        assertEquals(directBindings, owner.queryForList("SELECT * FROM " + SCHEMA + "." + BINDING + " ORDER BY tenant_id,instance_id"));
+        assertManifest();
+        verifier.verify();
+        verifier.verifyGovernedProcessStart();
+        assertTrue(verifier.hasCaseMigration());
+        verifier.verifyAutomationV14();
+        assertThrows(IllegalStateException.class, verifier::verifyEventsV15);
+        grant(owner, quotedRole, "SELECT, INSERT, UPDATE", "tianji_process_event_inbox", "tianji_process_event_subscription");
+        assertNotNull(processSecurity.processEventStorageReadiness(processEngine));
+        assertEventSourceTenantBoundary(runtimeJdbc);
+        assertStoredWaitReservation(runtimeJdbc);
+        owner.update("UPDATE " + HISTORY + " SET checksum=checksum+1 WHERE version='15'");
+        assertThrows(IllegalStateException.class, verifier::verifyEventsV15);
+        owner.update("UPDATE " + HISTORY + " SET checksum=checksum-1 WHERE version='15'");
+        verifier.verifyEventsV15();
+        assertEventIndexes(ownerSource, owner);
+        owner.execute("DROP INDEX " + SCHEMA + ".process_event_pending_idx");
+        assertThrows(IllegalStateException.class, verifier::verifyEventsV15);
+        verifier.verifyAutomationV14();
+        owner.execute("""
+                CREATE INDEX process_event_pending_idx ON tianji_process.tianji_process_event_inbox
+                (next_retry_at,tenant_id,receipt_id) WHERE state='RECEIVED'
+                """);
+        verifier.verifyEventsV15();
+        owner.execute("ALTER TABLE " + SCHEMA + "." + BINDING + " DROP CONSTRAINT instance_event_source_fk");
+        assertThrows(IllegalStateException.class, verifier::verifyEventsV15);
+        owner.execute("""
+                ALTER TABLE tianji_process.tianji_process_instance_binding ADD CONSTRAINT instance_event_source_fk
+                FOREIGN KEY (tenant_id,source_event_receipt_id)
+                REFERENCES tianji_process.tianji_process_event_inbox (tenant_id,receipt_id) ON DELETE NO ACTION
+                """);
+        verifier.verifyEventsV15();
 
         owner.execute("ALTER TABLE " + SCHEMA + "." + NODE + " DROP CONSTRAINT node_execution_recovery_check");
         assertThrows(IllegalStateException.class, verifier::verifyAutomationV14);
@@ -268,6 +319,138 @@ class AutomationProcessSchemaPostgresTest {
                 "bad-result", 2, "ref-other", hash, hash, hash, hash, "retry-2", hash, recovery.replace("\"business\"", "null")));
     }
 
+    private static void assertEventSourceTenantBoundary(JdbcTemplate runtime) {
+        String hash = "a".repeat(64);
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_event_inbox
+                  (tenant_id,producer_issuer,producer_subject,event_id,receipt_id,fingerprint,route_key,route_version,
+                   route_sha256,release_key,mode,wait_token_sha256,payload,correlation_key,state,occurred_at,received_at,
+                   expires_at,next_retry_at,attempts,definition_key,activation_revision,admitted_at)
+                VALUES (1,?,'producer','event','receipt',?,'route',1,?,'release','SIGNAL',?,'{}','business','RECEIVED',
+                    statement_timestamp(),statement_timestamp(),statement_timestamp()+interval '1 hour',
+                    statement_timestamp(),0,'root',1,statement_timestamp())
+                """, hash, hash, hash, hash));
+        assertConstraint("event_inbox_admission_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_inbox SET admission_json='{}'
+                WHERE tenant_id=1 AND receipt_id='receipt'
+                """));
+        assertConstraint("event_inbox_state_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_inbox SET state='APPLIED',next_retry_at=NULL,
+                    decided_at=statement_timestamp(),decision_code='APPLIED'
+                WHERE tenant_id=1 AND receipt_id='receipt'
+                """));
+        assertConstraint("event_inbox_state_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_inbox SET instance_id='instance'
+                WHERE tenant_id=1 AND receipt_id='receipt'
+                """));
+        assertConstraint("event_inbox_state_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_inbox SET state='APPLIED',next_retry_at=NULL,
+                    instance_id='instance',node_execution_ref='ref-1',decided_at=statement_timestamp(),decision_code='OTHER'
+                WHERE tenant_id=1 AND receipt_id='receipt'
+                """));
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_release
+                  (tenant_id,release_key,state,manifest_sha256,publisher_type,publisher_id,created_at)
+                SELECT 2,release_key,state,manifest_sha256,publisher_type,publisher_id,created_at
+                FROM tianji_process.tianji_process_release WHERE tenant_id=1 AND release_key='release'
+                """));
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_draft
+                  (tenant_id,draft_id,definition_key,title,owner_type,owner_issuer,owner_id,state,revision,
+                   content_json,content_sha256,last_command_id,created_at,updated_at)
+                SELECT 2,draft_id,definition_key,title,owner_type,owner_issuer,owner_id,state,revision,
+                   content_json,content_sha256,last_command_id,created_at,updated_at
+                FROM tianji_process.tianji_process_draft WHERE tenant_id=1 AND draft_id='pd-1'
+                """));
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_automation_release
+                  (tenant_id,release_key,root_definition_key,source_descriptor,source_sha256,compiler_version,compiled_sha256,
+                   created_at,source_draft_id,source_draft_revision,draft_content_sha256,dependency_manifest,dependency_sha256)
+                SELECT 2,release_key,root_definition_key,source_descriptor,source_sha256,compiler_version,compiled_sha256,
+                   created_at,source_draft_id,source_draft_revision,draft_content_sha256,dependency_manifest,dependency_sha256
+                FROM tianji_process.tianji_process_automation_release WHERE tenant_id=1 AND release_key='release'
+                """));
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_automation_activation
+                  (tenant_id,definition_key,revision,release_key,previous_revision,actor_type,actor_issuer,actor_id,command_id,
+                   request_sha256,source_sha256,compiled_sha256,dependency_sha256,authorization_sha256,dependency_evidence_sha256,
+                   release_signature_sha256,trust_generation,admission_proof,observed_at,proof_valid_until,activated_at)
+                SELECT 2,definition_key,revision,release_key,previous_revision,actor_type,actor_issuer,actor_id,command_id,
+                   request_sha256,source_sha256,compiled_sha256,dependency_sha256,authorization_sha256,dependency_evidence_sha256,
+                   release_signature_sha256,trust_generation,admission_proof,observed_at,proof_valid_until,activated_at
+                FROM tianji_process.tianji_process_automation_activation WHERE tenant_id=1 AND definition_key='root' AND revision=1
+                """));
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_command_receipt
+                  (tenant_id,subject_type,subject_issuer,subject_id,command_type,command_id,request_sha256,release_key,
+                   correlation_id,state,resource_id,created_at)
+                VALUES (2,'USER',?,'owner','START','start',?,'release','correlation','APPLIED','instance',statement_timestamp())
+                """, hash, hash));
+        assertConstraint("instance_event_source_fk", () -> runtime.update("""
+                INSERT INTO tianji_process.tianji_process_instance_binding
+                  (tenant_id,instance_id,release_key,definition_key,owner_type,owner_issuer,owner_id,profile,configuration,
+                   configuration_sha256,start_request_sha256,created_at,activation_revision,source_command_type,source_command_id,
+                   resolved_start_sha256,admission_kind,source_event_receipt_id,admission_evidence,admitted_at)
+                SELECT 2,instance_id,release_key,definition_key,owner_type,owner_issuer,owner_id,profile,configuration,
+                   configuration_sha256,start_request_sha256,created_at,activation_revision,source_command_type,source_command_id,
+                   resolved_start_sha256,'EVENT','receipt',admission_evidence,admitted_at
+                FROM tianji_process.tianji_process_instance_binding WHERE tenant_id=1 AND instance_id='instance'
+                """));
+    }
+
+    private static void assertStoredWaitReservation(JdbcTemplate runtime) {
+        String token = "b".repeat(64);
+        assertEquals(1, runtime.update("""
+                INSERT INTO tianji_process.tianji_process_event_subscription
+                  (tenant_id,token_sha256,instance_id,parent_scope_id,target_node_id,reservation_id,route_key,
+                   route_version,source_ref,state,revision,deadline_at,created_at)
+                VALUES (1,?,'instance','scope','node',?,'route',1,'producer','RESERVED',1,
+                    statement_timestamp()+interval '1 hour',statement_timestamp())
+                """, token, UUID.fromString("6a09c875-624f-42e0-9579-2d0629859a3b")));
+        assertConstraint("event_subscription_native_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_subscription SET state='BOUND',native_execution_id='native'
+                WHERE tenant_id=1 AND token_sha256=?
+                """, token));
+        assertEquals(1, runtime.update("""
+                UPDATE tianji_process.tianji_process_event_subscription SET state='BOUND',native_execution_id='native',
+                    native_subscription_id='subscription',node_execution_ref='ref-1',revision=2
+                WHERE tenant_id=1 AND token_sha256=?
+                """, token));
+        assertConstraint("event_subscription_state_check", () -> runtime.update("""
+                UPDATE tianji_process.tianji_process_event_subscription SET state='CONSUMED'
+                WHERE tenant_id=1 AND token_sha256=?
+                """, token));
+        assertEquals(1, runtime.update("""
+                UPDATE tianji_process.tianji_process_event_subscription
+                SET state='CONSUMED',revision=3,closed_at=statement_timestamp()
+                WHERE tenant_id=1 AND token_sha256=?
+                """, token));
+    }
+
+    private static void assertEventIndexes(DriverManagerDataSource source, JdbcTemplate owner) {
+        new TransactionTemplate(new DataSourceTransactionManager(source)).executeWithoutResult(status -> {
+            owner.execute("SET LOCAL enable_seqscan=off");
+            var pending = owner.queryForList("""
+                    EXPLAIN (COSTS OFF) SELECT receipt_id FROM tianji_process.tianji_process_event_inbox
+                    WHERE state='RECEIVED' AND next_retry_at<=statement_timestamp()
+                    ORDER BY next_retry_at,tenant_id,receipt_id LIMIT 20
+                    """, String.class);
+            assertTrue(pending.stream().anyMatch(line -> line.contains("process_event_pending_idx")), pending.toString());
+            var waitQueue = owner.queryForList("""
+                    EXPLAIN (COSTS OFF) SELECT receipt_id FROM tianji_process.tianji_process_event_inbox
+                    WHERE tenant_id=1 AND wait_token_sha256=? AND mode='SIGNAL' AND state='RECEIVED'
+                    ORDER BY received_at LIMIT 20
+                    """, String.class, "a".repeat(64));
+            assertTrue(waitQueue.stream().anyMatch(line -> line.contains("process_event_wait_idx")), waitQueue.toString());
+            var subscription = owner.queryForList("""
+                    EXPLAIN (COSTS OFF) SELECT token_sha256 FROM tianji_process.tianji_process_event_subscription
+                    WHERE tenant_id=1 AND instance_id='instance' AND parent_scope_id='scope'
+                        AND target_node_id='node' AND state IN ('RESERVED','BOUND')
+                    """, String.class);
+            assertTrue(subscription.stream().anyMatch(line -> line.contains("event_subscription_scope_idx")), subscription.toString());
+        });
+    }
+
     private static void assertConstraint(String expected, Runnable action) {
         var failed = assertThrows(DataIntegrityViolationException.class, action::run);
         var postgres = org.junit.jupiter.api.Assertions.assertInstanceOf(PSQLException.class, failed.getMostSpecificCause());
@@ -276,14 +459,19 @@ class AutomationProcessSchemaPostgresTest {
     }
 
     private static void assertManifest() throws Exception {
-        try (var manifest = AutomationProcessSchemaPostgresTest.class.getResourceAsStream("/db/tianji-process/manifest.json");
-             var sql = AutomationProcessSchemaPostgresTest.class.getResourceAsStream("/db/tianji-process/" + V14)) {
+        try (var manifest = AutomationProcessSchemaPostgresTest.class.getResourceAsStream("/db/tianji-process/manifest.json")) {
             assertNotNull(manifest);
-            assertNotNull(sql);
-            String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(sql.readAllBytes()));
             var mapper = JsonMapper.builder().enable(tools.jackson.core.StreamReadFeature.STRICT_DUPLICATE_DETECTION).build();
             assertEquals(mapper.valueToTree(Map.of("schemaVersion", 1, "scripts",
-                    List.of(Map.of("version", 14, "file", V14, "sha256", digest)))), mapper.readTree(manifest));
+                    List.of(migrationEntry(14, V14), migrationEntry(15, V15)))), mapper.readTree(manifest));
+        }
+    }
+
+    private static Map<String, Object> migrationEntry(int version, String file) throws Exception {
+        try (var sql = AutomationProcessSchemaPostgresTest.class.getResourceAsStream("/db/tianji-process/" + file)) {
+            assertNotNull(sql);
+            String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(sql.readAllBytes()));
+            return Map.of("version", version, "file", file, "sha256", digest);
         }
     }
 

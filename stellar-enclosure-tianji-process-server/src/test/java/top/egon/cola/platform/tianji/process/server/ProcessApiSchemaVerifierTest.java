@@ -74,6 +74,18 @@ class ProcessApiSchemaVerifierTest {
     }
 
     @Test
+    void event_writer_refuses_the_v14_prefix_used_by_existing_readers() throws Exception {
+        var catalog = Catalog.governedStartReady();
+        catalog.history.add(history("14", V14, true, checksum(V14)));
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = spy(new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process"));
+            doNothing().when(verifier).verify();
+            assertDoesNotThrow(verifier::verifyGovernedProcessStart);
+            assertThrows(IllegalStateException.class, verifier::verifyEventsV15);
+        }
+    }
+
+    @Test
     void later_history_accepts_v14_only_as_a_validated_extension_of_v13() throws Exception {
         try (var resource = ProcessApiSchemaVerifierTest.class.getResourceAsStream("/db/tianji-process/" + V14)) {
             assertNotNull(resource, "Process automation V14 must be packaged");
