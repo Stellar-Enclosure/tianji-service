@@ -1,6 +1,8 @@
 package top.egon.cola.platform.tianji.worker;
 
+import jakarta.validation.Valid;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerTaskDTO;
 import java.time.Duration;
 
 /** Transactional handlers commit their business mutation and receipt atomically; other modes require durable intent and replay. */
@@ -15,5 +17,9 @@ public interface WorkerExecutionStore {
     default WorkerExecutionReceipt executeNonTransactional(WorkerTaskDTO task, WorkerHandlerDescriptor descriptor,
                                                             String targetId, NonTransactionalWorkerHandler handler) {
         throw new UnsupportedOperationException("Non-transactional workers are not supported");
+    }
+    default WorkerExecutionReceipt executeAutomation(@Valid AutomationWorkerTaskDTO task,
+                                                      @Valid AutomationWorkerHandlerRegistration registration) {
+        throw new IllegalStateException("Typed worker storage unavailable");
     }
 }

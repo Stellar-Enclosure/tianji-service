@@ -1,15 +1,21 @@
 package top.egon.cola.platform.tianji.worker;
 
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.validation.annotation.Validated;
 import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerBusinessResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerTaskDTO;
 
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +24,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.Map;
@@ -25,6 +32,8 @@ import java.util.Objects;
 import java.util.TreeMap;
 
 /** Executes local JDBC business work and its replayable receipt in one owned transaction. */
+@Slf4j
+@Validated
 public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
     private static final int MAX_RESULT_BYTES = 131_072;
     private final DataSource source;
@@ -33,6 +42,7 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
     private final String table;
     private final String intentTable;
     private final String schemaHistory;
+    private final WorkerEffectReceiptStore effects;
     private final WorkerExecutionSchemaVerifier schemaVerifier;
     private final String sourceId;
     private final long tenantId;
@@ -41,9 +51,16 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
     private final JsonMapper mapper = JsonMapper.builder().build();
     private volatile boolean intentReadableVerified;
     private volatile boolean nonTransactionalVerified;
+    private volatile boolean effectsVerified;
 
     public JdbcWorkerExecutionStore(DataSource source, DataSourceTransactionManager manager, String schema, String sourceId,
                                     long tenantId, Duration maximumWorkTime, Duration deadlineSafetyMargin) {
+        this(source, manager, schema, sourceId, tenantId, maximumWorkTime, deadlineSafetyMargin, null);
+    }
+
+    public JdbcWorkerExecutionStore(DataSource source, DataSourceTransactionManager manager, String schema, String sourceId,
+                                    long tenantId, Duration maximumWorkTime, Duration deadlineSafetyMargin,
+                                    WorkerEffectOutcomeResolver resolver) {
         if (source == null || manager == null || manager.getDataSource() != source || schema == null
                 || !schema.matches("[a-z_][a-z0-9_]{0,62}") || sourceId == null
                 || !sourceId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}") || tenantId <= 0
@@ -63,6 +80,68 @@ public final class JdbcWorkerExecutionStore implements WorkerExecutionStore {
         this.deadlineSafetyMargin = deadlineSafetyMargin;
         this.schemaVerifier = new WorkerExecutionSchemaVerifier(source, schema);
         schemaVerifier.verify();
+        var transaction = new TransactionTemplate(manager);
+        transaction.setTimeout(Math.max(1, (int) maximumWorkTime.toSeconds()));
+        effects = new WorkerEffectReceiptStore(jdbc, transaction, '"' + schema + "\".tianji_worker_effect_receipt", source, resolver);
+    }
+
+    @Override
+    public WorkerExecutionReceipt executeAutomation(@Valid AutomationWorkerTaskDTO task,
+                                                    @Valid AutomationWorkerHandlerRegistration registration) {
+        Objects.requireNonNull(task, "task");
+        Objects.requireNonNull(registration, "registration");
+        if (TransactionSynchronizationManager.isActualTransactionActive() || manager.getDataSource() != source) {
+            throw new IllegalStateException("Worker automation must own its business transaction");
+        }
+        var descriptor = registration.descriptor();
+        var snapshot = snapshot(task, registration);
+        snapshot.verifyContractHash(tenantId, sourceId);
+        if (!descriptor.capabilityKey().equals(snapshot.getCapabilityKey())
+                || descriptor.capabilityVersion() != snapshot.getCapabilityVersion()
+                || !descriptor.inputSchemaSha256().equals(snapshot.getInputSchemaSha256())
+                || !descriptor.outputSchemaSha256().equals(snapshot.getOutputSchemaSha256())
+                || !descriptor.handlerVersion().equals(snapshot.getHandlerVersion())
+                || descriptor.effectMode() != snapshot.getEffectMode()
+                || !Objects.equals(descriptor.targetId(), snapshot.getTargetId())
+                || !WorkerDigests.taskInputSha256(snapshot.getInput()).equals(snapshot.getInputSha256())
+                || !WorkerDigests.automationEffectFingerprint(descriptor, snapshot.getInput()).equals(snapshot.getEffectFingerprint())) {
+            throw invalid();
+        }
+        requireEffectsV3();
+        var now = effects.now();
+        var proof = snapshot.getEffectRecovery();
+        if (proof != null && (proof.observedAt().isAfter(now) || !now.isBefore(proof.validUntil()))) {
+            throw new WorkerHandlerFailureException(WorkerFailureKindEnum.UNKNOWN, "WORKER_RECOVERY_PROOF_EXPIRED");
+        }
+        var deadline = earliest(snapshot.getAttemptDeadlineAt(), snapshot.getLeaseExpiresAt());
+        if (proof != null) deadline = earliest(deadline, proof.validUntil());
+        deadline = earliest(deadline.minus(deadlineSafetyMargin), now.plus(maximumWorkTime));
+        requireTime(now, deadline);
+        var context = new AutomationWorkerExecutionContextVO(sourceId, tenantId, snapshot.getEffectKey(), snapshot.getInput(), deadline);
+        return effects.execute(new WorkerEffectReceiptStore.EffectExecutionVO(registration, context, snapshot.getEffectFingerprint(),
+                WorkerDigests.businessInputSha256(snapshot.getInput()), proof));
+    }
+
+    private synchronized void requireEffectsV3() {
+        if (!effectsVerified) {
+            schemaVerifier.verifyEffectsV3();
+            effectsVerified = true;
+        }
+    }
+
+    private static AutomationWorkerTaskDTO snapshot(AutomationWorkerTaskDTO task, AutomationWorkerHandlerRegistration registration) {
+        var input = WorkerDigests.immutableTypedObject(task.getInput());
+        var normalized = registration.normalizeInput(input);
+        if (!Arrays.equals(ProcessTypedJson.canonicalBytes(input), ProcessTypedJson.canonicalBytes(normalized))) throw invalid();
+        return new AutomationWorkerTaskDTO(task.getTaskId(), task.getActivityOccurrenceId(), task.getNodeExecutionRef(),
+                task.getLeaseToken(), task.getCapabilityKey(), task.getCapabilityVersion(), normalized, task.getInputSha256(),
+                task.getEffectKey(), task.getAttemptDeadlineAt(), task.getLeaseExpiresAt(), task.getHandlerVersion(),
+                task.getEffectMode(), task.getTargetId(), task.getInputSchemaSha256(), task.getOutputSchemaSha256(),
+                task.getEffectFingerprint(), task.getEffectRecovery(), task.getTaskContractSha256());
+    }
+
+    private static Instant earliest(Instant left, Instant right) {
+        return left.isBefore(right) ? left : right;
     }
 
     @Override public long tenantId() { return tenantId; }

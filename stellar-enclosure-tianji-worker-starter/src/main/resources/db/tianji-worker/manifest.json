@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "scripts": [
+    {
+      "version": 3,
+      "file": "V3__add_worker_effect_receipt.sql",
+      "sha256": "f8058263e83002f231f37205e5942635dbcad09ec6c4680f46d3f7d9680106a7"
+    }
+  ]
+}

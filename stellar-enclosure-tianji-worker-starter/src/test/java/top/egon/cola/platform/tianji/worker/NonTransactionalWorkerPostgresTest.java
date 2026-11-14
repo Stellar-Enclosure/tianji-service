@@ -53,7 +53,7 @@ class NonTransactionalWorkerPostgresTest {
         Integer oldChecksum = jdbc.queryForObject("SELECT checksum FROM business.tianji_worker_schema_history WHERE version='1'", Integer.class);
         var ownerVerifier = new WorkerExecutionSchemaVerifier(bootstrapSource, "business");
         ownerVerifier.verify(); assertThrows(IllegalStateException.class, ownerVerifier::verifyNonTransactional);
-        var current = flyway(bootstrapSource, null);
+        var current = flyway(bootstrapSource, "2");
         assertEquals(1, current.migrate().migrationsExecuted); current.validate();
         assertEquals(oldChecksum, jdbc.queryForObject("SELECT checksum FROM business.tianji_worker_schema_history WHERE version='1'", Integer.class));
         jdbc.execute("GRANT USAGE ON SCHEMA business TO \"" + user + "\"");
