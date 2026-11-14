@@ -1,12 +1,28 @@
 package top.egon.cola.platform.tianji.worker;
 
+import jakarta.validation.ConstraintViolation;
+import jakarta.validation.Validator;
 import org.junit.jupiter.api.Test;
+import org.springframework.aop.support.AopUtils;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.scheduling.TaskScheduler;
+import org.springframework.validation.beanvalidation.MethodValidationPostProcessor;
 import top.egon.cola.platform.tianji.client.ProcessClientException;
 import top.egon.cola.platform.tianji.contract.orchestration.*;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerBusinessResultDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerClient;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerCompletionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
+import top.egon.cola.platform.tianji.worker.WorkerExecutionStore.AutomationWorkerReadinessVO;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -15,6 +31,8 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -32,6 +50,7 @@ import static org.mockito.Mockito.*;
 class RemoteWorkerPollerTest {
     private static final Instant NOW = Instant.parse("2026-10-29T00:00:00Z");
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
+    private static final String TRUSTED_SOURCE = "trusted-process";
 
     @Test
     void auto_configuration_is_disabled_by_default_and_requires_host_dependencies_when_enabled() {
@@ -62,6 +81,289 @@ class RemoteWorkerPollerTest {
         });
         when(store.deadlineSafetyMargin()).thenReturn(Duration.ofSeconds(1));
         runner.run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
+    void single_configured_scheduler_acquires_v1_and_v2_for_the_same_logical_capability() {
+        var legacy = mock(WorkerClient.class);
+        var typed = mock(AutomationWorkerClient.class);
+        var executionStore = store();
+        when(executionStore.automationReadiness()).thenReturn(ready());
+        var scheduler = mock(TaskScheduler.class);
+        var callback = captureScheduler(scheduler);
+        when(legacy.acquire(any())).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, null));
+        when(typed.acquire(any())).thenReturn(new AutomationWorkerAcquireDTO(AutomationWorkerAcquireDTO.StatusEnum.EMPTY, null));
+        var runner = new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(TianjiWorkerAutoConfiguration.class))
+                .withPropertyValues("stellar.tianji.worker.enabled=true", "stellar.tianji.worker.tenant-id=20",
+                        "stellar.tianji.worker.concurrency=2")
+                .withBean(WorkerClient.class, () -> legacy)
+                .withBean("automationWorkerClient", AutomationWorkerClient.class, () -> typed)
+                .withBean(WorkerExecutionStore.class, () -> executionStore)
+                .withBean(WorkerHandlerRegistration.class, () -> registration(contract()))
+                .withBean(AutomationWorkerHandlerRegistration.class, RemoteWorkerPollerTest::automationRegistration)
+                .withBean("tianjiWorkerScheduler", TaskScheduler.class, () -> scheduler)
+                .withBean("tianjiWorkerExecutor", Executor.class, () -> Runnable::run);
+        runner.run(context -> {
+            assertThat(context).hasNotFailed().hasSingleBean(RemoteWorkerPoller.class);
+            verify(scheduler).scheduleWithFixedDelay(any(Runnable.class), eq(Duration.ofSeconds(2)));
+            callback.get().run();
+            verify(executionStore).automationReadiness();
+            verify(typed).acquire(new AutomationWorkerAcquireCommand("riskCheck", 1));
+            verify(legacy).acquire(new AcquireWorkerTaskCommand("riskCheck", "1"));
+        });
+    }
+
+    @Test
+    void a_typed_client_with_the_wrong_bean_name_never_acquires_and_legacy_keeps_polling() {
+        var legacy = mock(WorkerClient.class);
+        var unqualified = mock(AutomationWorkerClient.class);
+        var executionStore = store();
+        when(executionStore.automationReadiness()).thenReturn(ready());
+        when(legacy.acquire(any())).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, null));
+        var scheduler = mock(TaskScheduler.class);
+        var callback = captureScheduler(scheduler);
+        new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(TianjiWorkerAutoConfiguration.class))
+                .withPropertyValues("stellar.tianji.worker.enabled=true", "stellar.tianji.worker.tenant-id=20",
+                        "stellar.tianji.worker.concurrency=2")
+                .withBean(WorkerClient.class, () -> legacy)
+                .withBean("otherAutomationClient", AutomationWorkerClient.class, () -> unqualified)
+                .withBean(WorkerExecutionStore.class, () -> executionStore)
+                .withBean(WorkerHandlerRegistration.class, () -> registration(contract()))
+                .withBean(AutomationWorkerHandlerRegistration.class, RemoteWorkerPollerTest::automationRegistration)
+                .withBean("tianjiWorkerScheduler", TaskScheduler.class, () -> scheduler)
+                .withBean("tianjiWorkerExecutor", Executor.class, () -> Runnable::run)
+                .run(context -> {
+                    assertThat(context).hasNotFailed().hasSingleBean(RemoteWorkerPoller.class);
+                    callback.get().run();
+                    verify(legacy, atLeastOnce()).acquire(new AcquireWorkerTaskCommand("riskCheck", "1"));
+                    verifyNoInteractions(unqualified);
+                });
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void host_method_validation_keeps_the_final_poller_live_and_rejects_an_invalid_typed_handoff() {
+        var registration = automationRegistration();
+        var fixture = new AutomationPollingFixture(registration);
+        var task = automationTask(registration, 1, null);
+        var validator = mock(Validator.class);
+        when(validator.validate(any(AutomationWorkerTaskDTO.class)))
+                .thenReturn(Set.of((ConstraintViolation<AutomationWorkerTaskDTO>) mock(ConstraintViolation.class)));
+        fixture.acquire(task);
+        new ApplicationContextRunner().withConfiguration(AutoConfigurations.of(TianjiWorkerAutoConfiguration.class))
+                .withPropertyValues("stellar.tianji.worker.enabled=true", "stellar.tianji.worker.tenant-id=20")
+                .withBean(WorkerClient.class, () -> mock(WorkerClient.class))
+                .withBean("automationWorkerClient", AutomationWorkerClient.class, () -> fixture.typed)
+                .withBean(WorkerExecutionStore.class, () -> fixture.store)
+                .withBean(AutomationWorkerHandlerRegistration.class, () -> registration)
+                .withBean("tianjiWorkerScheduler", TaskScheduler.class, () -> fixture.scheduler)
+                .withBean("tianjiWorkerExecutor", Executor.class, () -> Runnable::run)
+                .withBean(Validator.class, () -> validator)
+                .withBean(MethodValidationPostProcessor.class, () -> {
+                    var processor = new MethodValidationPostProcessor();
+                    processor.setProxyTargetClass(true);
+                    processor.setValidator(validator);
+                    return processor;
+                })
+                .run(context -> {
+                    assertThat(context).hasNotFailed().hasSingleBean(RemoteWorkerPoller.class);
+                    var poller = context.getBean(RemoteWorkerPoller.class);
+                    assertFalse(AopUtils.isAopProxy(poller));
+                    assertTrue(poller.isRunning());
+                    fixture.tick();
+                    verify(validator).validate(eq(task));
+                    verify(fixture.store, never()).executeAutomation(any(), any());
+                    verify(fixture.typed, never()).complete(any());
+                    verify(fixture.typed, never()).fail(any());
+                });
+    }
+
+    @Test
+    void missing_failed_or_out_of_scope_readiness_keeps_legacy_polling_until_typed_is_ready() {
+        var legacy = mock(WorkerClient.class);
+        var fixture = new AutomationPollingFixture(automationRegistration());
+        when(legacy.acquire(any())).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.EMPTY, null));
+        when(fixture.store.automationReadiness()).thenReturn(Optional.empty())
+                .thenThrow(new IllegalStateException("V3 unavailable"))
+                .thenReturn(Optional.of(new AutomationWorkerReadinessVO(21, TRUSTED_SOURCE)))
+                .thenReturn(ready());
+        when(fixture.typed.acquire(any())).thenReturn(new AutomationWorkerAcquireDTO(AutomationWorkerAcquireDTO.StatusEnum.EMPTY, null));
+
+        var poller = fixture.poller(legacy, List.of(registration(contract())), 2);
+        poller.start();
+        try {
+            for (int tick = 1; tick <= 3; tick++) {
+                fixture.tick();
+                verify(legacy, atLeast(tick)).acquire(new AcquireWorkerTaskCommand("riskCheck", "1"));
+                verifyNoInteractions(fixture.typed);
+            }
+            fixture.tick();
+            verify(fixture.typed).acquire(new AutomationWorkerAcquireCommand("riskCheck", 1));
+            assertTrue(poller.isRunning());
+        } finally {
+            poller.stop();
+        }
+    }
+
+    @Test
+    void typed_tasks_with_wrong_scope_hash_descriptor_or_noncanonical_token_never_enter_the_store() {
+        var valid = automationRegistration();
+        var fixture = new AutomationPollingFixture(valid);
+        var wrongSource = automationTask(valid, 1, null);
+        wrongSource.setTaskContractSha256(wrongSource.contractSha256(20, "foreign-process"));
+        var wrongTenant = automationTask(valid, 1, null);
+        wrongTenant.setTaskContractSha256(wrongTenant.contractSha256(21, TRUSTED_SOURCE));
+        var wrongInput = automationTask(valid, 1, null).setInputSha256("b".repeat(64));
+        wrongInput.setTaskContractSha256(wrongInput.contractSha256(20, TRUSTED_SOURCE));
+        var wrongVersion = automationTask(valid, 1, null).setHandlerVersion("unexpected");
+        wrongVersion.setTaskContractSha256(wrongVersion.contractSha256(20, TRUSTED_SOURCE));
+        var wrongFingerprint = automationTask(valid, 1, null).setEffectFingerprint("c".repeat(64));
+        wrongFingerprint.setTaskContractSha256(wrongFingerprint.contractSha256(20, TRUSTED_SOURCE));
+        var validToken = automationTask(valid, 0, null).getLeaseToken();
+        var tokenAlias = automationTask(valid, 0, null).setLeaseToken(validToken.substring(0, 42) + "B");
+        assertArrayEquals(Base64.getUrlDecoder().decode(validToken), Base64.getUrlDecoder().decode(tokenAlias.getLeaseToken()));
+        assertThrows(IllegalArgumentException.class, tokenAlias::leaseTokenSha256);
+        assertNotEquals(WorkerDigests.rawSha256(validToken.getBytes(StandardCharsets.UTF_8)),
+                WorkerDigests.rawSha256(Base64.getUrlDecoder().decode(validToken)));
+
+        var poller = fixture.poller(mock(WorkerClient.class), List.of(), 1);
+        poller.start();
+        try {
+            for (var rejected : List.of(wrongSource, wrongTenant, wrongInput, wrongVersion, wrongFingerprint, tokenAlias)) {
+                fixture.acquire(rejected);
+                fixture.tick();
+                if (!poller.isRunning()) poller.start();
+            }
+            verify(fixture.store, never()).executeAutomation(any(), any());
+            verify(fixture.typed, never()).complete(any());
+            verify(fixture.typed, never()).fail(any());
+        } finally {
+            poller.stop();
+        }
+    }
+
+    @Test
+    void typed_completion_replays_identical_transport_intent_and_new_lease_preserves_the_effect_generation() {
+        var registration = automationRegistration();
+        var fixture = new AutomationPollingFixture(registration);
+        var output = Map.<String, Object>of("approved", true);
+        var initial = automationTask(registration, 1, null);
+        var result = new AutomationWorkerBusinessResultDTO("receipt-1", output);
+        String resultHash = AutomationWorkerBusinessResultDTO.resultSha256(initial.getEffectFingerprint(), "receipt-1", output);
+        var proof = new WorkerEffectRecoveryVO(WorkerEffectRecoveryVO.Mode.REPLAY_APPLIED, 4, NOW.minusSeconds(1),
+                NOW.plusSeconds(20), "effect-authority", "d".repeat(64), "receipt-1", resultHash);
+        var task = automationTask(registration, 1, proof);
+        var reacquired = automationTask(registration, 2, proof);
+        when(fixture.store.executeAutomation(any(), same(registration))).thenReturn(WorkerExecutionReceipt.fromAutomation(
+                registration.descriptor().handlerVersion(), NOW, task.getEffectFingerprint(), result, resultHash, true));
+        List<AutomationWorkerCompletionCommand> reports = new ArrayList<>();
+        when(fixture.typed.complete(any())).thenAnswer(call -> {
+            var command = call.<AutomationWorkerCompletionCommand>getArgument(0);
+            reports.add(new AutomationWorkerCompletionCommand(command.getTaskId(), command.getActivityOccurrenceId(),
+                    command.getNodeExecutionRef(), command.getLeaseToken(), command.getCommandId(), command.getEffectKey(),
+                    command.getBusinessReceiptId(), Map.copyOf(command.getOutput())));
+            if (reports.size() < 3) throw new ProcessClientException(0, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+            return new AutomationWorkerReportDTO(command.getTaskId(), command.getActivityOccurrenceId(),
+                    AutomationWorkerReportDTO.OutcomeEnum.COMPLETED, NOW);
+        });
+
+        var poller = fixture.poller(mock(WorkerClient.class), List.of(), 1);
+        poller.start();
+        try {
+            fixture.acquire(task);
+            fixture.tick();
+            assertEquals(2, reports.size());
+            assertEquals(reports.get(0), reports.get(1));
+            assertEquals(task.getLeaseToken(), reports.getFirst().getLeaseToken());
+            assertEquals(task.getEffectKey(), reports.getFirst().getEffectKey());
+            verify(fixture.store, times(1)).executeAutomation(eq(task), same(registration));
+
+            fixture.acquire(reacquired);
+            fixture.tick();
+            assertEquals(3, reports.size());
+            var first = reports.getFirst();
+            var recovery = reports.getLast();
+            assertNotEquals(first.getCommandId(), recovery.getCommandId());
+            assertEquals(reacquired.getLeaseToken(), recovery.getLeaseToken());
+            assertEquals(first.getEffectKey(), recovery.getEffectKey());
+            assertEquals(first.getBusinessReceiptId(), recovery.getBusinessReceiptId());
+            assertEquals(first.getOutput(), recovery.getOutput());
+            verify(fixture.store).executeAutomation(argThat(received -> received.getLeaseToken().equals(reacquired.getLeaseToken())
+                    && received.getEffectRecovery().observedGeneration() == 4
+                    && received.getEffectFingerprint().equals(task.getEffectFingerprint())),
+                    same(registration));
+            verify(fixture.typed, never()).fail(any());
+        } finally {
+            poller.stop();
+        }
+    }
+
+    @Test
+    void expired_recovery_proof_reports_unknown_without_entering_the_store() {
+        var registration = automationRegistration();
+        var fixture = new AutomationPollingFixture(registration);
+        var poller = fixture.poller(mock(WorkerClient.class), List.of(), 1);
+        var noProof = automationTask(registration, 1, null);
+        String outputHash = AutomationWorkerBusinessResultDTO.resultSha256(noProof.getEffectFingerprint(), "receipt-1",
+                Map.of("approved", true));
+        when(fixture.typed.fail(any())).thenAnswer(call -> {
+            var failure = call.<AutomationWorkerFailureCommand>getArgument(0);
+            return new AutomationWorkerReportDTO(failure.getTaskId(), failure.getActivityOccurrenceId(),
+                    AutomationWorkerReportDTO.OutcomeEnum.UNKNOWN, NOW);
+        });
+        poller.start();
+        try {
+            for (var expiry : List.of(NOW.minusNanos(1_000), NOW, NOW.plusSeconds(5))) {
+                var proof = new WorkerEffectRecoveryVO(WorkerEffectRecoveryVO.Mode.REPLAY_APPLIED, 4, NOW.minusSeconds(1),
+                        expiry, "effect-authority", "d".repeat(64), "receipt-1", outputHash);
+                fixture.acquire(automationTask(registration, 1, proof));
+                fixture.tick();
+            }
+            var futureProof = new WorkerEffectRecoveryVO(WorkerEffectRecoveryVO.Mode.REPLAY_APPLIED, 4, NOW.plusSeconds(3),
+                    NOW.plusSeconds(20), "effect-authority", "d".repeat(64), "receipt-1", outputHash);
+            fixture.acquire(automationTask(registration, 1, futureProof));
+            fixture.tick();
+            var sent = org.mockito.ArgumentCaptor.forClass(AutomationWorkerFailureCommand.class);
+            verify(fixture.typed, times(4)).fail(sent.capture());
+            sent.getAllValues().forEach(report -> {
+                assertEquals(AutomationWorkerFailureCommand.KindEnum.UNKNOWN, report.getKind());
+                assertNull(report.getBusinessReceiptId());
+            });
+            assertEquals(List.of("WORKER_RECOVERY_PROOF_EXPIRED", "WORKER_RECOVERY_PROOF_EXPIRED",
+                            "WORKER_RECOVERY_PROOF_EXPIRED", "WORKER_RECOVERY_PROOF_MISMATCH"),
+                    sent.getAllValues().stream().map(AutomationWorkerFailureCommand::getErrorCode).toList());
+            verify(fixture.store, never()).executeAutomation(any(), any());
+            verify(fixture.typed, never()).complete(any());
+        } finally {
+            poller.stop();
+        }
+    }
+
+    @Test
+    void ordinary_typed_acquisition_with_no_recovery_proof_executes_and_completes_once() {
+        var registration = automationRegistration();
+        var fixture = new AutomationPollingFixture(registration);
+        var task = automationTask(registration, 1, null);
+        var output = Map.<String, Object>of("approved", true);
+        var result = new AutomationWorkerBusinessResultDTO("receipt-1", output);
+        var receipt = WorkerExecutionReceipt.fromAutomation(registration.descriptor().handlerVersion(), NOW,
+                task.getEffectFingerprint(), result,
+                AutomationWorkerBusinessResultDTO.resultSha256(task.getEffectFingerprint(), "receipt-1", output), false);
+        fixture.acquire(task);
+        when(fixture.store.executeAutomation(eq(task), same(registration))).thenReturn(receipt);
+        when(fixture.typed.complete(any())).thenReturn(new AutomationWorkerReportDTO(task.getTaskId(), task.getActivityOccurrenceId(),
+                AutomationWorkerReportDTO.OutcomeEnum.COMPLETED, NOW));
+        var poller = fixture.poller(mock(WorkerClient.class), List.of(), 1);
+        poller.start();
+        try {
+            fixture.tick();
+            verify(fixture.store).executeAutomation(eq(task), same(registration));
+            verify(fixture.typed).complete(argThat(command -> "receipt-1".equals(command.getBusinessReceiptId())
+                    && output.equals(command.getOutput()) && task.getLeaseToken().equals(command.getLeaseToken())));
+            verify(fixture.typed, never()).fail(any());
+        } finally {
+            poller.stop();
+        }
     }
 
     @Test
@@ -368,6 +670,59 @@ class RemoteWorkerPollerTest {
     }
     private static WorkerHandlerRegistration registration(WorkerContractDTO contract) {
         return new WorkerHandlerRegistration(new WorkerHandlerDescriptor(contract, "v1"), (context, jdbc) -> new WorkerBusinessResultDTO("receipt", Map.of("approved", true)));
+    }
+    private static AutomationWorkerHandlerRegistration automationRegistration() {
+        var input = ProcessSchemaVO.fromWire(Map.of("type", "object", "additionalProperties", false, "required", List.of("amount"),
+                "properties", Map.of("amount", Map.of("type", "integer"))));
+        var output = ProcessSchemaVO.fromWire(Map.of("type", "object", "additionalProperties", false, "required", List.of("approved"),
+                "properties", Map.of("approved", Map.of("type", "boolean"))));
+        var descriptor = new AutomationWorkerHandlerDescriptor("riskCheck", 1, WorkerDigests.schemaSha256(input),
+                WorkerDigests.schemaSha256(output), WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, "typed-v1", null);
+        return new AutomationWorkerHandlerRegistration(descriptor, input, output, (context, jdbc) -> null, null);
+    }
+    private static Optional<AutomationWorkerReadinessVO> ready() {
+        return Optional.of(new AutomationWorkerReadinessVO(20, TRUSTED_SOURCE));
+    }
+    private static AutomationWorkerTaskDTO automationTask(AutomationWorkerHandlerRegistration registration, int leaseSerial,
+                                                           WorkerEffectRecoveryVO proof) {
+        var descriptor = registration.descriptor();
+        var input = Map.<String, Object>of("amount", 10L);
+        byte[] token = new byte[32];
+        token[0] = (byte) leaseSerial;
+        var task = AutomationWorkerTaskDTO.builder().taskId("task").activityOccurrenceId("occurrence").nodeExecutionRef("node-execution")
+                .leaseToken(Base64.getUrlEncoder().withoutPadding().encodeToString(token))
+                .capabilityKey(descriptor.capabilityKey()).capabilityVersion(descriptor.capabilityVersion())
+                .input(input).inputSha256(WorkerDigests.taskInputSha256(input)).effectKey("effect-1")
+                .attemptDeadlineAt(NOW.plusSeconds(60)).leaseExpiresAt(NOW.plusSeconds(30)).handlerVersion(descriptor.handlerVersion())
+                .effectMode(descriptor.effectMode()).targetId(descriptor.targetId()).inputSchemaSha256(descriptor.inputSchemaSha256())
+                .outputSchemaSha256(descriptor.outputSchemaSha256()).effectFingerprint(WorkerDigests.automationEffectFingerprint(descriptor, input))
+                .effectRecovery(proof).build();
+        return task.setTaskContractSha256(task.contractSha256(20, TRUSTED_SOURCE));
+    }
+    private static final class AutomationPollingFixture {
+        private final AutomationWorkerClient typed = mock(AutomationWorkerClient.class);
+        private final WorkerExecutionStore store = store();
+        private final TaskScheduler scheduler = mock(TaskScheduler.class);
+        private final AtomicReference<Runnable> callback = captureScheduler(scheduler);
+        private final AutomationWorkerHandlerRegistration registration;
+
+        private AutomationPollingFixture(AutomationWorkerHandlerRegistration registration) {
+            this.registration = registration;
+            when(store.automationReadiness()).thenReturn(ready());
+        }
+
+        private RemoteWorkerPoller poller(WorkerClient legacy, List<WorkerHandlerRegistration> handlers, int concurrency) {
+            return new RemoteWorkerPoller(legacy, typed, store, handlers, List.of(), List.of(registration), scheduler, Runnable::run,
+                    properties(concurrency, Duration.ZERO), CLOCK);
+        }
+
+        private void acquire(AutomationWorkerTaskDTO task) {
+            when(typed.acquire(any())).thenReturn(new AutomationWorkerAcquireDTO(AutomationWorkerAcquireDTO.StatusEnum.ACQUIRED, task));
+        }
+
+        private void tick() {
+            callback.get().run();
+        }
     }
     private static WorkerContractDTO contract() {
         return new WorkerContractDTO("riskCheck", "1", WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT,
