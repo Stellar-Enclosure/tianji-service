@@ -9115,7 +9115,8 @@
             ],
             "minLength": 1,
             "maxLength": 2048,
-            "description": "Opaque keyset cursor bound to the current authorized scope and query filters."
+            "description": "Opaque keyset cursor bound to the current authorized scope and query filters.",
+            "pattern": "^[A-Za-z0-9_-]+$"
           }
         }
       },
@@ -9938,7 +9939,7 @@
             "$ref": "#/components/schemas/Base64UrlToken32"
           },
           "commandId": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/CommandId"
           },
           "effectKey": {
             "$ref": "#/components/schemas/CommandId"
@@ -9978,7 +9979,7 @@
             "$ref": "#/components/schemas/Base64UrlToken32"
           },
           "commandId": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/CommandId"
           },
           "kind": {
             "type": "string",

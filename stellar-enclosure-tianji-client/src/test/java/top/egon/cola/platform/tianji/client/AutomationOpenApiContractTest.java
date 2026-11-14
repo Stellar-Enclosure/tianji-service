@@ -191,6 +191,26 @@ class AutomationOpenApiContractTest {
     }
 
     @Test
+    void workerReportIdsAndNodePaginationMatchTheirConsumerContracts() throws IOException {
+        JsonNode doc = mapper.readTree(artifact());
+        for (String name : List.of("AutomationWorkerCompletionCommand", "AutomationWorkerFailureCommand")) {
+            var commandId = schema(doc, name).path("properties").path("commandId");
+            assertEquals("#/components/schemas/CommandId", commandId.path("$ref").asText(), name);
+            assertTrue("1-report".matches(resolve(doc, commandId).path("pattern").asText()), name);
+        }
+        JsonNode list = operation(doc, "listProcessNodeExecutions");
+        JsonNode cursorQuery = null;
+        for (JsonNode parameter : list.path("parameters")) {
+            if ("cursor".equals(parameter.path("name").asText())) cursorQuery = parameter.path("schema");
+        }
+        assertNotNull(cursorQuery);
+        var cursor = schema(doc, "ProcessNodeExecutionPageDTO").path("properties").path("nextCursor");
+        assertEquals(cursorQuery.path("pattern"), cursor.path("pattern"));
+        assertEquals(cursorQuery.path("maxLength"), cursor.path("maxLength"));
+        assertEquals(Set.of("string", "null"), values(cursor.path("type")));
+    }
+
+    @Test
     void processServerAndClientPublishIdenticalBytes() throws IOException {
         Path repo = repository();
         byte[] clientSource = Files.readAllBytes(repo.resolve(CLIENT_MODULE).resolve(SOURCE_RESOURCES).resolve(AUTOMATION));
