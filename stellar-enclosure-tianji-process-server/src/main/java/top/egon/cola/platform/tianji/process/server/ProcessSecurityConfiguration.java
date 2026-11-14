@@ -14,6 +14,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -31,6 +32,8 @@ import org.springframework.web.util.ContentCachingResponseWrapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.flowable.cmmn.engine.CmmnEngine;
 import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
@@ -38,6 +41,7 @@ import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessDraftController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilotProperties;
@@ -79,6 +83,8 @@ import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionCorrela
 import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionPoller;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableCaseWaitInspector;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
+import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftCommandReceiptStore;
+import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftStore;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
@@ -108,6 +114,14 @@ import java.util.function.BooleanSupplier;
 @EnableConfigurationProperties(GovernedStartPilotProperties.class)
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 public class ProcessSecurityConfiguration {
+    private static final PathPatternRequestMatcher.Builder MATCHER = PathPatternRequestMatcher.withDefaults();
+    private static final List<RequestMatcher> DRAFT_ROUTES = List.of(
+            MATCHER.matcher(HttpMethod.POST, ProcessDraftController.CREATE_PATH),
+            MATCHER.matcher(HttpMethod.GET, ProcessDraftController.DRAFT_PATH),
+            MATCHER.matcher(HttpMethod.PUT, ProcessDraftController.DRAFT_PATH),
+            MATCHER.matcher(HttpMethod.GET, ProcessDraftController.LIST_PATH),
+            MATCHER.matcher(HttpMethod.POST, ProcessDraftController.DISCARD_PATH));
+
     @Bean
     SecurityFilterChain processSecurityFilterChain(HttpSecurity http, Environment environment,
             ObjectProvider<IdpBearerAuthenticationFilter> identityFilters,
@@ -148,6 +162,7 @@ public class ProcessSecurityConfiguration {
                     if (enabled && startReceiptReadEnabled) authorize
                             .requestMatchers(HttpMethod.GET, ProcessStartReceiptController.PATH).authenticated()
                             .requestMatchers(HttpMethod.HEAD, ProcessStartReceiptController.PATH).authenticated();
+                    if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
@@ -190,8 +205,6 @@ public class ProcessSecurityConfiguration {
     static final class ClosedProcessSecurityErrors extends OncePerRequestFilter {
         private static final String CORRELATION = "/api/tianji/v1" + ProcessController.CORRELATION_PATH;
         private static final String OUTCOMES = "/api/tianji/v1/process-instances/{instanceId}/agent-outcomes";
-        private static final PathPatternRequestMatcher.Builder MATCHER = PathPatternRequestMatcher.withDefaults();
-
         private final List<RequestMatcher> routes;
 
         ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled) {
@@ -203,6 +216,7 @@ public class ProcessSecurityConfiguration {
                 selected.add(MATCHER.matcher(HttpMethod.GET, ProcessWorkerRecoveryClient.WORKER_FAILURES_PATH));
                 selected.add(MATCHER.matcher(HttpMethod.POST, ProcessWorkerRecoveryClient.WORKER_RECOVERIES_PATH));
             }
+            selected.addAll(DRAFT_ROUTES);
             routes = List.copyOf(selected);
         }
 
@@ -255,7 +269,9 @@ public class ProcessSecurityConfiguration {
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1" + ProcessController.CORRELATION_PATH, ProcessStartReceiptController.PATH,
-                        "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get"), true);
+                        "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get",
+                        ProcessDraftController.CREATE_PATH, ProcessDraftController.DRAFT_PATH, ProcessDraftController.LIST_PATH,
+                        ProcessDraftController.DISCARD_PATH), true);
     }
 
     @Bean
@@ -288,6 +304,44 @@ public class ProcessSecurityConfiguration {
         var verifier = engineSchemaVerifier(engine);
         verifier.verify();
         return verifier;
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    static class DraftConfiguration {
+        @Bean("processDraftStore")
+        @Lazy
+        ProcessDraftStore processDraftStore(ProcessEngine engine) {
+            var process = processConfiguration(engine);
+            return new ProcessDraftStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
+                    process.getDatabaseSchema());
+        }
+
+        @Bean("processDraftCommandReceiptStore")
+        @Lazy
+        ProcessDraftCommandReceiptStore processDraftCommandReceiptStore(ProcessEngine engine) {
+            var process = processConfiguration(engine);
+            return new ProcessDraftCommandReceiptStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
+                    process.getDatabaseSchema());
+        }
+
+        @Bean("processDraftTransactionTemplate")
+        @Lazy
+        TransactionTemplate processDraftTransactionTemplate(ProcessEngine engine) {
+            var transaction = new TransactionTemplate(processDraftTransactionManager(processConfiguration(engine)));
+            transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+            return transaction;
+        }
+
+        private static DataSourceTransactionManager processDraftTransactionManager(SpringProcessEngineConfiguration process) {
+            var source = process.getDataSource();
+            if (source instanceof TransactionAwareDataSourceProxy proxy) source = proxy.getTargetDataSource();
+            if (!(process.getTransactionManager() instanceof DataSourceTransactionManager manager)
+                    || source == null || source != manager.getDataSource()) {
+                throw new IllegalStateException("Process drafts require the owning Process JDBC manager and data source");
+            }
+            return manager;
+        }
     }
 
     private static ProcessApiSchemaVerifier engineSchemaVerifier(ProcessEngine engine) {

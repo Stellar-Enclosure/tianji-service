@@ -46,6 +46,16 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Publish a process release"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.release.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read a process release"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.create", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Create an owned process draft"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an owned process draft"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.save", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Save an owned process draft"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.list", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "List owned process drafts"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.discard", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Discard an owned process draft"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.start", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Start a process instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.process.startReceipt", defaultLocale = "en-US",
@@ -166,6 +176,11 @@ public final class TianjiProcessPermissions {
     public static final String WORKER_REPORT = "TIANJI_WORKER_REPORT";
     public static final String AGENT_RESULT_RECEIVE = "TIANJI_AGENT_RESULT_RECEIVE";
     public static final String RELEASE_PUBLISH_API = "tianji.api.process.release.publish";
+    public static final String DRAFT_CREATE_API = "tianji.api.process.draft.create.v2";
+    public static final String DRAFT_GET_API = "tianji.api.process.draft.get.v2";
+    public static final String DRAFT_SAVE_API = "tianji.api.process.draft.save.v2";
+    public static final String DRAFT_LIST_API = "tianji.api.process.draft.list.v2";
+    public static final String DRAFT_DISCARD_API = "tianji.api.process.draft.discard.v2";
     public static final String RELEASE_GET_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_RESOURCE_KEY;
     public static final String START_API = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_RESOURCE_KEY;
     public static final String MIGRATION_PREFLIGHT_API = "tianji.api.process.migration.preflight";

@@ -71,6 +71,8 @@ stellar:
     process:
       api:
         start-receipt-read-enabled: false
+      automation:
+        enabled: false
       cancellation:
         enabled: false
       migration-preflight:

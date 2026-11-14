@@ -24,6 +24,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskComman
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorkerCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.CreateProcessDraftCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DiscardProcessDraftCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.SaveProcessDraftCommand;
+import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftContentCodec;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -43,6 +47,8 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_AGENT_RESULT_BYTES = 64 * 1024;
     static final int MAX_PROCESS_CANCEL_BYTES = 4096;
     static final int MAX_PROCESS_WORKER_RECOVERY_BYTES = 8192;
+    static final int MAX_DRAFT_SAVE_BYTES = 5 * 1024 * 1024;
+    private static final int MAX_DRAFT_COMMAND_BYTES = 4 * 1024;
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
@@ -62,13 +68,22 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     public boolean supports(MethodParameter parameter, Type type, Class<? extends HttpMessageConverter<?>> converter) {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
                 || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
-                || type == RecoverProcessWorkerCommand.class;
+                || type == RecoverProcessWorkerCommand.class || draftCommand(type);
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
-        int maxBytes = type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
+        if (draftCommand(type)) {
+            var contentType = input.getHeaders().getContentType();
+            if (contentType != null && contentType.getCharset() != null
+                    && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
+                throw new IllegalArgumentException("Draft request must use UTF-8");
+            }
+        }
+        int maxBytes = type == SaveProcessDraftCommand.class ? MAX_DRAFT_SAVE_BYTES
+                : draftCommand(type) ? MAX_DRAFT_COMMAND_BYTES
+                : type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
                 : type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
                 : type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
         if (input.getHeaders().getContentLength() > maxBytes) throw new TooLarge();
@@ -78,6 +93,9 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (type == AgentTerminalEvent.class) validateAgentResult(body);
         if (type == CancelProcessCommand.class) validateProcessCancel(body);
         if (type == RecoverProcessWorkerCommand.class) validateProcessWorkerRecovery(body);
+        if (type == CreateProcessDraftCommand.class) ProcessDraftContentCodec.validateCreateWire(body);
+        if (type == SaveProcessDraftCommand.class) ProcessDraftContentCodec.validateSaveWire(body);
+        if (type == DiscardProcessDraftCommand.class) ProcessDraftContentCodec.validateDiscardWire(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -86,6 +104,10 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
 
     private static boolean workerCommand(Type type) {
         return type == AcquireWorkerTaskCommand.class || type == CompleteWorkerTaskCommand.class || type == FailWorkerTaskCommand.class;
+    }
+
+    private static boolean draftCommand(Type type) {
+        return type == CreateProcessDraftCommand.class || type == SaveProcessDraftCommand.class || type == DiscardProcessDraftCommand.class;
     }
 
     private static void validateWorkerBody(byte[] body, Type type) {

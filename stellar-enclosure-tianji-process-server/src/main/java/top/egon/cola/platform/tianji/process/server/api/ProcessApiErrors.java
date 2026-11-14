@@ -18,6 +18,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationErrorDTO;
+import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessDecisionFailedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -51,6 +52,17 @@ public final class ProcessApiErrors {
 
     @ExceptionHandler(ProcessTenantChangedException.class)
     ResponseEntity<OrchestrationErrorDTO> tenantChanged() { return error(HttpStatus.CONFLICT, "TIANJI_TENANT_CONTEXT_CHANGED"); }
+
+    @ExceptionHandler(AutomationOperationException.class)
+    ResponseEntity<OrchestrationErrorDTO> automationError(AutomationOperationException failure) {
+        HttpStatus status = switch (failure.code()) {
+            case TIANJI_REQUEST_TOO_LARGE -> HttpStatus.PAYLOAD_TOO_LARGE;
+            case TIANJI_DRAFT_VERSION_CONFLICT, TIANJI_DRAFT_STATE_CONFLICT, TIANJI_DRAFT_SOURCE_UNAVAILABLE,
+                    TIANJI_PROCESS_NOT_ACTIVATED, TIANJI_PROCESS_ACTIVATION_CONFLICT, TIANJI_EVENT_ROUTE_VERSION_CONFLICT,
+                    TIANJI_NODE_RETRY_BLOCKED, TIANJI_EVENT_CONFLICT, TIANJI_EVENT_ROUTE_CHANGED -> HttpStatus.CONFLICT;
+        };
+        return error(status, failure.stableCode());
+    }
 
     @ExceptionHandler(ProcessDecisionFailedException.class)
     ResponseEntity<OrchestrationErrorDTO> decisionFailed() { return error(HttpStatus.UNPROCESSABLE_CONTENT, "TIANJI_DECISION_FAILED"); }
