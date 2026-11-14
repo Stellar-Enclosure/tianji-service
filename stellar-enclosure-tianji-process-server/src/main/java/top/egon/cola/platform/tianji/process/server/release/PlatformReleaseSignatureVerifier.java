@@ -417,9 +417,13 @@ final class PlatformReleaseSignatureVerifier {
     }
 
     private static PublicKey publicKey(ReleaseSignatureTrustDTO trust) {
-        byte[] encoded = base64(trust.publicKey(), 44);
+        return publicKey(trust.publicKey(), trust.scope().get("keyId"));
+    }
+
+    private static PublicKey publicKey(String publicKey, String keyId) {
+        byte[] encoded = base64(publicKey, 44);
         if (!Arrays.equals(encoded, 0, SPKI_PREFIX.length, SPKI_PREFIX, 0, SPKI_PREFIX.length)
-                || !hash(encoded).equals(trust.scope().get("keyId"))) throw rejected();
+                || !hash(encoded).equals(keyId)) throw rejected();
         try {
             var key = KeyFactory.getInstance(ALGORITHM).generatePublic(new X509EncodedKeySpec(encoded));
             if (!(key instanceof EdECPublicKey edKey) || !ALGORITHM.equals(edKey.getParams().getName())
@@ -434,14 +438,28 @@ final class PlatformReleaseSignatureVerifier {
         }
     }
 
+    static void verifyAutomationSignature(byte[] payload, AutomationReleaseTrustVerifier.TrustedKeyVO trust,
+                                          AutomationReleaseTrustVerifier.SignedEnvelopeVO envelope,
+                                          long currentGeneration, Instant verifiedAt) {
+        if (trust.generation() != currentGeneration || !trust.keyId().equals(envelope.keyId())
+                || trust.notBefore().isAfter(envelope.issuedAt()) || envelope.issuedAt().isAfter(verifiedAt)
+                || !verifiedAt.isBefore(envelope.expiresAt()) || envelope.expiresAt().isAfter(trust.notAfter())) {
+            throw rejected();
+        }
+        verifyEd25519(publicKey(trust.encodedPublicKey(), trust.keyId()), payload, base64(envelope.signature(), 64));
+    }
+
     private static void verifySignature(PublicKey key, String claims, byte[] signature) {
+        byte[] signed = (DOMAIN + "\u0000" + claims).getBytes(UTF_8);
+        verifyEd25519(key, signed, signature);
+    }
+
+    private static void verifyEd25519(PublicKey key, byte[] signed, byte[] signature) {
         Signature verifier;
         try {
             verifier = Signature.getInstance(ALGORITHM);
             verifier.initVerify(key);
-            verifier.update(DOMAIN.getBytes(UTF_8));
-            verifier.update((byte) 0);
-            verifier.update(claims.getBytes(UTF_8));
+            verifier.update(signed);
         } catch (InvalidKeyException malformed) {
             throw rejected();
         } catch (NoSuchAlgorithmException | SignatureException unavailable) {

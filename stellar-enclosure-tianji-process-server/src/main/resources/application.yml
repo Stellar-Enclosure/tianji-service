@@ -51,6 +51,7 @@ egon:
             permission-scopes:
               TIANJI_PROCESS_RELEASE_PUBLISH: ["tianji:process:publish"]
               TIANJI_PROCESS_RELEASE_READ: ["tianji:process:release:read"]
+              TIANJI_PROCESS_RELEASE_ACTIVATE: ["tianji:process:activate"]
               TIANJI_PROCESS_START: ["tianji:process:start"]
               TIANJI_PROCESS_READ: ["tianji:process:read"]
               TIANJI_PROCESS_CANCEL: ["tianji:process:cancel"]

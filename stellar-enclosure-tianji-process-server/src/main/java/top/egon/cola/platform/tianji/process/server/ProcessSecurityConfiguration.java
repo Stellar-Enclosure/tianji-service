@@ -28,6 +28,7 @@ import org.springframework.security.web.servlet.util.matcher.PathPatternRequestM
 import org.springframework.security.web.util.matcher.RequestMatcher;
 import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.filter.RequestContextFilter;
+import org.springframework.web.servlet.HandlerExceptionResolver;
 import org.springframework.web.util.ContentCachingResponseWrapper;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
@@ -42,8 +43,11 @@ import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessDraftController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessActivationController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessAutomationController;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator;
+import top.egon.cola.platform.tianji.process.server.release.AutomationActivationStore;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
@@ -127,6 +131,15 @@ public class ProcessSecurityConfiguration {
             MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.VALIDATE_PATH),
             MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.RELEASES_PATH),
             MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.RELEASE_PATH));
+    private static final List<RequestMatcher> ACTIVATION_ROUTES = List.of(
+            MATCHER.matcher(HttpMethod.POST, ProcessActivationController.PATH),
+            MATCHER.matcher(HttpMethod.GET, ProcessActivationController.PATH));
+
+    @Bean("processActivationMediaErrors")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    HandlerExceptionResolver processActivationMediaErrors() {
+        return ProcessApiErrors.activationMediaErrors(request -> ACTIVATION_ROUTES.stream().anyMatch(route -> route.matches(request)));
+    }
 
     @Bean
     SecurityFilterChain processSecurityFilterChain(HttpSecurity http, Environment environment,
@@ -168,7 +181,8 @@ public class ProcessSecurityConfiguration {
                     if (enabled && startReceiptReadEnabled) authorize
                             .requestMatchers(HttpMethod.GET, ProcessStartReceiptController.PATH).authenticated()
                             .requestMatchers(HttpMethod.HEAD, ProcessStartReceiptController.PATH).authenticated();
-                    if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
+                    if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
+                            .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
@@ -223,6 +237,7 @@ public class ProcessSecurityConfiguration {
                 selected.add(MATCHER.matcher(HttpMethod.POST, ProcessWorkerRecoveryClient.WORKER_RECOVERIES_PATH));
             }
             selected.addAll(DRAFT_ROUTES);
+            selected.addAll(ACTIVATION_ROUTES);
             routes = List.copyOf(selected);
         }
 
@@ -278,7 +293,8 @@ public class ProcessSecurityConfiguration {
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get",
                         ProcessDraftController.CREATE_PATH, ProcessDraftController.DRAFT_PATH, ProcessDraftController.LIST_PATH,
                         ProcessDraftController.DISCARD_PATH, ProcessAutomationController.VALIDATE_PATH,
-                        ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH), true);
+                        ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH,
+                        ProcessActivationController.PATH), true);
     }
 
     @Bean
@@ -337,6 +353,14 @@ public class ProcessSecurityConfiguration {
         AutomationReleaseStore automationReleaseStore(ProcessEngine engine) {
             var process = processConfiguration(engine);
             return new AutomationReleaseStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
+                    process.getDatabaseSchema());
+        }
+
+        @Bean("automationActivationStore")
+        @Lazy
+        AutomationActivationStore automationActivationStore(ProcessEngine engine) {
+            var process = processConfiguration(engine);
+            return new AutomationActivationStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
                     process.getDatabaseSchema());
         }
 

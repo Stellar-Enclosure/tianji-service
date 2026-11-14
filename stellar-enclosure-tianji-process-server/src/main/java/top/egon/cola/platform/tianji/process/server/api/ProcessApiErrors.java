@@ -2,19 +2,27 @@ package top.egon.cola.platform.tianji.process.server.api;
 
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.web.method.HandlerMethod;
 import org.springframework.web.servlet.HandlerMapping;
 import java.util.concurrent.RejectedExecutionException;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.web.util.matcher.RequestMatcher;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
+import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.HandlerExceptionResolver;
+import org.springframework.web.servlet.ModelAndView;
+import org.springframework.web.servlet.handler.AbstractHandlerExceptionResolver;
 import lombok.extern.slf4j.Slf4j;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationErrorDTO;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
@@ -26,6 +34,9 @@ import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostExcepti
 import top.egon.cola.platform.tianji.process.server.error.ProcessCancellationBlockedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessWorkerRecoveryBlockedException;
+
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 
 @Slf4j
 @RestControllerAdvice(basePackageClasses = ProcessController.class)
@@ -69,6 +80,33 @@ public final class ProcessApiErrors {
     @ExceptionHandler({IllegalArgumentException.class, HttpMessageNotReadableException.class})
     ResponseEntity<OrchestrationErrorDTO> invalid() { return error(HttpStatus.BAD_REQUEST, "TIANJI_INVALID_COMMAND"); }
 
+    /** Media selection can fail before MVC has selected a controller for package-scoped advice. */
+    public static HandlerExceptionResolver activationMediaErrors(RequestMatcher route) {
+        return new AbstractHandlerExceptionResolver() {
+            @Override
+            protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,
+                                                      Object handler, Exception failure) {
+                if (!(failure instanceof HttpMediaTypeNotSupportedException || failure instanceof HttpMediaTypeNotAcceptableException)
+                        || !route.matches(request) || response.isCommitted()) return null;
+                response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+                response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+                response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+                response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                try {
+                    response.getWriter().write("{\"code\":\"TIANJI_INVALID_COMMAND\",\"correlationId\":null}");
+                } catch (java.io.IOException unavailable) {
+                    throw new UncheckedIOException(unavailable);
+                }
+                return new ModelAndView();
+            }
+
+            @Override
+            public int getOrder() {
+                return -1;
+            }
+        };
+    }
+
     @ExceptionHandler({ProcessRequestBodyAdvice.TooLarge.class, CaseRequestBodyAdvice.TooLarge.class})
     ResponseEntity<OrchestrationErrorDTO> tooLarge() { return error(HttpStatus.PAYLOAD_TOO_LARGE, "TIANJI_REQUEST_TOO_LARGE"); }
 
@@ -87,11 +125,16 @@ public final class ProcessApiErrors {
 
     @ExceptionHandler(RuntimeException.class)
     ResponseEntity<OrchestrationErrorDTO> unexpected(RuntimeException failure, HttpServletRequest request) {
-        if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler
-                && CaseController.class.isAssignableFrom(handler.getBeanType())) {
-            if (failure instanceof RejectedExecutionException) return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
-            log.error("Case API request failed: type={}", failure.getClass().getName());
-            return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");
+        if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler) {
+            if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())) {
+                log.error("Process activation API request failed: type={}", failure.getClass().getName());
+                return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");
+            }
+            if (CaseController.class.isAssignableFrom(handler.getBeanType())) {
+                if (failure instanceof RejectedExecutionException) return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
+                log.error("Case API request failed: type={}", failure.getClass().getName());
+                return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");
+            }
         }
         log.error("Process API request failed: type={}", failure.getClass().getName());
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "TIANJI_INTERNAL_ERROR");

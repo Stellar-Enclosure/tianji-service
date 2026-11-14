@@ -7,27 +7,37 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
 import org.mapstruct.factory.Mappers;
+import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.boot.WebApplicationType;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
 import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.stereotype.Component;
 import org.springframework.security.authentication.AuthenticationCredentialsNotFoundException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.mock.env.MockEnvironment;
+import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO.TemplateRefVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationModelSourceVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.NodePolicyVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.DependencySnapshotVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.ImmutableReleaseVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.TemplateRegistrationVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.VersionedRefVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.WorkerRegistrationVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.ActivationCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.AutomationActivationDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.CreateProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DraftContentVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DraftModelSourceVO;
@@ -40,6 +50,8 @@ import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
+import org.springframework.security.access.AccessDeniedException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftCommandReceiptBO;
@@ -51,10 +63,14 @@ import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftSt
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyPairGenerator;
+import java.security.Signature;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -62,8 +78,11 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @Isolated("Owns one expressly provisioned empty Process database")
 @Timeout(150)
@@ -226,7 +245,356 @@ class AutomationPublicationActivationIT {
             assertEquals(0, count(db, "tianji_process_automation_activation"));
             verifiedWorkerDependencyControlsFirstPublication(db, first, reopened, components, again, environment);
             publishedDecisionRetainsItsOwnExactDeployment(db, reopened, components, again);
+            verifiesIndependentActivationAndFrozenHistory(db, first, reopened, components, again, environment, winner.releaseVersion());
         }
+    }
+
+    @Test
+    void resolvesRealNamedServiceMapperAndOnlyNamedHostAuthorities() {
+        var activationStore = mock(AutomationActivationStore.class);
+        var releaseStore = mock(AutomationReleaseStore.class);
+        var release = new ImmutableReleaseVO(OWNER.tenantId(), "wiring-v2", "review", null,
+                "a".repeat(64), AutomationReleaseStore.compilerVersion(), "b".repeat(64), Instant.EPOCH,
+                "draft-wiring-v2", 1, "c".repeat(64), Map.of(), "d".repeat(64));
+        when(releaseStore.find(OWNER.tenantId(), release.releaseVersion())).thenReturn(Optional.of(release));
+        var unqualifiedUsage = new AtomicBoolean();
+        var permissionUsage = new AtomicBoolean();
+        var trustUsage = new AtomicBoolean();
+        var testClock = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        when(activationStore.now()).thenReturn(testClock);
+        var runner = new ApplicationContextRunner()
+                .withPropertyValues(ENABLED + "=true")
+                .withUserConfiguration(AutomationActivationService.class,
+                        Mappers.getMapper(AutomationActivationConverter.class).getClass())
+                .withBean("automationActivationStore", AutomationActivationStore.class, () -> activationStore)
+                .withBean("automationReleaseStore", AutomationReleaseStore.class, () -> releaseStore)
+                .withBean("processReleaseService", ProcessReleaseService.class, () -> mock(ProcessReleaseService.class))
+                .withBean("processApiSchemaVerifier", ProcessApiSchemaVerifier.class, () -> mock(ProcessApiSchemaVerifier.class))
+                .withBean("processDraftTransactionTemplate", TransactionTemplate.class,
+                        () -> new TransactionTemplate(mock(PlatformTransactionManager.class)))
+                .withBean("anotherAdmissionAuthority", AutomationAdmissionAuthority.class, () -> query -> {
+                    unqualifiedUsage.set(true);
+                    throw new AssertionError("Unnamed admission authority was used");
+                })
+                .withBean("anotherTrustAuthority", AutomationReleaseTrustVerifier.TrustAuthority.class, () -> (query, descriptor) -> {
+                    unqualifiedUsage.set(true);
+                    throw new AssertionError("Unnamed trust authority was used");
+                });
+        var command = new ActivationCommand(release.releaseVersion(), 0L, "activate-wiring");
+        runner.run(app -> {
+            assertNull(app.getStartupFailure());
+            var service = app.getBean("automationActivationService", AutomationActivationService.class);
+            var mapper = app.getBean("automationActivationConverter", AutomationActivationConverter.class);
+            assertEquals("automationActivationConverter", mapper.getClass().getAnnotation(Component.class).value());
+            assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "review", command));
+            assertFalse(unqualifiedUsage.get());
+        });
+        runner.withBean("automationAdmissionAuthority", AutomationAdmissionAuthority.class, () -> query -> {
+            permissionUsage.set(true);
+            return new AutomationAdmissionProofVO(query.sha256(), "fixture", "a".repeat(64), testClock,
+                    testClock.plusSeconds(15), 1, "b".repeat(64), "c".repeat(64), "d".repeat(64), Map.of());
+        }).withBean("automationReleaseTrustAuthority", AutomationReleaseTrustVerifier.TrustAuthority.class, () -> (query, descriptor) -> {
+            trustUsage.set(true);
+            return null;
+        }).run(app -> {
+            assertNull(app.getStartupFailure());
+            var service = app.getBean("automationActivationService", AutomationActivationService.class);
+            assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "review", command));
+            assertTrue(permissionUsage.get());
+            assertTrue(trustUsage.get());
+            assertFalse(unqualifiedUsage.get());
+        });
+    }
+
+    private static void verifiesIndependentActivationAndFrozenHistory(
+            TestDatabaseVO db, ConfigurableApplicationContext first, ConfigurableApplicationContext reopened,
+            TestServicesVO components, TestServicesVO again, MockEnvironment environment, String releaseVersion) throws Exception {
+        var key = KeyPairGenerator.getInstance("Ed25519").generateKeyPair();
+        var allowReplay = new AtomicBoolean(true);
+        var allowSigning = new AtomicBoolean(true);
+        var expireProof = new AtomicBoolean();
+        var signatureCalls = new AtomicInteger();
+        var replayCalls = new AtomicInteger();
+        var waitForRace = new AtomicBoolean();
+        var fencedDeadline = new AtomicReference<Instant>();
+        var observedBoth = new CountDownLatch(2);
+        var ownerFromAnotherIssuer = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "editor", "https://idp.test/other");
+        var signatures = new java.util.concurrent.ConcurrentHashMap<String, AutomationReleaseTrustVerifier.TrustObservationVO>();
+        AutomationReleaseTrustVerifier.TrustAuthority signaturesByRelease = (query, release) -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            signatureCalls.incrementAndGet();
+            if (!allowSigning.get()) throw new IllegalStateException("Signing registry is offline");
+            return signatures.get(query.getReleaseVersion());
+        };
+        AutomationAdmissionAuthority permission = query -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            Instant now = db.owner().queryForObject("SELECT clock_timestamp()", java.time.OffsetDateTime.class).toInstant();
+            if (query.getPurpose() == AutomationAdmissionQuery.Purpose.REPLAY_ACTIVATION) {
+                replayCalls.incrementAndGet();
+                if (!allowReplay.get()) throw new AccessDeniedException("Denied historical permission");
+                return new AutomationAdmissionProofVO(query.sha256(), "replay-auth", "a".repeat(64), now, now.plusSeconds(20),
+                        1, "b".repeat(64), "c".repeat(64), "d".repeat(64), Map.of());
+            }
+            if (!OWNER.equals(query.getActor())) throw new AccessDeniedException("Independent activation permission denied");
+            if (waitForRace.get()) {
+                observedBoth.countDown();
+                await(observedBoth);
+            }
+            var material = signatures.get(query.getReleaseVersion());
+            Instant validUntil = now.plusSeconds(20);
+            if ("activation-fenced-expiry".equals(query.getCommandId())) {
+                validUntil = now.plusSeconds(4);
+                fencedDeadline.set(validUntil);
+            }
+            return new AutomationAdmissionProofVO(query.sha256(), "activate-auth", "a".repeat(64),
+                    expireProof.get() ? now.minusSeconds(20) : now, expireProof.get() ? now.minusSeconds(1) : validUntil,
+                    material.key().generation(), material.envelopeSha256(), material.payloadSha256(),
+                    material.dependencyEvidenceSha256(query), Map.of("authorizationVersion", "v1"));
+        };
+        var service = activation(first, components.releases(), environment, permission, signaturesByRelease);
+        var restarted = activation(reopened, again.releases(), environment, permission, signaturesByRelease);
+        var jdbc = new JdbcTemplate(((DataSourceTransactionManager) first.getBean(SpringProcessEngineConfiguration.class)
+                .getTransactionManager()).getDataSource());
+        var descriptors = new AutomationReleaseStore(jdbc, SCHEMA);
+        publishActivationProfiles(first, components.releases(), environment);
+        for (String version : List.of(releaseVersion, "rollback-target", "worker-release", "human-release", "two-agent-release")) {
+            var release = descriptors.find(OWNER.tenantId(), version).orElseThrow();
+            byte[] exact = AutomationReleaseTrustVerifier.canonicalPayload(release);
+            Instant time = Instant.now().truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+            String keyId = PlatformReleaseArtifactValidator.hash(key.getPublic().getEncoded());
+            var trusted = new AutomationReleaseTrustVerifier.TrustedKeyVO(keyId, OWNER.tenantId(), 1,
+                    Base64.getEncoder().encodeToString(key.getPublic().getEncoded()), time.minusSeconds(60), time.plusSeconds(90));
+            Instant issuedAt = time.minusSeconds(10);
+            Instant expiresAt = time.plusSeconds(60);
+            var signer = Signature.getInstance("Ed25519");
+            signer.initSign(key.getPrivate());
+            signer.update(AutomationReleaseTrustVerifier.signingPayload(release, keyId, issuedAt, expiresAt));
+            var envelope = new AutomationReleaseTrustVerifier.SignedEnvelopeVO(keyId, issuedAt, expiresAt,
+                    Base64.getEncoder().encodeToString(signer.sign()));
+            signatures.put(version, new AutomationReleaseTrustVerifier.TrustObservationVO(trusted, 1, envelope,
+                    release.dependencies(), AutomationReleaseTrustVerifier.payloadSha256(exact)));
+        }
+        assertNull(service.list(OWNER, "review", null, null, null).getCurrent());
+        var initial = new ActivationCommand(releaseVersion, 0L, "activation-original");
+        assertThrows(AccessDeniedException.class, () -> service.activate(COPIER, "review", initial));
+        assertThrows(IllegalArgumentException.class, () -> service.activate(OWNER, "different", initial));
+        assertThrows(ProcessResourceNotFoundException.class, () -> service.activate(OTHER_TENANT, "review", initial));
+        assertThrows(ProcessResourceNotFoundException.class, () -> service.list(OTHER_TENANT, "review", null, null, null));
+        expireProof.set(true);
+        assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "review", initial));
+        expireProof.set(false);
+        assertEquals(0, count(db, "tianji_process_automation_activation"));
+
+        // Recompute every advertised digest around a forged envelope. Only actual Ed25519 verification rejects it.
+        var originalMaterial = signatures.get(releaseVersion);
+        var originalEnvelope = originalMaterial.envelope();
+        signatures.put(releaseVersion, new AutomationReleaseTrustVerifier.TrustObservationVO(originalMaterial.key(), 1,
+                new AutomationReleaseTrustVerifier.SignedEnvelopeVO(originalEnvelope.keyId(), originalEnvelope.issuedAt(),
+                        originalEnvelope.expiresAt(), Base64.getEncoder().encodeToString(new byte[64])),
+                originalMaterial.observedDependencies(), originalMaterial.payloadSha256()));
+        assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "review", initial));
+        signatures.put(releaseVersion, new AutomationReleaseTrustVerifier.TrustObservationVO(originalMaterial.key(), 1,
+                new AutomationReleaseTrustVerifier.SignedEnvelopeVO(originalEnvelope.keyId(), originalEnvelope.issuedAt(),
+                        originalEnvelope.expiresAt().plusSeconds(10), originalEnvelope.signature()),
+                originalMaterial.observedDependencies(), originalMaterial.payloadSha256()));
+        assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "review", initial));
+        signatures.put(releaseVersion, originalMaterial);
+
+        var firstResult = service.activate(OWNER, "review", initial);
+        assertEquals(1, firstResult.getRevision());
+        assertNull(firstResult.getPreviousRevision());
+        assertEquals(initial.getReleaseVersion(), firstResult.getReleaseVersion());
+        var manager = first.getBean(SpringProcessEngineConfiguration.class).getTransactionManager();
+        var expiryCommand = new ActivationCommand(releaseVersion, 1L, "activation-fenced-expiry");
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            var pending = new AtomicReference<java.util.concurrent.Future<AutomationActivationDTO>>();
+            new TransactionTemplate(manager).executeWithoutResult(status -> {
+                PlatformReleaseTenantFence.acquireExclusive(jdbc, OWNER.tenantId());
+                pending.set(pool.submit(() -> restarted.activate(OWNER, "review", expiryCommand)));
+                awaitBlockedActivation(db);
+                assertNotNull(fencedDeadline.get());
+                awaitDatabaseDeadline(db, fencedDeadline.get());
+            });
+            var expired = assertThrows(java.util.concurrent.ExecutionException.class, () -> pending.get().get(10, TimeUnit.SECONDS));
+            assertInstanceOf(IllegalStateException.class, expired.getCause());
+            assertEquals("Automation admission proof is unavailable or expired", expired.getCause().getMessage());
+        }
+        assertEquals(1, count(db, "tianji_process_automation_activation"));
+        waitForRace.set(true);
+        var left = new ActivationCommand("rollback-target", 1L, "activation-left");
+        var right = new ActivationCommand("worker-release", 1L, "activation-right");
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            var leftCall = pool.submit(() -> raceActivation(service, left));
+            var rightCall = pool.submit(() -> raceActivation(restarted, right));
+            var resultLeft = leftCall.get(20, TimeUnit.SECONDS);
+            var resultRight = rightCall.get(20, TimeUnit.SECONDS);
+            assertTrue((resultLeft == null) != (resultRight == null));
+        }
+        waitForRace.set(false);
+        var initialPage = service.list(OWNER, "review", null, 1, null);
+        assertEquals(2, initialPage.getCurrent().revision());
+        assertEquals(2, initialPage.getItems().getFirst().getRevision());
+        assertNotNull(initialPage.getNextCursor());
+        assertEquals(3, service.activate(OWNER, "review", new ActivationCommand(initialPage.getCurrent().releaseVersion(),
+                2L, "activation-explicit-again")).getRevision());
+        var nextPage = restarted.list(OWNER, "review", null, 1, initialPage.getNextCursor());
+        assertEquals(3, nextPage.getCurrent().revision());
+        assertEquals(List.of(firstResult), nextPage.getItems());
+        assertNull(nextPage.getNextCursor());
+        assertEquals(List.of(firstResult), service.list(OWNER, "review", initial.getCommandId(), 20, null).getItems());
+        assertTrue(service.list(ownerFromAnotherIssuer, "review", initial.getCommandId(), null, null).getItems().isEmpty());
+
+        var human = service.activate(OWNER, "approval", new ActivationCommand("human-release", 0L, "activate-human"));
+        assertEquals(1, human.getRevision());
+        assertEquals("human-release", service.list(OWNER, "approval", null, null, null).getCurrent().releaseVersion());
+        var multi = new ActivationCommand("two-agent-release", 0L, "activate-agents");
+        var fullObservation = signatures.get("two-agent-release");
+        var incompleteDependencies = new java.util.LinkedHashMap<>(fullObservation.observedDependencies());
+        var templates = (Map<?, ?>) incompleteDependencies.get("agentTemplates");
+        assertEquals(2, templates.size());
+        var firstTemplate = templates.entrySet().iterator().next();
+        incompleteDependencies.put("agentTemplates", Map.of(firstTemplate.getKey(), firstTemplate.getValue()));
+        signatures.put("two-agent-release", new AutomationReleaseTrustVerifier.TrustObservationVO(fullObservation.key(),
+                fullObservation.currentGeneration(), fullObservation.envelope(), incompleteDependencies, fullObservation.payloadSha256()));
+        assertThrows(IllegalStateException.class, () -> service.activate(OWNER, "twoAgents", multi));
+        assertNull(service.list(OWNER, "twoAgents", null, null, null).getCurrent());
+        signatures.put("two-agent-release", fullObservation);
+        assertEquals(1, restarted.activate(OWNER, "twoAgents", multi).getRevision());
+        assertEquals("two-agent-release", service.list(OWNER, "twoAgents", null, null, null).getCurrent().releaseVersion());
+
+        environment.setProperty(ENABLED, "false");
+        allowSigning.set(false);
+        int registryLookups = signatureCalls.get();
+        assertEquals(firstResult, restarted.activate(OWNER, "review", initial));
+        assertEquals(1, replayCalls.get());
+        assertEquals(registryLookups, signatureCalls.get());
+        assertThrows(ProcessConflictException.class, () -> restarted.activate(OWNER, "review",
+                new ActivationCommand("rollback-target", 2L, initial.getCommandId())));
+        allowReplay.set(false);
+        assertThrows(AccessDeniedException.class, () -> restarted.activate(OWNER, "review", initial));
+        assertEquals(5, count(db, "tianji_process_automation_activation"));
+        assertEquals(0, count(db, "tianji_platform_release_activation"));
+        assertEquals(0, count(db, "act_ru_execution"));
+        assertEquals(3, restarted.list(OWNER, "review", null, null, null).getCurrent().revision());
+    }
+
+    private static void publishActivationProfiles(ConfigurableApplicationContext app, ProcessReleaseService releases,
+                                                  MockEnvironment environment) {
+        var empty = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(), "required", List.of(),
+                "additionalProperties", false));
+        var stop = new NodePolicyVO.PolicyActionVO("END", null);
+        var policy = new NodePolicyVO(Duration.ofMinutes(5), Duration.ofMinutes(2), Duration.ofSeconds(30), stop, stop, stop,
+                new NodePolicyVO.RetryPolicyVO(1, Duration.ZERO, List.of()), "BEST_EFFORT_STOP", "WAIT_RECOVERY");
+        var human = new AutomationNodeBindingVO("approve", "HUMAN", empty, empty, List.of(), List.of(), policy,
+                null, null, null, new AutomationNodeBindingVO.HumanBindingVO("approvers", empty, Duration.ofMinutes(1)), null, null);
+        String humanXml = XML.replace("id=\"review\"", "id=\"approval\"").replace("<endEvent id=\"end\"/>", """
+                <userTask id="approve"/>
+                <endEvent id="end"/>
+                <sequenceFlow id="approved" sourceRef="approve" targetRef="end"/>
+                """).replace("sourceRef=\"start\" targetRef=\"end\"", "sourceRef=\"start\" targetRef=\"approve\"");
+        String agentXml = XML.replace("id=\"review\"", "id=\"twoAgents\"").replace("<endEvent id=\"end\"/>", """
+                <serviceTask id="collect"/>
+                <serviceTask id="verify"/>
+                <endEvent id="end"/>
+                <sequenceFlow id="collected" sourceRef="collect" targetRef="verify"/>
+                <sequenceFlow id="verified" sourceRef="verify" targetRef="end"/>
+                """).replace("sourceRef=\"start\" targetRef=\"end\"", "sourceRef=\"start\" targetRef=\"collect\"");
+        var collect = new TemplateRefVO("collector", 1, "a".repeat(64));
+        var verify = new TemplateRefVO("verifier", 2, "b".repeat(64));
+        String schemaSha = AutomationModelValidator.schemaSha256(empty);
+        var registries = new DependencySnapshotVO(OWNER.tenantId(), Map.of(), Map.of(
+                new VersionedRefVO(collect.key(), collect.version()), new TemplateRegistrationVO(collect, schemaSha, schemaSha, schemaSha),
+                new VersionedRefVO(verify.key(), verify.version()), new TemplateRegistrationVO(verify, schemaSha, schemaSha, schemaSha)),
+                Set.of(), Map.of("approvers", "c".repeat(64)), Map.of());
+        var dependencyProvider = new AutomationReleaseStore.DependencyResolver() {
+            @Override
+            public DependencySnapshotVO resolve(ProcessActor actor, AutomationModelSourceVO source) { return registries; }
+
+            @Override
+            public boolean isCurrent(ProcessActor actor, AutomationModelSourceVO source, DependencySnapshotVO observation) {
+                return actor.tenantId() == registries.tenantId() && observation == registries;
+            }
+        };
+        var drafts = service(app, releases, environment, new AtomicBoolean(), dependencyProvider);
+        publishProfile(drafts, "approval", "human-release", humanXml, empty, List.of(human));
+        publishProfile(drafts, "twoAgents", "two-agent-release", agentXml, empty, List.of(
+                agentNode("collect", collect, empty, policy), agentNode("verify", verify, empty, policy)));
+    }
+
+    private static AutomationNodeBindingVO agentNode(String id, TemplateRefVO template, ProcessSchemaVO empty, NodePolicyVO policy) {
+        var agent = new AgentTaskBindingVO(template, List.of(template), empty, Map.of(), List.of(), null);
+        return new AutomationNodeBindingVO(id, "AGENT", empty, empty, List.of(), List.of(), policy,
+                null, null, agent, null, null, null);
+    }
+
+    private static void publishProfile(ProcessDraftService drafts, String definition, String version, String xml,
+                                       ProcessSchemaVO empty, List<AutomationNodeBindingVO> nodes) {
+        var source = new AutomationModelSourceVO("AUTOMATION_V2",
+                List.of(new AutomationModelSourceVO.ModelSourceVO("BPMN", definition, xml)), empty, empty, nodes, List.of());
+        var created = drafts.create(OWNER, definition, new CreateProcessDraftCommand(definition, null, "draft-" + version));
+        var saved = drafts.save(OWNER, created.getDraftId(),
+                new SaveProcessDraftCommand("save-" + version, 1, definition, AutomationReleaseStore.copyContent(source)));
+        var validation = drafts.validate(OWNER, preview(saved));
+        assertTrue(validation.isValid(), () -> validation.getIssues().toString());
+        assertEquals(version, publish(drafts, OWNER, command(saved, version, "publish-" + version)).releaseVersion());
+    }
+
+    private static void awaitBlockedActivation(TestDatabaseVO db) {
+        Instant timeout = Instant.now().plusSeconds(8);
+        while (Instant.now().isBefore(timeout)) {
+            if (Boolean.TRUE.equals(db.owner().queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted
+                      AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))
+                    """, Boolean.class))) return;
+            pause();
+        }
+        fail("Activation did not wait on the tenant fence");
+    }
+
+    private static void awaitDatabaseDeadline(TestDatabaseVO db, Instant cutoff) {
+        while (db.owner().queryForObject("SELECT clock_timestamp()", java.time.OffsetDateTime.class).toInstant().isBefore(cutoff)) {
+            pause();
+        }
+    }
+
+    private static void pause() {
+        try {
+            Thread.sleep(20);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    private static AutomationActivationDTO raceActivation(AutomationActivationService service, ActivationCommand command) {
+        try {
+            return service.activate(OWNER, "review", command);
+        } catch (ProcessVersionConflictException expected) {
+            return null;
+        }
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(10, TimeUnit.SECONDS));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    private static AutomationActivationService activation(ConfigurableApplicationContext app, ProcessReleaseService releases,
+            MockEnvironment environment, AutomationAdmissionAuthority authority, AutomationReleaseTrustVerifier.TrustAuthority trust) {
+        var manager = (DataSourceTransactionManager) app.getBean(SpringProcessEngineConfiguration.class).getTransactionManager();
+        var source = manager.getDataSource();
+        var jdbc = new JdbcTemplate(source);
+        var transaction = new TransactionTemplate(manager);
+        transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        var providers = new StaticListableBeanFactory(Map.of("authority", authority, "trust", trust));
+        return new AutomationActivationService(new AutomationActivationStore(jdbc, SCHEMA), new AutomationReleaseStore(jdbc, SCHEMA),
+                releases, Mappers.getMapper(AutomationActivationConverter.class), new ProcessApiSchemaVerifier(source, SCHEMA),
+                transaction, environment, providers.getBeanProvider(AutomationAdmissionAuthority.class),
+                providers.getBeanProvider(AutomationReleaseTrustVerifier.TrustAuthority.class));
     }
 
     private static void rejectsLegacyStartForCompiledRelease(TestDatabaseVO db, ConfigurableApplicationContext reopened,
