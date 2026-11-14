@@ -28,6 +28,7 @@ import java.util.function.Supplier;
 /** Parses bounded UTF-8 without entity resolution and validates against packaged Flowable schemas. */
 final class SafeModelXml {
     static final int MAX_BYTES = 512 * 1024;
+    static final int MAX_AUTOMATION_SOURCE_BYTES = 4 * 1024 * 1024;
     private static final int MAX_ELEMENTS = 2_000;
     private static final int MAX_DEPTH = 24;
     private static final int MAX_ATTRIBUTES = 32;
@@ -40,19 +41,29 @@ final class SafeModelXml {
     private SafeModelXml() { }
 
     static Document parseCmmn(byte[] bytes) {
-        return parse(bytes, () -> CmmnSchema.CMMN);
+        return parse(bytes, MAX_BYTES, MAX_ELEMENTS, MAX_DEPTH, () -> CmmnSchema.CMMN);
     }
 
     static Document parse(byte[] bytes, boolean bpmn) {
-        return parse(bytes, () -> bpmn ? Schemas.BPMN : Schemas.DMN);
+        return parse(bytes, MAX_BYTES, MAX_ELEMENTS, MAX_DEPTH, () -> bpmn ? Schemas.BPMN : Schemas.DMN);
     }
 
-    private static Document parse(byte[] bytes, Supplier<Schema> schemaSupplier) {
-        if (bytes == null || bytes.length == 0 || bytes.length > MAX_BYTES) throw invalid();
+    static Document parseAutomation(byte[] bytes, boolean bpmn, int remainingPackageBytes) {
+        if (remainingPackageBytes <= 0 || remainingPackageBytes > MAX_AUTOMATION_SOURCE_BYTES) throw invalid();
+        return parse(bytes, remainingPackageBytes, MAX_ELEMENTS, MAX_DEPTH, () -> bpmn ? Schemas.BPMN : Schemas.DMN);
+    }
+
+    static Document parseCompiledAutomationBpmn(byte[] bytes) {
+        return parse(bytes, MAX_AUTOMATION_SOURCE_BYTES, MAX_ELEMENTS * 4, MAX_DEPTH * 2, () -> Schemas.BPMN);
+    }
+
+    private static Document parse(byte[] bytes, int byteLimit, int elementLimit, int depthLimit,
+                                  Supplier<Schema> schemaSupplier) {
+        if (bytes == null || bytes.length == 0 || bytes.length > byteLimit) throw invalid();
         try {
             String xml = StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                     .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString();
-            scan(xml);
+            scan(xml, elementLimit, depthLimit);
             DocumentBuilderFactory factory = DocumentBuilderFactory.newDefaultInstance();
             factory.setNamespaceAware(true);
             factory.setXIncludeAware(false);
@@ -81,7 +92,7 @@ final class SafeModelXml {
         }
     }
 
-    private static void scan(String xml) throws Exception {
+    private static void scan(String xml, int elementLimit, int depthLimit) throws Exception {
         XMLInputFactory factory = XMLInputFactory.newDefaultFactory();
         factory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
         factory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
@@ -97,7 +108,7 @@ final class SafeModelXml {
                 if (event == XMLStreamConstants.DTD || event == XMLStreamConstants.ENTITY_REFERENCE
                         || event == XMLStreamConstants.PROCESSING_INSTRUCTION) throw invalid();
                 if (event == XMLStreamConstants.START_ELEMENT) {
-                    if (++depth > MAX_DEPTH || ++elements > MAX_ELEMENTS || reader.getAttributeCount() > MAX_ATTRIBUTES) throw invalid();
+                    if (++depth > depthLimit || ++elements > elementLimit || reader.getAttributeCount() > MAX_ATTRIBUTES) throw invalid();
                 } else if (event == XMLStreamConstants.END_ELEMENT) depth--;
             }
         } finally {

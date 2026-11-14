@@ -25,6 +25,25 @@ class ProcessModelValidatorTest {
     private final ProcessModelValidator validator = new ProcessModelValidator();
 
     @Test
+    void preserves_the_legacy_worker_artifact_and_rejects_reserved_v2_native_input() throws Exception {
+        byte[] original = fixture("worker-mapping.bpmn20.xml");
+        var model = validator.validateBpmn(original, "workerMapping");
+        assertArrayEquals(original, model.xml());
+        assertEquals("919512377f5410336915d1bf95ba2855eb08478e1bec3eb12253159958ccc157",
+                java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(model.xml())));
+        assertEquals("riskCheck", model.workerTasks().get("worker").topic());
+
+        String xml = new String(original, StandardCharsets.UTF_8);
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(
+                xml.replace("riskCheck:1", "tianji-v2:worker:" + "a".repeat(64))), "workerMapping"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(
+                xml.replace("flowable:type=\"external-worker\"",
+                        "flowable:class=\"top.egon.cola.platform.tianji.ProcessBootstrap\"")), "workerMapping"));
+        assertThrows(IllegalArgumentException.class, () -> validator.validateBpmn(bytes(
+                xml + "<!--" + "x".repeat(SafeModelXml.MAX_BYTES) + "-->"), "workerMapping"));
+    }
+
+    @Test
     void worker_business_error_symbols_and_fixture_are_present() {
         assertAll(
                 () -> assertDoesNotThrow(() -> ValidatedProcessModel.class.getDeclaredMethod("workerBusinessErrors")),

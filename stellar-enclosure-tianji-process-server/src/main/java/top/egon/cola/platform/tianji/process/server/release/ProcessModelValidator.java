@@ -1,8 +1,16 @@
 package top.egon.cola.platform.tianji.process.server.release;
 
+import lombok.extern.slf4j.Slf4j;
+import org.flowable.bpmn.converter.BpmnXMLConverter;
+import org.flowable.bpmn.model.ServiceTask;
+import org.flowable.bpmn.model.StartEvent;
+import org.flowable.dmn.xml.converter.DmnXMLConverter;
+import org.flowable.validation.ProcessValidatorFactory;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.CompiledModelEvidenceVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.CompiledControlBindingsVO;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.RouteCondition;
@@ -21,6 +29,7 @@ import javax.xml.XMLConstants;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -30,6 +39,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /** Validates bounded, non-scriptable process models; publication applies additional feature gates. */
+@Slf4j
 public final class ProcessModelValidator {
     public ValidatedCaseModel validateCmmn(byte[] xml, String expectedKey) { return new CmmnModelValidator().validate(xml, expectedKey); }
 
@@ -670,8 +680,527 @@ public final class ProcessModelValidator {
 
     public ValidatedProcessModel validateDmn(byte[] source, String expectedKey) {
         byte[] bytes = copy(source, expectedKey);
-        Document document = SafeModelXml.parse(bytes, false);
-        Element root = document.getDocumentElement();
+        return validateDmn(bytes, expectedKey, SafeModelXml.parse(bytes, false).getDocumentElement());
+    }
+
+    static ValidatedProcessModel validateAutomationDecision(byte[] bytes, String expectedKey, Element root) {
+        var validated = validateDmn(bytes, expectedKey, root);
+        try {
+            var converted = new DmnXMLConverter().convertToDmnModel(() -> new java.io.ByteArrayInputStream(bytes), true, true);
+            if (converted.getDecisions().size() != 1 || !expectedKey.equals(converted.getDecisions().getFirst().getId())) throw invalid();
+            return validated;
+        } catch (RuntimeException failure) {
+            throw invalid();
+        }
+    }
+
+    static CompiledControlBindingsVO validateCompiledAutomationBpmn(byte[] bytes, CompiledModelEvidenceVO evidence) {
+        return validateCompiledAutomationBpmn(bytes, SafeModelXml.parseCompiledAutomationBpmn(bytes), evidence);
+    }
+
+    static CompiledControlBindingsVO validateCompiledAutomationBpmn(byte[] bytes, Document document, CompiledModelEvidenceVO evidence) {
+        if (evidence == null || bytes == null || document == null || evidence.tenantId() <= 0 || !AutomationModelValidator.PROFILE.equals(evidence.profile())
+                || !AutomationModelCompiler.VERSION.equals(evidence.compilerVersion()) || !AutomationModelValidator.isId(evidence.rootDefinitionKey())
+                || !AutomationModelValidator.isSha256(evidence.sourceSha256()) || !AutomationModelValidator.isSha256(evidence.dependencySha256())
+                || evidence.nativeFirstActivity() == null || evidence.nativeIds().isEmpty()
+                || evidence.resourceDigests().size() > 64 || evidence.nativeIds().size() > 512
+                || evidence.resourceDigests().values().stream().anyMatch(value -> !AutomationModelValidator.isSha256(value))) throw invalid();
+        String rootResource = evidence.rootDefinitionKey() + ".bpmn20.xml";
+        if (!AutomationModelValidator.rawSha256(bytes).equals(evidence.resourceDigests().get(rootResource))
+                || !AutomationModelCompiler.compiledSha256(evidence.tenantId(), evidence.profile(), evidence.compilerVersion(),
+                evidence.rootDefinitionKey(), evidence.nativeFirstActivity(), evidence.resourceDigests(), evidence.nativeIds())
+                .equals(evidence.compiledSha256())) throw invalid();
+        Element process = only(document.getDocumentElement(), "process");
+        String namespace = AutomationModelCompiler.METADATA;
+        if (!BPMN.equals(process.getNamespaceURI()) || !evidence.rootDefinitionKey().equals(process.getAttribute("id"))
+                || !"true".equals(process.getAttribute("isExecutable"))
+                || !Long.toString(evidence.tenantId()).equals(process.getAttributeNS(namespace, "tenantId"))
+                || !evidence.profile().equals(process.getAttributeNS(namespace, "profile"))
+                || !evidence.compilerVersion().equals(process.getAttributeNS(namespace, "compilerVersion"))
+                || !evidence.sourceSha256().equals(process.getAttributeNS(namespace, "sourceSha256"))
+                || !evidence.dependencySha256().equals(process.getAttributeNS(namespace, "dependencySha256"))) throw invalid();
+        var extension = only(process, "extensionElements");
+        var metadata = only(extension, "bindings");
+        if (!namespace.equals(metadata.getNamespaceURI())) throw invalid();
+        String json = metadata.getTextContent();
+        byte[] bindingBytes = AutomationModelValidator.utf8(json);
+        if (bindingBytes.length == 0 || bindingBytes.length > 1024 * 1024) throw invalid();
+        try {
+            var bindings = AutomationModelValidator.JSON.readValue(json, CompiledControlBindingsVO.class);
+            if (bindings == null || !Arrays.equals(bindingBytes, AutomationModelCompiler.controlBindingsBytes(bindings))) throw invalid();
+            if (!compiledNativeIds(document).equals(evidence.nativeIds())) throw invalid();
+            var syntax = new CompiledBpmnSyntax(evidence, bindings);
+            syntax.check(document.getDocumentElement(), process);
+            var nativeModel = new BpmnXMLConverter().convertToBpmnModel(() -> new java.io.ByteArrayInputStream(bytes), true, true);
+            var nativeIssues = new ProcessValidatorFactory().createDefaultProcessValidator().validate(nativeModel);
+            if (nativeIssues.stream().anyMatch(issue -> !issue.isWarning())) throw invalid();
+            var root = nativeModel.getMainProcess();
+            if (nativeModel.getProcesses().size() != 1 || root == null || !evidence.rootDefinitionKey().equals(root.getId())) throw invalid();
+            var starts = root.findFlowElementsOfType(StartEvent.class, false);
+            if (starts.size() != 1) throw invalid();
+            var start = starts.getFirst();
+            if (start.getOutgoingFlows().size() != 1
+                    || !evidence.nativeFirstActivity().equals(start.getOutgoingFlows().getFirst().getTargetRef())
+                    || !(root.getFlowElement(evidence.nativeFirstActivity()) instanceof ServiceTask bootstrap)
+                    || !bootstrap.isAsynchronous() || !"${tianjiAutomationBootstrap}".equals(bootstrap.getImplementation())
+                    || evidence.nativeIds().values().stream().anyMatch(id -> nativeModel.getFlowElement(id) == null)) throw invalid();
+            return bindings;
+        } catch (RuntimeException failure) {
+            throw invalid();
+        }
+    }
+
+    /** Extracts only deterministic logical IDs from already bounded XML before full compiled verification. */
+    static Map<String, String> compiledNativeIds(Document document) {
+        var process = only(document.getDocumentElement(), "process");
+        var result = new LinkedHashMap<String, String>();
+        var elements = process.getElementsByTagNameNS(BPMN, "*");
+        for (int index = 0; index < elements.getLength(); index++) {
+            var element = (Element) elements.item(index);
+            if (!element.hasAttributeNS(AutomationModelCompiler.METADATA, "logicalId")) continue;
+            String logicalId = element.getAttributeNS(AutomationModelCompiler.METADATA, "logicalId");
+            String nativeId = element.getAttribute("id");
+            if (!AutomationModelValidator.isId(logicalId) || !AutomationModelCompiler.id("node", logicalId).equals(nativeId)
+                    || result.putIfAbsent(logicalId, nativeId) != null || result.size() > 512) throw invalid();
+        }
+        if (result.isEmpty()) throw invalid();
+        return Map.copyOf(result);
+    }
+
+    private static final class CompiledBpmnSyntax {
+        private static final String NS = AutomationModelCompiler.METADATA;
+        private static final String XSI = XMLConstants.W3C_XML_SCHEMA_INSTANCE_NS_URI;
+        private static final Set<String> FLOW = Set.of("startEvent", "endEvent", "exclusiveGateway", "parallelGateway", "subProcess",
+                "serviceTask", "userTask", "intermediateCatchEvent", "boundaryEvent", "sequenceFlow");
+        private static final Set<String> ROOT_METADATA = Set.of("profile", "compilerVersion", "sourceSha256", "dependencySha256", "tenantId");
+        private static final Pattern NATIVE_ID = Pattern.compile("ta_[0-9a-f]{40}(?:_(?:message|entered|resolved|recover|end|wait)){0,2}");
+        private final CompiledModelEvidenceVO evidence;
+        private final CompiledControlBindingsVO bindings;
+        private final Map<String, Element> elements = new LinkedHashMap<>();
+        private final Map<String, Element> primaryTasks = new LinkedHashMap<>();
+        private final Map<String, String> fixedDelegates = new LinkedHashMap<>();
+        private final Set<String> usedConditions = new HashSet<>();
+        private final Set<String> usedBranches = new HashSet<>();
+
+        private CompiledBpmnSyntax(CompiledModelEvidenceVO evidence, CompiledControlBindingsVO bindings) {
+            this.evidence = evidence;
+            this.bindings = bindings;
+        }
+
+        private void check(Element root, Element process) {
+            if (!BPMN.equals(root.getNamespaceURI()) || !"definitions".equals(root.getLocalName())
+                    || !NS.equals(root.getAttribute("targetNamespace"))) throw invalid();
+            validateAttributes(root, Set.of("targetNamespace"), Set.of(), Set.of(), Set.of());
+            if (!evidence.nativeFirstActivity().equals(nativeId("first", AutomationModelCompiler.BOOTSTRAP))) throw invalid();
+            registerDelegate(evidence.nativeFirstActivity(), "tianjiAutomationBootstrap");
+            if (!bindings.occurrenceSlots().keySet().equals(bindings.policySlots().keySet())) throw invalid();
+            bindings.occurrenceSlots().forEach((id, slot) -> {
+                if (!nativeId("node", id).equals(slot.scopeId()) || !slot.scopeId().equals(evidence.nativeIds().get(id))) throw invalid();
+                if (slot.activityId() != null) {
+                    if (!nativeId("activity", id).equals(slot.activityId())) throw invalid();
+                    primaryTasks.put(slot.activityId(), null);
+                }
+                if (slot.mergeId() != null) {
+                    if (!nativeId("multi-merge", id).equals(slot.mergeId())) throw invalid();
+                    registerDelegate(slot.mergeId(), "tianjiAutomationMerge");
+                }
+                var policy = bindings.policySlots().get(id);
+                registerBoundary(id, policy.failureBoundaryId(), "node-error");
+                registerBoundary(id, policy.nodeTimeoutBoundaryId(), "node-timeout");
+                if (policy.attemptTimeoutBoundaryId() != null) registerBoundary(id, policy.attemptTimeoutBoundaryId(), "attempt-timeout");
+                if (policy.attemptEscalationBoundaryId() != null) registerBoundary(id, policy.attemptEscalationBoundaryId(), "node-attempt-timeout");
+            });
+            checkElement(process, null, process);
+            for (Element child : children(root, "error")) checkElement(child, null, process);
+            for (Element child : children(root, "message")) checkElement(child, null, process);
+            if (elementChildren(root).size() != 1 + children(root, "error").size() + children(root, "message").size()
+                    || !usedConditions.equals(bindings.conditions().keySet())
+                    || !usedBranches.equals(bindings.branchIndices().keySet())) throw invalid();
+            validateLinks(process);
+            bindings.occurrenceSlots().forEach(this::checkOccurrence);
+            for (String id : fixedDelegates.keySet()) {
+                if (!elements.containsKey(id)) throw invalid();
+            }
+        }
+
+        private void checkElement(Element element, Element enclosingScope, Element process) {
+            String tag = element.getLocalName();
+            String ns = element.getNamespaceURI();
+            String id = element.getAttribute("id");
+            if (!id.isEmpty() && element != process) {
+                if (!NATIVE_ID.matcher(id).matches() || elements.putIfAbsent(id, element) != null) throw invalid();
+            }
+            if (BPMN.equals(ns) && FLOW.contains(tag) && id.isEmpty()) throw invalid();
+            if (element.hasAttributeNS(NS, "logicalId")) {
+                String name = element.getAttributeNS(NS, "logicalId");
+                String scope = logicalScope(enclosingScope);
+                int nested = scope == null ? 0 : scope.length() + 1;
+                if (!FLOW.contains(tag) || Set.of("serviceTask", "intermediateCatchEvent", "userTask", "sequenceFlow", "boundaryEvent").contains(tag)
+                        || scope != null && !name.startsWith(scope + ".") || name.length() <= nested) throw invalid();
+            }
+            if (BPMN.equals(ns)) {
+                switch (tag) {
+                    case "process" -> validateAttributes(element, Set.of("id", "isExecutable"), Set.of(), ROOT_METADATA, Set.of());
+                    case "startEvent", "endEvent", "parallelGateway" ->
+                            validateAttributes(element, Set.of("id"), Set.of(), Set.of("logicalId"), Set.of());
+                    case "exclusiveGateway" ->
+                            validateAttributes(element, Set.of("id", "default"), Set.of(), Set.of("logicalId"), Set.of());
+                    case "subProcess" -> {
+                        validateAttributes(element, Set.of("id"), Set.of(),
+                                Set.of("logicalId", "occurrence", "maxItems", "maxIterations"), Set.of());
+                        if (element.hasAttributeNS(NS, "maxItems")) checkIntegerAttribute(element, "maxItems", 256);
+                        if (element.hasAttributeNS(NS, "maxIterations")) checkIntegerAttribute(element, "maxIterations", 1_000);
+                        if (element.hasAttributeNS(NS, "maxItems") && element.hasAttributeNS(NS, "maxIterations")) throw invalid();
+                    }
+                    case "userTask", "intermediateCatchEvent" -> validateAttributes(element, Set.of("id"), Set.of(), Set.of(), Set.of());
+                    case "boundaryEvent" -> validateAttributes(element, Set.of("id", "attachedToRef"), Set.of(), Set.of(), Set.of());
+                    case "sequenceFlow" -> {
+                        validateAttributes(element, Set.of("id", "sourceRef", "targetRef"), Set.of(), Set.of("branchIndex"), Set.of());
+                        if (element.hasAttributeNS(NS, "branchIndex")) {
+                            Integer index = bindings.branchIndices().get(id);
+                            if (index == null || index < 0 || index >= 32 || !index.toString().equals(element.getAttributeNS(NS, "branchIndex"))
+                                    || !usedBranches.add(id)) throw invalid();
+                        }
+                    }
+                    case "conditionExpression" -> {
+                        validateAttributes(element, Set.of(), Set.of(), Set.of(), Set.of("type"));
+                        if (!"tFormalExpression".equals(element.getAttributeNS(XSI, "type"))) throw invalid();
+                        String edge = ((Element) element.getParentNode()).getAttribute("id");
+                        String key = enclosingScope == null ? null : enclosingScope.getAttributeNS(NS, "occurrence");
+                        String operation = "condition";
+                        if (key != null && !key.isEmpty()) {
+                            String enclosing = logicalScope(enclosingScope);
+                            if (enclosing != null && nativeId("loop-next", enclosing).equals(edge)) operation = "continueLoop";
+                        }
+                        if (!"continueLoop".equals(operation) && bindings.occurrenceSlots().keySet().stream()
+                                .anyMatch(name -> nativeId("loop-next", name).equals(edge))) operation = "continueLoop";
+                        checkCondition(element, edge, operation);
+                    }
+                    case "completionCondition" -> {
+                        validateAttributes(element, Set.of(), Set.of(), Set.of(), Set.of());
+                        checkCondition(element, enclosingScope.getAttribute("id"), "completeMultiInstance");
+                    }
+                    case "serviceTask" -> checkTask(element, id);
+                    case "multiInstanceLoopCharacteristics" -> {
+                        validateAttributes(element, Set.of("isSequential"), Set.of("collection", "elementVariable", "elementIndexVariable"), Set.of(), Set.of());
+                        if (!Set.of("true", "false").contains(element.getAttribute("isSequential"))
+                                || !predicate("items", enclosingScope.getAttribute("id")).equals(element.getAttributeNS(FLOWABLE, "collection"))
+                                || !"ta_item".equals(element.getAttributeNS(FLOWABLE, "elementVariable"))
+                                || !"ta_itemIndex".equals(element.getAttributeNS(FLOWABLE, "elementIndexVariable"))) throw invalid();
+                    }
+                    case "extensionElements", "timerEventDefinition" ->
+                            validateAttributes(element, Set.of(), Set.of(), Set.of(), Set.of());
+                    case "timeDuration" -> {
+                        validateAttributes(element, Set.of(), Set.of(), Set.of(), Set.of());
+                        String text = element.getTextContent().trim();
+                        Duration duration = Duration.parse(text);
+                        if (!duration.isPositive() || duration.compareTo(Duration.ofDays(30)) > 0
+                                || !text.equals(duration.toString())) throw invalid();
+                    }
+                    case "terminateEventDefinition" -> {
+                        validateAttributes(element, Set.of(), Set.of("terminateAll"), Set.of(), Set.of());
+                        if (!"true".equals(element.getAttributeNS(FLOWABLE, "terminateAll"))) throw invalid();
+                    }
+                    case "message" -> {
+                        validateAttributes(element, Set.of("id", "name"), Set.of(), Set.of(), Set.of());
+                        if (!id.endsWith("_message") || !("tianji-v2:" + id.substring(0, id.length() - 8))
+                                .equals(element.getAttribute("name"))) throw invalid();
+                    }
+                    case "error" -> {
+                        validateAttributes(element, Set.of("id", "errorCode"), Set.of(), Set.of(), Set.of());
+                        String code = element.getAttribute("errorCode");
+                        if ((!"TIANJI_AUTOMATION_NODE_FAILURE".equals(code)
+                                && !code.matches("TIANJI_AUTOMATION_ATTEMPT_TIMEOUT_(BRANCH|END|WAIT_RECOVERY|RETRY)"))
+                                || !nativeId("error-code", code).equals(id)) throw invalid();
+                    }
+                    case "messageEventDefinition" -> validateAttributes(element, Set.of("messageRef"), Set.of(), Set.of(), Set.of());
+                    case "errorEventDefinition" -> validateAttributes(element, Set.of("errorRef"), Set.of(), Set.of(), Set.of());
+                    default -> throw invalid();
+                }
+            } else if (FLOWABLE.equals(ns)) {
+                switch (tag) {
+                    case "executionListener" -> {
+                        validateAttributes(element, Set.of("event", "delegateExpression"), Set.of(), Set.of(), Set.of());
+                        String expected = switch (element.getAttribute("event")) {
+                            case "start" -> "tianjiAutomationScopeEnter";
+                            case "end" -> "tianjiAutomationScopeExit";
+                            default -> throw invalid();
+                        };
+                        if (!delegate(expected).equals(element.getAttribute("delegateExpression"))
+                                || !enclosingScope.hasAttributeNS(NS, "logicalId")) throw invalid();
+                    }
+                    case "externalWorkerInParameter", "externalWorkerOutParameter" ->
+                            validateAttributes(element, Set.of("source", "target"), Set.of(), Set.of(), Set.of());
+                    default -> throw invalid();
+                }
+            } else if (NS.equals(ns) && "bindings".equals(tag)) {
+                validateAttributes(element, Set.of(), Set.of(), Set.of(), Set.of());
+            } else throw invalid();
+
+            for (Node node = element.getFirstChild(); node != null; node = node.getNextSibling()) {
+                if (node instanceof Element child) {
+                    Element scope = Set.of("process", "subProcess").contains(tag) ? element : enclosingScope;
+                    if (!allowedChild(element, child, process)) throw invalid();
+                    checkElement(child, scope, process);
+                } else if (node.getNodeType() != Node.TEXT_NODE || (!Set.of("bindings", "conditionExpression",
+                        "completionCondition", "timeDuration").contains(tag) && !node.getNodeValue().isBlank())) throw invalid();
+            }
+        }
+
+        private static boolean allowedChild(Element parent, Element child, Element process) {
+            String tag = child.getLocalName();
+            String parentTag = parent.getLocalName();
+            return switch (parentTag) {
+                case "process" -> BPMN.equals(child.getNamespaceURI()) && (FLOW.contains(tag) || "extensionElements".equals(tag));
+                case "subProcess" -> BPMN.equals(child.getNamespaceURI())
+                        && (FLOW.contains(tag) || Set.of("extensionElements", "multiInstanceLoopCharacteristics").contains(tag));
+                case "serviceTask" -> BPMN.equals(child.getNamespaceURI()) && "extensionElements".equals(tag)
+                        && "external-worker".equals(parent.getAttributeNS(FLOWABLE, "type"));
+                case "extensionElements" -> parent.getParentNode() == process ? NS.equals(child.getNamespaceURI()) && "bindings".equals(tag)
+                        : FLOWABLE.equals(child.getNamespaceURI()) && ("subProcess".equals(parent.getParentNode().getLocalName())
+                        ? "executionListener".equals(tag) : Set.of("externalWorkerInParameter", "externalWorkerOutParameter").contains(tag));
+                case "endEvent" -> BPMN.equals(child.getNamespaceURI())
+                        && Set.of("errorEventDefinition", "terminateEventDefinition").contains(tag);
+                case "sequenceFlow" -> BPMN.equals(child.getNamespaceURI()) && "conditionExpression".equals(tag);
+                case "multiInstanceLoopCharacteristics" -> BPMN.equals(child.getNamespaceURI()) && "completionCondition".equals(tag);
+                case "boundaryEvent", "intermediateCatchEvent" -> BPMN.equals(child.getNamespaceURI())
+                        && Set.of("errorEventDefinition", "timerEventDefinition", "messageEventDefinition").contains(tag);
+                case "timerEventDefinition" -> BPMN.equals(child.getNamespaceURI()) && "timeDuration".equals(tag);
+                default -> false;
+            };
+        }
+
+        private void checkTask(Element task, String id) {
+            String implementation = task.getAttributeNS(FLOWABLE, "delegateExpression");
+            if ("external-worker".equals(task.getAttributeNS(FLOWABLE, "type"))) {
+                validateAttributes(task, Set.of("id"), Set.of("type", "topic", "doNotIncludeVariables"), Set.of(), Set.of());
+                if (!primaryTasks.containsKey(id) || !task.getAttributeNS(FLOWABLE, "topic").matches("tianji-v2:worker:[0-9a-f]{64}")
+                        || !"true".equals(task.getAttributeNS(FLOWABLE, "doNotIncludeVariables"))) throw invalid();
+                var extension = only(task, "extensionElements");
+                var input = children(extension, "externalWorkerInParameter");
+                var output = only(extension, "externalWorkerOutParameter");
+                if (input.size() != AutomationModelCompiler.WORKER_FIELDS.size() || !"resultRef".equals(output.getAttribute("source"))
+                        || !"resultRef".equals(output.getAttribute("target"))) throw invalid();
+                for (int index = 0; index < input.size(); index++) {
+                    String field = AutomationModelCompiler.WORKER_FIELDS.get(index);
+                    if (!field.equals(input.get(index).getAttribute("source")) || !field.equals(input.get(index).getAttribute("target"))) throw invalid();
+                }
+                primaryTasks.put(id, task);
+                return;
+            }
+            validateAttributes(task, Set.of("id"), Set.of("delegateExpression", "async"),
+                    Set.of("decisionKey", "occurrence", "outcome", "action"), Set.of());
+            String expected = fixedDelegates.get(id);
+            if (primaryTasks.containsKey(id)) {
+                if (task.hasAttributeNS(NS, "decisionKey") && AutomationModelValidator.isId(task.getAttributeNS(NS, "decisionKey"))) {
+                    expected = "tianjiAutomationDecision";
+                } else {
+                    expected = "tianjiAutomationAgentDispatch";
+                }
+                primaryTasks.put(id, task);
+            }
+            if (expected == null && "tianjiAutomationMerge".equals(fixedMergeDelegate(task, id))) expected = "tianjiAutomationMerge";
+            if (expected == null || !delegate(expected).equals(implementation)
+                    || evidence.nativeFirstActivity().equals(id) != "true".equals(task.getAttributeNS(FLOWABLE, "async"))
+                    || !evidence.nativeFirstActivity().equals(id) && task.hasAttributeNS(FLOWABLE, "async")) throw invalid();
+        }
+
+        private String fixedMergeDelegate(Element task, String id) {
+            String scope = task.getAttributeNS(NS, "occurrence");
+            for (var slot : bindings.occurrenceSlots().entrySet()) {
+                if (slot.getValue().scopeId().equals(scope) && nativeId("merge", slot.getKey()).equals(id)
+                        && id.equals(slot.getValue().attemptOrBodyId())) return "tianjiAutomationMerge";
+            }
+            return null;
+        }
+
+        private void checkCondition(Element element, String id, String operation) {
+            if (!bindings.conditions().containsKey(id) || !usedConditions.add(id)
+                    || !predicate(operation, id).equals(element.getTextContent().trim())) throw invalid();
+        }
+
+        private static void checkIntegerAttribute(Element element, String name, int maximum) {
+            String value = element.getAttributeNS(NS, name);
+            if (!value.matches("[1-9][0-9]{0,3}") || Integer.parseInt(value) > maximum) throw invalid();
+        }
+
+        private void validateLinks(Element root) {
+            int rootStarts = 0;
+            for (Element element : elements.values()) {
+                String tag = element.getLocalName();
+                Element container = (Element) element.getParentNode();
+                switch (tag) {
+                    case "sequenceFlow" -> {
+                        Element from = scopedElement(element.getAttribute("sourceRef"), container);
+                        scopedElement(element.getAttribute("targetRef"), container);
+                        if (element.hasAttributeNS(NS, "branchIndex") && !"parallelGateway".equals(from.getLocalName())) throw invalid();
+                        if (!children(element, "conditionExpression").isEmpty() && !"exclusiveGateway".equals(from.getLocalName())) throw invalid();
+                    }
+                    case "exclusiveGateway" -> {
+                        if (!element.hasAttribute("default")) break;
+                        Element flow = scopedElement(element.getAttribute("default"), container);
+                        if (!"sequenceFlow".equals(flow.getLocalName()) || !element.getAttribute("id").equals(flow.getAttribute("sourceRef"))
+                                || !children(flow, "conditionExpression").isEmpty()) throw invalid();
+                    }
+                    case "boundaryEvent" -> scopedElement(element.getAttribute("attachedToRef"), container);
+                    case "messageEventDefinition" -> {
+                        Element message = elements.get(element.getAttribute("messageRef"));
+                        if (message == null || !"message".equals(message.getLocalName())) throw invalid();
+                    }
+                    case "errorEventDefinition" -> {
+                        Element error = elements.get(element.getAttribute("errorRef"));
+                        if (error == null || !"error".equals(error.getLocalName())) throw invalid();
+                    }
+                    case "startEvent" -> {
+                        if (container == root) rootStarts++;
+                    }
+                    default -> { }
+                }
+            }
+            if (rootStarts != 1) throw invalid();
+        }
+
+        private Element scopedElement(String id, Element scope) {
+            Element element = elements.get(id);
+            if (element == null || element.getParentNode() != scope || !FLOW.contains(element.getLocalName())) throw invalid();
+            return element;
+        }
+
+        private void checkOccurrence(String id, AutomationModelCompiler.OccurrenceSlotVO slot) {
+            Element scope = elements.get(slot.scopeId());
+            if (scope == null) throw invalid();
+            boolean join = "parallelGateway".equals(scope.getLocalName());
+            if (!join && !"subProcess".equals(scope.getLocalName())) throw invalid();
+            if (!join) {
+                var listeners = children(only(scope, "extensionElements"), "executionListener");
+                if (listeners.size() != 2 || !"start".equals(listeners.getFirst().getAttribute("event"))
+                        || !"end".equals(listeners.getLast().getAttribute("event"))) throw invalid();
+            }
+            Element body = elements.get(slot.attemptOrBodyId());
+            if (slot.attemptOrBodyId() != null) {
+                if (body == null || body.getParentNode() != (join ? scope.getParentNode() : scope)
+                        || !slot.scopeId().equals(body.getAttributeNS(NS, "occurrence"))) throw invalid();
+                if (!Set.of(nativeId("attempt", id), nativeId("loop-body", id), nativeId("multi-body", id), nativeId("merge", id))
+                        .contains(slot.attemptOrBodyId())) throw invalid();
+            }
+            if (slot.activityId() != null) {
+                Element activity = elements.get(slot.activityId());
+                if (body == null || activity == null || activity.getParentNode() != body
+                        || !Set.of("serviceTask", "userTask", "intermediateCatchEvent").contains(activity.getLocalName())) throw invalid();
+            }
+            if (slot.waitId() != null) {
+                Element wait = elements.get(slot.waitId());
+                if (wait == null || wait.getParentNode() != body || !"intermediateCatchEvent".equals(wait.getLocalName())
+                        || (!slot.waitId().equals(slot.activityId()) && !nativeId("agent-wait", id).equals(slot.waitId()))) throw invalid();
+            }
+            if (slot.mergeId() != null && elements.get(slot.mergeId()).getParentNode() != scope) throw invalid();
+
+            var policy = bindings.policySlots().get(id);
+            if (policy.dispatchTimeout() == null || !policy.dispatchTimeout().isPositive()
+                    || policy.dispatchTimeout().compareTo(Duration.ofDays(30)) > 0 || policy.maxAttempts() < 1
+                    || policy.maxAttempts() > 10 || policy.retryBackoff() == null || policy.retryBackoff().isNegative()
+                    || policy.retryBackoff().compareTo(Duration.ofHours(1)) > 0) throw invalid();
+            String attachment = join ? slot.attemptOrBodyId() : slot.scopeId();
+            checkBoundary(policy.failureBoundaryId(), attachment, slot.scopeId(), "FAILURE");
+            checkBoundary(policy.nodeTimeoutBoundaryId(), attachment, slot.scopeId(), "NODE_TIMEOUT");
+            if (policy.attemptTimeoutBoundaryId() != null) {
+                checkBoundary(policy.attemptTimeoutBoundaryId(), slot.attemptOrBodyId(), slot.scopeId(), "ATTEMPT_TIMEOUT");
+            }
+            if (policy.attemptEscalationBoundaryId() != null) {
+                checkBoundary(policy.attemptEscalationBoundaryId(), attachment, slot.scopeId(), "ATTEMPT_TIMEOUT");
+            }
+        }
+
+        private void checkBoundary(String binding, String attachment, String ownerScope, String outcome) {
+            Element boundary = elements.get(binding);
+            Element action = elements.get(binding + "_recover");
+            Element transition = elements.get(binding + "_resolved");
+            Element entered = elements.get(binding + "_entered");
+            if (boundary == null || action == null || !"boundaryEvent".equals(boundary.getLocalName())
+                    || !attachment.equals(boundary.getAttribute("attachedToRef"))
+                    || !ownerScope.equals(action.getAttributeNS(NS, "occurrence"))
+                    || !outcome.equals(action.getAttributeNS(NS, "outcome"))
+                    || !Set.of("BRANCH", "END", "WAIT_RECOVERY", "RETRY").contains(action.getAttributeNS(NS, "action"))
+                    || elementChildren(boundary).size() != 1 || transition == null || entered == null
+                    || !binding.equals(entered.getAttribute("sourceRef")) || !(binding + "_recover").equals(entered.getAttribute("targetRef"))
+                    || !(binding + "_recover").equals(transition.getAttribute("sourceRef"))) throw invalid();
+            Element target = elements.get(transition.getAttribute("targetRef"));
+            String policy = action.getAttributeNS(NS, "action");
+            if (target == null) throw invalid();
+            String definition = elementChildren(boundary).getFirst().getLocalName();
+            if ("ATTEMPT_TIMEOUT".equals(outcome) && "timerEventDefinition".equals(definition)) {
+                if (!"endEvent".equals(target.getLocalName()) || children(target, "errorEventDefinition").size() != 1
+                        || !(binding + "_end").equals(target.getAttribute("id"))) throw invalid();
+                return;
+            }
+            switch (policy) {
+                case "WAIT_RECOVERY", "RETRY" -> {
+                    if (!"intermediateCatchEvent".equals(target.getLocalName()) || !(binding + "_wait").equals(target.getAttribute("id"))
+                            || children(target, "messageEventDefinition").size() != 1) throw invalid();
+                }
+                case "END" -> {
+                    if (!"endEvent".equals(target.getLocalName()) || !(binding + "_end").equals(target.getAttribute("id"))
+                            || children(target, "terminateEventDefinition").size() != 1) throw invalid();
+                }
+                case "BRANCH" -> {
+                    if (!target.hasAttributeNS(NS, "logicalId") || "startEvent".equals(target.getLocalName())) throw invalid();
+                }
+                default -> throw invalid();
+            }
+        }
+
+        private void registerBoundary(String logical, String id, String type) {
+            if (!nativeId(type, logical).equals(id)) throw invalid();
+            registerDelegate(id + "_recover", "tianjiAutomationPolicy");
+        }
+
+        private void registerDelegate(String id, String delegate) {
+            if (fixedDelegates.putIfAbsent(id, delegate) != null) throw invalid();
+        }
+
+        private static String logicalScope(Element container) {
+            for (Node current = container; current instanceof Element element; current = current.getParentNode()) {
+                if (element.hasAttributeNS(NS, "logicalId")) return element.getAttributeNS(NS, "logicalId");
+            }
+            return null;
+        }
+
+        private static String nativeId(String purpose, String logicalId) {
+            return AutomationModelCompiler.id(purpose, logicalId);
+        }
+
+        private static String delegate(String name) {
+            return "${" + name + "}";
+        }
+
+        private static String predicate(String operation, String id) {
+            return "${tianjiAutomationControl." + operation + "(execution, '" + id + "')}";
+        }
+
+        private static List<Element> elementChildren(Element parent) {
+            var children = new ArrayList<Element>();
+            for (Node node = parent.getFirstChild(); node != null; node = node.getNextSibling()) {
+                if (node instanceof Element element) children.add(element);
+            }
+            return children;
+        }
+
+        private static void validateAttributes(Element element, Set<String> plain, Set<String> flowable,
+                                               Set<String> metadata, Set<String> xsi) {
+            var attributes = element.getAttributes();
+            for (int index = 0; index < attributes.getLength(); index++) {
+                Node attribute = attributes.item(index);
+                String ns = attribute.getNamespaceURI();
+                String name = attribute.getLocalName();
+                if (XMLConstants.XMLNS_ATTRIBUTE_NS_URI.equals(ns)) continue;
+                if (ns == null && plain.contains(name) || FLOWABLE.equals(ns) && flowable.contains(name)
+                        || NS.equals(ns) && metadata.contains(name) || XSI.equals(ns) && xsi.contains(name)) continue;
+                throw invalid();
+            }
+        }
+    }
+
+    private static ValidatedProcessModel validateDmn(byte[] bytes, String expectedKey, Element root) {
         validateTree(root, DMN, DMN_CHILDREN, DMN_ATTRIBUTES);
         if (!"definitions".equals(root.getLocalName())) throw invalid();
         Element decision = only(root, "decision");
