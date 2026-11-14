@@ -13,18 +13,37 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2.SideEffectOutcomeEnum;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSession;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.net.Authenticator;
+import java.net.CookieHandler;
 import java.net.InetSocketAddress;
+import java.net.ProxySelector;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpHeaders;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Flow;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -34,6 +53,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @Timeout(20)
 class HttpAgentResultClientTest {
     private static final Instant NOW = Instant.parse("2026-10-30T00:00:00Z");
+    private static final String CARRIER = "00-" + "a".repeat(32) + "-" + "b".repeat(16) + "-01";
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final AgentTerminalEvent event = event();
     private final AtomicReference<Handler> handler = new AtomicReference<>();
@@ -50,6 +70,159 @@ class HttpAgentResultClientTest {
         base = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/");
     }
     @AfterEach void stopStub() { server.stop(0); executor.shutdownNow(); }
+
+    @Test
+    void v2_preserves_raw_terminal_fact_bytes_and_sends_typed_form_on_existing_inbox() {
+        var fact = v2();
+        byte[] raw = rawV2(fact);
+        var seen = new java.util.concurrent.LinkedBlockingQueue<byte[]>();
+        var receipt = v2Receipt(fact);
+        handler.set(exchange -> {
+            assertEquals("POST", exchange.getRequestMethod());
+            assertEquals(AgentResultTraceLinkCarrier.PATH, exchange.getRequestURI().getRawPath());
+            assertEquals("20", exchange.getRequestHeaders().getFirst("X-Egon-Tianji-Tenant"));
+            assertEquals("Bearer result-token", exchange.getRequestHeaders().getFirst("Authorization"));
+            assertNull(exchange.getRequestHeaders().getFirst(AgentResultTraceLinkCarrier.HEADER));
+            seen.add(exchange.getRequestBody().readAllBytes());
+            exchange.getResponseHeaders().set("Cache-Control", "no-store");
+            respond(exchange, 202, mapper.writeValueAsBytes(receipt));
+        });
+        try (var client = client(Duration.ofSeconds(3))) {
+            assertEquals(receipt, client.receiveV2(fact, raw, CARRIER));
+            assertArrayEquals(raw, seen.remove());
+            assertEquals(receipt, client.receiveV2(fact));
+            assertArrayEquals(fact.canonicalBytes(), seen.remove());
+            byte[] padded = (" ".repeat(16_384 - raw.length) + new String(raw, StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+            assertEquals(receipt, client.receiveV2(fact, padded, null));
+            assertArrayEquals(padded, seen.remove());
+            assertTrue(seen.isEmpty());
+        }
+    }
+
+    @Test
+    void v2_rejects_nonexact_or_malformed_originals_before_token_and_transport() {
+        var fact = v2();
+        String canonical = new String(fact.canonicalBytes(), StandardCharsets.UTF_8);
+        var tokenCalls = new AtomicInteger();
+        var requests = new AtomicInteger();
+        handler.set(exchange -> { requests.incrementAndGet(); respond(exchange, 500, new byte[0]); });
+        try (var client = new HttpAgentResultClient(base, HttpClient.newHttpClient(), tenant -> {
+            tokenCalls.incrementAndGet();
+            return "result-token";
+        }, Duration.ofSeconds(3))) {
+            for (String invalid : List.of(
+                    canonical.replace("\"schemaVersion\":2", "\"schemaVersion\":1"),
+                    canonical.replace("\"schemaVersion\":2", "\"schemaVersion\":2.0"),
+                    canonical.replace("\"schemaVersion\":2", "\"schemaVersion\":\"2\""),
+                    canonical.replace("\"schemaVersion\":2", "\"schemaVersion\":2,\"schemaVersion\":2"),
+                    canonical.replace("\"artifactRef\":null,", ""),
+                    canonical.replace("\"tenantId\":20", "\"tenantId\":21"),
+                    canonical.replace("\"ownerSubjectId\":\"process-worker\"", "\"ownerSubjectId\":\"other-worker\""),
+                    canonical.replace("\"sourceId\":\"process-east\"", "\"sourceId\":\"another-process\""),
+                    canonical.replace("\"configurationSha256\":\"" + "c".repeat(64), "\"configurationSha256\":\"" + "f".repeat(64)),
+                    canonical.replace("\"finishedAt\":\"2026-10-30T00:00:00Z\"", "\"finishedAt\":1793318400"),
+                    canonical.substring(0, canonical.length() - 1) + ",\"unexpected\":true}",
+                    canonical + " {}", " ".repeat(16_385), "")) {
+                assertThrows(IllegalArgumentException.class,
+                        () -> client.receiveV2(fact, invalid.getBytes(StandardCharsets.UTF_8), CARRIER), invalid);
+            }
+            byte[] invalidUtf8 = {(byte) 0xC0, (byte) 0xAF};
+            assertThrows(IllegalArgumentException.class, () -> client.receiveV2(fact, invalidUtf8, null));
+        }
+        assertEquals(0, tokenCalls.get());
+        assertEquals(0, requests.get());
+    }
+
+    @Test
+    void v2_trace_is_diagnostic_only_on_the_exact_https_destination_and_body_cannot_resubscribe() throws Exception {
+        var fact = v2();
+        byte[] raw = rawV2(fact);
+        var receipt = v2Receipt(fact);
+        for (URI origin : List.of(URI.create("https://process.example/"), URI.create("https://process.example/internal/"),
+                URI.create("http://127.0.0.1/"))) {
+            var http = new CapturingHttpClient(mapper.writeValueAsBytes(receipt));
+            try (var client = new HttpAgentResultClient(origin, http, tenant -> "result-token", Duration.ofSeconds(3))) {
+                assertEquals(receipt, client.receiveV2(fact, raw, CARRIER));
+                assertEquals(receipt, client.receiveV2(fact, raw, CARRIER + "," + CARRIER));
+            }
+            assertEquals(2, http.requests.size());
+            var first = http.requests.getFirst();
+            var second = http.requests.getLast();
+            boolean traceExpected = origin.equals(URI.create("https://process.example/"));
+            assertEquals(traceExpected ? List.of(CARRIER) : List.of(),
+                    first.headers().allValues(AgentResultTraceLinkCarrier.HEADER));
+            assertTrue(second.headers().allValues(AgentResultTraceLinkCarrier.HEADER).isEmpty());
+            assertEquals("POST", first.method());
+            assertEquals(origin.resolve(AgentResultTraceLinkCarrier.PATH.substring(1)), first.uri());
+            assertArrayEquals(raw, collect(first).get(2, TimeUnit.SECONDS));
+            assertArrayEquals(raw, collect(second).get(2, TimeUnit.SECONDS));
+            assertThrows(java.util.concurrent.ExecutionException.class, () -> collect(first).get(2, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void v2_requires_exact_accepted_receipt_and_preserves_transport_retry_signals_without_replay() {
+        var fact = v2();
+        var receipt = v2Receipt(fact);
+        String valid = mapper.writeValueAsString(receipt);
+        var requests = new AtomicInteger();
+        var rejected = new AtomicInteger();
+        var status = new AtomicInteger(202);
+        var payload = new AtomicReference<>(valid);
+        handler.set(exchange -> {
+            requests.incrementAndGet();
+            exchange.getRequestBody().readAllBytes();
+            exchange.getResponseHeaders().set("Cache-Control", "no-store");
+            exchange.getResponseHeaders().set("Retry-After", "7");
+            if (status.get() != 0) respond(exchange, status.get(), payload.get().getBytes(StandardCharsets.UTF_8));
+        });
+        var tokens = new HttpAgentResultClient.TokenProvider() {
+            @Override public String acquire(long tenantId) { return "private-result-token"; }
+            @Override public void rejected(long tenantId) { assertEquals(20, tenantId); rejected.incrementAndGet(); }
+        };
+        try (var client = new HttpAgentResultClient(base, HttpClient.newHttpClient(), tokens, Duration.ofSeconds(3))) {
+            for (String invalid : List.of(valid.replace(fact.eventId(), "d".repeat(64)),
+                    valid.replace(fact.fingerprint(), "e".repeat(64)),
+                    valid.replace("RECEIVED", "UNRECOGNIZED"),
+                    valid.replace("2026-10-30T00:00:00Z", "2026-10-30T02:00:00+02:00"),
+                    valid.replace("\"state\":\"RECEIVED\"", "\"state\":\"RECEIVED\",\"state\":\"APPLIED\""),
+                    valid.substring(0, valid.length() - 1) + ",\"unexpected\":true}")) {
+                payload.set(invalid);
+                assertCode("TIANJI_INVALID_RESPONSE", () -> client.receiveV2(fact));
+            }
+            payload.set(" ".repeat(16_385));
+            assertCode("TIANJI_RESPONSE_TOO_LARGE", () -> client.receiveV2(fact));
+            payload.set(valid);
+            status.set(200);
+            assertCode("TIANJI_INVALID_RESPONSE", () -> client.receiveV2(fact));
+            status.set(302);
+            var redirected = assertThrows(ProcessClientException.class, () -> client.receiveV2(fact));
+            assertEquals(302, redirected.httpStatus());
+            assertEquals("TIANJI_INVALID_RESPONSE", redirected.code());
+            payload.set("{\"code\":\"private-result-token\",\"detail\":\"private-payload\"}");
+            for (int failureStatus : List.of(401, 403, 404, 408, 429, 500, 503, 0)) {
+                status.set(failureStatus);
+                var failure = assertThrows(ProcessClientException.class, () -> client.receiveV2(fact));
+                assertEquals(failureStatus, failure.httpStatus());
+                if (failureStatus == 0 || failureStatus == 408 || failureStatus == 503) {
+                    assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", failure.code());
+                } else if (failureStatus == 500) {
+                    assertEquals("TIANJI_INTERNAL_ERROR", failure.code());
+                }
+                if (failureStatus != 0) assertEquals(Duration.ofSeconds(7), failure.retryAfter());
+                assertFalse(failure.toString().contains("private-result-token"));
+                assertFalse(failure.toString().contains("private-payload"));
+            }
+            status.set(503);
+            payload.set(" ".repeat(32_768));
+            var overloaded = assertThrows(ProcessClientException.class, () -> client.receiveV2(fact));
+            assertEquals(503, overloaded.httpStatus());
+            assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", overloaded.code());
+            assertEquals(Duration.ofSeconds(7), overloaded.retryAfter());
+        }
+        assertEquals(1, rejected.get());
+        assertEquals(18, requests.get());
+    }
 
     @Test
     void sends_one_bound_tenant_reference_and_keeps_received_distinct_from_applied() {
@@ -201,6 +374,91 @@ class HttpAgentResultClientTest {
         var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "occurrence", "a".repeat(64), NOW.plusSeconds(60));
         return new AgentTerminalEvent(1, "agent-east", AgentTerminalEvent.eventIdFor("agent-east", 20, "b".repeat(64), "process-worker", "run-one", 3),
                 20, "b".repeat(64), "process-worker", "intent", link, "review", 1, "run-one", 3, AgentRunStatusEnum.COMPLETED, NOW, "c".repeat(64), null, "UNKNOWN");
+    }
+    private static AgentTerminalEventV2 v2() {
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "occurrence", "a".repeat(64), NOW.plusSeconds(60));
+        var output = Map.<String, Object>of("summary", "Résumé", "notes", "n".repeat(5_000),
+                "items", java.util.stream.IntStream.range(0, 128).boxed().toList());
+        var outcome = SideEffectOutcomeEnum.NONE;
+        String id = AgentTerminalEventV2.eventIdFor("agent-east", 20, "b".repeat(64), "process-worker", "opaque-run-v2", 3);
+        return new AgentTerminalEventV2(2, "agent-east", id, 20, "b".repeat(64), "process-worker", "intent", link,
+                "review", 1, "opaque-run-v2", 3, "node-one", "c".repeat(64), "d".repeat(64), "e".repeat(64),
+                AgentRunStatusEnum.COMPLETED, NOW, AgentTerminalEventV2.resultSha256(AgentRunStatusEnum.COMPLETED, output, null, null, outcome),
+                output, null, null, outcome);
+    }
+
+    private static byte[] rawV2(AgentTerminalEventV2 event) {
+        return (" \n" + new String(event.canonicalBytes(), StandardCharsets.UTF_8)
+                .replace("Résumé", "R\\u00e9sum\\u00e9").replace("\"schemaVersion\":2", "\"schemaVersion\" : 2") + "\n")
+                .getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static AgentResultReceipt v2Receipt(AgentTerminalEventV2 event) {
+        return new AgentResultReceipt(event.eventId(), event.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+    }
+
+    private static CompletableFuture<byte[]> collect(HttpRequest request) {
+        var output = new ByteArrayOutputStream();
+        var body = new CompletableFuture<byte[]>();
+        request.bodyPublisher().orElseThrow().subscribe(new Flow.Subscriber<>() {
+            @Override public void onSubscribe(Flow.Subscription subscription) { subscription.request(Long.MAX_VALUE); }
+            @Override public void onNext(ByteBuffer buffer) {
+                byte[] bytes = new byte[buffer.remaining()];
+                buffer.get(bytes);
+                output.writeBytes(bytes);
+            }
+            @Override public void onError(Throwable failure) { body.completeExceptionally(failure); }
+            @Override public void onComplete() { body.complete(output.toByteArray()); }
+        });
+        return body;
+    }
+
+    private static final class CapturingHttpClient extends HttpClient {
+        private static final HttpHeaders HEADERS = HttpHeaders.of(
+                Map.of("Content-Type", List.of("application/json"), "Cache-Control", List.of("no-store")), (name, value) -> true);
+        private final List<HttpRequest> requests = new ArrayList<>();
+        private final byte[] response;
+
+        private CapturingHttpClient(byte[] response) { this.response = response; }
+        @Override public Optional<CookieHandler> cookieHandler() { return Optional.empty(); }
+        @Override public Optional<Duration> connectTimeout() { return Optional.empty(); }
+        @Override public Redirect followRedirects() { return Redirect.NEVER; }
+        @Override public Optional<ProxySelector> proxy() { return Optional.empty(); }
+        @Override public SSLContext sslContext() { throw new AssertionError("no TLS socket"); }
+        @Override public SSLParameters sslParameters() { return new SSLParameters(); }
+        @Override public Optional<Authenticator> authenticator() { return Optional.empty(); }
+        @Override public Version version() { return Version.HTTP_1_1; }
+        @Override public Optional<Executor> executor() { return Optional.empty(); }
+        @Override public <T> HttpResponse<T> send(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            throw new AssertionError("synchronous send is outside the contract");
+        }
+        @Override public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler) {
+            requests.add(request);
+            var subscriber = handler.apply(new HttpResponse.ResponseInfo() {
+                @Override public int statusCode() { return 202; }
+                @Override public HttpHeaders headers() { return HEADERS; }
+                @Override public Version version() { return Version.HTTP_1_1; }
+            });
+            subscriber.onSubscribe(new Flow.Subscription() {
+                @Override public void request(long count) { }
+                @Override public void cancel() { }
+            });
+            subscriber.onNext(List.of(ByteBuffer.wrap(response)));
+            subscriber.onComplete();
+            return subscriber.getBody().toCompletableFuture().thenApply(body -> new ReceiptResponse<>(request, body));
+        }
+        @Override public <T> CompletableFuture<HttpResponse<T>> sendAsync(HttpRequest request, HttpResponse.BodyHandler<T> handler,
+                HttpResponse.PushPromiseHandler<T> push) {
+            return sendAsync(request, handler);
+        }
+        private record ReceiptResponse<T>(HttpRequest request, T body) implements HttpResponse<T> {
+            @Override public int statusCode() { return 202; }
+            @Override public HttpHeaders headers() { return HEADERS; }
+            @Override public URI uri() { return request.uri(); }
+            @Override public Version version() { return Version.HTTP_1_1; }
+            @Override public Optional<SSLSession> sslSession() { return Optional.empty(); }
+            @Override public Optional<HttpResponse<T>> previousResponse() { return Optional.empty(); }
+        }
     }
     private static void respond(HttpExchange exchange, int status, byte[] body) throws IOException {
         exchange.getResponseHeaders().set("Content-Type", "application/json");
