@@ -159,6 +159,7 @@ public class AutomationModelValidator {
         private final Map<String, TemplateRefVO> agentConfigurationDependencies = new LinkedHashMap<>();
         private final Map<String, String> humanDependencies = new LinkedHashMap<>();
         private final Map<String, String> routeDependencies = new LinkedHashMap<>();
+        private final Map<String, Map<String, ProcessSchemaVO>> eventWaitLocalInputs = new HashMap<>();
         private int nodeCount;
 
         private ValidationState(AutomationModelSourceVO source, DependencySnapshotVO dependencies,
@@ -302,14 +303,25 @@ public class AutomationModelValidator {
                                      ScopeFlow flow, Function<String, ProcessSchemaVO> variables,
                                      ProcessSchemaVO scopeInput, ProcessSchemaVO scopeOutput) {
             String id = binding.nodeId();
+            boolean eventWait = "EVENT_WAIT".equals(binding.kind());
+            var localEventInputs = eventWait ? new LinkedHashMap<String, ProcessSchemaVO>() : null;
             for (MappingVO entry : binding.inputMapping()) {
+                if (entry.source().startsWith("event.")) {
+                    require(eventWait, id, "EVENT_INPUT_OUTSIDE_WAIT");
+                    continue;
+                }
+                var resolved = mappedSource(entry.source(), binding, flow, variables, false);
                 validateMapping(entry.target(), entry.source(), binding.inputSchema(),
-                        reference -> mappedSource(reference, binding, flow, variables, false), id);
+                        reference -> resolved, id);
+                if (eventWait) localEventInputs.put(entry.target(), resolved);
             }
-            if (!"AND_JOIN".equals(binding.kind())) {
+            if (eventWait) {
+                eventWaitLocalInputs.put(id, Map.copyOf(localEventInputs));
+            } else if (!"AND_JOIN".equals(binding.kind())) {
                 validateConstructedObject(binding.inputSchema(), binding.inputMapping(), id);
             }
             for (MappingVO entry : binding.outputMapping()) {
+                require(!entry.source().startsWith("event."), id, "EVENT_OUTPUT_SOURCE_UNAVAILABLE");
                 var existing = field(scopeInput, entry.target());
                 if (existing != null) {
                     require(accepts(existing, field(scopeOutput, entry.target())), id, "CONFLICTING_SCOPE_FIELD");
@@ -374,13 +386,6 @@ public class AutomationModelValidator {
                                              Function<String, ProcessSchemaVO> variables, boolean afterNode) {
             if (reference.startsWith("input.")) return field(source.inputSchema(), reference.substring(6));
             if (reference.startsWith("scope.")) return variables.apply(reference.substring(6));
-            if (reference.startsWith("event.")) {
-                var routes = source.eventRoutes().stream().filter(route -> binding.nodeId().equals(route.targetNodeId())).toList();
-                if (routes.isEmpty()) return null;
-                ProcessSchemaVO schema = field(routes.getFirst().payloadSchema(), reference.substring(6));
-                return routes.stream().allMatch(route -> Objects.equals(schema, field(route.payloadSchema(), reference.substring(6))))
-                        ? schema : null;
-            }
             var ref = outputRef(reference, flow.nodes.keySet());
             if (ref == null || !bindings.containsKey(ref.nodeId())) return null;
             require(afterNode && binding.nodeId().equals(ref.nodeId())
@@ -420,6 +425,7 @@ public class AutomationModelValidator {
         }
 
         private void validateRoutes(String rootKey) {
+            var routedWaits = new HashSet<String>();
             for (EventRouteVO route : source.eventRoutes()) {
                 String id = route.routeKey();
                 var authority = dependencies.routes().get(new VersionedRefVO(id, route.version()));
@@ -433,8 +439,41 @@ public class AutomationModelValidator {
                     validateMapping(entry.target(), entry.source(), schema,
                             reference -> field(route.payloadSchema(), reference.substring(6)), id);
                 }
-                if (start) validateConstructedObject(schema, route.mapping(), id);
+                if (start) {
+                    validateConstructedObject(schema, route.mapping(), id);
+                } else {
+                    validateSignalRoute(route, target);
+                    routedWaits.add(target.nodeId());
+                }
                 routeDependencies.put(id + "/" + route.version(), authority.contractSha256());
+            }
+            eventWaitLocalInputs.keySet().stream().filter(id -> !routedWaits.contains(id)).forEach(id -> {
+                var binding = bindings.get(id);
+                require(binding.inputMapping().stream().noneMatch(entry -> entry.source().startsWith("event.")),
+                        id, "EVENT_SIGNAL_ROUTE_REQUIRED");
+                validateConstructedObject(binding.inputSchema(), binding.inputMapping(), id);
+            });
+        }
+
+        private void validateSignalRoute(EventRouteVO route, AutomationNodeBindingVO target) {
+            String id = route.routeKey();
+            var combined = new ArrayList<>(target.inputMapping());
+            combined.addAll(route.mapping());
+            validateConstructedObject(target.inputSchema(), combined, id);
+            var supplied = new LinkedHashMap<>(eventWaitLocalInputs.get(target.nodeId()));
+            for (var mapping : combined) {
+                if (!mapping.source().startsWith("event.")) continue;
+                var sourceSchema = field(route.payloadSchema(), mapping.source().substring("event.".length()));
+                require(accepts(field(target.inputSchema(), mapping.target()), sourceSchema), id, "MAPPING_TYPE_MISMATCH");
+                supplied.put(mapping.target(), sourceSchema);
+            }
+            require(projectsConstructedOutput(target.outputSchema(), target.inputSchema(), "", supplied),
+                    id, "EVENT_WAIT_OUTPUT_NOT_CONSTRUCTIBLE");
+            String ownOutput = "nodes." + target.nodeId() + ".output.";
+            for (var mapping : target.outputMapping()) {
+                if (!mapping.source().startsWith(ownOutput)) continue;
+                String outputPath = mapping.source().substring(ownOutput.length());
+                require(guaranteedProjectionPath(outputPath, supplied), id, "EVENT_WAIT_OUTPUT_MAPPING_SOURCE_MISSING");
             }
         }
     }
@@ -803,6 +842,60 @@ public class AutomationModelValidator {
                     && (!supplied || !requiredTargetsCovered(property.getValue(), key, targets))) return false;
         }
         return true;
+    }
+
+    private static boolean projectsConstructedOutput(ProcessSchemaVO output, ProcessSchemaVO input, String path,
+                                                     Map<String, ProcessSchemaVO> supplied) {
+        var source = supplied.get(path);
+        if (source != null) return acceptsProjection(output, source);
+        if (input == null || !output.type().equals(input.type())) return false;
+        if ("object".equals(output.type())) {
+            for (var property : output.properties().entrySet()) {
+                String name = property.getKey();
+                String child = path.isEmpty() ? name : path + "." + name;
+                if (supplied.keySet().stream().anyMatch(target -> containsPath(child, target))) {
+                    if (!projectsConstructedOutput(property.getValue(), input.properties().get(name), child, supplied)) return false;
+                } else if (output.required().contains(name)) return false;
+            }
+            return true;
+        }
+        if ("array".equals(output.type())) {
+            for (int index = 0; index < input.maxItems(); index++) {
+                String item = path + "[" + index + "]";
+                if (supplied.keySet().stream().noneMatch(target -> containsPath(item, target))) break;
+                if (index >= output.maxItems() || !projectsConstructedOutput(output.items(), input.items(), item, supplied)) return false;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** The native projection ignores input-only fields, including those nested in array items. */
+    private static boolean acceptsProjection(ProcessSchemaVO output, ProcessSchemaVO source) {
+        if (!output.type().equals(source.type())) return false;
+        return switch (output.type()) {
+            case "object" -> source.required().containsAll(output.required()) && output.properties().entrySet().stream()
+                    .allMatch(entry -> !source.properties().containsKey(entry.getKey())
+                            || acceptsProjection(entry.getValue(), source.properties().get(entry.getKey())));
+            case "array" -> source.maxItems() <= output.maxItems()
+                    && (source.maxItems() == 0 || acceptsProjection(output.items(), source.items()));
+            default -> accepts(output, source);
+        };
+    }
+
+    private static boolean guaranteedProjectionPath(String reference, Map<String, ProcessSchemaVO> supplied) {
+        if (supplied.containsKey(reference) || supplied.keySet().stream().anyMatch(target -> containsPath(reference, target))) return true;
+        for (var mapping : supplied.entrySet()) {
+            String path = mapping.getKey();
+            if (!containsPath(path, reference) || reference.charAt(path.length()) != '.') continue;
+            var source = mapping.getValue();
+            for (String part : reference.substring(path.length() + 1).split("\\.")) {
+                if (!"object".equals(source.type()) || !source.required().contains(part)) return false;
+                source = source.properties().get(part);
+            }
+            return true;
+        }
+        return false;
     }
 
     /** Conservatively proves that all values from source are legal for the target. */

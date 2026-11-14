@@ -1,7 +1,9 @@
 package top.egon.cola.platform.tianji.process.server.execution;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.SqlArrayValue;
@@ -56,6 +58,14 @@ public class ProcessNodeExecutionStore {
     private static final String SCOPED = " WHERE tenant_id=? AND instance_id=?";
     private static final String OPEN = " AND state NOT IN ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')";
     private static final String WORKER = " AND kind IN ('SERVICE','RULE') AND capability_key IS NOT NULL AND NOT excluded";
+    private static final String EVENT_WAIT_CAS = SCOPED + """
+              AND occurrence_id=? AND attempt=? AND node_execution_ref=? AND node_id=? AND parent_scope_id=? AND attempt_scope_id=?
+              AND configuration_sha256=? AND input_schema_sha256=? AND output_schema_sha256=? AND input_sha256=? AND input_json=?::jsonb
+              AND started_at=? AND attempt_deadline_at=? AND node_deadline_at=? AND revision=?
+              AND native_subscription_id IS NOT DISTINCT FROM ?::varchar AND kind='EVENT_WAIT' AND state='WAITING' AND NOT excluded
+              AND native_job_id IS NULL AND side_effect_outcome='NONE' AND error_code IS NULL
+              AND output_json IS NULL AND output_sha256 IS NULL AND accepted_at IS NULL AND finished_at IS NULL
+            """;
     private final JdbcTemplate jdbc;
     private final String schema;
     private final String table;
@@ -337,6 +347,72 @@ public class ProcessNodeExecutionStore {
                         + SCOPED + " AND node_execution_ref=? AND revision=? AND state='WAITING' AND NOT excluded",
                 json(normalizedOutput, MAX_DATA), digest("AUTOMATION_NODE_OUTPUT_V2", row.getOutputSchemaSha256(), normalizedOutput),
                 utc(timestamp), tenantId, instanceId, nodeExecutionRef, expectedRevision) == 1;
+    }
+
+    /** Associates the exact native message subscription after Flowable creates it under the root guard. */
+    void bindEventSubscription(@NotNull @Valid ProcessNodeExecutionBO row, @NotBlank @Size(max = 255) String nativeSubscriptionId) {
+        requireWaitingEvent(row, nativeSubscriptionId);
+        if (row.getNativeSubscriptionId() != null || !withinEventDeadline(row, waitingEventTime(row))) throw unavailable();
+        updateEventWait(row, " SET native_subscription_id=?,revision=revision+1", nativeSubscriptionId);
+    }
+
+    /** Persists the final typed input and output before the exact native wait leaves the same transaction. */
+    public boolean acceptEventResult(@NotNull @Valid ProcessNodeExecutionBO row, @NotBlank @Size(max = 255) String nativeSubscriptionId,
+                                     @NotNull Map<String, Object> normalizedInput, @NotNull Map<String, Object> normalizedOutput) {
+        requireWaitingEvent(row, nativeSubscriptionId);
+        if (!nativeSubscriptionId.equals(row.getNativeSubscriptionId())) throw unavailable();
+        String input = json(normalizedInput, MAX_DATA);
+        String output = json(normalizedOutput, MAX_DATA);
+        String inputHash = digest("AUTOMATION_NODE_INPUT_V2", row.getInputSchemaSha256(), normalizedInput);
+        String outputHash = digest("AUTOMATION_NODE_OUTPUT_V2", row.getOutputSchemaSha256(), normalizedOutput);
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT octet_length((?::jsonb)::text)<=? AND octet_length((?::jsonb)::text)<=?",
+                Boolean.class, input, MAX_DATA, output, MAX_DATA))) {
+            throw new IllegalArgumentException("Automation event result exceeds its storage limit");
+        }
+        Instant timestamp = waitingEventTime(row);
+        if (!withinEventDeadline(row, timestamp)) {
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS(SELECT 1 FROM " + table + EVENT_WAIT_CAS + ")",
+                    Boolean.class, eventWaitIdentity(row)))) throw unavailable();
+            return false;
+        }
+        updateEventWait(row, " SET state='RESULT_ACCEPTED',revision=revision+1,input_json=?::jsonb,input_sha256=?,"
+                        + "output_json=?::jsonb,output_sha256=?,accepted_at=?",
+                input, inputHash, output, outputHash, utc(timestamp));
+        return true;
+    }
+
+    private void requireWaitingEvent(ProcessNodeExecutionBO row, String nativeSubscriptionId) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        if (nativeSubscriptionId == null || nativeSubscriptionId.isBlank() || nativeSubscriptionId.length() > 255
+                || nativeSubscriptionId.chars().anyMatch(Character::isISOControl) || row.getKind() != KindEnum.EVENT_WAIT
+                || row.getState() != StateEnum.WAITING || row.isExcluded()
+                || !digest("AUTOMATION_NODE_INPUT_V2", row.getInputSchemaSha256(), row.getInput()).equals(row.getInputSha256())) {
+            throw unavailable();
+        }
+    }
+
+    private Instant waitingEventTime(ProcessNodeExecutionBO row) {
+        Instant timestamp = now();
+        if (timestamp.isBefore(row.getStartedAt())) throw unavailable();
+        return timestamp;
+    }
+
+    private static boolean withinEventDeadline(ProcessNodeExecutionBO row, Instant timestamp) {
+        return timestamp.isBefore(row.getAttemptDeadlineAt()) && timestamp.isBefore(row.getNodeDeadlineAt());
+    }
+
+    private void updateEventWait(ProcessNodeExecutionBO row, String changes, Object... values) {
+        var parameters = new ArrayList<Object>();
+        Collections.addAll(parameters, values);
+        Collections.addAll(parameters, eventWaitIdentity(row));
+        if (jdbc.update("UPDATE " + table + changes + EVENT_WAIT_CAS, parameters.toArray()) != 1) throw unavailable();
+    }
+
+    private static Object[] eventWaitIdentity(ProcessNodeExecutionBO row) {
+        return new Object[]{row.getTenantId(), row.getInstanceId(), row.getOccurrenceId(), row.getAttempt(),
+                row.getNodeExecutionRef(), row.getNodeId(), row.getParentScopeId(), row.getAttemptScopeId(), row.getConfigurationSha256(),
+                row.getInputSchemaSha256(), row.getOutputSchemaSha256(), row.getInputSha256(), json(row.getInput(), MAX_DATA),
+                utc(row.getStartedAt()), utc(row.getAttemptDeadlineAt()), utc(row.getNodeDeadlineAt()), row.getRevision(), row.getNativeSubscriptionId()};
     }
 
     void completeLocal(ProcessNodeExecutionBO row, Map<String, Object> normalizedOutput) {

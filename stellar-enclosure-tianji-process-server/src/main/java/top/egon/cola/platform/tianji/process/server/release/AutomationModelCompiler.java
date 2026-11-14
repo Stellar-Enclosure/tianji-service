@@ -51,6 +51,11 @@ public class AutomationModelCompiler {
 
     public CompiledAutomationModelVO compile(@Valid @NotNull ValidatedAutomationModelVO model) {
         if (model == null) throw new IllegalArgumentException("Validated automation model is required");
+        for (var route : model.source().eventRoutes()) {
+            if (route.schedule() != null && route.schedule().interval().getNano() % 1_000 != 0) {
+                throw new IllegalArgumentException("Schedule interval must be a whole number of microseconds");
+            }
+        }
         var sourceManifest = sourceManifest(model.source());
         String sourceHash = sourceSha256(sourceManifest);
         var dependencies = dependencyManifest(model);
@@ -144,6 +149,10 @@ public class AutomationModelCompiler {
     /** The loop condition in the sealed BPMN is keyed by its outgoing continuation flow. */
     public static String loopContinuationFlowId(String logicalNodeId) {
         return id("loop-next", logicalNodeId);
+    }
+
+    public static String bootstrapActivityId() {
+        return id("first", BOOTSTRAP);
     }
 
     /** Server-owned expression entry points shared with the native runtime. */

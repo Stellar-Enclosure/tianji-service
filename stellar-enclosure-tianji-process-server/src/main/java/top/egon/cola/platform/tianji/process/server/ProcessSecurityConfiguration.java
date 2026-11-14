@@ -83,6 +83,8 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandRece
 import top.egon.cola.platform.tianji.process.server.api.ProcessEventController;
 import top.egon.cola.platform.tianji.process.server.event.ProcessEventApplicationService;
 import top.egon.cola.platform.tianji.process.server.event.ProcessEventInboxStore;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventSchedule;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventSubscriptionStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryService;
 import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
@@ -472,19 +474,35 @@ public class ProcessSecurityConfiguration {
     @EnableScheduling
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
     static class EventReconciliationConfiguration {
-        @Bean("processEventReconciliation")
-        EventReconciliation processEventReconciliation(
+        @Bean("processEventSchedule")
+        ProcessEventSchedule processEventSchedule(@Qualifier("automationActivationStore") AutomationActivationStore activations,
+                @Qualifier("automationReleaseStore") AutomationReleaseStore releases,
                 @Qualifier("processEventApplicationService") ProcessEventApplicationService service) {
-            return new EventReconciliation(service);
+            return new ProcessEventSchedule(activations, releases, service);
         }
 
-        record EventReconciliation(ProcessEventApplicationService service) {
+        @Bean("processEventReconciliation")
+        EventReconciliation processEventReconciliation(
+                @Qualifier("processEventApplicationService") ProcessEventApplicationService service,
+                @Qualifier("processEventSchedule") ProcessEventSchedule schedule,
+                ObjectProvider<ProcessEventSchedule.ScheduleRegistration> registrations) {
+            return new EventReconciliation(service, schedule, registrations);
+        }
+
+        record EventReconciliation(ProcessEventApplicationService service, ProcessEventSchedule schedule,
+                                   ObjectProvider<ProcessEventSchedule.ScheduleRegistration> registrations) {
             @Scheduled(fixedDelayString = "${stellar.tianji.process.events.poll-interval:1s}")
             public void reconcile() {
                 try {
                     service.advancePending(32);
                 } catch (RuntimeException failure) {
                     log.warn("Process event reconciliation failed: type={}", failure.getClass().getName());
+                }
+                try {
+                    var registration = registrations.getIfAvailable();
+                    if (registration != null) schedule.advanceRegistered(registration);
+                } catch (RuntimeException failure) {
+                    log.warn("Process event schedule failed: type={}", failure.getClass().getName());
                 }
             }
         }
@@ -495,7 +513,14 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
     ProcessEventApplicationService processEventApplicationService(ProcessEngine engine,
             @Qualifier("processExecutionService") ProcessExecutionService execution, Environment environment,
-            ObjectProvider<ProcessEventApplicationService.EventSourceAuthorizer> sourceAuthorizers) {
+            ObjectProvider<ProcessEventApplicationService.EventSourceAuthorizer> sourceAuthorizers,
+            @Qualifier("processEventSubscriptionStore") ProcessEventSubscriptionStore subscriptions,
+            @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
+            @Qualifier("automationReleaseStore") AutomationReleaseStore releases,
+            ProcessReleaseService releaseService,
+            @Qualifier("automationInstanceGuardCommandInterceptor") AutomationInstanceGuardCommandInterceptor guard,
+            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes,
+            @Qualifier("processNodeLifecycleListener") ProcessNodeLifecycleListener lifecycle) {
         var configuration = processConfiguration(engine);
         var source = caseDataSource(configuration);
         var jdbc = new JdbcTemplate(source);
@@ -505,7 +530,10 @@ public class ProcessSecurityConfiguration {
         var inbox = new ProcessEventInboxStore(jdbc, configuration.getDatabaseSchema());
         var authorizer = sourceAuthorizers.getIfAvailable();
         if (authorizer == null) throw new IllegalStateException("Process events require a trusted event source authorizer");
-        return new ProcessEventApplicationService(inbox, execution, transaction, environment, authorizer);
+        subscriptions.requireDataSource(source);
+        var signal = new ProcessEventApplicationService.SignalParticipantsVO(subscriptions, bindings, releases, releaseService,
+                guard, nodes, new ProcessControlNativeAccess(source, configuration), lifecycle, configuration.getRuntimeService());
+        return new ProcessEventApplicationService(inbox, execution, transaction, environment, authorizer, signal);
     }
 
     @Bean("processApiSchemaVerifier")

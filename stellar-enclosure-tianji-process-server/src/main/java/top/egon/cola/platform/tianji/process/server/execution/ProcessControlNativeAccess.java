@@ -104,6 +104,38 @@ public final class ProcessControlNativeAccess {
         return engine == candidate;
     }
 
+    public EventSubscription requireEventWait(AutomationInstanceBindingBO binding, String nativeDefinitionId,
+            String nativeActivityId, String nativeExecutionId, String nativeSubscriptionId, String nativeAttemptScopeId) {
+        return findEventWait(binding, nativeDefinitionId, nativeActivityId, nativeExecutionId, nativeSubscriptionId,
+                nativeAttemptScopeId).orElseThrow(ProcessControlNativeAccess::unavailable);
+    }
+
+    public Optional<EventSubscription> findEventWait(AutomationInstanceBindingBO binding, String nativeDefinitionId,
+            String nativeActivityId, String nativeExecutionId, String nativeSubscriptionId, String nativeAttemptScopeId) {
+        requireTransaction();
+        String root = binding.getInstanceId();
+        String tenant = Long.toString(binding.getTenantId());
+        AutomationInstanceGuardCommandInterceptor.requireHeld(binding.getTenantId(), root);
+        var execution = runtime.createExecutionQuery().executionId(nativeExecutionId).singleResult();
+        var subscription = runtime.createEventSubscriptionQuery().id(nativeSubscriptionId).singleResult();
+        if (execution == null && subscription == null) return Optional.empty();
+        if (execution == null || !root.equals(execution.getRootProcessInstanceId())
+                || !root.equals(execution.getProcessInstanceId()) || !tenant.equals(execution.getTenantId())
+                || !nativeAttemptScopeId.equals(execution.getParentId())) throw unavailable();
+        if (subscription == null && (execution.isEnded() || !nativeActivityId.equals(execution.getActivityId()))) {
+            return Optional.empty();
+        }
+        if (subscription == null || execution.isEnded() || execution.isSuspended()
+                || !nativeActivityId.equals(execution.getActivityId()) || !nativeDefinitionId.equals(subscription.getProcessDefinitionId())
+                || !root.equals(subscription.getProcessInstanceId()) || !tenant.equals(subscription.getTenantId())
+                || !nativeExecutionId.equals(subscription.getExecutionId()) || !nativeActivityId.equals(subscription.getActivityId())
+                || !"message".equals(subscription.getEventType())
+                || !("tianji-v2:" + nativeActivityId).equals(subscription.getEventName())) throw unavailable();
+        var scope = new Scope(binding.getTenantId(), tenant, root, nativeDefinitionId);
+        if (readRoot(scope, true).isEmpty()) throw unavailable();
+        return Optional.of(subscription);
+    }
+
     public ControlFacts observe(ProcessCommandReceiptStore.TaskOrigin start,
                                 ProcessReleaseService.Definition definition,
                                 ValidatedProcessModel model) {

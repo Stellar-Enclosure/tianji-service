@@ -15,6 +15,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.ApplicationContext;
@@ -27,6 +28,8 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
+import top.egon.cola.component.outbox.api.TransactionalOutbox;
+import top.egon.cola.component.outbox.delivery.DeliveryHandlerRegistry;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.execution.AutomationBootstrapBehavior;
 import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
@@ -35,6 +38,8 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessControlServ
 import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventSubscriptionStore;
+import top.egon.cola.platform.tianji.process.server.event.ProcessLifecycleEventPublisher;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.task.FlowableHumanTaskService;
@@ -153,6 +158,24 @@ public class ProcessStorageConfiguration {
         return new ProcessNodeExecutionStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
     }
 
+    @Bean("processEventSubscriptionStore")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
+    ProcessEventSubscriptionStore processEventSubscriptionStore(OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
+        var jdbc = new JdbcTemplate(outbox.dataSource());
+        jdbc.setQueryTimeout(5);
+        return new ProcessEventSubscriptionStore(jdbc, properties.getStorage().getJdbc().getSchema());
+    }
+
+    @Bean("processLifecycleEventPublisher")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.events.lifecycle", name = "enabled", havingValue = "true")
+    ProcessLifecycleEventPublisher processLifecycleEventPublisher(OutboxInfrastructure infrastructure, TransactionalOutbox outbox,
+            DeliveryHandlerRegistry handlers, Environment environment) {
+        String destination = environment.getRequiredProperty("stellar.tianji.process.events.lifecycle.destination");
+        String sourceId = environment.getRequiredProperty("stellar.tianji.process.events.lifecycle.source-id");
+        handlers.required(ProcessLifecycleEventPublisher.CHANNEL).validateDestination(destination);
+        return new ProcessLifecycleEventPublisher(infrastructure, outbox, sourceId, destination);
+    }
+
     @Bean("automationInstanceGuardCommandInterceptor")
     AutomationInstanceGuardCommandInterceptor automationInstanceGuardCommandInterceptor(OutboxInfrastructure outbox,
             TransactionalOutboxProperties properties, @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings) {
@@ -163,8 +186,14 @@ public class ProcessStorageConfiguration {
     ProcessNodeLifecycleListener processNodeLifecycleListener(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
             @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
             @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes,
-            @Qualifier("automationHumanCandidateDirectory") ObjectProvider<ProcessNodeLifecycleListener.HumanCandidateDirectory> candidates) {
-        return new ProcessNodeLifecycleListener(bindings, nodes, nativeAutomationReleases(outbox, properties), candidates);
+            @Qualifier("automationHumanCandidateDirectory") ObjectProvider<ProcessNodeLifecycleListener.HumanCandidateDirectory> candidates,
+            @Qualifier("processEventSubscriptionStore") ObjectProvider<ProcessEventSubscriptionStore> subscriptions,
+            @Qualifier("processLifecycleEventPublisher") ObjectProvider<ProcessLifecycleEventPublisher> lifecycle,
+            @Qualifier("automationEventReservationDirectory") ObjectProvider<ProcessNodeLifecycleListener.EventReservationDirectory> reservations) {
+        var eventSubscriptions = subscriptions.getIfAvailable();
+        if (eventSubscriptions != null) eventSubscriptions.requireDataSource(outbox.dataSource());
+        return new ProcessNodeLifecycleListener(bindings, nodes, nativeAutomationReleases(outbox, properties), candidates,
+                eventSubscriptions, lifecycle.getIfAvailable(), reservations.getIfAvailable());
     }
 
     @Bean("automationBootstrapBehavior")
@@ -186,8 +215,11 @@ public class ProcessStorageConfiguration {
     ProcessControlService.AutomationControlParticipants automationControlParticipants(OutboxInfrastructure outbox,
             TransactionalOutboxProperties properties, @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
             @Qualifier("automationInstanceGuardCommandInterceptor") AutomationInstanceGuardCommandInterceptor guard,
-            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes) {
-        return new ProcessControlService.AutomationControlParticipants(bindings, nativeAutomationReleases(outbox, properties), guard, nodes);
+            @Qualifier("processNodeExecutionStore") ProcessNodeExecutionStore nodes,
+            @Qualifier("processEventSubscriptionStore") ObjectProvider<ProcessEventSubscriptionStore> subscriptions,
+            @Qualifier("processLifecycleEventPublisher") ObjectProvider<ProcessLifecycleEventPublisher> lifecycle) {
+        return new ProcessControlService.AutomationControlParticipants(bindings, nativeAutomationReleases(outbox, properties), guard, nodes,
+                subscriptions.getIfAvailable(), lifecycle.getIfAvailable());
     }
 
     private static AutomationReleaseStore nativeAutomationReleases(OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {

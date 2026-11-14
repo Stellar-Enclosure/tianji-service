@@ -13,6 +13,7 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.event.EventInboxBO.EventAdmissionVO;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseTenantFence;
@@ -23,8 +24,8 @@ import java.sql.SQLException;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.util.Map;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -50,11 +51,13 @@ public class ProcessEventInboxStore {
     private static final String RECEIPT_KEY = " WHERE tenant_id=? AND receipt_id=?";
     private final JdbcTemplate jdbc;
     private final String table;
+    private final String subscriptions;
 
     public ProcessEventInboxStore(JdbcTemplate jdbc, String schema) {
         this.jdbc = Objects.requireNonNull(jdbc);
         if (schema == null || !schema.matches("[a-z_][a-z0-9_]{0,62}")) throw new IllegalArgumentException("Invalid Process schema");
         table = '"' + schema + "\".tianji_process_event_inbox";
+        subscriptions = '"' + schema + "\".tianji_process_event_subscription";
     }
 
     public Optional<EventInboxBO> findOriginal(@NotNull ProcessActor producer, @NotNull String eventId) {
@@ -89,8 +92,8 @@ public class ProcessEventInboxStore {
     boolean insert(@NotNull @Valid EventInboxBO row) {
         requireWrite();
         requireEvidence(row);
-        if (!"START".equals(row.getMode()) || !"RECEIVED".equals(row.getState()) || row.getAttempts() != 0
-                || !row.getReceivedAt().equals(row.getNextRetryAt())) throw unavailable();
+        if (!"START".equals(row.getMode())) throw unavailable();
+        requireInitial(row);
         var payload = text(row.getPayload(), EventInboxBO.MAX_PAYLOAD_BYTES);
         var admission = text(admissionWire(row.getAdmission()), EventInboxBO.MAX_ADMISSION_BYTES);
         if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT octet_length((?::jsonb)::text)<=? AND octet_length((?::jsonb)::text)<=?",
@@ -105,6 +108,26 @@ public class ProcessEventInboxStore {
                 row.getCommandId(), payload, row.getCorrelationKey(), utc(row.getOccurredAt()), utc(row.getReceivedAt()),
                 utc(row.getExpiresAt()), utc(row.getNextRetryAt()), row.getDefinitionKey(), row.getActivationRevision(),
                 utc(row.getAdmittedAt()), utc(row.getAdmissionNotAfter()), admission) == 1;
+    }
+
+    /** Records exact reservation affinity even before native binding. V15 keeps result references empty until application. */
+    boolean insertSignal(@NotNull @Valid EventInboxBO row, @NotNull @Valid EventSubscriptionBO reservation) {
+        requireSignalWrite(row, reservation);
+        requireInitial(row);
+        requireStoredReservation(reservation);
+        String payload = text(row.getPayload(), EventInboxBO.MAX_PAYLOAD_BYTES);
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT octet_length((?::jsonb)::text)<=?",
+                Boolean.class, payload, EventInboxBO.MAX_PAYLOAD_BYTES))) {
+            throw new IllegalArgumentException("Process event exceeds its storage limit");
+        }
+        return jdbc.update("INSERT INTO " + table + " (" + COLUMNS + ") VALUES (?,?,?,?,?,?,?,?,?,?,"
+                        + "'SIGNAL',NULL,?,?::jsonb,?,'RECEIVED',NULL,NULL,?,?,?,NULL,?,0,NULL,?,?,?,NULL,NULL)"
+                        + " ON CONFLICT (tenant_id,producer_issuer,producer_subject,event_id) DO NOTHING",
+                row.getTenantId(), row.getProducerIssuer(), row.getProducerSubject(), row.getEventId(), row.getReceiptId(),
+                row.getFingerprint(), row.getRouteKey(), row.getRouteVersion(), row.getRouteSha256(), row.getReleaseKey(),
+                row.getWaitTokenSha256(), payload, row.getCorrelationKey(), utc(row.getOccurredAt()), utc(row.getReceivedAt()),
+                utc(row.getExpiresAt()), utc(row.getNextRetryAt()), row.getDefinitionKey(), row.getActivationRevision(),
+                utc(row.getAdmittedAt())) == 1;
     }
 
     /** Callers hold the tenant fence and exact inbox row before deciding an original START result. */
@@ -125,30 +148,104 @@ public class ProcessEventInboxStore {
                 .setDecidedAt(decidedAt).setNextRetryAt(null);
     }
 
-    /** A short retry claim never reads START history or finalizes an event. */
+    /** Applies one accepted result, or closes one pending receipt without assigning native result references. */
+    EventInboxBO decideSignal(@NotNull @Valid EventInboxBO locked, @NotNull @Valid EventSubscriptionBO reservation,
+                              @NotNull String state, @NotNull String decisionCode) {
+        requireSignalWrite(locked, reservation);
+        boolean allowed = switch (state) {
+            case "APPLIED" -> "APPLIED".equals(decisionCode) && reservation.getState() == EventSubscriptionBO.State.CONSUMED
+                    && EventInboxBO.eventId(reservation.getNodeExecutionRef());
+            case "IGNORED_LATE" -> "LATE".equals(decisionCode);
+            case "REJECTED" -> Set.of("EXPIRED", "ROUTE_REVOKED", "INVALID_PAYLOAD").contains(decisionCode);
+            case "DEAD" -> "RETRY_EXHAUSTED".equals(decisionCode) && locked.getAttempts() >= MAX_RETRIES;
+            default -> false;
+        };
+        if (!allowed || !"RECEIVED".equals(locked.getState())) throw unavailable();
+        requireStoredReservation(reservation);
+        boolean applied = "APPLIED".equals(state);
+        String instanceId = applied ? reservation.getInstanceId() : null;
+        String nodeExecutionRef = applied ? reservation.getNodeExecutionRef() : null;
+        Instant decidedAt = now();
+        if (jdbc.update("UPDATE " + table
+                        + " SET state=?,decided_at=?,decision_code=?,instance_id=?,node_execution_ref=?,next_retry_at=NULL"
+                        + RECEIPT_KEY + " AND mode='SIGNAL' AND state='RECEIVED' AND producer_issuer=? AND producer_subject=?"
+                        + " AND event_id=? AND fingerprint=? AND wait_token_sha256=? AND definition_key=? AND release_key=?"
+                        + " AND activation_revision=? AND route_key=? AND route_version=? AND route_sha256=?",
+                state, utc(decidedAt), decisionCode, instanceId, nodeExecutionRef, locked.getTenantId(), locked.getReceiptId(),
+                locked.getProducerIssuer(), locked.getProducerSubject(), locked.getEventId(), locked.getFingerprint(),
+                locked.getWaitTokenSha256(), locked.getDefinitionKey(), locked.getReleaseKey(), locked.getActivationRevision(),
+                locked.getRouteKey(), locked.getRouteVersion(), locked.getRouteSha256()) != 1) throw unavailable();
+        return locked.setState(state).setDecisionCode(decisionCode).setInstanceId(instanceId).setNodeExecutionRef(nodeExecutionRef)
+                .setDecidedAt(decidedAt).setNextRetryAt(null);
+    }
+
+    /** The same root guard serializes arrivals and ensures a later receipt cannot overtake an earlier pending receipt. */
+    boolean hasEarlierPendingSignal(@NotNull @Valid EventInboxBO locked, @NotNull @Valid EventSubscriptionBO reservation) {
+        requireSignalWrite(locked, reservation);
+        if (!"RECEIVED".equals(locked.getState())) throw unavailable();
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1 FROM %s WHERE tenant_id=? AND wait_token_sha256=? AND mode='SIGNAL' AND state='RECEIVED'
+                        AND (received_at,receipt_id)<(?,?)
+                )
+                """.formatted(table), Boolean.class, locked.getTenantId(), locked.getWaitTokenSha256(),
+                utc(locked.getReceivedAt()), locked.getReceiptId()));
+    }
+
+    /** Releases short retry claims before any root guard or native execution is acquired. */
     List<ClaimedEventVO> claimPending(int limit) {
         requireWrite();
         if (limit < 1 || limit > MAX_BATCH) throw new IllegalArgumentException("Invalid event scan limit");
         return jdbc.query("""
                 WITH selected AS (
                     SELECT tenant_id,receipt_id,next_retry_at FROM %1$s
-                    WHERE mode='START' AND state='RECEIVED' AND next_retry_at<=statement_timestamp()
+                    WHERE state='RECEIVED' AND next_retry_at<=statement_timestamp()
                     ORDER BY next_retry_at,tenant_id,receipt_id LIMIT ? FOR UPDATE SKIP LOCKED
                 ), claimed AS (
-                    UPDATE %1$s inbox SET next_retry_at=LEAST(inbox.admission_not_after,
+                    UPDATE %1$s inbox SET next_retry_at=LEAST(
+                        CASE WHEN inbox.mode='START' THEN inbox.admission_not_after
+                             WHEN inbox.expires_at>statement_timestamp() THEN inbox.expires_at END,
                         statement_timestamp() + LEAST(60, (1 << LEAST(inbox.attempts,6))) * interval '1 second')
                     FROM selected WHERE inbox.tenant_id=selected.tenant_id AND inbox.receipt_id=selected.receipt_id
-                    RETURNING inbox.tenant_id,inbox.receipt_id,inbox.next_retry_at,inbox.attempts
+                    RETURNING inbox.tenant_id,inbox.receipt_id,inbox.next_retry_at,inbox.attempts,inbox.mode
                 ) SELECT claimed.* FROM claimed ORDER BY next_retry_at,tenant_id,receipt_id
                 """.formatted(table), (row, index) -> new ClaimedEventVO(row.getLong("tenant_id"),
-                row.getString("receipt_id"), instant(row, "next_retry_at"), row.getInt("attempts")), limit);
+                row.getString("receipt_id"), instant(row, "next_retry_at"), row.getInt("attempts"), row.getString("mode")), limit);
     }
 
     void recordRetry(ClaimedEventVO claim) {
         requireWrite();
         jdbc.update("UPDATE " + table + " SET attempts=attempts+1" + RECEIPT_KEY
-                        + " AND mode='START' AND state='RECEIVED' AND next_retry_at=? AND attempts=? AND attempts<?",
-                claim.tenantId(), claim.receiptId(), utc(claim.nextRetryAt()), claim.attempts(), MAX_RETRIES);
+                        + " AND mode=? AND state='RECEIVED' AND next_retry_at=? AND attempts=? AND attempts<?",
+                claim.tenantId(), claim.receiptId(), claim.mode(), utc(claim.nextRetryAt()), claim.attempts(), MAX_RETRIES);
+    }
+
+    private static void requireInitial(EventInboxBO row) {
+        if (!"RECEIVED".equals(row.getState()) || row.getAttempts() != 0 || !row.getReceivedAt().equals(row.getNextRetryAt())
+                || row.getInstanceId() != null || row.getNodeExecutionRef() != null || row.getDecidedAt() != null
+                || row.getDecisionCode() != null) throw unavailable();
+    }
+
+    private void requireSignalWrite(EventInboxBO row, EventSubscriptionBO reservation) {
+        requireWrite();
+        requireEvidence(row);
+        if (!"SIGNAL".equals(row.getMode()) || row.getTenantId() != reservation.getTenantId()
+                || !row.getWaitTokenSha256().equals(reservation.getTokenSha256()) || !row.getRouteKey().equals(reservation.getRouteKey())
+                || row.getRouteVersion() != reservation.getRouteVersion()) throw unavailable();
+        AutomationInstanceGuardCommandInterceptor.requireHeld(row.getTenantId(), reservation.getInstanceId());
+    }
+
+    private void requireStoredReservation(EventSubscriptionBO reservation) {
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (
+                    SELECT 1 FROM %s WHERE tenant_id=? AND token_sha256=? AND instance_id=? AND parent_scope_id=?
+                        AND target_node_id=? AND reservation_id=? AND route_key=? AND route_version=? AND source_ref=?
+                        AND state=? AND revision=? AND node_execution_ref IS NOT DISTINCT FROM ?
+                )
+                """.formatted(subscriptions), Boolean.class, reservation.getTenantId(), reservation.getTokenSha256(),
+                reservation.getInstanceId(), reservation.getParentScopeId(), reservation.getTargetNodeId(),
+                reservation.getReservationId(), reservation.getRouteKey(), reservation.getRouteVersion(), reservation.getSourceRef(),
+                reservation.getState().name(), reservation.getRevision(), reservation.getNodeExecutionRef()))) throw unavailable();
     }
 
     private EventInboxBO read(ResultSet row, int index) throws SQLException {
@@ -193,7 +290,8 @@ public class ProcessEventInboxStore {
                     || !row.getFingerprint().equals(admission.originalRequestSha256()) || !row.getAdmittedAt().equals(admission.admittedAt())
                     || !admission.admissionNotAfter().equals(row.getAdmissionNotAfter())
                     || !ProcessExecutionService.eventStartCommandId(row.producer(), row.getEventId()).equals(row.getCommandId())) throw unavailable();
-        } else if (!"SIGNAL".equals(row.getMode()) || admission != null) {
+        } else if (!"SIGNAL".equals(row.getMode()) || admission != null || row.getCommandId() != null
+                || row.getAdmissionNotAfter() != null || !EventInboxBO.sha256(row.getWaitTokenSha256())) {
             throw unavailable();
         }
     }
@@ -253,5 +351,5 @@ public class ProcessEventInboxStore {
         return new IllegalStateException("Process event storage evidence is unavailable");
     }
 
-    record ClaimedEventVO(long tenantId, String receiptId, Instant nextRetryAt, int attempts) { }
+    record ClaimedEventVO(long tenantId, String receiptId, Instant nextRetryAt, int attempts, String mode) { }
 }

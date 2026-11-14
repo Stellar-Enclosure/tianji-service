@@ -7,6 +7,8 @@ import org.flowable.bpmn.model.BoundaryEvent;
 import org.flowable.bpmn.model.EndEvent;
 import org.flowable.bpmn.model.ExternalWorkerServiceTask;
 import org.flowable.bpmn.model.ExclusiveGateway;
+import org.flowable.bpmn.model.IntermediateCatchEvent;
+import org.flowable.bpmn.model.MessageEventDefinition;
 import org.flowable.bpmn.model.TimerEventDefinition;
 import org.flowable.bpmn.model.FlowableListener;
 import org.flowable.bpmn.model.FlowElement;
@@ -16,6 +18,7 @@ import org.flowable.bpmn.model.ParallelGateway;
 import org.flowable.bpmn.model.SequenceFlow;
 import org.flowable.bpmn.model.ServiceTask;
 import org.flowable.bpmn.model.SubProcess;
+import org.flowable.bpmn.model.TerminateEventDefinition;
 import org.flowable.bpmn.model.UserTask;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.common.engine.api.delegate.Expression;
@@ -28,6 +31,7 @@ import org.flowable.engine.delegate.ExecutionListener;
 import org.flowable.engine.impl.bpmn.behavior.AbstractBpmnActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.BoundaryTimerEventActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.ExternalWorkerTaskActivityBehavior;
+import org.flowable.engine.impl.bpmn.behavior.IntermediateCatchMessageEventActivityBehavior;
 import org.flowable.engine.impl.bpmn.parser.BpmnParse;
 import org.flowable.engine.impl.jobexecutor.TimerEventHandler;
 import org.flowable.engine.impl.persistence.entity.ExecutionEntity;
@@ -60,6 +64,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.Automatio
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionPathVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.LoopControlVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.MappingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.MergeVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.MultiInstanceControlVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.SubprocessControlVO;
@@ -67,12 +72,16 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNo
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.SideEffectOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.EventRouteVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
 import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor.ProcessReference;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
+import top.egon.cola.platform.tianji.process.server.event.EventSubscriptionBO;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventSubscriptionStore;
+import top.egon.cola.platform.tianji.process.server.event.ProcessLifecycleEventPublisher;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.ControlPredicate;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.OccurrenceSlotVO;
@@ -100,6 +109,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -142,6 +152,14 @@ public class ProcessNodeLifecycleListener {
     @Qualifier("processNodeExecutionStore") private final ProcessNodeExecutionStore nodes;
     @Qualifier("automationReleaseStore") private final AutomationReleaseStore releases;
     @Qualifier("automationHumanCandidateDirectory") private final ObjectProvider<HumanCandidateDirectory> candidates;
+    @Qualifier("processEventSubscriptionStore") private final ProcessEventSubscriptionStore subscriptions;
+    @Qualifier("processLifecycleEventPublisher") private final ProcessLifecycleEventPublisher lifecycleEvents;
+    @Qualifier("automationEventReservationDirectory") private final EventReservationDirectory eventReservations;
+
+    public ProcessNodeLifecycleListener(ProcessInstanceBindingStore bindings, ProcessNodeExecutionStore nodes,
+            AutomationReleaseStore releases, ObjectProvider<HumanCandidateDirectory> candidates) {
+        this(bindings, nodes, releases, candidates, null, null, null);
+    }
 
     public static void register(SpringProcessEngineConfiguration configuration, Supplier<ProcessNodeLifecycleListener> listener) {
         var existing = configuration.getPostBpmnParseHandlers();
@@ -224,9 +242,10 @@ public class ProcessNodeLifecycleListener {
 
     private void excludeUnselectedMultiChildren(LifecycleContextVO context, DelegateExecution execution, String bodyId,
                                                 Set<Integer> retained) {
-        var references = execution.getExecutions().stream().filter(child -> bodyId.equals(child.getCurrentActivityId())
+        var excluded = execution.getExecutions().stream().filter(child -> bodyId.equals(child.getCurrentActivityId())
                 && child.getVariableLocal(AutomationModelCompiler.MULTI_INSTANCE_INDEX) instanceof Integer index
-                && !retained.contains(index))
+                && !retained.contains(index)).toList();
+        var references = excluded.stream()
                 .flatMap(child -> child.getVariablesLocal().entrySet().stream())
                 .filter(entry -> entry.getKey().startsWith(MULTI_NODE_REF))
                 .map(entry -> {
@@ -238,6 +257,7 @@ public class ProcessNodeLifecycleListener {
             var root = context.binding();
             nodes.excludeMultiChildren(root.getTenantId(), root.getInstanceId(), root.getConfigurationSha256(), references);
         }
+        closeDiscardedReservations(context, excluded);
     }
 
     private static boolean insideBody(DelegateExecution execution, String bodyId) {
@@ -313,14 +333,26 @@ public class ProcessNodeLifecycleListener {
     private void beforeScopeExit(DelegateExecution execution) {
         var context = context(execution);
         var end = (EndEvent) execution.getCurrentFlowElement();
-        if (!end.getEventDefinitions().isEmpty()) return;
+        if (!end.getEventDefinitions().isEmpty()) {
+            if (end.getEventDefinitions().getFirst() instanceof TerminateEventDefinition terminate && terminate.isTerminateAll()) {
+                closeRootReservations(context);
+                publish(context, "INSTANCE_CANCELLED", nodes.now(), null, null);
+            }
+            return;
+        }
         var parent = requireParent(execution);
         if (parent.getCurrentFlowElement() instanceof SubProcess) {
             finishNativeScope(context, parent);
         } else if (parent.getId().equals(context.binding().getInstanceId())) {
             var output = projectScope(context.release().source().outputSchema(), visibleScope(context, parent));
             storeNativeObject(context, parent, AutomationBootstrapBehavior.ROOT_OUTPUT, output);
+            closeRootReservations(context);
+            publish(context, "INSTANCE_COMPLETED", nodes.now(), null, null);
         }
+    }
+
+    private void closeRootReservations(LifecycleContextVO context) {
+        if (subscriptions != null) subscriptions.closeOpen(context.binding().getTenantId(), context.binding().getInstanceId());
     }
 
     private void finishNativeScope(LifecycleContextVO context, DelegateExecution scope) {
@@ -690,6 +722,7 @@ public class ProcessNodeLifecycleListener {
         var output = object(definition.outputSchema().normalizeValue(result));
         nodes.completeLocal(row, output);
         applyNodeOutput(context, definition, output, scope);
+        publish(context, "NODE_COMPLETED", nodes.now(), row, null);
     }
 
     private void onWorkerJobCreated(CreateExternalWorkerJobAfterContext created) {
@@ -719,6 +752,7 @@ public class ProcessNodeLifecycleListener {
         }
         applyNodeOutput(context, attempt.binding(), row.getOutput(), attempt.occurrence());
         nodes.finish(row, StateEnum.COMPLETED);
+        publish(context, "NODE_COMPLETED", nodes.now(), row, null);
         execution.removeVariableLocal(RESULT_REF);
     }
 
@@ -1090,6 +1124,125 @@ public class ProcessNodeLifecycleListener {
         insert(context, binding, scope.getKey(), occurrence, event, scope.getValue(), null);
     }
 
+    private void bindEventWait(ExecutionEntity execution) {
+        if (subscriptions == null) return;
+        var wait = exactEventWait(execution);
+        if (wait == null) return;
+        var root = wait.context().binding();
+        var row = wait.row();
+        if (row.getState() != StateEnum.WAITING || row.isExcluded()) throw unavailable();
+        var reservation = subscriptions.findOpen(root.getTenantId(), root.getInstanceId(), row.getParentScopeId(), row.getNodeId())
+                .orElse(null);
+        if (reservation == null) return;
+        boolean published = wait.context().release().source().eventRoutes().stream().anyMatch(route -> "SIGNAL".equals(route.mode())
+                && row.getNodeId().equals(route.targetNodeId()) && reservation.getRouteKey().equals(route.routeKey())
+                && reservation.getRouteVersion() == route.version() && reservation.getSourceRef().equals(route.sourceRef()));
+        if (!published) throw unavailable();
+        var now = subscriptions.now();
+        if (!now.isBefore(reservation.getDeadlineAt()) || !now.isBefore(row.getAttemptDeadlineAt())) {
+            subscriptions.close(reservation);
+            return;
+        }
+        var message = execution.getEventSubscriptions().stream()
+                .filter(item -> "message".equals(item.getEventType())
+                        && ("tianji-v2:" + execution.getCurrentActivityId()).equals(item.getEventName())
+                        && execution.getId().equals(item.getExecutionId()) && execution.getTenantId().equals(item.getTenantId())
+                        && root.getInstanceId().equals(item.getProcessInstanceId())
+                        && execution.getCurrentActivityId().equals(item.getActivityId())
+                        && execution.getProcessDefinitionId().equals(item.getProcessDefinitionId()))
+                .limit(2).toList();
+        if (message.size() != 1) throw unavailable();
+        nodes.bindEventSubscription(row, message.getFirst().getId());
+        subscriptions.bindExact(reservation,
+                new ProcessEventSubscriptionStore.NativeWaitVO(execution.getId(), message.getFirst().getId(), row.getNodeExecutionRef()));
+    }
+
+    public boolean acceptEventResult(AutomationInstanceBindingBO root, ImmutableReleaseVO release, EventRouteVO route,
+            EventSubscriptionBO reservation, ProcessNodeExecutionBO row, Map<String, Object> payload) {
+        AutomationInstanceGuardCommandInterceptor.requireHeld(root.getTenantId(), root.getInstanceId());
+        var definition = binding(release, row.getNodeId());
+        if (root.getTenantId() != release.tenantId() || root.getTenantId() != row.getTenantId()
+                || root.getTenantId() != reservation.getTenantId() || !root.getInstanceId().equals(row.getInstanceId())
+                || !root.getInstanceId().equals(reservation.getInstanceId()) || !root.getReleaseKey().equals(release.releaseVersion())
+                || !root.getConfigurationSha256().equals(row.getConfigurationSha256())
+                || !row.getParentScopeId().equals(reservation.getParentScopeId())
+                || !row.getNodeExecutionRef().equals(reservation.getNodeExecutionRef())
+                || !Objects.equals(row.getNativeSubscriptionId(), reservation.getNativeSubscriptionId())
+                || row.getKind() != KindEnum.EVENT_WAIT || row.getState() != StateEnum.WAITING
+                || !row.getNodeId().equals(reservation.getTargetNodeId()) || !row.getNodeId().equals(route.targetNodeId())
+                || !"EVENT_WAIT".equals(definition.kind()) || !"SIGNAL".equals(route.mode())
+                || !reservation.getRouteKey().equals(route.routeKey()) || reservation.getRouteVersion() != route.version()
+                || !reservation.getSourceRef().equals(route.sourceRef()) || !release.source().eventRoutes().contains(route)
+                || !row.getInputSchemaSha256().equals(schemaSha256(definition.inputSchema()))
+                || !row.getOutputSchemaSha256().equals(schemaSha256(definition.outputSchema()))) throw unavailable();
+        var normalizedPayload = object(route.payloadSchema().normalizeValue(payload));
+        var input = mutableObject(row.getInput());
+        for (var mapping : route.mapping()) applyEventMapping(input, normalizedPayload, mapping);
+        for (var mapping : definition.inputMapping()) {
+            if (mapping.source().startsWith("event.")) applyEventMapping(input, normalizedPayload, mapping);
+        }
+        var completeInput = object(definition.inputSchema().normalizeValue(input));
+        var output = object(definition.outputSchema().normalizeValue(projectEventOutput(definition.outputSchema(), completeInput)));
+        return nodes.acceptEventResult(row, reservation.getNativeSubscriptionId(), completeInput, output);
+    }
+
+    private static void applyEventMapping(Map<String, Object> input, Map<String, Object> payload, MappingVO mapping) {
+        try {
+            assign(input, mapping.target(), lookup(payload, mapping.source().substring("event.".length())));
+        } catch (IllegalStateException invalidPath) {
+            throw new IllegalArgumentException("Process signal payload does not satisfy its mapping");
+        }
+    }
+
+    private static Object projectEventOutput(ProcessSchemaVO schema, Object input) {
+        if ("object".equals(schema.type()) && input instanceof Map<?, ?> properties) {
+            var output = new LinkedHashMap<String, Object>();
+            for (var field : schema.properties().entrySet()) {
+                if (properties.containsKey(field.getKey())) {
+                    output.put(field.getKey(), projectEventOutput(field.getValue(), properties.get(field.getKey())));
+                }
+            }
+            return output;
+        }
+        if ("array".equals(schema.type()) && input instanceof List<?> items) {
+            return items.stream().map(item -> projectEventOutput(schema.items(), item)).toList();
+        }
+        return input;
+    }
+
+    private EventWaitVO exactEventWait(DelegateExecution execution) {
+        var context = context(execution);
+        var slot = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> execution.getCurrentActivityId().equals(entry.getValue().activityId())).findFirst().orElse(null);
+        if (slot == null) return null;
+        var definition = binding(context.release(), slot.getKey());
+        if (!"EVENT_WAIT".equals(definition.kind())) return null;
+        var attempt = requireParent(execution);
+        var occurrence = requireParent(attempt);
+        if (!slot.getValue().attemptOrBodyId().equals(attempt.getCurrentActivityId())
+                || !slot.getValue().scopeId().equals(occurrence.getCurrentActivityId())) throw unavailable();
+        var root = context.binding();
+        var row = nodes.findAttempt(root.getTenantId(), root.getInstanceId(), attempt.getId())
+                .orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        if (row.getKind() != KindEnum.EVENT_WAIT || !slot.getKey().equals(row.getNodeId())
+                || !occurrence.getParentId().equals(row.getParentScopeId())
+                || !occurrenceId(root, row.getNodeId(), occurrence.getId()).equals(row.getOccurrenceId())) throw unavailable();
+        return new EventWaitVO(context, definition, row, occurrence);
+    }
+
+    private void onEventWaitResult(DelegateExecution execution) {
+        if (subscriptions == null) return;
+        var wait = exactEventWait(execution);
+        if (wait == null) return;
+        var row = wait.row();
+        if (row.isExcluded() || row.getState() != StateEnum.RESULT_ACCEPTED || row.getOutput() == null || row.getAcceptedAt() == null) {
+            throw unavailable();
+        }
+        applyNodeOutput(wait.context(), wait.definition(), row.getOutput(), wait.occurrence());
+        nodes.finish(row, StateEnum.COMPLETED);
+        publish(wait.context(), "NODE_COMPLETED", nodes.now(), row, null);
+    }
+
     void onUserTask(DelegateTask task, boolean complete) {
         if (task.getExecutionId() == null || task.getProcessInstanceId() == null) throw unavailable();
         var execution = CommandContextUtil.getExecutionEntityManager().findById(task.getExecutionId());
@@ -1109,6 +1262,7 @@ public class ProcessNodeLifecycleListener {
         if (complete) {
             if (row.getState() != StateEnum.RESULT_ACCEPTED || row.getOutput() == null) throw unavailable();
             finishExit(context, logical, row, occurrence);
+            publish(context, "TASK_COMPLETED", nodes.now(), row, task.getId());
             return;
         }
         String expectedSha = expectedHumanPolicySha256(context.release(), scope.getKey());
@@ -1116,6 +1270,7 @@ public class ProcessNodeLifecycleListener {
         task.addCandidateGroups(policy.lanes().get(policy.initialLane()).stream().map(role -> "role:" + role).sorted().toList());
         Instant due = row.getStartedAt().plus(logical.human().dueAfter());
         task.setDueDate(Date.from(due.isBefore(row.getAttemptDeadlineAt()) ? due : row.getAttemptDeadlineAt()));
+        publish(context, "TASK_CREATED", row.getStartedAt(), row, task.getId());
     }
 
     private boolean beforeBoundaryTimer(DelegateExecution event, BoundaryEvent boundary) {
@@ -1167,8 +1322,33 @@ public class ProcessNodeLifecycleListener {
         } else if (row.getState() != StateEnum.TIMED_OUT && row.getState() != StateEnum.FAILED) {
             nodes.finish(row, StateEnum.TIMED_OUT);
         }
+        if (row.getKind() == KindEnum.EVENT_WAIT) closeWaitReservation(row);
+        closeDiscardedReservations(context, List.of(requireParent(event)));
         captureBoundary(row, boundary.getId(), attemptDeadline ? ATTEMPT_TIMEOUT : NODE_TIMEOUT, occurrenceSlot.scopeId());
         return true;
+    }
+
+    private void closeDiscardedReservations(LifecycleContextVO context, List<? extends DelegateExecution> roots) {
+        if (subscriptions == null || roots.isEmpty()) return;
+        var scopes = new LinkedHashSet<String>();
+        var pending = new ArrayDeque<DelegateExecution>(roots);
+        while (!pending.isEmpty()) {
+            var child = pending.removeFirst();
+            if (!scopes.add(child.getId())) throw unavailable();
+            pending.addAll(child.getExecutions());
+        }
+        var root = context.binding();
+        subscriptions.closeScopes(root.getTenantId(), root.getInstanceId(), scopes);
+    }
+
+    private void closeWaitReservation(ProcessNodeExecutionBO row) {
+        if (subscriptions == null) return;
+        subscriptions.findOpen(row.getTenantId(), row.getInstanceId(), row.getParentScopeId(), row.getNodeId())
+                .ifPresent(reservation -> {
+                    if (reservation.getState() == EventSubscriptionBO.State.BOUND
+                            && !row.getNodeExecutionRef().equals(reservation.getNodeExecutionRef())) throw unavailable();
+                    subscriptions.close(reservation);
+                });
     }
 
     private WorkerAttemptVO timerWorkerAttempt(LifecycleContextVO context, ProcessNodeExecutionBO row, OccurrenceSlotVO slot) {
@@ -1300,7 +1480,6 @@ public class ProcessNodeLifecycleListener {
         var root = context.binding();
         var existing = nodes.findAttempt(root.getTenantId(), root.getInstanceId(), attempt.getId());
         if (existing.isPresent()) return;
-        var input = formInput(context, binding, occurrence);
         String inputSchema = schemaSha256(binding.inputSchema());
         Instant now = nodes.now();
         var capability = binding.service();
@@ -1313,6 +1492,7 @@ public class ProcessNodeLifecycleListener {
         int attemptNumber = previous == null ? 1 : previous.getAttempt() + 1;
         var nodeDeadline = capability == null ? now.plus(binding.policy().nodeTimeout()) : workerNodeDeadline(occurrence, binding);
         if (previous != null && !nodeDeadline.equals(previous.getNodeDeadlineAt())) throw unavailable();
+        var input = formInput(context, binding, occurrence, previous);
         var attemptDeadline = now.plus(binding.policy().attemptTimeout());
         if (attemptDeadline.isAfter(nodeDeadline)) attemptDeadline = nodeDeadline;
         var executionRef = executionRef(root.getTenantId(), root.getInstanceId(), occurrenceId, attemptNumber);
@@ -1342,6 +1522,20 @@ public class ProcessNodeLifecycleListener {
         nodes.insertOccurrence(row);
         registerMultiChildNode(occurrence, executionRef);
         occurrence.setVariableLocal("tianjiAutomationNodeOccurrence", occurrence.getId());
+        if (row.getState() == StateEnum.WAITING) publish(context, "NODE_WAITING", row.getStartedAt(), row, null);
+    }
+
+    private void publish(LifecycleContextVO context, String type, Instant occurredAt, ProcessNodeExecutionBO row, String taskId) {
+        if (lifecycleEvents != null) {
+            lifecycleEvents.publish(context.binding(), type, occurredAt, row == null ? null : row.getOccurrenceId(),
+                    row == null ? null : row.getAttempt(), taskId, null);
+        }
+    }
+
+    private void onBootstrapCompleted(DelegateExecution execution) {
+        if (lifecycleEvents == null) return;
+        var context = context(execution);
+        publish(context, "INSTANCE_STARTED", context.binding().getSubmittedAt(), null, null);
     }
 
     private static void registerMultiChildNode(DelegateExecution occurrence, String nodeExecutionRef) {
@@ -1357,9 +1551,12 @@ public class ProcessNodeLifecycleListener {
         if (row.getState() == StateEnum.RESULT_ACCEPTED) {
             if (binding.human() != null && row.getOutput() != null) applyNodeOutput(context, binding, row.getOutput(), occurrence);
             nodes.finish(row, StateEnum.COMPLETED);
+            publish(context, "NODE_COMPLETED", nodes.now(), row, null);
         } else if (row.getState() == StateEnum.RUNNING || row.getState() == StateEnum.WAITING && "TIMER".equals(binding.kind())) {
             nodes.finish(row, StateEnum.COMPLETED);
-        } else if (row.getState() == StateEnum.WAITING && "HUMAN".equals(binding.kind())) {
+            publish(context, "NODE_COMPLETED", nodes.now(), row, null);
+        } else if (row.getState() == StateEnum.WAITING && (row.getKind() == KindEnum.HUMAN
+                || row.getKind() == KindEnum.EVENT_WAIT && subscriptions != null)) {
             throw unavailable();
         }
     }
@@ -1407,15 +1604,80 @@ public class ProcessNodeLifecycleListener {
         return value;
     }
 
-    private Map<String, Object> formInput(LifecycleContextVO context, AutomationNodeBindingVO binding, DelegateExecution occurrence) {
+    private Map<String, Object> formInput(LifecycleContextVO context, AutomationNodeBindingVO binding, DelegateExecution occurrence,
+            ProcessNodeExecutionBO previous) {
         var parent = requireParent(occurrence);
         var scope = visibleScope(context, parent, occurrence.getCurrentFlowElement());
         var container = occurrence.getCurrentFlowElement().getParentContainer();
         var form = new LinkedHashMap<String, Object>();
         for (var mapping : binding.inputMapping()) {
+            if ("EVENT_WAIT".equals(binding.kind()) && mapping.source().startsWith("event.")) continue;
             assign(form, mapping.target(), mappedValue(context, parent, container, scope, mapping.source()));
         }
+        if ("EVENT_WAIT".equals(binding.kind())) return form;
+        if (binding.service() != null) prepareOutboundEvent(context, binding, parent, container, occurrence, form, previous);
         return object(binding.inputSchema().normalizeValue(form));
+    }
+
+    private void prepareOutboundEvent(LifecycleContextVO context, AutomationNodeBindingVO worker, DelegateExecution parent,
+            FlowElementsContainer container, DelegateExecution occurrence, Map<String, Object> form, ProcessNodeExecutionBO previous) {
+        if (eventReservations == null) return;
+        var root = context.binding();
+        var capability = worker.service();
+        var configured = eventReservations.find(root.getTenantId(), context.release().compiledSha256(), worker.nodeId(),
+                capability.capabilityKey(), capability.version()).orElse(null);
+        if (configured == null) return;
+        if (subscriptions == null || worker.inputMapping().stream()
+                .anyMatch(mapping -> pathsOverlap(mapping.target(), configured.inputPath()))) throw unavailable();
+        var route = context.release().source().eventRoutes().stream().filter(item -> "SIGNAL".equals(item.mode())
+                && configured.routeKey().equals(item.routeKey()) && configured.routeVersion() == item.version()
+                && configured.targetNodeId().equals(item.targetNodeId())).findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        var target = binding(context.release(), route.targetNodeId());
+        var targetSlot = context.verified().controlBindings().occurrenceSlots().get(target.nodeId());
+        if (!"EVENT_WAIT".equals(target.kind()) || targetSlot == null
+                || !reachableWait(container, occurrence.getCurrentFlowElement(), targetSlot.scopeId())) throw unavailable();
+        if (previous != null) {
+            var token = lookup(previous.getInput(), configured.inputPath());
+            if (!(token instanceof String exact)) throw unavailable();
+            var reserved = subscriptions.find(root.getTenantId(), ProcessEventSubscriptionStore.tokenSha256(exact))
+                    .orElseThrow(ProcessNodeLifecycleListener::unavailable);
+            if (!root.getInstanceId().equals(reserved.getInstanceId()) || !parent.getId().equals(reserved.getParentScopeId())
+                    || !target.nodeId().equals(reserved.getTargetNodeId()) || !route.routeKey().equals(reserved.getRouteKey())
+                    || route.version() != reserved.getRouteVersion() || !route.sourceRef().equals(reserved.getSourceRef())) throw unavailable();
+            assign(form, configured.inputPath(), exact);
+            return;
+        }
+
+        // Normalize the full input before writing its reservation. The real token is exactly 43 URL-safe characters.
+        var input = mutableObject(form);
+        assign(input, configured.inputPath(), "A".repeat(43));
+        var normalized = object(worker.inputSchema().normalizeValue(input));
+        if (!(lookup(normalized, configured.inputPath()) instanceof String)) throw unavailable();
+        var now = subscriptions.now();
+        var deadline = now.plus(route.ttl()).truncatedTo(java.time.temporal.ChronoUnit.MICROS);
+        var reserved = subscriptions.reserve(root.getTenantId(), root.getInstanceId(), parent.getId(), target.nodeId(),
+                UUID.randomUUID(), route.routeKey(), route.version(), route.sourceRef(), deadline);
+        assign(form, configured.inputPath(), reserved.token());
+    }
+
+    private static boolean reachableWait(FlowElementsContainer container, FlowElement source, String target) {
+        if (!(source instanceof FlowNode first) || !(container.getFlowElement(target) instanceof SubProcess)) return false;
+        var visited = new LinkedHashSet<String>();
+        var pending = new ArrayDeque<FlowNode>();
+        pending.add(first);
+        while (!pending.isEmpty()) {
+            var candidate = pending.removeFirst();
+            if (!visited.add(candidate.getId())) continue;
+            if (target.equals(candidate.getId())) return true;
+            candidate.getOutgoingFlows().stream().map(SequenceFlow::getTargetFlowElement)
+                    .filter(FlowNode.class::isInstance).map(FlowNode.class::cast).forEach(pending::addLast);
+        }
+        return false;
+    }
+
+    private static boolean pathsOverlap(String first, String second) {
+        return first.equals(second) || first.startsWith(second + ".") || first.startsWith(second + "[")
+                || second.startsWith(first + ".") || second.startsWith(first + "[");
     }
 
     private Object mappedValue(LifecycleContextVO context, DelegateExecution parent, FlowElementsContainer container,
@@ -1652,6 +1914,9 @@ public class ProcessNodeLifecycleListener {
     private record LifecycleContextVO(SpringProcessEngineConfiguration engine, AutomationInstanceBindingBO binding,
             ImmutableReleaseVO release, VerifiedProcessModels.VerifiedAutomationModelsVO verified) { }
 
+    private record EventWaitVO(LifecycleContextVO context, AutomationNodeBindingVO definition, ProcessNodeExecutionBO row,
+            DelegateExecution occurrence) { }
+
     private record WorkerAttemptVO(AutomationNodeBindingVO binding, ProcessNodeExecutionBO row, ExecutionEntity occurrence,
                                    ExecutionEntity execution, OccurrenceSlotVO slot) { }
 
@@ -1706,6 +1971,22 @@ public class ProcessNodeLifecycleListener {
         public void execute(JobEntity job, String nodeRef, VariableScope scope, CommandContext context) {
             if (!(scope instanceof ExecutionEntity execution)) throw unavailable();
             listener.get().runWorkerRetry(job, nodeRef, execution);
+        }
+    }
+
+    @FunctionalInterface
+    public interface EventReservationDirectory {
+        /** Looks up immutable registrations in trusted, local host configuration. */
+        Optional<OutboundEventReservationVO> find(long tenantId, String compiledManifestSha256, String workerNodeId,
+                String capabilityKey, long capabilityVersion);
+    }
+
+    public record OutboundEventReservationVO(String routeKey, long routeVersion, String targetNodeId, String inputPath) {
+        public OutboundEventReservationVO {
+            if (routeKey == null || !routeKey.matches("[A-Za-z][A-Za-z0-9_.:-]{0,127}") || routeVersion < 1
+                    || routeVersion > ProcessTypedJson.V2_MAX_WIRE_INTEGER || targetNodeId == null
+                    || !targetNodeId.matches("[A-Za-z_][A-Za-z0-9_.-]{0,127}")) throw new IllegalArgumentException("Invalid event reservation registration");
+            new MappingVO(inputPath, "input.callback");
         }
     }
 
@@ -1801,7 +2082,7 @@ public class ProcessNodeLifecycleListener {
         @Override
         public Collection<Class<? extends BaseElement>> getHandledTypes() {
             return List.of(SubProcess.class, UserTask.class, ServiceTask.class, ExternalWorkerServiceTask.class,
-                    BoundaryEvent.class, EndEvent.class, SequenceFlow.class);
+                    BoundaryEvent.class, EndEvent.class, SequenceFlow.class, IntermediateCatchEvent.class);
         }
 
         @Override
@@ -1830,6 +2111,11 @@ public class ProcessNodeLifecycleListener {
                 listeners.add(nativeListener("start", (ExecutionListener) execution -> listener.get().beforeScopeExit(execution)));
                 end.setExecutionListeners(listeners);
             }
+            if (element instanceof ServiceTask task && AutomationModelCompiler.bootstrapActivityId().equals(task.getId())) {
+                var listeners = new ArrayList<>(task.getExecutionListeners());
+                listeners.add(nativeListener("end", (ExecutionListener) execution -> listener.get().onBootstrapCompleted(execution)));
+                task.setExecutionListeners(listeners);
+            }
             if (element instanceof UserTask task && task.getId().startsWith("ta_")) {
                 var listeners = new ArrayList<>(task.getTaskListeners());
                 listeners.add(nativeListener("create", (TaskListener) nativeTask -> listener.get().onUserTask(nativeTask, false)));
@@ -1842,6 +2128,12 @@ public class ProcessNodeLifecycleListener {
                 if (event instanceof TimerEventDefinition timer) {
                     boundary.setBehavior(new GuardedBoundaryTimer(listener, boundary, timer));
                 }
+            }
+            if (element instanceof IntermediateCatchEvent message && message.getId().startsWith("ta_")
+                    && message.getEventDefinitions().size() == 1
+                    && message.getEventDefinitions().getFirst() instanceof MessageEventDefinition definition
+                    && message.getBehavior() instanceof IntermediateCatchMessageEventActivityBehavior) {
+                message.setBehavior(new GuardedEventWait(listener, definition));
             }
             if (element instanceof ExternalWorkerServiceTask task && task.getId().startsWith("ta_")
                     && task.getTopic() != null && task.getTopic().startsWith("tianji-v2:worker:")) {
@@ -1876,6 +2168,27 @@ public class ProcessNodeLifecycleListener {
             result.setImplementationType("instance");
             result.setInstance(implementation);
             return result;
+        }
+    }
+
+    private static final class GuardedEventWait extends IntermediateCatchMessageEventActivityBehavior {
+        private final Supplier<ProcessNodeLifecycleListener> listener;
+
+        private GuardedEventWait(Supplier<ProcessNodeLifecycleListener> listener, MessageEventDefinition definition) {
+            super(definition);
+            this.listener = listener;
+        }
+
+        @Override
+        public void execute(DelegateExecution execution) {
+            super.execute(execution);
+            listener.get().bindEventWait((ExecutionEntity) execution);
+        }
+
+        @Override
+        public void trigger(DelegateExecution execution, String signal, Object data) {
+            listener.get().onEventWaitResult(execution);
+            super.trigger(execution, signal, data);
         }
     }
 

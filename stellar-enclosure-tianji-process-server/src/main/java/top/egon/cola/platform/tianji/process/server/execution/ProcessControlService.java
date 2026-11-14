@@ -42,6 +42,8 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNati
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.LockedRoot;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.TerminalFacts;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventSubscriptionStore;
+import top.egon.cola.platform.tianji.process.server.event.ProcessLifecycleEventPublisher;
 
 import javax.sql.DataSource;
 import java.sql.SQLException;
@@ -103,6 +105,7 @@ public final class ProcessControlService {
         source = manager.getDataSource(); schema = engine.getDatabaseSchema();
         automationVerifier = automation == null ? null : new ProcessApiSchemaVerifier(source, schema);
         if (!nativeAccess.usesDataSource(source) || !nativeAccess.usesEngine(engine) || !cancellations.usesDataSource(source)) throw invalidStorage();
+        if (automation != null && automation.subscriptions() != null) automation.subscriptions().requireDataSource(source);
         dispatch.requireStorage(source, manager, schema);
         jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(10);
         models = new VerifiedProcessModels(engine, dmn, validator);
@@ -262,6 +265,12 @@ public final class ProcessControlService {
                     start.releaseKey(), definition.engineDefinitionId(), definition.modelSha256(), current.businessKey(), start.correlationId()));
             scheduled = count > 0;
             automation.nodes().cancelOpen(actor.tenantId(), command.instanceId());
+            if (automation.subscriptions() != null) {
+                automation.subscriptions().closeOpen(actor.tenantId(), command.instanceId());
+            }
+            if (automation.lifecycle() != null) {
+                automation.lifecycle().publish(lockedBinding, "INSTANCE_CANCELLED", terminal.finishedAt(), null, null, null, null);
+            }
         } else {
             terminal = nativeAccess.automationTerminalHistory(lockedBinding, definition, null, false);
             reserve(actor, start, command, hash);
@@ -502,7 +511,13 @@ public final class ProcessControlService {
     private static IllegalStateException unavailable() { return new IllegalStateException("Process control source or dependency is unavailable"); }
 
     public record AutomationControlParticipants(ProcessInstanceBindingStore bindings, AutomationReleaseStore releases,
-            AutomationInstanceGuardCommandInterceptor guard, ProcessNodeExecutionStore nodes) {
+            AutomationInstanceGuardCommandInterceptor guard, ProcessNodeExecutionStore nodes,
+            ProcessEventSubscriptionStore subscriptions, ProcessLifecycleEventPublisher lifecycle) {
+        public AutomationControlParticipants(ProcessInstanceBindingStore bindings, AutomationReleaseStore releases,
+                AutomationInstanceGuardCommandInterceptor guard, ProcessNodeExecutionStore nodes) {
+            this(bindings, releases, guard, nodes, null, null);
+        }
+
         public AutomationControlParticipants {
             Objects.requireNonNull(bindings, "bindings");
             Objects.requireNonNull(releases, "releases");
