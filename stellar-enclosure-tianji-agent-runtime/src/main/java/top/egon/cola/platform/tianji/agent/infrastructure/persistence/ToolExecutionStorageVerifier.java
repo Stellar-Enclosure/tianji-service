@@ -23,6 +23,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** Read-only readiness of the independent tool journal; never provisions or repairs storage. */
 public final class ToolExecutionStorageVerifier {
@@ -87,6 +89,12 @@ public final class ToolExecutionStorageVerifier {
                     AND result - ARRAY['status','output','businessReceiptId','errorCode'] = '{}'::jsonb)
                 %1$s))
             """.formatted(RESULT_CONTENT);
+    private static final Pattern CHECK_RENDERING = Pattern.compile(
+            "\\(\\s*'(10000000000000000|9223372036854775807)'\\s*::bigint\\s*\\)\\s*::numeric\\b"
+            + "|::timestamp with time zone\\b"
+            + "|\\((jsonb_typeof\\((result|outcome|authorization_audit)\\)='object' AND \\3 \\?& ARRAY\\[[^\\]]+\\]"
+            + "\\s+AND \\3 - ARRAY\\[[^\\]]+\\] = '\\{\\}'::jsonb)\\)"
+            + "|'(?:[^']|'')*'");
     private final DataSource source;
     private final Supplier<String> runtimeMigration;
 
@@ -137,12 +145,12 @@ public final class ToolExecutionStorageVerifier {
         var checks = new HashMap<>(legacy.checks());
         checks.put("tool_action_profile", MemoryStorageVerifier.booleanSignature("action_profile = ANY (ARRAY['LEGACY_V1','RUNTIME_V2'])"));
         checks.put("tool_action_dispatch_group", MemoryStorageVerifier.booleanSignature(RUNTIME_DISPATCH_CHECK));
-        checks.put("tool_action_outcome", MemoryStorageVerifier.booleanSignature(RUNTIME_OUTCOME_CHECK));
+        checks.put("tool_action_outcome", MemoryStorageVerifier.booleanSignature(normalizeCheckRendering(RUNTIME_OUTCOME_CHECK)));
         return new MemoryStorageVerifier.Table(Map.copyOf(columns), Map.copyOf(checks));
     }
 
     static Map<String, MemoryStorageVerifier.Table> contract(String sql) {
-        var tables = MemoryStorageVerifier.contract(sql);
+        var tables = MemoryStorageVerifier.contract(normalizeCheckRendering(sql));
         if (!tables.keySet().equals(TABLES) || tables.get(CAPABILITY).columns().size() != 27 || tables.get(CAPABILITY).checks().size() != 5
                 || tables.get(INTENT).columns().size() != 43 || tables.get(INTENT).checks().size() != 11
                 || tables.get(INVOCATION).columns().size() != 34 || tables.get(INVOCATION).checks().size() != 10) throw invalid();
@@ -150,11 +158,20 @@ public final class ToolExecutionStorageVerifier {
     }
 
     static Map<String, MemoryStorageVerifier.Table> resultAccessContract(String sql) {
-        var tables = MemoryStorageVerifier.contract(sql);
+        var tables = MemoryStorageVerifier.contract(normalizeCheckRendering(sql));
         if (!tables.keySet().equals(Set.of(ACCESS))) throw invalid();
         var access = tables.get(ACCESS);
         if (!access.columns().equals(RESULT_ACCESS_COLUMNS) || !access.checks().keySet().equals(RESULT_ACCESS_CHECKS)) throw invalid();
         return Map.copyOf(tables);
+    }
+
+    /** PostgreSQL flattens the journal's three adjacent JSON object guards and expands casts when deparsing. */
+    private static String normalizeCheckRendering(String sql) {
+        return CHECK_RENDERING.matcher(sql).replaceAll(match -> {
+            if (match.group(1) != null) return match.group(1) + "::numeric";
+            if (match.group(2) != null) return Matcher.quoteReplacement(match.group(2));
+            return match.group().startsWith("::") ? "::timestamptz" : Matcher.quoteReplacement(match.group());
+        });
     }
 
     private SchemaProfile history(JdbcTemplate jdbc, int minimum) {
@@ -219,7 +236,7 @@ public final class ToolExecutionStorageVerifier {
                 WHERE n.nspname='tianji_agent' AND t.relname=? AND c.contype='c'
                 """, rs -> {
             if (!rs.getBoolean("convalidated") || !rs.getBoolean("enforced")
-                    || actual.put(rs.getString("conname"), MemoryStorageVerifier.booleanSignature(rs.getString("expression"))) != null) throw invalid();
+                    || actual.put(rs.getString("conname"), MemoryStorageVerifier.booleanSignature(normalizeCheckRendering(rs.getString("expression")))) != null) throw invalid();
         }, table);
         if (!expected.checks().equals(actual)) throw invalid();
     }

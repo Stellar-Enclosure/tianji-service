@@ -107,6 +107,45 @@ class ToolExecutionStorageVerifierTest {
                 MemoryStorageVerifier.booleanSignature("(expires_at <= (created_at + '168:00:00'::interval))"));
     }
 
+    @Test void actual_postgres_deparser_forms_preserve_legacy_and_runtime_checks() throws Exception {
+        for (boolean runtime : List.of(false, true)) {
+            var catalog = new Catalog(true);
+            if (runtime) {
+                catalog.installThroughV16();
+                catalog.installRuntime();
+            }
+            renderPostgresCheck(catalog, INTENT, "tool_action_outcome");
+            renderPostgresCheck(catalog, INVOCATION, "tool_invocation_outcome");
+            renderPostgresCheck(catalog, INVOCATION, "tool_invocation_authorization");
+            renderPostgresCheck(catalog, ACCESS, "tool_result_access_authorization");
+            try (var templates = templates(source(), catalog, new AtomicReference<>(), new ArrayList<>())) {
+                new ToolExecutionStorageVerifier(catalog.source, () -> RUNTIME_MIGRATION).verifyResultAccess();
+            }
+        }
+    }
+
+    @Test void deparsed_checks_still_reject_a_changed_numeric_bound_or_boolean_operator() throws Exception {
+        assertRejected(catalog -> {
+            var row = renderPostgresCheck(catalog, INTENT, "tool_action_outcome");
+            row.put("expression", row.get("expression").toString().replace("10000000000000000", "10000000000000001"));
+        });
+        assertResultAccessRejected(catalog -> {
+            var row = renderPostgresCheck(catalog, ACCESS, "tool_result_access_authorization");
+            row.put("expression", row.get("expression").toString().replace("AND authorization_audit ?&", "OR authorization_audit ?&"));
+        });
+    }
+
+    private static Map<String, Object> renderPostgresCheck(Catalog catalog, String table, String name) {
+        var row = find(catalog.checks.get(table), "conname", name);
+        String expression = row.get("expression").toString()
+                .replaceAll("\\((jsonb_typeof\\((result|outcome|authorization_audit)\\)='object' AND \\2 \\?& ARRAY\\[[^\\]]+\\]\\s+AND \\2 - ARRAY\\[[^\\]]+\\] = '\\{\\}'::jsonb)\\)", "$1")
+                .replace("10000000000000000::numeric", "('10000000000000000'::bigint)::numeric")
+                .replace("9223372036854775807::numeric", "('9223372036854775807'::bigint)::numeric")
+                .replace("::timestamptz", "::timestamp with time zone");
+        row.put("expression", expression);
+        return row;
+    }
+
     @Test void expired_action_requires_a_nonnull_error_before_comparing_the_terminal_code() throws Exception {
         assertTrue(sql().contains("last_error_code IS NOT NULL AND last_error_code='INTENT_EXPIRED'"),
                 "A NULL terminal code must make the EXPIRED branch false rather than SQL UNKNOWN");
