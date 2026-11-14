@@ -46,6 +46,12 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Publish a process release"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.release.get", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read a process release"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.model.validate", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Validate an exact process draft revision"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.release.publish", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Publish an exact process draft revision"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.release.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an immutable automation release source"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.create", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Create an owned process draft"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.get", defaultLocale = "en-US",
@@ -176,6 +182,9 @@ public final class TianjiProcessPermissions {
     public static final String WORKER_REPORT = "TIANJI_WORKER_REPORT";
     public static final String AGENT_RESULT_RECEIVE = "TIANJI_AGENT_RESULT_RECEIVE";
     public static final String RELEASE_PUBLISH_API = "tianji.api.process.release.publish";
+    public static final String AUTOMATION_MODEL_VALIDATE_API = "tianji.api.process.model.validate.v2";
+    public static final String AUTOMATION_RELEASE_PUBLISH_API = "tianji.api.process.release.publish.v2";
+    public static final String AUTOMATION_RELEASE_GET_API = "tianji.api.process.release.get.v2";
     public static final String DRAFT_CREATE_API = "tianji.api.process.draft.create.v2";
     public static final String DRAFT_GET_API = "tianji.api.process.draft.get.v2";
     public static final String DRAFT_SAVE_API = "tianji.api.process.draft.save.v2";

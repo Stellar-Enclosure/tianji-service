@@ -3,6 +3,9 @@ package top.egon.cola.platform.tianji.process.server.release;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotNull;
+import lombok.extern.slf4j.Slf4j;
 import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
 import org.flowable.dmn.api.DmnDecision;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
@@ -26,6 +29,8 @@ import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehav
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskTimerAvailability;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.ImmutableReleaseVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.PreparedDescriptorVO;
 import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseActivationService.ProcessLink;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
@@ -52,7 +57,11 @@ import java.util.TreeMap;
 import java.util.function.BooleanSupplier;
 
 /** Internal release transaction; callers must authorize the trusted actor before invoking it. */
+@Slf4j
 public final class ProcessReleaseService {
+    public static final String AUTOMATION_BINDING_REF = "automationBindingRef";
+    private static final Map<String, ValueType> AUTOMATION_ROOT_INPUT = Map.of(AUTOMATION_BINDING_REF, ValueType.STRING);
+    private static final int MAX_AUTOMATION_MODELS = 64;
     private static final int MAX_MODELS = 16;
     private static final int MAX_BUNDLE_BYTES = 4 * 1024 * 1024;
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -171,13 +180,13 @@ public final class ProcessReleaseService {
         validateCaseSources(actor.tenantId(), releaseKey, models);
         String manifestHash = manifestHash(models.stream().map(item ->
                 new ModelResource(item.type(), item.definitionKey(), item.xml(), item.inputs())).toList());
-        return Objects.requireNonNull(write.execute(status -> publishInTransaction(actor, releaseKey, manifestHash, models)));
+        return Objects.requireNonNull(write.execute(status -> publishInTransaction(actor, releaseKey, manifestHash, models, false)));
     }
 
     public Release get(ProcessActor actor, String releaseKey) {
         Objects.requireNonNull(actor, "actor");
         requireReleaseKey(releaseKey);
-        return Objects.requireNonNull(read.execute(status -> load(actor.tenantId(), releaseKey, false)));
+        return Objects.requireNonNull(read.execute(status -> loadLegacy(actor.tenantId(), releaseKey)));
     }
 
     /** Observe the published bundle and deployed model bytes in one owning ProcessDB snapshot. */
@@ -191,7 +200,7 @@ public final class ProcessReleaseService {
             if (!Boolean.TRUE.equals(jdbc.queryForObject("SELECT NOT pg_catalog.pg_is_in_recovery()", Boolean.class))) {
                 throw unavailable();
             }
-            var release = load(actor.tenantId(), releaseKey, false);
+            var release = loadLegacy(actor.tenantId(), releaseKey);
             verifyActivationBundle(actor.tenantId(), release, link);
             return release;
         }));
@@ -238,7 +247,7 @@ public final class ProcessReleaseService {
             throw new IllegalStateException("Process migration release requires the owning snapshot");
         }
         try {
-            return Optional.of(load(actor.tenantId(), releaseKey, false));
+            return Optional.of(loadLegacy(actor.tenantId(), releaseKey));
         } catch (ProcessResourceNotFoundException missing) {
             return Optional.empty();
         }
@@ -273,15 +282,72 @@ public final class ProcessReleaseService {
         }));
     }
 
+    /** Use the Process database transaction that also seals the draft and stores the original receipt. */
+    public void publishCompiled(@NotNull ProcessActor actor, @NotNull String releaseKey,
+                                @NotNull @Valid PreparedDescriptorVO descriptor) {
+        requireAutomationTransaction(true);
+        requireReleaseKey(releaseKey);
+        var compiled = descriptor.compiled();
+        if (compiled.evidence().tenantId() != actor.tenantId()
+                || !AutomationModelValidator.PROFILE.equals(compiled.evidence().profile())) throw invalid();
+        List<PreparedModel> models = compiled.artifacts().values().stream().map(artifact -> {
+            byte[] xml = artifact.xml();
+            return switch (artifact.type()) {
+                case BPMN -> new PreparedModel(Type.BPMN, artifact.definitionKey(), xml, artifact.sha256(),
+                        AUTOMATION_ROOT_INPUT, null, null);
+                case DMN -> new PreparedModel(Type.DMN, artifact.definitionKey(), xml, artifact.sha256(),
+                        descriptor.decisionInputs(artifact.definitionKey()), null, null);
+                case CMMN -> throw invalid();
+            };
+        }).sorted(Comparator.comparing((PreparedModel model) -> model.type().name())
+                .thenComparing(PreparedModel::definitionKey)).toList();
+        Release release = publishInTransaction(actor, releaseKey, compiled.compiledSha256(), models, true);
+        try {
+            new VerifiedProcessModels(process, cmmn, dmn, validator).automation(actor.tenantId(), compiled.evidence(),
+                    compiled.source(), compiled.dependencyManifest(), release);
+        } catch (ProcessResourceNotFoundException inconsistent) {
+            throw invalidDeployment();
+        }
+    }
+
+    /** Verify an immutable descriptor against the exact original native deployment in the owning snapshot. */
+    public void requireVerifiedAutomation(@NotNull @Valid ImmutableReleaseVO descriptor) {
+        requireAutomationTransaction(false);
+        try {
+            var release = load(descriptor.tenantId(), descriptor.releaseVersion(), false, MAX_AUTOMATION_MODELS);
+            var verified = new VerifiedProcessModels(process, cmmn, dmn, validator).automation(descriptor.tenantId(),
+                    descriptor.compilerVersion(), descriptor.sourceSha256(), descriptor.compiledSha256(),
+                    descriptor.dependencySha256(), descriptor.source(), descriptor.dependencies(), release);
+            if (!AUTOMATION_ROOT_INPUT.equals(verified.root().inputs())) throw unavailable();
+        } catch (ProcessResourceNotFoundException inconsistent) {
+            throw new IllegalStateException("Stored automation deployment evidence is unavailable");
+        }
+    }
+
+    public void lockAutomationPublication(long tenantId) {
+        requireAutomationTransaction(true);
+        if (tenantId <= 0) throw invalid();
+        PlatformReleaseTenantFence.acquireShared(jdbc, tenantId);
+    }
+
+    private void requireAutomationTransaction(boolean writing) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())
+                || writing && TransactionSynchronizationManager.isCurrentTransactionReadOnly()) {
+            throw new IllegalStateException("Automation release requires its owning Process transaction");
+        }
+    }
+
     private Release publishInTransaction(ProcessActor actor, String releaseKey, String manifestHash,
-                                         List<PreparedModel> models) {
+                                         List<PreparedModel> models, boolean automation) {
         int inserted = jdbc.update("INSERT INTO " + table("tianji_process_release") + " "
                         + "(tenant_id, release_key, state, manifest_sha256, publisher_type, publisher_id, publisher_issuer, created_at) "
                         + "VALUES (?, ?, 'PREPARING', ?, ?, ?, ?, clock_timestamp()) ON CONFLICT DO NOTHING",
                 actor.tenantId(), releaseKey, manifestHash, actor.subjectType().name(), actor.subjectId(), actor.issuerFingerprint());
         if (inserted == 0) {
+            if (automation) throw conflict();
             Release existing = load(actor.tenantId(), releaseKey, true);
-            if (!existing.manifestSha256().equals(manifestHash)) throw conflict();
+            if (!existing.manifestSha256().equals(manifestHash) || isAutomationRelease(actor.tenantId(), existing)) throw conflict();
             return existing;
         }
         for (PreparedModel model : models) {
@@ -300,7 +366,7 @@ public final class ProcessReleaseService {
                 + "WHERE tenant_id=? AND release_key=? AND state='PREPARING'", actor.tenantId(), releaseKey) != 1) {
             throw new IllegalStateException("Process release could not be activated");
         }
-        return load(actor.tenantId(), releaseKey, false);
+        return load(actor.tenantId(), releaseKey, false, automation ? MAX_AUTOMATION_MODELS : MAX_MODELS);
     }
 
     private Definition deploy(long tenantId, String releaseKey, PreparedModel prepared) {
@@ -342,7 +408,38 @@ public final class ProcessReleaseService {
         };
     }
 
+    private Release loadLegacy(long tenantId, String releaseKey) {
+        Release release = load(tenantId, releaseKey, false);
+        if (isAutomationRelease(tenantId, release)) throw unavailable();
+        return release;
+    }
+
+    private boolean isAutomationRelease(long tenantId, Release release) {
+        var internalRoot = release.definitions().stream().filter(definition ->
+                definition.type() == Type.BPMN && AUTOMATION_ROOT_INPUT.equals(definition.inputs())).findFirst();
+        if (internalRoot.isEmpty()) return false;
+
+        String extensions = AutomationReleaseStore.releaseTable(schema);
+        boolean canRead = Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT pg_catalog.has_table_privilege(pg_catalog.to_regclass(?)::oid,'SELECT')
+                """, Boolean.class, extensions));
+        if (canRead && Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + extensions
+                + " WHERE tenant_id=? AND release_key=?)", Boolean.class, tenantId, release.releaseKey()))) return true;
+
+        // Validate ambiguous legacy single-input definitions even during a staged migration.
+        try {
+            new VerifiedProcessModels(process, cmmn, dmn, validator).runningProcess(tenantId, internalRoot.get());
+            return false;
+        } catch (IllegalStateException | ProcessResourceNotFoundException inconsistent) {
+            return true;
+        }
+    }
+
     private Release load(long tenantId, String releaseKey, boolean lock) {
+        return load(tenantId, releaseKey, lock, MAX_MODELS);
+    }
+
+    private Release load(long tenantId, String releaseKey, boolean lock, int maxModels) {
         List<ReleaseRow> rows = jdbc.query("SELECT manifest_sha256, state, created_at FROM " + table("tianji_process_release")
                         + " WHERE tenant_id=? AND release_key=?" + (lock ? " FOR UPDATE" : ""),
                 (rs, row) -> new ReleaseRow(rs.getString("manifest_sha256"), rs.getString("state"),
@@ -355,7 +452,7 @@ public final class ProcessReleaseService {
                 (rs, row) -> new Definition(Type.valueOf(rs.getString("model_type")), rs.getString("definition_key"),
                         rs.getString("engine_definition_id"), rs.getString("engine_deployment_id"), rs.getInt("engine_version"),
                         rs.getString("model_sha256"), decodeSchema(rs.getString("input_schema"))), tenantId, releaseKey);
-        if (definitions.isEmpty() || definitions.size() > MAX_MODELS) throw unavailable();
+        if (definitions.isEmpty() || definitions.size() > maxModels) throw unavailable();
         ReleaseRow row = rows.getFirst();
         return new Release(releaseKey, row.hash(), row.createdAt(), definitions);
     }
@@ -558,7 +655,12 @@ public final class ProcessReleaseService {
                                  ValidatedProcessModel model, ValidatedCaseModel caseModel) {
         private PreparedModel {
             xml = xml.clone(); inputs = Map.copyOf(inputs);
-            if (type == Type.CMMN ? caseModel == null || model != null : model == null || caseModel != null) throw invalid();
+            boolean valid = switch (type) {
+                case CMMN -> caseModel != null && model == null;
+                case DMN -> caseModel == null;
+                case BPMN -> caseModel == null && (model != null || AUTOMATION_ROOT_INPUT.equals(inputs));
+            };
+            if (!valid) throw invalid();
         }
         @Override public byte[] xml() { return xml.clone(); }
     }

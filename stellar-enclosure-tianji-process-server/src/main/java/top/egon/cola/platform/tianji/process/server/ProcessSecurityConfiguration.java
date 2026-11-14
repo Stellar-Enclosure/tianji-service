@@ -42,6 +42,9 @@ import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessDraftController;
+import top.egon.cola.platform.tianji.process.server.api.ProcessAutomationController;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilotProperties;
@@ -120,7 +123,10 @@ public class ProcessSecurityConfiguration {
             MATCHER.matcher(HttpMethod.GET, ProcessDraftController.DRAFT_PATH),
             MATCHER.matcher(HttpMethod.PUT, ProcessDraftController.DRAFT_PATH),
             MATCHER.matcher(HttpMethod.GET, ProcessDraftController.LIST_PATH),
-            MATCHER.matcher(HttpMethod.POST, ProcessDraftController.DISCARD_PATH));
+            MATCHER.matcher(HttpMethod.POST, ProcessDraftController.DISCARD_PATH),
+            MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.VALIDATE_PATH),
+            MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.RELEASES_PATH),
+            MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.RELEASE_PATH));
 
     @Bean
     SecurityFilterChain processSecurityFilterChain(HttpSecurity http, Environment environment,
@@ -271,7 +277,8 @@ public class ProcessSecurityConfiguration {
                         "/api/tianji/v1" + ProcessController.CORRELATION_PATH, ProcessStartReceiptController.PATH,
                         "/api/tianji/v1/decisions", "/api/tianji/v1/decisions/**", "/api/tianji/v1/cases/start", "/api/tianji/v1/cases/get",
                         ProcessDraftController.CREATE_PATH, ProcessDraftController.DRAFT_PATH, ProcessDraftController.LIST_PATH,
-                        ProcessDraftController.DISCARD_PATH), true);
+                        ProcessDraftController.DISCARD_PATH, ProcessAutomationController.VALIDATE_PATH,
+                        ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH), true);
     }
 
     @Bean
@@ -323,6 +330,20 @@ public class ProcessSecurityConfiguration {
             var process = processConfiguration(engine);
             return new ProcessDraftCommandReceiptStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
                     process.getDatabaseSchema());
+        }
+
+        @Bean("automationReleaseStore")
+        @Lazy
+        AutomationReleaseStore automationReleaseStore(ProcessEngine engine) {
+            var process = processConfiguration(engine);
+            return new AutomationReleaseStore(new JdbcTemplate(processDraftTransactionManager(process).getDataSource()),
+                    process.getDatabaseSchema());
+        }
+
+        @Bean("automationReleaseDependencies")
+        @ConditionalOnMissingBean(name = "automationReleaseDependencies")
+        AutomationReleaseStore.DependencyResolver automationReleaseDependencies() {
+            return (actor, source) -> AutomationModelValidator.DependencySnapshotVO.empty(actor.tenantId());
         }
 
         @Bean("processDraftTransactionTemplate")

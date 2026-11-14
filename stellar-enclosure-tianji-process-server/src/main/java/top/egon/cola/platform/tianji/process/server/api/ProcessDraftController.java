@@ -33,6 +33,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.Dra
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.ProcessDraftDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.ProcessDraftPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.SaveProcessDraftCommand;
+import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
@@ -72,10 +74,18 @@ public class ProcessDraftController {
                                                   @Valid @RequestBody CreateProcessDraftCommand command, HttpServletRequest request) {
         var owner = access.require(DRAFT_CREATE_API);
         parameters(request, Set.of());
-        if (command.getBaseReleaseVersion() != null && !owner.equals(access.require(RELEASE_GET_API))) {
-            throw new AccessDeniedException("Draft source authorization changed");
-        }
+        if (command.getBaseReleaseVersion() != null) requireVisibleSource(owner);
         return noStore(service.create(owner, definitionKey, command));
+    }
+
+    private void requireVisibleSource(ProcessActor owner) {
+        ProcessActor reader;
+        try {
+            reader = access.require(AUTOMATION_RELEASE_GET_API);
+        } catch (AccessDeniedException denied) {
+            throw new ProcessResourceNotFoundException();
+        }
+        if (!owner.equals(reader)) throw new ProcessResourceNotFoundException();
     }
 
     @PermissionResource(key = DRAFT_GET_API, type = ResourceType.API, labelPage = PAGE, labelKey = "api.draft.get",

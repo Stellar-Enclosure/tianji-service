@@ -26,7 +26,9 @@ import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand
 import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorkerCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.CreateProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DiscardProcessDraftCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.PublishProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.SaveProcessDraftCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.ValidateProcessDraftQuery;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftContentCodec;
 
 import java.io.ByteArrayInputStream;
@@ -57,7 +59,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
-    private static final JsonMapper STRICT_PROCESS_CANCEL_JSON = JsonMapper.builder(JsonFactory.builder()
+    private static final JsonMapper STRICT_FLAT_PROCESS_JSON = JsonMapper.builder(JsonFactory.builder()
                     .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(2).maxStringLength(4096)
                             .maxNameLength(64).maxNumberLength(20).maxTokenCount(32).build()).build())
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -96,6 +98,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (type == CreateProcessDraftCommand.class) ProcessDraftContentCodec.validateCreateWire(body);
         if (type == SaveProcessDraftCommand.class) ProcessDraftContentCodec.validateSaveWire(body);
         if (type == DiscardProcessDraftCommand.class) ProcessDraftContentCodec.validateDiscardWire(body);
+        if (type == PublishProcessDraftCommand.class || type == ValidateProcessDraftQuery.class) validatePublicationBody(body, type);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
@@ -107,7 +110,32 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     }
 
     private static boolean draftCommand(Type type) {
-        return type == CreateProcessDraftCommand.class || type == SaveProcessDraftCommand.class || type == DiscardProcessDraftCommand.class;
+        return type == CreateProcessDraftCommand.class || type == SaveProcessDraftCommand.class || type == DiscardProcessDraftCommand.class
+                || type == PublishProcessDraftCommand.class || type == ValidateProcessDraftQuery.class;
+    }
+
+    private static void validatePublicationBody(byte[] body, Type type) {
+        boolean publishing = type == PublishProcessDraftCommand.class;
+        Set<String> fields = publishing
+                ? Set.of("draftId", "expectedRevision", "expectedContentSha256", "releaseVersion", "commandId")
+                : Set.of("draftId", "expectedRevision", "expectedContentSha256");
+        try {
+            String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var root = STRICT_FLAT_PROCESS_JSON.readTree(json);
+            if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(fields)
+                    || !root.get("expectedRevision").isIntegralNumber() || !root.get("expectedRevision").canConvertToLong()) {
+                throw invalidPublicationBody();
+            }
+            for (String field : fields) {
+                if (!"expectedRevision".equals(field) && !root.get(field).isString()) throw invalidPublicationBody();
+            }
+        } catch (CharacterCodingException | RuntimeException invalid) {
+            throw invalidPublicationBody();
+        }
+    }
+
+    private static IllegalArgumentException invalidPublicationBody() {
+        return new IllegalArgumentException("Invalid process automation request");
     }
 
     private static void validateWorkerBody(byte[] body, Type type) {
@@ -150,12 +178,12 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     private static void validateProcessCancel(byte[] body) {
         Set<String> fields = Set.of("instanceId", "commandId", "expectedVersion", "reason");
         try {
-            var root = STRICT_PROCESS_CANCEL_JSON.readTree(body);
+            var root = STRICT_FLAT_PROCESS_JSON.readTree(body);
             if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(fields)) {
                 throw invalidProcessCancel();
             }
             strings(root, fields);
-            STRICT_PROCESS_CANCEL_JSON.readValue(body, CancelProcessCommand.class);
+            STRICT_FLAT_PROCESS_JSON.readValue(body, CancelProcessCommand.class);
         } catch (RuntimeException invalid) {
             throw invalidProcessCancel();
         }
@@ -165,12 +193,12 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         Set<String> fields = Set.of("instanceId", "jobId", "commandId", "expectedVersion", "reason");
         try {
             String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
-            var root = STRICT_PROCESS_CANCEL_JSON.readTree(json);
+            var root = STRICT_FLAT_PROCESS_JSON.readTree(json);
             if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(fields)) {
                 throw invalidProcessWorkerRecovery();
             }
             strings(root, fields);
-            STRICT_PROCESS_CANCEL_JSON.readValue(json, RecoverProcessWorkerCommand.class);
+            STRICT_FLAT_PROCESS_JSON.readValue(json, RecoverProcessWorkerCommand.class);
         } catch (CharacterCodingException | RuntimeException invalid) {
             throw invalidProcessWorkerRecovery();
         }

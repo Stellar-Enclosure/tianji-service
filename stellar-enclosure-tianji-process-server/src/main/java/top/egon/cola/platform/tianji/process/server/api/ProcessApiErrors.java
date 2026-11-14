@@ -15,8 +15,7 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationErrorDTO;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
@@ -28,10 +27,10 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessCancellationBlo
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessWorkerRecoveryBlockedException;
 
+@Slf4j
 @RestControllerAdvice(basePackageClasses = ProcessController.class)
 @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
 public final class ProcessApiErrors {
-    private static final Logger log = LoggerFactory.getLogger(ProcessApiErrors.class);
     @ExceptionHandler(ProcessResourceNotFoundException.class)
     ResponseEntity<OrchestrationErrorDTO> notFound() { return error(HttpStatus.NOT_FOUND, "TIANJI_RESOURCE_NOT_FOUND"); }
 
@@ -98,7 +97,7 @@ public final class ProcessApiErrors {
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "TIANJI_INTERNAL_ERROR");
     }
 
-    private static ResponseEntity<OrchestrationErrorDTO> error(HttpStatus status, String code) {
+    static ResponseEntity<OrchestrationErrorDTO> error(HttpStatus status, String code) {
         return ResponseEntity.status(status).contentType(MediaType.APPLICATION_JSON).cacheControl(CacheControl.noStore())
                 .body(new OrchestrationErrorDTO(code, null));
     }
