@@ -27,6 +27,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorker
 import top.egon.cola.platform.tianji.contract.orchestration.automation.NodeRetryCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.CompleteEngineHumanTaskCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessEventCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.ActivationCommand;
@@ -47,6 +48,7 @@ import java.lang.reflect.Type;
 import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -58,6 +60,8 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     static final int MAX_BYTES = 9 * 1_048_576;
     static final int MAX_WORKER_BYTES = 256 * 1024;
     static final int MAX_AGENT_RESULT_BYTES = 64 * 1024;
+    static final int MAX_AGENT_RESULT_V2_BYTES = 16 * 1024;
+    static final int MAX_AGENT_INLINE_RESULT_BYTES = 8 * 1024;
     static final int MAX_PROCESS_CANCEL_BYTES = 4096;
     static final int MAX_PROCESS_WORKER_RECOVERY_BYTES = 8192;
     static final int MAX_DRAFT_SAVE_BYTES = 5 * 1024 * 1024;
@@ -80,6 +84,18 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             "routeVersion", "waitToken", "payload");
     private static final Pattern EVENT_INSTANT = Pattern.compile(
             "[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[.][0-9]{1,6})?Z");
+    private static final Set<String> AGENT_FIELDS = Set.of("schemaVersion", "producerId", "eventId", "tenantId",
+            "ownerIssuerSha256", "ownerSubjectId", "idempotencyKey", "link", "definitionKey", "definitionVersion",
+            "runId", "terminalRevision", "status", "finishedAt", "resultSha256", "sideEffectOutcome");
+    private static final Set<String> AGENT_V2_FIELDS = agentV2Fields();
+    private static final Set<String> AGENT_INTEGER_FIELDS = Set.of("schemaVersion", "tenantId", "definitionVersion", "terminalRevision");
+    private static final Set<String> AGENT_STRING_FIELDS = Set.of("producerId", "eventId", "ownerIssuerSha256", "ownerSubjectId",
+            "idempotencyKey", "definitionKey", "runId", "status", "finishedAt", "resultSha256", "sideEffectOutcome");
+    private static final Set<String> AGENT_LINK_FIELDS = Set.of("sourceId", "scopeType", "scopeInstanceId", "activityOccurrenceId",
+            "definitionContentSha256", "dispatchNotAfter");
+    private static final Set<String> AGENT_V2_PROVENANCE_FIELDS = Set.of("nodeExecutionRef", "configurationSha256", "inputSha256", "outputSchemaSha256");
+    private static final Set<String> AGENT_ARTIFACT_STRINGS = Set.of("resourceKey", "contentSha256", "mediaType");
+    private static final Set<String> AGENT_ARTIFACT_FIELDS = Set.of("resourceKey", "contentSha256", "mediaType", "sizeBytes");
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
@@ -108,7 +124,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     @Override
     public boolean supports(MethodParameter parameter, Type type, Class<? extends HttpMessageConverter<?>> converter) {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
-                || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
+                || workerCommand(type) || type == AgentTerminalEvent.class || agentResultUnion(parameter, type) || type == CancelProcessCommand.class
                 || type == RecoverProcessWorkerCommand.class || draftCommand(type) || type == ActivationCommand.class
                 || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class
                 || type == NodeRetryCommand.class || type == ProcessEventCommand.class || automationWorkerCommand(type);
@@ -117,6 +133,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
+        boolean agentUnion = agentResultUnion(parameter, type);
         if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class
                 || type == CompleteEngineHumanTaskCommand.class || type == NodeRetryCommand.class
                 || type == ProcessEventCommand.class || automationWorkerCommand(type)) {
@@ -137,13 +154,14 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
                 : type == ActivationCommand.class ? MAX_ACTIVATION_COMMAND_BYTES
                 : type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
                 : type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
-                : type == AgentTerminalEvent.class ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
+                : type == AgentTerminalEvent.class || agentUnion ? MAX_AGENT_RESULT_BYTES : workerCommand(type) ? MAX_WORKER_BYTES : MAX_BYTES;
         if (input.getHeaders().getContentLength() > maxBytes) throw new TooLarge();
         byte[] body = input.getBody().readNBytes(maxBytes + 1);
         if (body.length > maxBytes) throw new TooLarge();
         if (workerCommand(type)) validateWorkerBody(body, type);
         if (automationWorkerCommand(type)) validateAutomationWorkerBody(body, type);
         if (type == AgentTerminalEvent.class) validateAgentResult(body);
+        if (agentUnion) validateAgentResultUnion(body, input.getHeaders());
         if (type == CancelProcessCommand.class) validateProcessCancel(body);
         if (type == RecoverProcessWorkerCommand.class) validateProcessWorkerRecovery(body);
         if (type == CreateProcessDraftCommand.class) ProcessDraftContentCodec.validateCreateWire(body);
@@ -347,26 +365,123 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     }
 
     private static void validateAgentResult(byte[] body) {
-        Set<String> required = Set.of("schemaVersion", "producerId", "eventId", "tenantId", "ownerIssuerSha256", "ownerSubjectId",
-                "idempotencyKey", "link", "definitionKey", "definitionVersion", "runId", "terminalRevision", "status", "finishedAt",
-                "resultSha256", "sideEffectOutcome");
-        Set<String> linkFields = Set.of("sourceId", "scopeType", "scopeInstanceId", "activityOccurrenceId", "definitionContentSha256", "dispatchNotAfter");
         try {
-            var root = STRICT_AGENT_RESULT_JSON.readTree(body);
-            if (root == null || !root.isObject()) throw invalidAgentResult();
-            var fields = Set.copyOf(root.propertyNames());
-            if (!fields.containsAll(required) || fields.stream().anyMatch(name -> !required.contains(name) && !"errorCode".equals(name))) throw invalidAgentResult();
-            for (String name : Set.of("schemaVersion", "tenantId", "definitionVersion", "terminalRevision")) {
-                if (!root.get(name).isIntegralNumber() || !root.get(name).canConvertToLong()) throw invalidAgentResult();
-            }
-            strings(root, Set.of("producerId", "eventId", "ownerIssuerSha256", "ownerSubjectId", "idempotencyKey", "definitionKey", "runId",
-                    "status", "finishedAt", "resultSha256", "sideEffectOutcome"));
-            if (root.get("errorCode") != null && !root.get("errorCode").isNull() && !root.get("errorCode").isString()) throw invalidAgentResult();
-            var link = root.get("link");
-            if (link == null || !link.isObject() || !Set.copyOf(link.propertyNames()).equals(linkFields)) throw invalidAgentResult();
-            strings(link, linkFields);
+            validateAgentV1Fields(STRICT_AGENT_RESULT_JSON.readTree(body));
             STRICT_AGENT_RESULT_JSON.readValue(body, AgentTerminalEvent.class);
         } catch (RuntimeException invalid) { throw invalidAgentResult(); }
+    }
+
+    private static boolean agentResultUnion(MethodParameter parameter, Type type) {
+        return type == JsonNode.class && parameter != null && parameter.getContainingClass() == AgentResultInboxController.class;
+    }
+
+    private static void validateAgentResultUnion(byte[] body, HttpHeaders headers) {
+        try {
+            var root = STRICT_AUTOMATION_START_JSON.readTree(body);
+            int version = agentVersion(root);
+            if (version == 1) {
+                validateAgentResult(body);
+                return;
+            }
+            if (body.length > MAX_AGENT_RESULT_V2_BYTES) throw new TooLarge();
+            var contentType = headers.getContentType();
+            if (contentType != null && contentType.getCharset() != null && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
+                throw invalidAgentResult();
+            }
+            String utf8 = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            decodeAgentResult(STRICT_AUTOMATION_START_JSON.readTree(utf8));
+        } catch (TooLarge oversized) {
+            throw oversized;
+        } catch (CharacterCodingException | RuntimeException invalid) {
+            throw invalidAgentResult();
+        }
+    }
+
+    static AgentTerminalRequestVO decodeAgentResult(JsonNode root) {
+        try {
+            return switch (agentVersion(root)) {
+                case 1 -> {
+                    validateAgentV1Fields(root);
+                    yield new AgentTerminalRequestVO(STRICT_AGENT_RESULT_JSON.treeToValue(root, AgentTerminalEvent.class), null);
+                }
+                case 2 -> new AgentTerminalRequestVO(null, decodeAgentResultV2(root));
+                default -> throw invalidAgentResult();
+            };
+        } catch (TooLarge oversized) {
+            throw oversized;
+        } catch (RuntimeException invalid) {
+            throw invalidAgentResult();
+        }
+    }
+
+    private static int agentVersion(JsonNode root) {
+        if (root == null || !root.isObject()) throw invalidAgentResult();
+        var version = root.path("schemaVersion");
+        if (!version.isIntegralNumber() || !version.canConvertToLong()) throw invalidAgentResult();
+        long value = version.longValue();
+        if (value != 1 && value != 2) throw invalidAgentResult();
+        return (int) value;
+    }
+
+    private static void validateAgentV1Fields(JsonNode root) {
+        if (root == null || !root.isObject()) throw invalidAgentResult();
+        var fields = Set.copyOf(root.propertyNames());
+        if (!fields.containsAll(AGENT_FIELDS)
+                || fields.stream().anyMatch(name -> !AGENT_FIELDS.contains(name) && !"errorCode".equals(name))) throw invalidAgentResult();
+        validateAgentCommonFields(root);
+        var error = root.get("errorCode");
+        if (error != null && !error.isNull() && !error.isString()) throw invalidAgentResult();
+    }
+
+    private static JsonNode validateAgentCommonFields(JsonNode root) {
+        for (String name : AGENT_INTEGER_FIELDS) {
+            var number = root.path(name);
+            if (!number.isIntegralNumber() || !number.canConvertToLong()) throw invalidAgentResult();
+        }
+        strings(root, AGENT_STRING_FIELDS);
+        var link = root.path("link");
+        if (!link.isObject() || !Set.copyOf(link.propertyNames()).equals(AGENT_LINK_FIELDS)) throw invalidAgentResult();
+        strings(link, AGENT_LINK_FIELDS);
+        return link;
+    }
+
+    private static AgentTerminalEventV2 decodeAgentResultV2(JsonNode root) {
+        if (!Set.copyOf(root.propertyNames()).equals(AGENT_V2_FIELDS)) throw invalidAgentResult();
+        var link = validateAgentCommonFields(root);
+        strings(root, AGENT_V2_PROVENANCE_FIELDS);
+        if (!EVENT_INSTANT.matcher(root.path("finishedAt").asString()).matches()
+                || !EVENT_INSTANT.matcher(link.path("dispatchNotAfter").asString()).matches()) throw invalidAgentResult();
+        var error = root.get("errorCode");
+        if (!error.isNull() && !error.isString()) throw invalidAgentResult();
+        var artifact = root.get("artifactRef");
+        if (!artifact.isNull()) {
+            if (!artifact.isObject() || !Set.copyOf(artifact.propertyNames()).equals(AGENT_ARTIFACT_FIELDS)
+                    || !artifact.path("sizeBytes").isIntegralNumber() || !artifact.path("sizeBytes").canConvertToLong()) throw invalidAgentResult();
+            strings(artifact, AGENT_ARTIFACT_STRINGS);
+        }
+        var output = root.get("output");
+        if (!output.isNull()) {
+            if (!output.isObject()) throw invalidAgentResult();
+            Object typedOutput = STRICT_AUTOMATION_START_JSON.treeToValue(output, Map.class);
+            ProcessTypedJson.validateTypedIntegerLeaves(typedOutput);
+            if (ProcessTypedJson.canonicalBytes(typedOutput).length > MAX_AGENT_INLINE_RESULT_BYTES) throw new TooLarge();
+        }
+        // The record checks terminal shape, immutable output and both identities after exact wire validation.
+        var event = STRICT_AUTOMATION_START_JSON.treeToValue(root, AgentTerminalEventV2.class);
+        if (ProcessTypedJson.canonicalBytes(event.toWire()).length > MAX_AGENT_RESULT_V2_BYTES) throw new TooLarge();
+        return event;
+    }
+
+    private static Set<String> agentV2Fields() {
+        var fields = new HashSet<>(AGENT_FIELDS);
+        fields.addAll(Set.of("nodeExecutionRef", "configurationSha256", "inputSha256", "outputSchemaSha256", "output", "artifactRef", "errorCode"));
+        return Set.copyOf(fields);
+    }
+
+    record AgentTerminalRequestVO(AgentTerminalEvent v1, AgentTerminalEventV2 v2) {
+        AgentTerminalRequestVO {
+            if ((v1 == null) == (v2 == null)) throw invalidAgentResult();
+        }
     }
 
     private static void validateProcessCancel(byte[] body) {

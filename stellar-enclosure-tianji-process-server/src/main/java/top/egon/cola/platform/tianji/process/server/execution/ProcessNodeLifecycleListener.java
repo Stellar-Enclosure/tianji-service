@@ -32,6 +32,7 @@ import org.flowable.engine.impl.bpmn.behavior.AbstractBpmnActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.BoundaryTimerEventActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.ExternalWorkerTaskActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.IntermediateCatchMessageEventActivityBehavior;
+import org.flowable.engine.impl.bpmn.helper.ErrorPropagation;
 import org.flowable.engine.impl.bpmn.parser.BpmnParse;
 import org.flowable.engine.impl.jobexecutor.TimerEventHandler;
 import org.flowable.engine.impl.persistence.entity.ExecutionEntity;
@@ -1143,7 +1144,14 @@ public class ProcessNodeLifecycleListener {
             subscriptions.close(reservation);
             return;
         }
-        var message = execution.getEventSubscriptions().stream()
+        var message = exactNativeMessage(execution, root);
+        nodes.bindEventSubscription(row, message.getId());
+        subscriptions.bindExact(reservation,
+                new ProcessEventSubscriptionStore.NativeWaitVO(execution.getId(), message.getId(), row.getNodeExecutionRef()));
+    }
+
+    private static EventSubscriptionEntity exactNativeMessage(ExecutionEntity execution, AutomationInstanceBindingBO root) {
+        var messages = execution.getEventSubscriptions().stream()
                 .filter(item -> "message".equals(item.getEventType())
                         && ("tianji-v2:" + execution.getCurrentActivityId()).equals(item.getEventName())
                         && execution.getId().equals(item.getExecutionId()) && execution.getTenantId().equals(item.getTenantId())
@@ -1151,10 +1159,8 @@ public class ProcessNodeLifecycleListener {
                         && execution.getCurrentActivityId().equals(item.getActivityId())
                         && execution.getProcessDefinitionId().equals(item.getProcessDefinitionId()))
                 .limit(2).toList();
-        if (message.size() != 1) throw unavailable();
-        nodes.bindEventSubscription(row, message.getFirst().getId());
-        subscriptions.bindExact(reservation,
-                new ProcessEventSubscriptionStore.NativeWaitVO(execution.getId(), message.getFirst().getId(), row.getNodeExecutionRef()));
+        if (messages.size() != 1) throw unavailable();
+        return messages.getFirst();
     }
 
     public boolean acceptEventResult(AutomationInstanceBindingBO root, ImmutableReleaseVO release, EventRouteVO route,
@@ -1241,6 +1247,65 @@ public class ProcessNodeLifecycleListener {
         applyNodeOutput(wait.context(), wait.definition(), row.getOutput(), wait.occurrence());
         nodes.finish(row, StateEnum.COMPLETED);
         publish(wait.context(), "NODE_COMPLETED", nodes.now(), row, null);
+    }
+
+    private void bindAgentWait(ExecutionEntity execution) {
+        var wait = exactAgentWait(execution);
+        if (wait == null) return;
+        var subscription = exactNativeMessage(execution, wait.context().binding());
+        nodes.bindAgentSubscription(wait.row(), subscription.getId());
+    }
+
+    /** Returns true when failure handling owns continuation or keeps the exact native wait parked. */
+    private boolean onAgentWaitResult(ExecutionEntity execution) {
+        var wait = exactAgentWait(execution);
+        if (wait == null) return false;
+        var row = wait.row();
+        if (row.isExcluded() || row.getNativeJobId() == null || row.getAgentRunId() == null || row.getAcceptedAt() == null
+                || !exactNativeMessage(execution, wait.context().binding()).getId().equals(row.getNativeSubscriptionId())) {
+            throw unavailable();
+        }
+        if (row.getState() == StateEnum.RESULT_ACCEPTED && row.getOutput() != null && row.getErrorCode() == null) {
+            applyNodeOutput(wait.context(), wait.definition(), row.getOutput(), wait.occurrence());
+            nodes.finish(row, StateEnum.COMPLETED);
+            publish(wait.context(), "NODE_COMPLETED", nodes.now(), row, null);
+            return false;
+        }
+        if (row.getState() != StateEnum.FAILED || row.getOutput() != null || row.getErrorCode() == null) throw unavailable();
+        String action = wait.definition().policy().onFailure().action();
+        if ("WAIT_RECOVERY".equals(action) || "RETRY".equals(action)) {
+            // Keep the native attempt and its original hard timer. Only a separate authorized recovery can leave this wait.
+            nodes.parkFailedAgentResult(row);
+            return true;
+        }
+        var slots = wait.context().verified().controlBindings().policySlots().get(row.getNodeId());
+        if (slots == null || slots.failureBoundaryId() == null) throw unavailable();
+        captureBoundary(row, slots.failureBoundaryId(), "FAILURE", wait.occurrence().getCurrentActivityId());
+        ErrorPropagation.propagateError("TIANJI_AUTOMATION_NODE_FAILURE", execution);
+        return true;
+    }
+
+    private EventWaitVO exactAgentWait(ExecutionEntity execution) {
+        var context = context(execution);
+        var entry = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(item -> execution.getCurrentActivityId().equals(item.getValue().waitId())).findFirst().orElse(null);
+        if (entry == null) return null;
+        var definition = binding(context.release(), entry.getKey());
+        if (definition.agent() == null || !"AGENT".equals(definition.kind())) return null;
+        var slot = entry.getValue();
+        var attempt = requireParent(execution);
+        var occurrence = requireParent(attempt);
+        var root = context.binding();
+        var row = nodes.findAttempt(root.getTenantId(), root.getInstanceId(), attempt.getId())
+                .orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        if (!slot.attemptOrBodyId().equals(attempt.getCurrentActivityId())
+                || !slot.scopeId().equals(occurrence.getCurrentActivityId())
+                || row.getKind() != KindEnum.AGENT || !entry.getKey().equals(row.getNodeId())
+                || !occurrence.getParentId().equals(row.getParentScopeId())
+                || !occurrenceId(root, row.getNodeId(), occurrence.getId()).equals(row.getOccurrenceId())
+                || !root.getConfigurationSha256().equals(row.getConfigurationSha256())
+                || !schemaSha256(definition.outputSchema()).equals(row.getOutputSchemaSha256())) throw unavailable();
+        return new EventWaitVO(context, definition, row, occurrence);
     }
 
     void onUserTask(DelegateTask task, boolean complete) {
@@ -2183,11 +2248,14 @@ public class ProcessNodeLifecycleListener {
         public void execute(DelegateExecution execution) {
             super.execute(execution);
             listener.get().bindEventWait((ExecutionEntity) execution);
+            listener.get().bindAgentWait((ExecutionEntity) execution);
         }
 
         @Override
         public void trigger(DelegateExecution execution, String signal, Object data) {
-            listener.get().onEventWaitResult(execution);
+            var active = listener.get();
+            if (active.onAgentWaitResult((ExecutionEntity) execution)) return;
+            active.onEventWaitResult(execution);
             super.trigger(execution, signal, data);
         }
     }

@@ -13,8 +13,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.JsonNode;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
-import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
@@ -58,10 +58,11 @@ public class AgentResultInboxController {
             allowedPrincipals = PermissionManifest.PrincipalType.SERVICE, oauthScopes = TianjiProcessPermissions.AGENT_RESULT_RECEIVE_SCOPE)
     @RequiresPermissions(codes = TianjiProcessPermissions.AGENT_RESULT_RECEIVE)
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<AgentResultReceipt> receive(@RequestBody AgentTerminalEvent event) {
+    public ResponseEntity<AgentResultReceipt> receive(@RequestBody JsonNode body) {
         ProcessActor producer = access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API);
         if (producer.subjectType() != ProcessActor.SubjectType.SERVICE) throw new AccessDeniedException("service identity required");
-        var receipt = inbox.receive(producer, event);
+        var event = ProcessRequestBodyAdvice.decodeAgentResult(body);
+        var receipt = event.v2() == null ? inbox.receive(producer, event.v1()) : inbox.receiveV2(producer, event.v2());
         observation.afterReceive();
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(receipt);
     }

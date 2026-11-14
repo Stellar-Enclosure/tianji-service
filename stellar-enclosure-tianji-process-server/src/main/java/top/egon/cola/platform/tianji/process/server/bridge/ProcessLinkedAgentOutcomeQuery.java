@@ -47,6 +47,7 @@ public final class ProcessLinkedAgentOutcomeQuery {
     private static final String ANCHOR_DOMAIN = "TIANJI_PROCESS_AGENT_OUTCOME_CURSOR_V1";
     private static final Set<String> LATE = Set.of("DISPATCH_CLOSED", "WAIT_ENDED", "MESSAGE_CONSUMED");
     private static final Set<String> DEAD = Set.of("DISPATCH_MISMATCH", "RETRY_DEADLINE", "RETRY_EXHAUSTED");
+    private static final String TYPED_RESULT_SCHEMA_MISMATCH = "RESULT_SCHEMA_MISMATCH";
 
     private final DataSource source;
     private final String schema;
@@ -216,16 +217,17 @@ public final class ProcessLinkedAgentOutcomeQuery {
     private ItemDTO received(ResultSet rs, TaskOrigin start, AgentDispatchStore.Key key, DispatchState dispatch,
             String run, Instant created, Instant deadline, Instant observedAt, String activity) throws SQLException {
         var entry = AgentResultInbox.read(rs);
-        var event = entry.event();
-        var registration = producers.require(entry.producer(), event);
+        var registration = entry.eventV2() == null
+                ? producers.require(entry.producer(), entry.event())
+                : producers.requireV2(entry.producer(), entry.eventV2());
         var receipt = entry.receipt();
         var received = receipt.receivedAt();
         var decided = entry.decidedAt();
         String reason = rs.getString("decision_code");
         if (!registration.owner().equals(key.actor()) || !registration.sourceId().equals(key.sourceId())
-                || !key.instanceId().equals(event.link().scopeInstanceId())
-                || !key.occurrenceId().equals(event.link().activityOccurrenceId())
-                || !event.runId().equals(run) || received.isBefore(created) || received.isAfter(observedAt)
+                || !key.instanceId().equals(entry.link().scopeInstanceId())
+                || !key.occurrenceId().equals(entry.link().activityOccurrenceId())
+                || !entry.runId().equals(run) || received.isBefore(created) || received.isAfter(observedAt)
                 || decided != null && (decided.isBefore(received) || decided.isAfter(observedAt))) throw unavailable();
         switch (receipt.state()) {
             case RECEIVED -> {
@@ -234,7 +236,7 @@ public final class ProcessLinkedAgentOutcomeQuery {
             case APPLIED -> {
                 if (dispatch == DispatchState.SUBMITTED || !"MESSAGE_APPLIED".equals(reason) || decided == null
                         || !"APPLIED".equals(rs.getString("audit_state"))
-                        || !event.fingerprint().equals(rs.getString("audit_hash"))
+                        || !entry.fingerprint().equals(rs.getString("audit_hash"))
                         || !start.releaseKey().equals(rs.getString("audit_release"))
                         || !start.correlationId().equals(rs.getString("audit_correlation"))
                         || rs.getString("audit_resource") == null || rs.getString("audit_resource").isBlank()) throw unavailable();
@@ -243,7 +245,8 @@ public final class ProcessLinkedAgentOutcomeQuery {
                 if (reason == null || !LATE.contains(reason) || decided == null) throw unavailable();
             }
             case DEAD -> {
-                if (reason == null || !DEAD.contains(reason) || decided == null) throw unavailable();
+                if (reason == null || decided == null || !DEAD.contains(reason)
+                        && !(entry.eventV2() != null && TYPED_RESULT_SCHEMA_MISMATCH.equals(reason))) throw unavailable();
             }
         }
         AgentRunStatusEnum terminal = null;
@@ -251,10 +254,10 @@ public final class ProcessLinkedAgentOutcomeQuery {
             var link = new AgentProcessLink(key.sourceId(), WorkerScopeTypeEnum.BPMN, key.instanceId(), key.occurrenceId(),
                     rs.getString("agent_definition_sha256"), deadline);
             if (!new LinkedAgentLookupQuery(AgentDispatchStore.idempotencyKey(key), link)
-                    .equals(new LinkedAgentLookupQuery(event.idempotencyKey(), event.link()))
-                    || !event.definitionKey().equals(rs.getString("agent_definition_key"))
-                    || event.definitionVersion() != rs.getLong("agent_definition_version")) throw unavailable();
-            terminal = event.status();
+                    .equals(new LinkedAgentLookupQuery(entry.idempotencyKey(), entry.link()))
+                    || !entry.definitionKey().equals(rs.getString("agent_definition_key"))
+                    || entry.definitionVersion() != rs.getLong("agent_definition_version")) throw unavailable();
+            terminal = entry.status();
         }
         return new ItemDTO(activity, dispatch, InboxState.valueOf(receipt.state().name()), terminal, created, received, decided);
     }

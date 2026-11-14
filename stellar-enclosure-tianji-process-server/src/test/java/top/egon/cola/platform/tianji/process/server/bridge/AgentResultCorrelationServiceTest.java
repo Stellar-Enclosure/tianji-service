@@ -10,8 +10,12 @@ import org.mockito.MockedConstruction;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentResultArtifactRefVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
@@ -198,6 +202,41 @@ class AgentResultCorrelationServiceTest {
             verify(connection).rollback();
             verify(connection, times(2)).commit();
         }
+    }
+
+    @Test
+    void typed_result_respects_the_frozen_schema_and_rejects_a_wire_shape_switch() {
+        var inline = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of("answer", Map.of("type", "string")),
+                "required", List.of("answer"), "additionalProperties", false));
+        assertEquals(Map.of("answer", "ok"), AgentResultCorrelationService.normalizeResult(
+                typedResult(Map.of("answer", "ok"), null), inline));
+        assertThrows(IllegalArgumentException.class, () -> AgentResultCorrelationService.normalizeResult(
+                typedResult(Map.of("answer", 1), null), inline));
+        var artifact = new AgentResultArtifactRefVO("artifact-key", "a".repeat(64), "application/json", 30L);
+        assertThrows(IllegalArgumentException.class, () -> AgentResultCorrelationService.normalizeResult(
+                typedResult(null, artifact), inline));
+        var schema = ProcessSchemaVO.fromWire(Map.of("type", "object", "additionalProperties", false,
+                "properties", Map.of(
+                        "resourceKey", Map.of("type", "string", "maxLength", 128, "pattern", "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"),
+                        "contentSha256", Map.of("type", "string", "maxLength", 64, "pattern", "^[0-9a-f]{64}$"),
+                        "mediaType", Map.of("type", "string", "maxLength", 127, "pattern", "^[a-z0-9.+-]{1,63}/[a-z0-9.+-]{1,63}$"),
+                        "sizeBytes", Map.of("type", "integer", "minimum", 0, "maximum", 999999999999999L)),
+                "required", List.of("sizeBytes", "resourceKey", "mediaType", "contentSha256")));
+        assertEquals(artifact.toWire(), AgentResultCorrelationService.normalizeResult(typedResult(null, artifact), schema));
+        assertThrows(IllegalArgumentException.class, () -> AgentResultCorrelationService.normalizeResult(
+                typedResult(artifact.toWire(), null), schema));
+    }
+
+    private AgentTerminalEventV2 typedResult(Map<String, Object> output, AgentResultArtifactRefVO artifact) {
+        var status = AgentRunStatusEnum.COMPLETED;
+        var effect = AgentTerminalEventV2.SideEffectOutcomeEnum.NONE;
+        String hash = "a".repeat(64);
+        String eventId = AgentTerminalEventV2.eventIdFor(event.producerId(), event.tenantId(), event.ownerIssuerSha256(),
+                event.ownerSubjectId(), event.runId(), event.terminalRevision());
+        return new AgentTerminalEventV2(2, event.producerId(), eventId, event.tenantId(), event.ownerIssuerSha256(),
+                event.ownerSubjectId(), event.idempotencyKey(), event.link(), event.definitionKey(), event.definitionVersion(),
+                event.runId(), event.terminalRevision(), "node-result", hash, hash, hash, status, event.finishedAt(),
+                AgentTerminalEventV2.resultSha256(status, output, artifact, null, effect), output, artifact, null, effect);
     }
 
     private AgentResultCorrelationService service() { return new AgentResultCorrelationService(process, workers, inbox, Duration.ofSeconds(1), 3); }

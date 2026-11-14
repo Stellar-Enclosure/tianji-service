@@ -1,7 +1,11 @@
 package top.egon.cola.platform.tianji.process.server.bridge;
 
+import org.flowable.dmn.engine.DmnEngine;
+import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -12,6 +16,12 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.scheduling.concurrent.ConcurrentTaskScheduler;
 import top.egon.cola.platform.tianji.client.HttpLinkedAgentClient;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentClient;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
+import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
+import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
+import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
@@ -49,11 +59,32 @@ public class ProcessAgentBridgeConfiguration {
         };
     }
 
-    @Bean
+    @Bean("agentResultCorrelationService")
     AgentResultCorrelationService agentResultCorrelationService(ProcessEngine engine, FlowableWorkerService workers,
-            AgentResultInbox inbox, AgentDispatchStore dispatches, AgentResultProducerRegistry producers, ProcessAgentBridgeProperties properties) {
+            AgentResultInbox inbox, AgentDispatchStore dispatches, AgentResultProducerRegistry producers, ProcessAgentBridgeProperties properties,
+            @Qualifier("automationInstanceGuardCommandInterceptor") ObjectProvider<AutomationInstanceGuardCommandInterceptor> guards,
+            @Qualifier("automationReleaseStore") ObjectProvider<AutomationReleaseStore> releases,
+            @Qualifier("processNodeExecutionStore") ObjectProvider<ProcessNodeExecutionStore> nodes,
+            ObjectProvider<ProcessReleaseService> releaseServices, ObjectProvider<ProcessModelValidator> validators,
+            ObjectProvider<DmnEngine> decisions) {
         inbox.requireBindings(dispatches, producers);
-        return new AgentResultCorrelationService(configuration(engine), workers, inbox, properties.inboxRetryDelay(), properties.inboxMaxFailures());
+        var process = configuration(engine);
+        var guard = guards.getIfAvailable();
+        var releaseStore = releases.getIfAvailable();
+        var nodeStore = nodes.getIfAvailable();
+        if (guard == null && releaseStore == null && nodeStore == null) {
+            return new AgentResultCorrelationService(process, workers, inbox, properties.inboxRetryDelay(), properties.inboxMaxFailures());
+        }
+        var releaseService = releaseServices.getIfAvailable();
+        var validator = validators.getIfAvailable();
+        var decisionEngine = decisions.getIfAvailable();
+        if (guard == null || releaseStore == null || nodeStore == null || releaseService == null || validator == null
+                || decisionEngine == null || !(decisionEngine.getDmnEngineConfiguration() instanceof SpringDmnEngineConfiguration dmn)
+                || !(process.getTransactionManager() instanceof DataSourceTransactionManager manager)
+                || !releaseService.usesStorage(process, manager.getDataSource(), manager)) throw invalid();
+        var inspector = new FlowableAgentWaitInspector(process, releaseService, new VerifiedProcessModels(process, dmn, validator), validator);
+        var typed = new AgentResultCorrelationService.TypedParticipantsVO(guard, releaseStore, releaseService, nodeStore, inspector);
+        return new AgentResultCorrelationService(process, workers, inbox, properties.inboxRetryDelay(), properties.inboxMaxFailures(), typed);
     }
 
     @Bean(destroyMethod = "close")

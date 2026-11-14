@@ -28,6 +28,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInbox;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxProperties;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -38,10 +39,12 @@ import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3Authorizatio
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -59,6 +62,71 @@ class AgentResultInboxControllerTest {
     private final TianjiProcessAccess access = mock(TianjiProcessAccess.class);
     private final ProcessActor producer = ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "agent-result-service", "https://idp.example/20");
     private final AgentTerminalEvent event = event();
+
+    @Test
+    void accepts_exact_legacy_and_v2_terminal_events_on_the_same_private_route() throws Exception {
+        when(access.require(TianjiProcessPermissions.AGENT_RESULT_RECEIVE_API)).thenReturn(producer);
+        var oldReceipt = new AgentResultReceipt(event.eventId(), event.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+        when(inbox.receive(producer, event)).thenReturn(oldReceipt);
+        var v2 = typedEvent();
+        var typedReceipt = new AgentResultReceipt(v2.eventId(), v2.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+        when(inbox.receiveV2(producer, v2)).thenReturn(typedReceipt);
+        var mvc = mvc();
+        mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(event)))
+                .andExpect(status().isAccepted()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.eventFingerprint").value(event.fingerprint()));
+        mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON).content(v2.canonicalBytes()))
+                .andExpect(status().isAccepted()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(jsonPath("$.eventId").value(v2.eventId())).andExpect(jsonPath("$.eventFingerprint").value(v2.fingerprint()))
+                .andExpect(jsonPath("$.state").value("RECEIVED")).andExpect(jsonPath("$.receivedAt").value(NOW.toString()))
+                .andExpect(jsonPath("$.length()").value(4));
+        verify(inbox).receive(producer, event);
+        verify(inbox).receiveV2(producer, v2);
+        verifyNoMoreInteractions(inbox);
+    }
+
+    @Test
+    void rejects_mixed_or_open_v2_envelopes_before_authentication_or_storage() throws Exception {
+        var v2 = typedEvent();
+        String wire = new String(v2.canonicalBytes(), StandardCharsets.UTF_8);
+        var mvc = mvc();
+        for (String invalid : List.of(
+                wire.replace("\"schemaVersion\":2,", ""),
+                wire.replace("\"schemaVersion\":2", "\"schemaVersion\":3"),
+                wire.replace("\"schemaVersion\":2", "\"schemaVersion\":2.0"),
+                wire.replace("\"schemaVersion\":2", "\"schemaVersion\":2,\"schemaVersion\":2"),
+                wire.replace("\"schemaVersion\":2", "\"schemaVersion\":1"),
+                wire.replace("\"artifactRef\":null,", ""),
+                wire.replace("\"errorCode\":null,", ""),
+                wire.replace("\"output\":{\"approved\":true},", ""),
+                wire.replace("\"approved\":true", "\"approved\":true,\"approved\":true"),
+                wire.replace("\"scopeType\":\"BPMN\"", "\"scopeType\":\"CMMN\""),
+                wire.replace("\"finishedAt\":\"" + NOW + "\"", "\"finishedAt\":\"2026-10-30T00:00:00.0000001Z\""),
+                wire.replace("\"finishedAt\":\"" + NOW + "\"", "\"finishedAt\":\"2026-10-30T08:00:00+08:00\""),
+                wire.replace(v2.resultSha256(), "1".repeat(64)),
+                wire.substring(0, wire.length() - 1) + ",\"unregistered\":true}",
+                wire + " {}")) {
+            assertNotEquals(wire, invalid);
+            mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON).content(invalid))
+                    .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("TIANJI_INVALID_COMMAND"));
+        }
+        verifyNoInteractions(inbox, access);
+    }
+
+    @Test
+    void bounds_actual_v2_request_and_inline_output_separately() throws Exception {
+        var v2 = typedEvent();
+        String wire = new String(v2.canonicalBytes(), StandardCharsets.UTF_8);
+        String largeEnvelope = wire + " ".repeat(16 * 1024 + 1 - wire.length());
+        String largeInline = wire.replace("{\"approved\":true}", "{\"approved\":\"" + "a".repeat(8 * 1024) + "\"}");
+        assertTrue(largeInline.getBytes(StandardCharsets.UTF_8).length < 16 * 1024);
+        var mvc = mvc();
+        mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON).content(largeEnvelope))
+                .andExpect(status().isPayloadTooLarge());
+        mvc.perform(post(AgentResultTraceLinkCarrier.PATH).contentType(MediaType.APPLICATION_JSON).content(largeInline))
+                .andExpect(status().isPayloadTooLarge());
+        verifyNoInteractions(inbox, access);
+    }
 
     @Test
     void returns_only_the_durable_receipt_after_authorizing_a_service_identity() throws Exception {
@@ -266,5 +334,17 @@ class AgentResultInboxControllerTest {
         return new AgentTerminalEvent(1, "agent-east", AgentTerminalEvent.eventIdFor("agent-east", 20, "b".repeat(64), "process-worker", "run-one", 3),
                 20, "b".repeat(64), "process-worker", "intent", link, "research", 2, "run-one", 3, AgentRunStatusEnum.COMPLETED,
                 NOW, "c".repeat(64), null, "UNKNOWN");
+    }
+
+    private static AgentTerminalEventV2 typedEvent() {
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "typed-occurrence", "a".repeat(64), NOW.plusSeconds(60));
+        var status = AgentRunStatusEnum.COMPLETED;
+        var outcome = AgentTerminalEventV2.SideEffectOutcomeEnum.NONE;
+        Map<String, Object> output = Map.of("approved", true);
+        String id = AgentTerminalEventV2.eventIdFor("agent-east", 20, "b".repeat(64), "process-worker", "typed-run", 3);
+        String result = AgentTerminalEventV2.resultSha256(status, output, null, null, outcome);
+        return new AgentTerminalEventV2(2, "agent-east", id, 20, "b".repeat(64), "process-worker", "typed-intent", link,
+                "research", 2, "typed-run", 3, "typed-node", "d".repeat(64), "e".repeat(64), "f".repeat(64),
+                status, NOW, result, output, null, null, outcome);
     }
 }

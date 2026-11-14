@@ -1,7 +1,9 @@
 package top.egon.cola.platform.tianji.process.server.bridge;
 
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 
@@ -23,10 +25,22 @@ public final class AgentResultProducerRegistry {
     }
 
     public Registration require(ProcessActor authenticated, AgentTerminalEvent event) {
-        if (!service(authenticated) || event == null || authenticated.tenantId() != event.tenantId()
-                || event.link().scopeType() != WorkerScopeTypeEnum.BPMN) throw new ProcessResourceNotFoundException();
-        var owner = new ProcessActor(event.tenantId(), ProcessActor.SubjectType.SERVICE, event.ownerSubjectId(), event.ownerIssuerSha256());
-        Registration registration = registrations.get(key(authenticated, event.producerId(), event.link().sourceId(), owner));
+        if (event == null) throw new ProcessResourceNotFoundException();
+        return require(authenticated, event.tenantId(), event.producerId(), event.link(), event.ownerSubjectId(), event.ownerIssuerSha256());
+    }
+
+    public Registration requireV2(ProcessActor authenticated, AgentTerminalEventV2 event) {
+        if (event == null) throw new ProcessResourceNotFoundException();
+        return require(authenticated, event.tenantId(), event.producerId(), event.link(), event.ownerSubjectId(), event.ownerIssuerSha256());
+    }
+
+    private Registration require(ProcessActor authenticated, long tenantId, String producerId, AgentProcessLink link,
+                                 String ownerSubjectId, String ownerIssuerSha256) {
+        if (!service(authenticated) || authenticated.tenantId() != tenantId || link.scopeType() != WorkerScopeTypeEnum.BPMN) {
+            throw new ProcessResourceNotFoundException();
+        }
+        var owner = new ProcessActor(tenantId, ProcessActor.SubjectType.SERVICE, ownerSubjectId, ownerIssuerSha256);
+        Registration registration = registrations.get(key(authenticated, producerId, link.sourceId(), owner));
         if (registration == null) throw new ProcessResourceNotFoundException();
         return registration;
     }
