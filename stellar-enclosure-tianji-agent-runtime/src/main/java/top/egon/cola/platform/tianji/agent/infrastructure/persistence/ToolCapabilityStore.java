@@ -16,6 +16,7 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
@@ -143,13 +144,18 @@ public final class ToolCapabilityStore {
         var run = binding.run(); var actor = run.actor(); databaseNow();
         String states = queuedOnly ? "status='QUEUED'" : "status IN ('QUEUED','RUNNING')";
         var deadlines = jdbc.query("SELECT deadline_at FROM tianji_agent.agent_run WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=? AND run_id=?"
-                        + " AND cancel_requested_at IS NULL AND deadline_at>clock_timestamp() AND " + states + " FOR SHARE",
+                        + " AND cancel_requested_at IS NULL AND deadline_at>clock_timestamp() AND " + states + " FOR UPDATE",
                 (rs, number) -> rs.getTimestamp("deadline_at").toInstant(), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), run.runId());
         if (deadlines.size() > 1) throw unavailable();
         if (deadlines.isEmpty() || !deadlines.getFirst().equals(run.deadlineAt()) || !deadlines.getFirst().isAfter(databaseNow())) return false;
         AgentLedgerService.ExecutionMaterial material;
-        try { material = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId())); }
-        catch (RuntimeException malformedSource) { throw unavailable(); }
+        try {
+            material = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId()));
+        } catch (AgentLedgerService.RuntimeProfileRequiredException runtime) {
+            return requireRuntimeSource(binding, queuedOnly);
+        } catch (RuntimeException malformedSource) {
+            throw unavailable();
+        }
         if (material == null) throw unavailable();
         if (!run.equals(material.authorization())) return false;
         var snapshot = material.snapshot(); var policy = snapshot.effectivePolicy();
@@ -158,6 +164,25 @@ public final class ToolCapabilityStore {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Tool version or policy is not allowed by the immutable execution snapshot");
         }
         return run.deadlineAt().isAfter(databaseNow());
+    }
+
+    private boolean requireRuntimeSource(ToolExecutionGrant.BindingVO binding, boolean queuedOnly) {
+        var requested = binding.run();
+        AgentLedgerService.ToolRunEvidenceVO material;
+        try {
+            material = ledger.toolRunEvidence(requested.actor(), new GetAgentRunQuery(requested.runId()));
+        } catch (RuntimeException malformedSource) {
+            throw unavailable();
+        }
+        if (material.profile() != AgentLedgerService.RunProfileEnum.RUNTIME_V2 || material.processLink() == null) throw unavailable();
+        if (!requested.equals(material.authorization())) return false;
+        if (material.maxToolCalls() < 1 || !material.toolRefs().contains(binding.tool())) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Tool version or policy is not allowed by the immutable execution snapshot");
+        }
+        var now = databaseNow();
+        return requested.deadlineAt().isAfter(now)
+                && (material.run().status() == AgentRunStatusEnum.QUEUED
+                    || !queuedOnly && material.activeLease() != null && material.activeLease().expiresAt().isAfter(now));
     }
 
     private Optional<StoredCapabilityResult> read(ToolExecutionGrant.BindingVO binding) {

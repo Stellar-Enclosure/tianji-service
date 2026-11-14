@@ -22,6 +22,7 @@ import top.egon.cola.component.agentflow.api.execution.AgentExecutionResult;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutor;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextBO;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
+import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Decision;
@@ -77,7 +78,15 @@ public class AgentRuntimeExecutionService {
     private final AgentRuntimeCallReceiptStore receipts;
     @Qualifier("tianjiRuntimeReceiptTransaction")
     private final TransactionTemplate receiptTransaction;
+    @Qualifier("tianjiRuntimeToolExecutionService")
+    private final AgentRuntimeToolExecutionService tools;
     private final String workerId = UUID.randomUUID().toString();
+
+    public AgentRuntimeExecutionService(AgentLedgerService ledger, AgentRunAuthorization authorization, AgentExecutor executor,
+                                        TianjiHostContextConverter contextMapper, ScheduledThreadPoolExecutor control,
+                                        AgentRuntimeCallReceiptStore receipts, TransactionTemplate receiptTransaction) {
+        this(ledger, authorization, executor, contextMapper, control, receipts, receiptTransaction, null);
+    }
 
     boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
 
@@ -156,6 +165,7 @@ public class AgentRuntimeExecutionService {
                     boolean exact = switch (purpose) {
                         case "EXECUTE" -> material.template().getExecutorRef().equals(capability);
                         case "MODEL_CALL" -> permitsModel(material, capability);
+                        case "TOOL_CALL" -> tools != null && toolRefs(material).anyMatch(ref -> ref.key().equals(capability));
                         default -> false;
                     };
                     if (!scope.equals(requestedScope) || !exact || cancellation.isDone()) throw unavailable();
@@ -163,6 +173,19 @@ public class AgentRuntimeExecutionService {
                             claim.run().revision(), null, deadline, cancellation::isDone,
                             (permit, currentPurpose) -> purpose.equals(currentPurpose));
                 }, request -> beginModelCall(actor, material, claim, scope, cancellation, request));
+        if (tools != null) {
+            context.setToolCallHandler((request, boundary) -> {
+                if (!scope.equals(request.scope()) || !claim.run().runId().equals(request.executionId())
+                        || toolRefs(material).noneMatch(ref -> ref.key().equals(request.toolRef().key())
+                                && ref.version() == request.toolRef().version()
+                                && ref.contentSha256().equals(request.toolRef().contentSha256()))) throw unavailable();
+                Runnable current = () -> {
+                    if (cancellation.isDone()) throw leaseLost();
+                };
+                current.run();
+                return tools.execute(material, ledger.renewRuntimeLease(actor, claim.lease(), LEASE_DURATION), request, boundary, current);
+            });
+        }
         var timer = control.scheduleWithFixedDelay(() -> checkLease(actor, claim, stop, cancellation),
                 1, 1, TimeUnit.SECONDS);
         AgentExecutionResult result;
@@ -251,6 +274,12 @@ public class AgentRuntimeExecutionService {
         var config = material.template().getConfiguration();
         return config.agenticPlan() == null ? config.modelRef().equals(ref)
                 : config.agenticPlan().agents().stream().anyMatch(leaf -> leaf.modelRef().equals(ref));
+    }
+
+    private static java.util.stream.Stream<TemplateDependencyRefVO> toolRefs(RuntimeExecutionMaterialVO material) {
+        var config = material.template().getConfiguration();
+        return config.agenticPlan() == null ? config.toolRefs().stream()
+                : config.agenticPlan().agents().stream().flatMap(leaf -> leaf.toolRefs().stream());
     }
 
     private static Long tokenCount(Integer value) { return value == null ? null : value.longValue(); }

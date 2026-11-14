@@ -135,6 +135,33 @@ class ToolActionApprovalSqlTest {
         }
     }
 
+    @Test void runtime_approval_cas_consumes_the_same_proof_and_links_only_the_technical_call() throws Exception {
+        try (var fixture = new Fixture()) {
+            var legacy = waiting(7, NOW.plusSeconds(30));
+            var runtime = new ToolActionIntentSql.Row(ACTION, TOOL, legacy.origin(), ToolExecutionJsonCodec.ActionProfile.RUNTIME_V2,
+                    legacy.state(), legacy.revision(), legacy.createdAt(), legacy.updatedAt(), legacy.expiresAt(),
+                    null, null, "NONE", null, null, null);
+            var call = UUID.fromString("20000000-0000-0000-0000-000000000003");
+            var dispatch = new ToolActionIntentSql.DispatchVO(DISPATCH_RUN, null, call, 1, DISPATCH.nonceSha256(), EXECUTOR);
+            var observed = approval();
+            fixture.inTransaction(() -> {
+                fixture.sql.beginApprovedWrite(runtime, observed, dispatch, NOW, NOW.plusSeconds(10));
+                return null;
+            });
+            assertEquals(1, fixture.updates.size());
+            var update = fixture.updates.getFirst();
+            var set = update.sql().substring(0, update.sql().indexOf("WHERE"));
+            assertTrue(set.contains("dispatch_call_id=?"));
+            assertFalse(set.contains("dispatch_invocation_id=?"));
+            assertPredicates(update.sql(), List.of("action_profile='RUNTIME_V2'", "state='AWAITING_APPROVAL'", "revision=?",
+                    "dispatch_invocation_id IS NULL", "dispatch_call_id IS NULL", "approval_receipt_id IS NULL", "approval_proof IS NULL",
+                    "origin_run_id=?", "origin_snapshot_sha256=?", "logical_identity_sha256=?"));
+            assertArguments(update, observed.sourceNamespaceSha256(), observed.approval().approvalReceiptId(),
+                    new ToolExecutionJsonCodec().approvalSha256(proof(observed), ACTION), call, runtime.revision(),
+                    OWNER.issuerFingerprint(), ACTION.requestSha256(), DISPATCH.nonceSha256(), EXECUTOR.issuerFingerprint());
+        }
+    }
+
     @Test void only_an_empty_waiting_action_and_first_same_tenant_dispatch_generation_can_consume() throws Exception {
         try (var fixture = new Fixture()) {
             for (String state : List.of("PREPARED", "DISPATCHING", "UNKNOWN", "APPLIED")) assertThrows(IllegalArgumentException.class,

@@ -7,15 +7,20 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.agent.application.tool.FixedToolApprovalVerifier.ApprovedObservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolActionRequest;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 
 import javax.sql.DataSource;
 import java.time.Clock;
@@ -23,6 +28,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -53,6 +59,7 @@ public final class ToolActionIntentStore {
     }
     public boolean usesDataSource(DataSource candidate) { return candidate == source; }
     public boolean usesLedger(AgentLedgerService candidate) { return candidate == ledger; }
+    public boolean usesAuthorization(ToolExecutionAuthorization candidate) { return candidate == authorization; }
     public synchronized void verifyStorage() {
         verified.set(null);
         var profile = new ToolExecutionStorageVerifier(source).verifyAndReturnProfile();
@@ -68,9 +75,132 @@ public final class ToolActionIntentStore {
         return transact(window, () -> projection(intents.prepare(run, lease, action, descriptor, requestedExpiry, window.deadlineAt(), window.storage().profile())));
     }
 
+    public PreparedActionResult prepareRuntime(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action,
+                                               ToolDescriptor descriptor, Instant requestedExpiry, Instant callDeadline) {
+        Objects.requireNonNull(requestedExpiry, "requested expiry");
+        var window = authorize(run, lease, action, descriptor, ToolExecutionAuthorization.Boundary.PREPARE, null,
+                Objects.requireNonNull(callDeadline, "call deadline"));
+        return transact(window, () -> {
+            requireRuntimeAuthorization(run);
+            return projection(intents.prepare(run, lease, action, descriptor, requestedExpiry, window.deadlineAt(), window.storage().profile()));
+        });
+    }
+
     public Optional<PreparedActionResult> current(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor) {
         var window = authorize(run, lease, action, descriptor);
         return transact(window, () -> intents.current(run, lease, action, descriptor, window.deadlineAt(), window.storage().profile()).map(ToolActionIntentStore::projection));
+    }
+
+    /**
+     * Commits the exact active call and shared effect before the host may invoke its fixed transport.
+     * Approval was obtained by the host outside this transaction and must match the prepared action.
+     */
+    public RuntimeCallReceiptBO dispatchRuntime(AgentRunAuthorization.Request run, AgentRunLease lease, long runRevision,
+                                                ToolActionRequest action, ToolDescriptor descriptor, RuntimeCallReceiptBO prepared,
+                                                RuntimeCallReceiptBO.DispatchVO dispatch, ApprovedObservation approval,
+                                                Runnable verifyLocalPermit) {
+        requireRuntimeCall(run, lease, action, descriptor, prepared, RuntimeCallReceiptBO.State.PREPARED);
+        if (dispatch == null || (descriptor.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED) != (approval != null)) throw invalid();
+        var window = authorize(run, lease, action, descriptor, ToolExecutionAuthorization.Boundary.DISPATCH, prepared);
+        return transact(window, () -> {
+            requireRuntimeAuthorization(run);
+            return runtimeCalls().markDispatched(run.actor(), lease, runRevision, prepared.getCallId(),
+                prepared.getRevision(), dispatch, localPermit(window, verifyLocalPermit), actual -> {
+                    requireRuntimeCall(run, lease, action, descriptor, actual, RuntimeCallReceiptBO.State.DISPATCHED);
+                    requireSameCallCapability(prepared, actual);
+                    var locked = lockRuntimeAction(action, descriptor, window.deadlineAt());
+                    var executor = new TrustedAgentActor(run.actor().tenantId(), TrustedAgentActor.SubjectType.SERVICE,
+                            dispatch.executorId(), dispatch.executorIssuer());
+                    var exactDispatch = new ToolActionIntentSql.DispatchVO(actual.getRunId(), null, actual.getCallId(),
+                            dispatch.epoch(), dispatch.nonceSha256(), executor);
+                    if (approval == null) {
+                        intents.beginWrite(locked, exactDispatch, actual.getDispatchedAt(), window.deadlineAt());
+                    } else {
+                        intents.beginApprovedWrite(locked, approval, exactDispatch, actual.getDispatchedAt(), window.deadlineAt());
+                    }
+                });
+        });
+    }
+
+    /** Records the known or unknown result of the original fired dispatch with its technical receipt. */
+    public RuntimeCallReceiptBO finishRuntime(AgentRunAuthorization.Request run, AgentRunLease lease, long runRevision,
+                                              ToolActionRequest action, ToolDescriptor descriptor, RuntimeCallReceiptBO dispatched,
+                                              ToolExecutionOutcome result, Runnable verifyLocalPermit) {
+        requireRuntimeCall(run, lease, action, descriptor, dispatched, RuntimeCallReceiptBO.State.DISPATCHED);
+        if (dispatched.getDispatch() == null || result == null || result.actualCost() != null) throw invalid();
+        var outcome = result.validated(descriptor);
+        var code = switch (outcome.status()) {
+            case SUCCEEDED -> RuntimeCallReceiptBO.State.SUCCEEDED;
+            case REJECTED, FAILED_KNOWN -> RuntimeCallReceiptBO.State.FAILED;
+            case UNKNOWN -> RuntimeCallReceiptBO.State.UNKNOWN;
+            default -> throw invalid();
+        };
+        String digest = code == RuntimeCallReceiptBO.State.SUCCEEDED
+                ? new ToolExecutionJsonCodec().runtimeWriteResultSha256(action.intentId(), action.requestSha256(), descriptor, outcome) : null;
+        var technical = new RuntimeCallReceiptBO.OutcomeVO(code, digest, null, null, outcome.errorCode());
+        var window = authorize(run, lease, action, descriptor, ToolExecutionAuthorization.Boundary.DISPATCH, dispatched);
+        return transact(window, () -> {
+            requireRuntimeAuthorization(run);
+            return runtimeCalls().finish(run.actor(), lease, runRevision, dispatched.getCallId(),
+                dispatched.getRevision(), dispatched.getDispatch(), technical, localPermit(window, verifyLocalPermit), actual -> {
+                    requireRuntimeCall(run, lease, action, descriptor, actual, RuntimeCallReceiptBO.State.DISPATCHED);
+                    requireSameCallCapability(dispatched, actual);
+                    var row = lockRuntimeAction(action, descriptor, window.deadlineAt());
+                    var finishedAt = ledger.databaseNow();
+                    if (descriptor.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED) {
+                        intents.completeApprovedWrite(row, outcome, finishedAt, window.deadlineAt());
+                    } else {
+                        intents.completeWrite(row, outcome, finishedAt, window.deadlineAt());
+                    }
+                });
+        });
+    }
+
+    private void requireRuntimeAuthorization(AgentRunAuthorization.Request expected) {
+        var current = ledger.runtimeExecutionMaterial(expected.actor(), new GetAgentRunQuery(expected.runId()));
+        if (!expected.equals(current.authorization())) throw unavailable();
+    }
+
+    private static void requireSameCallCapability(RuntimeCallReceiptBO expected, RuntimeCallReceiptBO actual) {
+        if (!expected.getCapability().equals(actual.getCapability()) || !expected.getDeadlineAt().equals(actual.getDeadlineAt())) {
+            throw unavailable();
+        }
+    }
+
+    private AgentRuntimeCallReceiptStore runtimeCalls() {
+        return new AgentRuntimeCallReceiptStore(source, new AgentRuntimeBindingStore(source));
+    }
+
+    private ToolActionIntentSql.Row lockRuntimeAction(ToolActionRequest action, ToolDescriptor descriptor, Instant deadline) {
+        var row = descriptor.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED
+                ? intents.lockForRuntimeApproval(action, descriptor, deadline) : intents.lockForRuntimeWrite(action, descriptor, deadline);
+        if (row.profile() != ToolExecutionJsonCodec.ActionProfile.RUNTIME_V2) throw unavailable();
+        return row;
+    }
+
+    private Runnable localPermit(WindowVO window, Runnable current) {
+        Objects.requireNonNull(current, "runtime tool permit");
+        return () -> {
+            check(window);
+            current.run();
+            check(window);
+        };
+    }
+
+    private static void requireRuntimeCall(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action,
+                                           ToolDescriptor descriptor, RuntimeCallReceiptBO call, RuntimeCallReceiptBO.State state) {
+        if (run == null || lease == null || action == null || descriptor == null || call == null || call.getState() != state
+                || call.getKind() != RuntimeCallReceiptBO.Kind.TOOL || !run.actor().equals(call.getOwner())
+                || !run.actor().equals(action.owner()) || run.actor().tenantId() != call.getTenantId()
+                || !run.runId().equals(call.getRunId()) || !lease.runId().equals(call.getRunId())
+                || lease.epoch() != call.getLeaseEpoch() || call.getCallId() == null
+                || !UUID.fromString(action.intentId()).equals(call.getIntentId())
+                || !descriptor.parametersSha256(action.arguments()).equals(call.getInputSha256())) throw invalid();
+        var capability = call.getCapability();
+        if (capability == null || !descriptor.key().equals(capability.toolKey()) || descriptor.version() != capability.toolVersion()
+                || !descriptor.reference().contentSha256().equals(capability.toolSha256())
+                || !descriptor.policy().bindingSha256().equals(capability.backendBindingSha256())
+                || descriptor.policy().risk() != capability.risk() || descriptor.policy().risk() == ToolPolicy.Risk.READ_ONLY) throw invalid();
     }
 
     /** Internal stored facts only; exposing their result body requires a separate current authorization boundary. */
@@ -87,6 +217,16 @@ public final class ToolActionIntentStore {
     }
 
     private WindowVO authorize(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor) {
+        return authorize(run, lease, action, descriptor, ToolExecutionAuthorization.Boundary.PREPARE, null);
+    }
+
+    private WindowVO authorize(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
+                               ToolExecutionAuthorization.Boundary boundary, RuntimeCallReceiptBO call) {
+        return authorize(run, lease, action, descriptor, boundary, call, null);
+    }
+
+    private WindowVO authorize(AgentRunAuthorization.Request run, AgentRunLease lease, ToolActionRequest action, ToolDescriptor descriptor,
+                               ToolExecutionAuthorization.Boundary boundary, RuntimeCallReceiptBO call, Instant prepareDeadline) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Tool preparation requires its own transaction");
         var storage = requireVerifiedStorage();
         if (run == null || lease == null || action == null || descriptor == null || !run.actor().equals(action.owner())
@@ -94,12 +234,36 @@ public final class ToolActionIntentStore {
         var reconstructed = new ToolActionRequest(run.actor(), descriptor, action.businessKey(), action.businessVersion(), action.arguments());
         if (!reconstructed.requestSha256().equals(action.requestSha256()) || !reconstructed.intentId().equals(action.intentId())) throw invalid();
         Instant now = clock.instant(); Instant deadline = now.plusSeconds(10);
+        Instant callDeadline = call == null ? null : call.getDeadlineAt();
+        if (call != null && (callDeadline == null || callDeadline.isAfter(run.deadlineAt())
+                || call.getCapability().grantId() == null)) throw invalid();
         if (run.deadlineAt().isBefore(deadline)) deadline = run.deadlineAt();
+        if (callDeadline != null && callDeadline.isBefore(deadline)) deadline = callDeadline;
+        if (prepareDeadline != null && prepareDeadline.isBefore(deadline)) deadline = prepareDeadline;
         if (!deadline.isAfter(now)) throw unavailable();
+        if ((boundary != ToolExecutionAuthorization.Boundary.PREPARE || prepareDeadline != null)
+                && storage.profile() != ToolExecutionStorageVerifier.SchemaProfile.V17) throw unavailable();
         var window = new WindowVO(deadline, nanoTime.getAsLong() + Duration.between(now, deadline).toNanos(), storage);
-        var request = new ToolExecutionAuthorization.Request(run, lease, descriptor.reference(), descriptor.policy().bindingSha256(), action.requestSha256(), action.intentId(), deadline);
+        String authorityParameters = call == null && prepareDeadline == null
+                ? action.requestSha256() : descriptor.parametersSha256(action.arguments());
+        var request = new ToolExecutionAuthorization.Request(run, lease, descriptor.reference(), descriptor.policy().bindingSha256(),
+                authorityParameters, action.intentId(), call == null ? deadline : callDeadline);
         ToolExecutionAuthorization.Decision decision;
-        try { decision = authorization.authorize(request, ToolExecutionAuthorization.Boundary.PREPARE); }
+        try {
+            if (call == null) {
+                decision = authorization.authorize(request, boundary);
+            } else {
+                var checked = authorization.check(request, boundary);
+                if (checked == null || !request.equals(checked.request()) || checked.boundary() != boundary) throw unavailable();
+                decision = checked.decision();
+                if (decision == ToolExecutionAuthorization.Decision.ALLOW) {
+                    var audit = checked.audit();
+                    if (audit == null || !call.getCapability().grantId().equals(audit.grantId())
+                            || audit.checkedAt().isBefore(now) || audit.checkedAt().isAfter(clock.instant())
+                            || audit.expiresAt().isBefore(callDeadline)) throw unavailable();
+                }
+            }
+        }
         catch (RuntimeException uncertain) { throw unavailable(); }
         if (decision == ToolExecutionAuthorization.Decision.DENY) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current tool preparation access was denied");
         if (decision != ToolExecutionAuthorization.Decision.ALLOW) throw unavailable();

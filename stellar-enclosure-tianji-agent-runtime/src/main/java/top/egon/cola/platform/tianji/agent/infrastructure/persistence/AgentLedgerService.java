@@ -38,6 +38,7 @@ import top.egon.cola.platform.tianji.contract.agent.AgentUsageDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentUsageKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.agent.AgentContextSnapshotsQuery;
@@ -51,6 +52,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQue
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TemplateDependencyRefVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
@@ -59,7 +61,6 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -90,6 +91,8 @@ public final class AgentLedgerService {
     private final TransactionTemplate transaction;
     private final AgentBudgetService budgetService;
     private final AgentRuntimeBindingStore runtimeBindings;
+    private final AgentRuntimeCallReceiptStore runtimeCallReceipts;
+    private final ToolActionIntentSql runtimeToolActions;
     private final AgentTerminalEventPublisher terminalPublisher;
     private final String terminalProducerId;
     private final List<String> modelUsageRoutes;
@@ -121,6 +124,8 @@ public final class AgentLedgerService {
         this.transaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
         this.budgetService = new AgentBudgetService(this, repository, transaction);
         this.runtimeBindings = new AgentRuntimeBindingStore(dataSource);
+        this.runtimeCallReceipts = new AgentRuntimeCallReceiptStore(dataSource, runtimeBindings);
+        this.runtimeToolActions = new ToolActionIntentSql(dataSource, this);
     }
 
     /** Trusted host opt-in. Original construction paths continue without any V15 check. */
@@ -1102,6 +1107,74 @@ public final class AgentLedgerService {
         @Override public String toString() { return "AgentLedgerService.LinkedRunEvidenceVO[redacted]"; }
     }
 
+    public record ToolRunEvidenceVO(AgentRunDTO run, AgentRunAuthorization.Request authorization,
+                                    AgentProcessLink processLink, List<DefinitionResourceRef> toolRefs,
+                                    int maxToolCalls, String legacyApprovalPolicyRef, RunProfileEnum profile,
+                                    AgentRunLease activeLease) {
+        public ToolRunEvidenceVO {
+            toolRefs = List.copyOf(toolRefs);
+        }
+
+        @Override public String toString() { return "AgentLedgerService.ToolRunEvidenceVO[redacted]"; }
+    }
+
+    /** Reads the fixed tool scope and live lease under the owned run fence. */
+    public ToolRunEvidenceVO toolRunEvidence(TrustedAgentActor actor, GetAgentRunQuery query) {
+        var read = new TransactionTemplate(transaction.getTransactionManager());
+        read.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
+        read.setTimeout(5);
+        return read.execute(status -> {
+            var stored = requireLockedRun(actor, query);
+            var profile = runtimeProfile(stored);
+            if (profile == RunProfileEnum.RUNTIME_V2) {
+                var material = runtimeMaterial(actor, stored);
+                return new ToolRunEvidenceVO(material.run(), material.authorization(), material.command().getLink(),
+                        runtimeToolRefs(material.template()), material.command().getLimits().maxToolCalls(), null,
+                        profile, activeToolLease(stored));
+            }
+            var material = executionMaterial(actor, stored);
+            var snapshot = material.snapshot();
+            var policy = snapshot.effectivePolicy();
+            var tools = snapshot.definition().dependencies().tools().stream()
+                    .filter(ref -> policy.allowedToolVersions().contains(ref.key() + '@' + ref.version()))
+                    .toList();
+            return new ToolRunEvidenceVO(material.run(), material.authorization(), snapshot.processLink(),
+                    exactToolRefs(tools), policy.maxToolCalls(), policy.approvalPolicyRef(), profile, activeToolLease(stored));
+        });
+    }
+
+    private AgentRunLease activeToolLease(JdbcAgentLedgerRepository.StoredRun stored) {
+        var run = stored.run();
+        if (run.status() != AgentRunStatusEnum.RUNNING || run.cancelRequested()) return null;
+        var clock = now();
+        if (stored.leaseExpiresAt() == null || !stored.leaseExpiresAt().isAfter(clock)
+                || !run.deadlineAt().isAfter(clock)) return null;
+        return new AgentRunLease(run.runId(), stored.leaseOwner(), stored.leaseEpoch(), stored.leaseExpiresAt());
+    }
+
+    static List<DefinitionResourceRef> runtimeToolRefs(AgentRuntimeTemplateCommand template) {
+        var config = template.getConfiguration();
+        var plan = config.agenticPlan();
+        var refs = plan == null ? config.toolRefs().stream()
+                : plan.agents().stream().flatMap(leaf -> leaf.toolRefs().stream());
+        return exactToolRefs(refs.map(AgentLedgerService::toolRef).toList());
+    }
+
+    private static DefinitionResourceRef toolRef(TemplateDependencyRefVO ref) {
+        return new DefinitionResourceRef(ref.key(), ref.version(), ref.contentSha256());
+    }
+
+    private static List<DefinitionResourceRef> exactToolRefs(List<DefinitionResourceRef> refs) {
+        var tools = new LinkedHashMap<ToolVersionVO, DefinitionResourceRef>();
+        for (var ref : refs) {
+            var previous = tools.putIfAbsent(new ToolVersionVO(ref.key(), ref.version()), ref);
+            if (previous != null && !previous.equals(ref)) throw runtimeUnavailable();
+        }
+        return List.copyOf(tools.values());
+    }
+
+    private record ToolVersionVO(String key, long version) { }
+
     public LinkedRunEvidenceVO linkedRunEvidence(TrustedAgentActor actor, GetAgentRunQuery query) {
         return transaction.execute(status -> {
             var stored = requireLockedRun(actor, query);
@@ -1277,7 +1350,7 @@ public final class AgentLedgerService {
     }
 
     private AgentExecutionSnapshot verifiedSnapshot(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun run) {
-        if (runtimeProfile(run) != RunProfileEnum.LEGACY_V1) throw runtimeUnavailable();
+        if (runtimeProfile(run) != RunProfileEnum.LEGACY_V1) throw new RuntimeProfileRequiredException();
         AgentExecutionSnapshot snapshot;
         JdbcAgentLedgerRepository.DefinitionRow definition;
         try {
@@ -1296,6 +1369,12 @@ public final class AgentLedgerService {
                     "Agent execution snapshot does not match its definition");
         }
         return snapshot;
+    }
+
+    static final class RuntimeProfileRequiredException extends AgentLedgerException {
+        private RuntimeProfileRequiredException() {
+            super(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent runtime execution evidence is unavailable");
+        }
     }
 
     public List<AgentEventDTO> events(TrustedAgentActor actor, AgentEventsQuery query) {
@@ -1447,7 +1526,7 @@ public final class AgentLedgerService {
             JdbcAgentLedgerRepository.StoredRun updated = repository.finishLeased(actor, lease, expectedRevision,
                     result.status(), resultJson, result.errorCode()).orElseThrow(() -> new AgentLedgerException(
                             AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent run lease or revision is no longer valid"));
-            closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+            closeOutstanding(actor, previous, profile);
             appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING, result.status(), null);
             return updated.run();
         });
@@ -1467,7 +1546,7 @@ public final class AgentLedgerService {
                     expectedRevision, json.write(result, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(
                     () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                             "Agent run deadline or revision has changed"));
-            closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+            closeOutstanding(actor, previous, profile);
             appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.TIMED_OUT, null);
             return updated.run();
         });
@@ -1490,7 +1569,7 @@ public final class AgentLedgerService {
                     expectedRevision, json.write(result, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(
                     () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                             "Agent run deadline or execution generation has changed"));
-            closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+            closeOutstanding(actor, previous, profile);
             appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.TIMED_OUT, null);
             return updated.run();
         });
@@ -1506,7 +1585,7 @@ public final class AgentLedgerService {
             JdbcAgentLedgerRepository.StoredRun updated = repository.suspendExpiredLease(actor, query.runId(),
                     expectedRevision).orElseThrow(() -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                     "Agent run lease is not eligible for reconciliation"));
-            closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+            closeOutstanding(actor, previous, profile);
             appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING,
                     AgentRunStatusEnum.SUSPENDED, "LEASE_EXPIRED");
             return updated.run();
@@ -1529,7 +1608,7 @@ public final class AgentLedgerService {
             JdbcAgentLedgerRepository.StoredRun updated = repository.suspendAuthorization(actor, lease, reason)
                     .orElseThrow(() -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED,
                             "Agent run lease or state is no longer valid"));
-            closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+            closeOutstanding(actor, previous, profile);
             appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING, AgentRunStatusEnum.SUSPENDED, reason);
             return updated.run();
         });
@@ -1650,7 +1729,7 @@ public final class AgentLedgerService {
                 JdbcAgentLedgerRepository.StoredRun updated = repository.expireDeadline(actor, query.runId(),
                         previous.run().revision(), json.write(expired, AgentJsonCodec.MAX_RESULT_BYTES))
                         .orElseThrow(AgentLedgerService::revisionConflict);
-                closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+                closeOutstanding(actor, previous, profile);
                 appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.TIMED_OUT, null);
                 result = new CancelAgentRunResult(query.runId(), false, updated.run().status(), updated.run().revision(), now());
             } else {
@@ -1664,6 +1743,7 @@ public final class AgentLedgerService {
                     } else {
                         updated = repository.requestRunningCancellation(actor, query.runId(), command.expectedRevision())
                                 .orElseThrow(AgentLedgerService::revisionConflict);
+                        if (profile.profile() == RunProfileEnum.RUNTIME_V2) closeOutstanding(actor, previous, profile);
                         repository.insertEvent(actor.tenantId(), new AgentEventDTO(UUID.randomUUID().toString(),
                                 query.runId(), updated.run().lastEventSequence(), "CANCEL_REQUESTED", null, null,
                                 null, now(), previous.correlationId(), "1", Map.of("reason", command.reason())));
@@ -1673,7 +1753,7 @@ public final class AgentLedgerService {
                             Map.of(), null, null, null, null, previous.run().attempt() == 0 ? "NONE" : "UNKNOWN");
                     updated = repository.cancelNotRunning(actor, query.runId(), command.expectedRevision(),
                             json.write(cancelled, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(AgentLedgerService::revisionConflict);
-                    closeOutstanding(actor, previous, profile, "TIANJI_RUNTIME_CALL_CLOSED");
+                    closeOutstanding(actor, previous, profile);
                     appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.CANCELLED, null);
                 }
                 result = new CancelAgentRunResult(query.runId(), true, updated.run().status(), updated.run().revision(),
@@ -1745,11 +1825,23 @@ public final class AgentLedgerService {
     }
 
     private void closeOutstanding(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun run,
-                                  VerifiedRunProfileVO profile, String callErrorCode) {
+                                  VerifiedRunProfileVO profile) {
         if (profile.profile() == RunProfileEnum.LEGACY_V1) {
             repository.markOutstandingBudgetUnknown(actor.tenantId(), run.run().runId());
-        } else {
-            repository.closePendingRuntimeCalls(actor, run.run().runId(), run.leaseEpoch(), profile.binding().getActiveCalls(), callErrorCode);
+            return;
+        }
+        var binding = profile.binding();
+        var runId = run.run().runId();
+        var pending = repository.pendingRuntimeCalls(actor, runId, run.leaseEpoch(), binding.getActiveCalls());
+        var cleanupDeadline = now().plusSeconds(10);
+        for (var call : pending) {
+            runtimeCallReceipts.recover(actor, runId, call.callId(), call.revision(), call.dispatchedWrite()
+                    ? receipt -> runtimeToolActions.closeRuntimeDispatch(receipt, now(), cleanupDeadline)
+                    : null);
+        }
+        var finalBinding = runtimeBindings.lockBinding(actor.tenantId(), runId);
+        if (finalBinding.getActiveCalls() != 0 || finalBinding.getRevision() - binding.getRevision() != pending.size()) {
+            throw runtimeUnavailable();
         }
     }
 

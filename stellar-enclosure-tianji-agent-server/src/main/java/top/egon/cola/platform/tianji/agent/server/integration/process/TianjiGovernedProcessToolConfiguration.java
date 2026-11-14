@@ -13,6 +13,9 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.core.env.Environment;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
@@ -21,6 +24,9 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcess
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.StartActionContextResolver;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge.ApprovalReceiptResolver;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeBindingStore;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeCallReceiptStore;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolActionIntentStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolCapabilityStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationRecorder;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolInvocationStore;
@@ -55,6 +61,41 @@ import java.util.Set;
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.tools.governed-process", name = "enabled", havingValue = "true")
 @EnableConfigurationProperties(TianjiGovernedProcessToolProperties.class)
 public class TianjiGovernedProcessToolConfiguration {
+    @Bean("tianjiRuntimeToolExecutionService")
+    @Lazy
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.runtime-v2", name = "enabled", havingValue = "true")
+    AgentRuntimeToolExecutionService tianjiRuntimeToolExecutionService(DataSource source, AgentLedgerService ledger,
+            @Qualifier("toolCapabilityStore") ToolCapabilityStore capabilities,
+            @Qualifier("toolActionIntentStore") ToolActionIntentStore actions,
+            @Qualifier("governedProcessToolResultAccessStore") ToolResultAccessStore results,
+            @Qualifier("tianjiToolGrantAuthorizer") TianjiToolGrantAuthorizer authorization,
+            @Qualifier("tianjiToolGrantBindings") TianjiToolGrantBindings grants,
+            @Qualifier("tianjiGovernedProcessDecisionTransport") TianjiFixedDecisionToolTransport decision,
+            @Qualifier("tianjiGovernedProcessStartTransport") TianjiFixedBpmnStartToolTransport start,
+            @Qualifier("tianjiGovernedProcessMcpTransport") ObjectProvider<TianjiFixedReadOnlyMcpToolTransport> mcp,
+            @Qualifier("tianjiGovernedProcessApprovalVerifier") ObjectProvider<TianjiFixedToolApprovalVerifier> verifier,
+            @Qualifier("tianjiRuntimeToolActionIdentity") ObjectProvider<AgentRuntimeToolExecutionService.ActionIdentity> identity,
+            @Qualifier("tianjiRuntimeToolApprovalReceipt") ObjectProvider<AgentRuntimeToolExecutionService.ApprovalReceipt> approvalReceipt,
+            TianjiGovernedProcessToolProperties properties) {
+        if (!ledger.usesDataSource(source) || !capabilities.usesDataSource(source) || !capabilities.usesLedger(ledger)
+                || !actions.usesDataSource(source) || !actions.usesLedger(ledger) || !actions.usesAuthorization(authorization)
+                || !results.usesDataSource(source) || !results.usesLedger(ledger) || !results.usesCapabilities(capabilities)
+                || !results.usesAuthorization(authorization) || !authorization.usesLedger(ledger) || !authorization.usesBindings(grants)) {
+            throw unavailable();
+        }
+        var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
+        transaction.setTimeout(5);
+        return new AgentRuntimeToolExecutionService(ledger, capabilities, actions, results, authorization, decision,
+                properties.mcpBindings().isEmpty() ? null : mcp.getObject(), start,
+                properties.approvalBindings().isEmpty() ? null : verifier.getObject(),
+                (runtime, reference) -> grants.resolveRuntime(runtime).stream()
+                        .filter(tool -> reference.equals(tool.descriptor().reference()))
+                        .map(tool -> new AgentRuntimeToolExecutionService.SelectedToolVO(tool.descriptor(), tool.binding()))
+                        .findFirst().orElse(null),
+                identity.getIfAvailable(), approvalReceipt.getIfAvailable(),
+                new AgentRuntimeCallReceiptStore(source, new AgentRuntimeBindingStore(source)), transaction);
+    }
+
     @Bean("governedProcessToolInvocationStore")
     ToolInvocationStore governedProcessToolInvocationStore(DataSource source, AgentLedgerService ledger,
             @Qualifier("toolCapabilityStore") ToolCapabilityStore capabilities,

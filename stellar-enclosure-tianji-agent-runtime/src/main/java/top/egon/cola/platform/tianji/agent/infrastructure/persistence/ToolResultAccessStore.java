@@ -25,6 +25,7 @@ import java.math.BigDecimal;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -64,6 +65,64 @@ public final class ToolResultAccessStore {
         verified.set(false);
         try { new ToolExecutionStorageVerifier(source).verifyResultAccess(); verified.set(true); }
         catch (RuntimeException privateFailure) { throw unavailable(); }
+    }
+
+    /** Discloses only a currently authorized successful idempotent result through a V2 technical receipt. */
+    public RuntimeRecordedAccessVO recordRuntimeStartResultAccess(StartResultAccessRequestVO request) {
+        if (request == null) throw invalid();
+        return recordRuntimeStartResultAccess(request, request.binding().run().deadlineAt(), () -> {});
+    }
+
+    public RuntimeRecordedAccessVO recordRuntimeStartResultAccess(StartResultAccessRequestVO request, Instant dispatchDeadline,
+                                                                  Runnable requireCurrent) {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw new IllegalStateException("Tool result access requires its own transaction");
+        }
+        if (request == null || dispatchDeadline == null || requireCurrent == null) throw invalid();
+        if (request.descriptor().policy().risk() != ToolPolicy.Risk.IDEMPOTENT_WRITE) throw denied();
+        Instant started = clock.instant();
+        long startedNanos = nanoTime.getAsLong();
+        var binding = request.binding();
+        var owner = binding.run().actor();
+        var query = new GetAgentRunQuery(binding.run().runId());
+        var initial = window(started, startedNanos, earlier(dispatchDeadline, earlier(started.plusSeconds(10), binding.run().deadlineAt())));
+        checkDisclosureWindow(initial);
+        requireCurrent.run();
+        try {
+            var scope = Objects.requireNonNull(transaction.execute(status -> {
+                var material = ledger.runtimeExecutionMaterial(owner, query);
+                if (!binding.run().equals(material.authorization())) throw unavailable();
+                var leaseExpiry = accesses.requireRuntimeLease(owner, request.lease(), material.run().revision());
+                return new RuntimeReadScopeVO(material.run().revision(), material.command().getLimits().toolTimeout(), leaseExpiry);
+            }));
+            var evidence = capabilities.current(binding, request.descriptor()).orElseThrow(ToolResultAccessStore::unavailable);
+            Instant deadline = earlier(initial.deadlineAt(), earlier(scope.leaseExpiry(), earlier(started.plus(scope.toolTimeout()), evidence.expiresAt())))
+                    .truncatedTo(ChronoUnit.MICROS);
+            var window = window(started, startedNanos, deadline);
+            checkDisclosureWindow(window);
+            var expected = new ToolExecutionAuthorization.Request(binding.run(), request.lease(), request.descriptor().reference(),
+                    request.descriptor().policy().bindingSha256(), request.parametersSha256(), request.action().intentId(), deadline);
+            var checked = authorization.check(expected, ToolExecutionAuthorization.Boundary.RECONCILE);
+            if (checked == null || !expected.equals(checked.request()) || checked.boundary() != ToolExecutionAuthorization.Boundary.RECONCILE) throw unavailable();
+            if (checked.decision() == ToolExecutionAuthorization.Decision.DENY) throw denied();
+            var audit = checked.audit();
+            if (checked.decision() != ToolExecutionAuthorization.Decision.ALLOW || audit == null
+                    || !evidence.grantId().equals(audit.grantId()) || audit.checkedAt().isBefore(started)
+                    || audit.checkedAt().isAfter(clock.instant()) || audit.expiresAt().isBefore(deadline)
+                    || audit.expiresAt().isAfter(evidence.expiresAt())) throw unavailable();
+            var result = Objects.requireNonNull(transaction.execute(status -> accesses.recordRuntimeStartResultAccess(
+                    request, scope.runRevision(), evidence, audit, window, () -> {
+                        checkDisclosureWindow(window);
+                        requireCurrent.run();
+                    })));
+            checkDisclosureWindow(window);
+            requireCurrent.run();
+            return result;
+        } catch (AgentLedgerException failure) {
+            throw new AgentLedgerException(failure.code(), "Tool result access is unavailable or changed");
+        } catch (RuntimeException privateFailure) {
+            throw unavailable();
+        }
     }
 
     RecordedAccessVO recordKnownStartResultAccess(StartResultAccessRequestVO request) {
@@ -164,9 +223,23 @@ public final class ToolResultAccessStore {
         }
         @Override public String toString() { return "ToolResultAccessStore.RecordedAccessVO[redacted]"; }
     }
+
+    public record RuntimeRecordedAccessVO(String runId, UUID accessId, long sourceActionRevision, String sourceResultSha256,
+                                          ToolExecutionOutcome sourceOutcome) {
+        public RuntimeRecordedAccessVO {
+            if (runId == null || runId.isBlank() || accessId == null || sourceActionRevision < 1 || sourceResultSha256 == null
+                    || !sourceResultSha256.matches("[0-9a-f]{64}") || sourceOutcome == null
+                    || sourceOutcome.status() != ToolExecutionOutcome.Status.SUCCEEDED) throw invalid();
+        }
+
+        @Override public String toString() { return "ToolResultAccessStore.RuntimeRecordedAccessVO[redacted]"; }
+    }
     record DisclosureWindowVO(Instant deadlineAt, long nanoDeadline) {
         DisclosureWindowVO { if (deadlineAt == null) throw invalid(); }
         @Override public String toString() { return "ToolResultAccessStore.DisclosureWindowVO[redacted]"; }
+    }
+    private record RuntimeReadScopeVO(long runRevision, Duration toolTimeout, Instant leaseExpiry) {
+        @Override public String toString() { return "ToolResultAccessStore.RuntimeReadScopeVO[redacted]"; }
     }
     private static boolean canonicalUuid(String value) { try { return value != null && UUID.fromString(value).toString().equals(value); } catch (IllegalArgumentException malformed) { return false; } }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Tool result access values are invalid"); }

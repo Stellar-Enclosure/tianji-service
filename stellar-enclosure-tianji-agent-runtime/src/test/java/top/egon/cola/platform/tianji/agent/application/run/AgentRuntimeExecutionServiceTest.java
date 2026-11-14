@@ -20,6 +20,7 @@ import top.egon.cola.component.agentflow.api.execution.AgentExecutor;
 import top.egon.cola.component.agentflow.api.session.SessionStore;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextBO;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
+import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -65,6 +66,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -204,8 +206,9 @@ class AgentRuntimeExecutionServiceTest {
         var session = mock(SessionStore.class);
         var permit = mock(CallPermitProvider.class);
         var lifecycle = mock(ModelCallLifecycle.class);
+        var tools = mock(AgentExecutionContextVO.ToolCallHandler.class);
         var cancellation = new CompletableFuture<Void>();
-        var input = new TianjiHostContextBO(scope, NOW, cancellation, source, session, permit, lifecycle);
+        var input = new TianjiHostContextBO(scope, NOW, cancellation, source, session, permit, lifecycle).setToolCallHandler(tools);
 
         try (var spring = mapperContext()) {
             var mapper = spring.getBean("tianjiHostContextConverter", TianjiHostContextConverter.class);
@@ -218,7 +221,39 @@ class AgentRuntimeExecutionServiceTest {
             assertSame(session, target.sessionStore());
             assertSame(permit, target.callPermitProvider());
             assertSame(lifecycle, target.modelCallLifecycle());
+            assertSame(tools, target.toolCallHandler());
             assertThrows(NullPointerException.class, () -> mapper.toTarget(input.setVerifiedScope(null)));
+        }
+    }
+
+    @Test
+    void fixedToolRequestUsesTheClaimedRuntimeScopeAndRejectsAChangedReferenceBeforeDispatch() {
+        var pinned = new TemplateDependencyRefVO("invoice-start", 3, "b".repeat(64));
+        var host = mock(AgentRuntimeToolExecutionService.class);
+        try (var fixture = new RuntimeFixture(List.of(pinned), host)) {
+            when(fixture.authorization.authorize(eq(fixture.request), any())).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+            when(ledger.get(fixture.actor, QUERY)).thenReturn(fixture.running);
+            when(ledger.renewRuntimeLease(eq(fixture.actor), eq(fixture.lease), any())).thenReturn(fixture.lease);
+            var done = fixture.run(AgentRunStatusEnum.COMPLETED, 3);
+            when(ledger.finish(eq(fixture.actor), eq(fixture.lease), eq(2L), any())).thenReturn(done);
+            when(host.execute(any(), eq(fixture.lease), any(), any(), any())).thenReturn(Map.of("instanceId", "started"));
+            var handle = mock(AgentExecutionHandle.class);
+            when(handle.completion()).thenReturn(CompletableFuture.completedFuture(completed()));
+            when(fixture.executor.execute(any(), any())).thenAnswer(call -> {
+                AgentExecutionContextVO context = call.getArgument(1);
+                assertNotNull(context.callPermitProvider().requirePermit(context.scope(), pinned.key(), "TOOL_CALL"));
+                var exact = new AgentExecutionContextVO.ToolReferenceVO(pinned.key(), pinned.version(), pinned.contentSha256());
+                var changed = new AgentExecutionContextVO.ToolReferenceVO(pinned.key(), pinned.version(), "e".repeat(64));
+                var boundary = mock(AgentExecutionContextVO.ToolCallBoundary.class);
+                assertThrows(AgentLedgerException.class, () -> context.toolCallHandler().call(
+                        new AgentExecutionContextVO.ToolCallRequestVO(QUERY.runId(), context.scope(), changed, Map.of(), true, fixture.deadline), boundary));
+                verifyNoInteractions(host);
+                assertEquals(Map.of("instanceId", "started"), context.toolCallHandler().call(
+                        new AgentExecutionContextVO.ToolCallRequestVO(QUERY.runId(), context.scope(), exact, Map.of(), true, fixture.deadline), boundary));
+                return handle;
+            });
+            assertSame(done, fixture.service.executeQueued(fixture.actor, QUERY));
+            verify(host).execute(any(), eq(fixture.lease), any(), any(), any());
         }
     }
 
@@ -403,17 +438,20 @@ class AgentRuntimeExecutionServiceTest {
         private final ScheduledThreadPoolExecutor control = mock(ScheduledThreadPoolExecutor.class);
         private Runnable heartbeatCheck;
         private final AnnotationConfigApplicationContext mappers = mapperContext();
-        private final AgentRuntimeExecutionService service = new AgentRuntimeExecutionService(ledger, authorization, executor,
-                mappers.getBean("tianjiHostContextConverter", TianjiHostContextConverter.class), control,
-                mock(AgentRuntimeCallReceiptStore.class), mock(TransactionTemplate.class));
+        private final AgentRuntimeExecutionService service;
 
-        private RuntimeFixture() {
+        private RuntimeFixture() { this(List.of(), null); }
+
+        private RuntimeFixture(List<TemplateDependencyRefVO> tools, AgentRuntimeToolExecutionService host) {
+            service = new AgentRuntimeExecutionService(ledger, authorization, executor,
+                    mappers.getBean("tianjiHostContextConverter", TianjiHostContextConverter.class), control,
+                    mock(AgentRuntimeCallReceiptStore.class), mock(TransactionTemplate.class), host);
             var limits = new AgentRuntimeTemplateCommand.TechnicalLimitsVO(Duration.ofSeconds(30), Duration.ofSeconds(2),
                     Duration.ofSeconds(2), 2, 1, 1, 8192, 1024);
             var schema = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
                     "required", List.of(), "additionalProperties", false));
             var config = new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
-                    new TemplateDependencyRefVO("instruction", 1, "f".repeat(64)), "model", List.of(), null);
+                    new TemplateDependencyRefVO("instruction", 1, "f".repeat(64)), "model", tools, null);
             var template = new AgentRuntimeTemplateCommand("review", 1, AgentRuntimeTemplateCommand.RuntimeProfileEnum.RUNTIME_V2,
                     "registered-executor", schema, schema, schema, config, limits);
             var command = new LinkedAgentRuntimeCommand().setInput(Map.of()).setParameters(Map.of()).setLimits(limits)

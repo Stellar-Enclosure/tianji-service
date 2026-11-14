@@ -42,6 +42,7 @@ import top.egon.cola.platform.tianji.agent.application.run.AgenticTemplateConver
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverterImpl;
+import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge;
@@ -121,7 +122,8 @@ public class TianjiAgentRuntimeAutoConfiguration {
             ListableBeanFactory beans,
             @Qualifier("agenticTemplateConverter") AgenticTemplateConverter templateConverter,
             @Qualifier("tianjiHostContextConverter") TianjiHostContextConverter hostConverter,
-            @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control) {
+            @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control,
+            @Qualifier("tianjiRuntimeToolExecutionService") ObjectProvider<AgentRuntimeToolExecutionService> toolExecution) {
         if (!ledger.usesDataSource(dataSource)) throw new IllegalStateException("TIANJI_RUNTIME_DATA_SOURCE_MISMATCH");
         new AgentStorageVerifier(dataSource).verifyRuntimeStorage();
         String storeRef = flowProperties.session().storeRef();
@@ -134,7 +136,9 @@ public class TianjiAgentRuntimeAutoConfiguration {
         var receipts = new AgentRuntimeCallReceiptStore(dataSource, new AgentRuntimeBindingStore(dataSource));
         var receiptTransaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
         receiptTransaction.setTimeout(5);
-        return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts, receiptTransaction);
+        var tools = toolExecution.getIfAvailable();
+        if (tools != null && !tools.usesLedger(ledger)) throw new IllegalStateException("TIANJI_RUNTIME_TOOL_LEDGER_MISMATCH");
+        return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts, receiptTransaction, tools);
     }
 
     @Bean("tianjiAgentRuntimeV2AdmissionGuard")

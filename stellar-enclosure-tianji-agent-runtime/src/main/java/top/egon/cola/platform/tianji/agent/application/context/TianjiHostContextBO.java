@@ -12,6 +12,7 @@ import top.egon.cola.component.agentflow.api.capability.CallPermitProvider;
 import top.egon.cola.component.agentflow.api.context.ContextScopeVO;
 import top.egon.cola.component.agentflow.api.context.ContextSource;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO.ModelCallLifecycle;
+import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO.ToolCallHandler;
 import top.egon.cola.component.agentflow.api.session.SessionStore;
 
 import java.time.Instant;
@@ -32,4 +33,11 @@ public class TianjiHostContextBO {
     private SessionStore sessionStore;
     @NotNull private CallPermitProvider callPermitProvider;
     private ModelCallLifecycle modelCallLifecycle;
+    private ToolCallHandler toolCallHandler;
+
+    public TianjiHostContextBO(ContextScopeVO verifiedScope, Instant deadline, CompletionStage<Void> cancellation,
+                               ContextSource contextSource, SessionStore sessionStore, CallPermitProvider callPermitProvider,
+                               ModelCallLifecycle modelCallLifecycle) {
+        this(verifiedScope, deadline, cancellation, contextSource, sessionStore, callPermitProvider, modelCallLifecycle, null);
+    }
 }

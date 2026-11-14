@@ -406,15 +406,20 @@ class TianjiGovernedProcessToolConfigurationTest {
         f.noExternalCalls(); verifyNoInteractions(f.source, f.issuers);
     }
 
-    @Test void fifteen_distinct_named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
+    @Test void named_factories_keep_explicit_ownership_qualifiers_and_lazy_boundaries() {
         var methods = Arrays.stream(TianjiGovernedProcessToolConfiguration.class.getDeclaredMethods()).filter(method -> method.isAnnotationPresent(Bean.class)).toList();
-        assertEquals(15, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
+        assertEquals(16, methods.size()); assertEquals(Set.copyOf(names()), methods.stream().map(method -> {
             var bean = method.getAnnotation(Bean.class); return bean.value().length == 0 ? method.getName() : bean.value()[0];
         }).collect(java.util.stream.Collectors.toSet()));
         var bridge = methods.stream().filter(method -> method.getName().equals("tianjiAdkGovernedProcessTools")).findFirst().orElseThrow(); assertTrue(bridge.getAnnotation(Lazy.class).value());
         var telemetry = Arrays.stream(bridge.getParameters()).filter(value -> value.getParameterizedType().getTypeName().contains("OpenTelemetry")).findFirst().orElseThrow(); assertNull(telemetry.getAnnotation(Qualifier.class));
         var host = Arrays.stream(bridge.getParameters()).filter(value -> value.getParameterizedType().getTypeName().contains("StartActionContextResolver")).findFirst().orElseThrow(); assertEquals(HOST, host.getAnnotation(Qualifier.class).value());
         var verifier = methods.stream().filter(method -> method.getName().equals("tianjiGovernedProcessToolRuntimeChainVerifier")).findFirst().orElseThrow(); assertFalse(verifier.getAnnotation(Lazy.class).value());
+        var runtime = methods.stream().filter(method -> method.getName().equals("tianjiRuntimeToolExecutionService")).findFirst().orElseThrow();
+        assertTrue(runtime.getAnnotation(Lazy.class).value());
+        assertEquals("stellar.tianji.agent.runtime-v2", runtime.getAnnotation(org.springframework.boot.autoconfigure.condition.ConditionalOnProperty.class).prefix());
+        assertTrue(Arrays.stream(runtime.getParameters()).filter(parameter -> parameter.getType() == ObjectProvider.class)
+                .allMatch(parameter -> parameter.isAnnotationPresent(Qualifier.class)));
         for (var method : methods) if (method.getReturnType() == HttpClient.class) assertEquals("shutdownNow", method.getAnnotation(Bean.class).destroyMethod());
         else if (method.getReturnType() == TianjiFixedDecisionToolTransport.class || method.getReturnType() == TianjiFixedBpmnStartToolTransport.class || method.getReturnType() == TianjiFixedToolApprovalVerifier.class || method.getReturnType() == TianjiFixedReadOnlyMcpToolTransport.class) assertEquals("close", method.getAnnotation(Bean.class).destroyMethod());
         for (String name : List.of("tianjiGovernedProcessMcpBindings", "tianjiGovernedProcessMcpTransport")) assertTrue(methods.stream().filter(method -> method.getName().equals(name)).findFirst().orElseThrow().getAnnotation(Lazy.class).value());
@@ -1022,7 +1027,7 @@ class TianjiGovernedProcessToolConfigurationTest {
     private static List<String> prerequisites() { return List.of("api", "storage", "execution-grants", "execution-authorization", "runtime", "tools.authority"); }
     private static MockEnvironment environment() { var env = new MockEnvironment(); prerequisites().forEach(feature -> env.setProperty("stellar.tianji.agent." + feature + ".enabled", "true")); env.setProperty(PREFIX + "enabled", "true"); return env; }
     @SuppressWarnings("unchecked") private static <T> ObjectProvider<T> provider(T value) { var provider = (ObjectProvider<T>) mock(ObjectProvider.class); when(provider.getObject()).thenReturn(value); when(provider.getIfAvailable()).thenReturn(value); return provider; }
-    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessApprovalBindings", "tianjiGovernedProcessApprovalVerifier", "tianjiGovernedProcessMcpBindings", "tianjiGovernedProcessMcpTransport", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier"); }
+    private static List<String> names() { return List.of("governedProcessToolInvocationStore", "governedProcessToolInvocationRecorder", "governedProcessToolResultAccessStore", "governedProcessToolResultAccessRecorder", "tianjiGovernedProcessDecisionBindings", "tianjiGovernedProcessStartBindings", "tianjiGovernedProcessApprovalBindings", "tianjiGovernedProcessApprovalVerifier", "tianjiGovernedProcessMcpBindings", "tianjiGovernedProcessMcpTransport", "tianjiGovernedProcessHttpClient", "tianjiGovernedProcessDecisionTransport", "tianjiGovernedProcessStartTransport", "tianjiAdkGovernedProcessTools", "tianjiGovernedProcessToolRuntimeChainVerifier", "tianjiRuntimeToolExecutionService"); }
     private static String[] values() {
         var values = new ArrayList<String>(); prerequisites().forEach(feature -> values.add("stellar.tianji.agent." + feature + ".enabled=true"));
         values.add(PREFIX + "enabled=true"); values.add(PREFIX + "concurrency=2");

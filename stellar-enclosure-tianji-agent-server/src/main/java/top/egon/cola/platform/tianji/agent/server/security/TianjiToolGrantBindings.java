@@ -1,11 +1,15 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolRegistry;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.RunProfileEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 
 import java.net.URI;
@@ -15,10 +19,12 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 
 /** Fixed host selection only; neither configured metadata nor a resolved binding grants tool authority. */
 public final class TianjiToolGrantBindings {
     private final ToolRegistry registry;
+    private final Map<DefinitionResourceRef, ToolDescriptor> registered;
     private final List<BindingVO> bindings;
     private final URI resource;
     private final TianjiServiceExecutionBindings services;
@@ -28,10 +34,12 @@ public final class TianjiToolGrantBindings {
         if (registrations == null || registrations.isEmpty() || registrations.size() > 256 || bindings == null || bindings.isEmpty() || bindings.size() > 256) throw invalid();
         var fixed = new ArrayList<>(registrations); registry = new ToolRegistry(fixed);
         this.resource = TianjiExecutionAuthorityBindings.resource(resource); this.services = services;
-        var references = new HashSet<DefinitionResourceRef>(); for (var descriptor : fixed) references.add(descriptor.reference());
+        var byReference = new HashMap<DefinitionResourceRef, ToolDescriptor>();
+        for (var descriptor : fixed) byReference.put(descriptor.reference(), descriptor);
+        this.registered = Map.copyOf(byReference);
         var configured = new ArrayList<>(bindings); var slots = new HashSet<List<Object>>(); var hashes = new HashMap<List<Object>, String>();
         for (var binding : configured) {
-            if (binding == null || !references.contains(binding.tool()) || binding.principalType() == TrustedAgentActor.SubjectType.SERVICE && services == null) throw invalid();
+            if (binding == null || !registered.containsKey(binding.tool()) || binding.principalType() == TrustedAgentActor.SubjectType.SERVICE && services == null) throw invalid();
             var origin = List.<Object>of(binding.tenantId(), binding.issuerFingerprint(), binding.principalType(), binding.definitionKey(), binding.definitionVersion());
             var slot = new ArrayList<>(origin); slot.add(binding.tool().key()); slot.add(binding.tool().version());
             String oldHash = hashes.putIfAbsent(origin, binding.definitionSha256());
@@ -48,19 +56,49 @@ public final class TianjiToolGrantBindings {
             var visible = registry.visible(snapshot); if (visible.isEmpty()) return List.of();
             var subject = run.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE
                     ? services == null ? null : services.require(run, snapshot.processLink()) : null;
-            var result = new ArrayList<ResolvedToolResult>();
-            for (var descriptor : visible.values()) {
-                var reference = descriptor.reference();
-                var matches = bindings.stream().filter(binding -> binding.tenantId() == run.actor().tenantId()
-                        && binding.issuerFingerprint().equals(run.actor().issuerFingerprint()) && binding.principalType() == run.actor().subjectType()
-                        && binding.definitionKey().equals(run.definitionKey()) && binding.definitionVersion() == run.definitionVersion()
-                        && binding.definitionSha256().equals(run.definitionSha256()) && binding.tool().equals(reference)).toList();
-                if (matches.size() != 1) throw unavailable(); var selected = matches.getFirst();
-                result.add(new ResolvedToolResult(descriptor, new ToolExecutionGrant.BindingVO(run, reference, descriptor.policy().bindingSha256(),
-                        selected.purpose(), resource, selected.authorizationResourceKey(), subject)));
+            return visible.values().stream().map(descriptor -> resolveTool(run, descriptor, subject)).toList();
+        } catch (RuntimeException uncertain) { throw unavailable(); }
+    }
+
+    /** Resolves only persisted V2 template references and the linked SERVICE source. */
+    public List<ResolvedToolResult> resolveRuntime(AgentLedgerService.ToolRunEvidenceVO material) {
+        try {
+            var run = material.authorization();
+            var stored = material.run();
+            var link = material.processLink();
+            if (material.profile() != RunProfileEnum.RUNTIME_V2 || run.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE
+                    || "LEGACY".equals(run.actor().issuerFingerprint()) || run.sessionRequired() || stored.sessionId() != null
+                    || !run.runId().equals(stored.runId()) || !run.definitionKey().equals(stored.definitionKey())
+                    || run.definitionVersion() != stored.definitionVersion() || !run.deadlineAt().equals(stored.deadlineAt())
+                    || link == null || link.scopeType() != WorkerScopeTypeEnum.BPMN
+                    || !run.definitionSha256().equals(link.definitionContentSha256()) || material.legacyApprovalPolicyRef() != null
+                    || material.maxToolCalls() < 1) throw unavailable();
+            var references = material.toolRefs();
+            if (references.isEmpty()) return List.of();
+            var subject = services.require(run, link);
+            var result = new ArrayList<ResolvedToolResult>(references.size());
+            var slots = new HashSet<List<Object>>();
+            for (var reference : references) {
+                var descriptor = registered.get(reference);
+                if (descriptor == null || !slots.add(List.of(reference.key(), reference.version()))) throw unavailable();
+                result.add(resolveTool(run, descriptor, subject));
             }
             return List.copyOf(result);
         } catch (RuntimeException uncertain) { throw unavailable(); }
+    }
+
+    private ResolvedToolResult resolveTool(AgentRunAuthorization.Request run, ToolDescriptor descriptor,
+                                           AgentServiceExecutionGrant.Subject subject) {
+        var actor = run.actor();
+        var reference = descriptor.reference();
+        var matches = bindings.stream().filter(binding -> binding.tenantId() == actor.tenantId()
+                && binding.issuerFingerprint().equals(actor.issuerFingerprint()) && binding.principalType() == actor.subjectType()
+                && binding.definitionKey().equals(run.definitionKey()) && binding.definitionVersion() == run.definitionVersion()
+                && binding.definitionSha256().equals(run.definitionSha256()) && binding.tool().equals(reference)).toList();
+        if (matches.size() != 1) throw unavailable();
+        var selected = matches.getFirst();
+        return new ResolvedToolResult(descriptor, new ToolExecutionGrant.BindingVO(run, reference, descriptor.policy().bindingSha256(),
+                selected.purpose(), resource, selected.authorizationResourceKey(), subject));
     }
 
     public List<BindingVO> bindings() { return bindings; }

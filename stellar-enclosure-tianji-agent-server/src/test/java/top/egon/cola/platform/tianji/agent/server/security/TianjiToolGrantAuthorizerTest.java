@@ -17,13 +17,17 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.RunProfileEnum;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolCapabilityStore;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
+import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ServiceExecutionAuthorizationContract;
 import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
@@ -104,6 +108,80 @@ class TianjiToolGrantAuthorizerTest {
                 return reply;
             }).when(fixture.client).decideService(any(), any());
             assertEquals(ToolExecutionAuthorization.Decision.UNAVAILABLE, fixture.authority.authorize(fixture.request(READ), ToolExecutionAuthorization.Boundary.PREPARE));
+        }
+    }
+
+    @Test void runtime_service_tool_is_checked_against_the_pinned_link_grant_and_live_lease() {
+        try (var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ),
+                Duration.ofSeconds(1), 2, System::nanoTime, true)) {
+            var boundary = ToolExecutionAuthorization.Boundary.DISPATCH;
+            var request = fixture.request(READ);
+            var badRef = new DefinitionResourceRef(READ.key(), READ.version(), "b".repeat(64));
+            var forgedTool = new ToolExecutionAuthorization.Request(request.run(), request.lease(), badRef,
+                    request.bindingSha256(), request.parametersSha256(), null, request.deadlineAt());
+            assertEquals(ToolExecutionAuthorization.Decision.DENY, fixture.authority.authorize(forgedTool, boundary));
+
+            var staleLease = new AgentRunLease(RUN, request.lease().owner(), 2, NOW.plusSeconds(30));
+            var stale = new ToolExecutionAuthorization.Request(request.run(), staleLease, request.tool(),
+                    request.bindingSha256(), request.parametersSha256(), null, request.deadlineAt());
+            assertEquals(ToolExecutionAuthorization.Decision.UNAVAILABLE, fixture.authority.authorize(stale, boundary));
+            verifyNoInteractions(fixture.client);
+
+            var result = fixture.authority.check(request, boundary);
+            assertEquals(ToolExecutionAuthorization.Decision.ALLOW, result.decision());
+            assertEquals(fixture.evidence(READ).grantId(), result.audit().grantId());
+            var expected = org.mockito.ArgumentCaptor.forClass(HttpExecutionAuthorizationClient.ServiceExpectation.class);
+            verify(fixture.client).decideService(any(), expected.capture());
+            var binding = fixture.scope(READ);
+            assertEquals(binding.capabilityId(), expected.getValue().intent().intentId());
+            assertEquals(binding.bindingSha256(), expected.getValue().intent().bindingSha256());
+            assertEquals(fixture.subject.get().resourceUri().toASCIIString(), expected.getValue().subjectSource().resourceUri());
+
+            var original = fixture.toolSource.get();
+            var link = original.processLink();
+            var changed = new AgentProcessLink(link.sourceId(), link.scopeType(), link.scopeInstanceId(), "different-occurrence",
+                    link.definitionContentSha256(), link.dispatchNotAfter());
+            doAnswer(call -> {
+                fixture.toolSource.set(fixture.runtimeSource(changed, original.activeLease()));
+                return fixture.serviceDecision(call.getArgument(0), call.getArgument(1), NOW.plusSeconds(30));
+            }).when(fixture.client).decideService(any(), any());
+            assertEquals(ToolExecutionAuthorization.Decision.UNAVAILABLE, fixture.authority.authorize(request, boundary));
+
+            fixture.toolSource.set(original);
+            doAnswer(call -> {
+                fixture.toolSource.set(fixture.runtimeSource(link, new AgentRunLease(RUN, "other-worker", 2, NOW.plusSeconds(40))));
+                return fixture.serviceDecision(call.getArgument(0), call.getArgument(1), NOW.plusSeconds(30));
+            }).when(fixture.client).decideService(any(), any());
+            assertEquals(ToolExecutionAuthorization.Decision.UNAVAILABLE, fixture.authority.authorize(request, boundary));
+
+            fixture.toolSource.set(original);
+            doAnswer(call -> {
+                fixture.toolSource.set(fixture.runtimeSource(link, new AgentRunLease(RUN, "runtime", 1, NOW.plusSeconds(40))));
+                return fixture.serviceDecision(call.getArgument(0), call.getArgument(1), NOW.plusSeconds(30));
+            }).when(fixture.client).decideService(any(), any());
+            assertEquals(ToolExecutionAuthorization.Decision.ALLOW, fixture.authority.authorize(request, boundary));
+            verify(fixture.ledger, never()).executionMaterial(any(), any());
+        }
+    }
+
+    @Test void runtime_run_gate_continues_to_check_all_pinned_tools_when_claiming_or_running() {
+        try (var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ),
+                Duration.ofSeconds(1), 2, System::nanoTime, true)) {
+            var running = fixture.toolSource.get();
+            var queued = new AgentRunDTO(RUN, fixture.run.definitionKey(), fixture.run.definitionVersion(), null,
+                    AgentRunStatusEnum.QUEUED, null, false, 0, 0, 0, fixture.run.deadlineAt(), NOW.minusSeconds(1), null);
+            fixture.toolSource.set(new AgentLedgerService.ToolRunEvidenceVO(queued, fixture.run, running.processLink(),
+                    running.toolRefs(), running.maxToolCalls(), null, RunProfileEnum.RUNTIME_V2, null));
+            assertEquals(AgentRunAuthorization.Decision.ALLOW,
+                    fixture.authority.authorizeRun(fixture.run, AgentRunAuthorization.Boundary.CLAIM));
+            fixture.toolSource.set(running);
+            assertEquals(AgentRunAuthorization.Decision.ALLOW,
+                    fixture.authority.authorizeRun(fixture.run, AgentRunAuthorization.Boundary.MODEL));
+            verify(fixture.client, times(2)).decideService(any(), any());
+            fixture.evidence.remove(READ.key());
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE,
+                    fixture.authority.authorizeRun(fixture.run, AgentRunAuthorization.Boundary.MODEL));
+            verifyNoMoreInteractions(fixture.client);
         }
     }
 
@@ -343,13 +421,17 @@ class TianjiToolGrantAuthorizerTest {
         final TrustedIssuerRegistry.TrustedIssuerVO originalTrust = new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER, URI.create("https://idp.example/jwks"), "tenant:20", TrustedIssuerRegistry.RealmType.TENANT, "20", TrustedIssuerRegistry.Status.ACTIVE, 1);
         final AtomicReference<TrustedIssuerRegistry.TrustedIssuerVO> trust = new AtomicReference<>(originalTrust); final AtomicReference<AgentServiceExecutionGrant.Subject> subject = new AtomicReference<>();
         final ConcurrentHashMap<String, ToolExecutionGrant.EvidenceVO> evidence = new ConcurrentHashMap<>(); final AtomicReference<AgentLedgerService.ExecutionMaterial> material = new AtomicReference<>();
+        final AtomicReference<AgentLedgerService.ToolRunEvidenceVO> toolSource = new AtomicReference<>();
         final AtomicReference<Instant> dbNow = new AtomicReference<>(NOW); final MutableClock clock = new MutableClock(); final LongSupplier nanoTime;
         final TrustedAgentActor actor; final AgentRunAuthorization.Request run; final TianjiToolGrantBindings bindings; final TianjiToolGrantAuthorizer authority;
 
         Fixture() { this(TrustedAgentActor.SubjectType.USER, List.of(READ), Duration.ofSeconds(1), 2, System::nanoTime); }
         Fixture(TrustedAgentActor.SubjectType type, List<ToolDescriptor> visible, Duration timeout, int capacity, LongSupplier nanoTime) {
+            this(type, visible, timeout, capacity, nanoTime, false);
+        }
+        Fixture(TrustedAgentActor.SubjectType type, List<ToolDescriptor> visible, Duration timeout, int capacity, LongSupplier nanoTime, boolean runtime) {
             this.nanoTime = nanoTime; actor = TrustedAgentActor.verified(20, type, type == TrustedAgentActor.SubjectType.USER ? "alice" : "worker", ISSUER.toASCIIString());
-            run = new AgentRunAuthorization.Request(actor, RUN, "assistant", 1, HASH, HASH, HASH, "policy-v1", true, NOW.plusSeconds(600));
+            run = new AgentRunAuthorization.Request(actor, RUN, "assistant", 1, HASH, HASH, HASH, "policy-v1", !runtime, NOW.plusSeconds(600));
             TianjiServiceExecutionBindings services = null;
             if (type == TrustedAgentActor.SubjectType.SERVICE) {
                 services = mock(TianjiServiceExecutionBindings.class); when(services.usesIssuerRegistry(issuers)).thenReturn(true);
@@ -359,12 +441,30 @@ class TianjiToolGrantAuthorizerTest {
             bindings = new TianjiToolGrantBindings(List.of(READ, WRITE), List.of(mapping(READ), mapping(WRITE)), RESOURCE, services);
             when(store.usesLedger(ledger)).thenReturn(true); when(store.current(any(), any())).thenAnswer(call -> Optional.ofNullable(evidence.get(((ToolExecutionGrant.BindingVO) call.getArgument(0)).tool().key())));
             when(ledger.executionMaterial(eq(actor), any())).thenAnswer(call -> material.get()); when(ledger.databaseNow()).thenAnswer(call -> dbNow.get());
+            if (runtime) {
+                toolSource.set(runtimeSource(new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "occurrence",
+                        HASH, NOW.plusSeconds(90)), new AgentRunLease(RUN, "runtime", 1, NOW.plusSeconds(20))));
+                when(ledger.toolRunEvidence(eq(actor), any())).thenAnswer(call -> toolSource.get());
+                when(ledger.executionMaterial(eq(actor), any())).thenThrow(new IllegalStateException("V1 reader rejects the V2 runtime"));
+            } else if (type == TrustedAgentActor.SubjectType.SERVICE) {
+                when(ledger.toolRunEvidence(eq(actor), any())).thenAnswer(call -> {
+                    var source = material.get();
+                    return new AgentLedgerService.ToolRunEvidenceVO(source.run(), run, source.snapshot().processLink(),
+                            source.snapshot().definition().dependencies().tools(), 5, null, RunProfileEnum.LEGACY_V1, null);
+                });
+            }
             when(issuers.findByIssuer(ISSUER.toASCIIString())).thenAnswer(call -> Optional.ofNullable(trust.get()));
             when(client.decide(any(), any())).thenAnswer(call -> userDecision(call.getArgument(0), call.getArgument(1), NOW.plusSeconds(30)));
             when(client.decideService(any(), any())).thenAnswer(call -> serviceDecision(call.getArgument(0), call.getArgument(1), NOW.plusSeconds(30)));
             material.set(material(visible, AgentRunStatusEnum.RUNNING, false, 1));
             evidence.put(READ.key(), freshEvidence(READ, 1, "sealed")); evidence.put(WRITE.key(), freshEvidence(WRITE, 1, "sealed"));
             authority = create(bindings, store, timeout, capacity);
+        }
+        AgentLedgerService.ToolRunEvidenceVO runtimeSource(AgentProcessLink link, AgentRunLease activeLease) {
+            var runView = new AgentRunDTO(RUN, run.definitionKey(), run.definitionVersion(), null, AgentRunStatusEnum.RUNNING,
+                    null, false, 1, 1, 1, run.deadlineAt(), NOW.minusSeconds(1), null);
+            return new AgentLedgerService.ToolRunEvidenceVO(runView, run, link, List.of(READ.reference()), 5, null,
+                    RunProfileEnum.RUNTIME_V2, activeLease);
         }
         TianjiToolGrantBindings.BindingVO mapping(ToolDescriptor descriptor) { return new TianjiToolGrantBindings.BindingVO(20, actor.issuerFingerprint(), actor.subjectType(), "assistant", 1, HASH, descriptor.reference(), purpose(descriptor), "tianji.api.agent.start"); }
         ToolExecutionGrant.BindingVO scope(ToolDescriptor descriptor) { return new ToolExecutionGrant.BindingVO(run, descriptor.reference(), descriptor.policy().bindingSha256(), purpose(descriptor), RESOURCE, "tianji.api.agent.start", subject.get()); }

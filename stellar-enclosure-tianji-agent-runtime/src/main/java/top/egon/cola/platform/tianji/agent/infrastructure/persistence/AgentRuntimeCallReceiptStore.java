@@ -22,11 +22,11 @@ import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO.OutcomeVO
 import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO.SourceResultVO;
 import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO.State;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
-import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 
 import javax.sql.DataSource;
 import java.sql.ResultSet;
@@ -81,6 +81,11 @@ public class AgentRuntimeCallReceiptStore {
             @Positive long runRevision,
             @NotNull @Valid RuntimeCallReceiptBO request,
             @NotNull Runnable verifyCurrentPermit) {
+        return prepare(owner, lease, runRevision, request, verifyCurrentPermit, false);
+    }
+
+    private RuntimeCallReceiptBO prepare(TrustedAgentActor owner, AgentRunLease lease, long runRevision,
+                                         RuntimeCallReceiptBO request, Runnable verifyCurrentPermit, boolean resultReplay) {
         Objects.requireNonNull(request, "request");
         var copy = copyRequest(request);
         copy.validateForPrepare();
@@ -94,6 +99,7 @@ public class AgentRuntimeCallReceiptStore {
         var now = current(locked, lease, runRevision, copy, verifyCurrentPermit);
         if (copy.getKind() == Kind.TOOL_RESULT_READ) verifySource(copy, action, now);
         if (original != null) {
+            if (resultReplay) return replayResultAccess(original, copy, action);
             if (!sameRequest(original, copy, context)) throw error(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT);
             return original;
         }
@@ -121,6 +127,17 @@ public class AgentRuntimeCallReceiptStore {
                 utc(copy.getDeadlineAt()), utc(now));
         if (inserted != 1) throw unavailable();
         return requireReceipt(owner.tenantId(), lease.runId(), copy.getCallId());
+    }
+
+    RuntimeCallReceiptBO recordResultAccess(TrustedAgentActor owner, AgentRunLease lease, long runRevision,
+                                            RuntimeCallReceiptBO request, Runnable verifyCurrentPermit) {
+        if (request.getKind() != Kind.TOOL_RESULT_READ) throw invalid();
+        var prepared = prepare(owner, lease, runRevision, request, verifyCurrentPermit, true);
+        if (prepared.getState() == State.SUCCEEDED) return prepared;
+        var dispatched = markDispatched(owner, lease, runRevision, request.getCallId(),
+                prepared.getRevision(), null, verifyCurrentPermit);
+        return finish(owner, lease, runRevision, request.getCallId(), dispatched.getRevision(), null,
+                new OutcomeVO(State.SUCCEEDED, request.getSourceResult().resultSha256(), null, null, null), verifyCurrentPermit);
     }
 
     public RuntimeCallReceiptBO markDispatched(
@@ -211,7 +228,10 @@ public class AgentRuntimeCallReceiptStore {
         boolean dispatchedWrite = receipt.isWrite() && receipt.getState() == State.DISPATCHED;
         if (dispatchedWrite != (recordBusinessOutcome != null)) throw invalid();
         var now = current(locked.execution, lease, runRevision, receipt, verifyCurrentPermit);
-        if (receipt.getKind() == Kind.TOOL_RESULT_READ && outcome.state() == State.SUCCEEDED) verifySource(receipt, locked.action, now);
+        if (receipt.getKind() == Kind.TOOL_RESULT_READ && outcome.state() == State.SUCCEEDED) {
+            verifySource(receipt, locked.action, now);
+            if (!receipt.getSourceResult().resultSha256().equals(outcome.resultSha256())) throw closed();
+        }
         try {
             if (dispatchedWrite) {
                 requireActionDispatch(locked.action, receipt, "DISPATCHING");
@@ -422,18 +442,25 @@ public class AgentRuntimeCallReceiptStore {
     }
 
     private String sourceResultSha256(RuntimeCallReceiptBO receipt, ActionRowVO action) {
-        return OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_RESULT_ACCESS_SOURCE_V1", receipt.getIntentId().toString(),
-                Long.toString(action.revision()), action.requestSha256(), canonicalSuccess(receipt, action)), Map.of());
+        var descriptor = actionDescriptor(receipt, action);
+        return toolCodec.sourceResultSha256(receipt.getIntentId().toString(), action.revision(), action.requestSha256(),
+                ToolExecutionJsonCodec.ActionProfile.valueOf(action.profile()), descriptor, successfulOutcome(action, descriptor));
     }
 
-    private String canonicalSuccess(RuntimeCallReceiptBO receipt, ActionRowVO action) {
+    private ToolDescriptor actionDescriptor(RuntimeCallReceiptBO receipt, ActionRowVO action) {
         var capability = receipt.getCapability();
-        var descriptor = toolCodec.descriptor(action.descriptor(),
+        return toolCodec.descriptor(action.descriptor(),
                 new DefinitionResourceRef(capability.toolKey(), capability.toolVersion(), capability.toolSha256()));
-        var profile = ToolExecutionJsonCodec.ActionProfile.valueOf(action.profile());
-        var outcome = toolCodec.outcome(profile, action.result(), descriptor);
+    }
+
+    private ToolExecutionOutcome successfulOutcome(ActionRowVO action, ToolDescriptor descriptor) {
+        var outcome = actionOutcome(action, descriptor);
         if (outcome.status() != ToolExecutionOutcome.Status.SUCCEEDED) throw unavailable();
-        return toolCodec.outcome(profile, descriptor, outcome);
+        return outcome;
+    }
+
+    private ToolExecutionOutcome actionOutcome(ActionRowVO action, ToolDescriptor descriptor) {
+        return toolCodec.outcome(ToolExecutionJsonCodec.ActionProfile.valueOf(action.profile()), action.result(), descriptor);
     }
 
     private static void requireDispatchableAction(ActionRowVO action, Instant now) {
@@ -443,24 +470,21 @@ public class AgentRuntimeCallReceiptStore {
     }
 
     private void requireActionOutcome(ActionRowVO action, RuntimeCallReceiptBO receipt, OutcomeVO outcome) {
-        if (outcome.state() == State.FAILED && action != null && "REJECTED".equals(action.state())) {
-            requireActionDispatch(action, receipt, "REJECTED");
-            return;
-        }
-        requireActionDispatch(action, receipt, switch (outcome.state()) {
-            case SUCCEEDED -> "APPLIED";
-            case FAILED -> "FAILED_KNOWN";
-            case UNKNOWN -> "UNKNOWN";
+        var expected = switch (outcome.state()) {
+            case SUCCEEDED -> ToolExecutionOutcome.Status.SUCCEEDED;
+            case FAILED -> action != null && "REJECTED".equals(action.state())
+                    ? ToolExecutionOutcome.Status.REJECTED : ToolExecutionOutcome.Status.FAILED_KNOWN;
+            case UNKNOWN -> ToolExecutionOutcome.Status.UNKNOWN;
             default -> throw invalid();
-        });
-        if (outcome.state() == State.SUCCEEDED && !outcome.resultSha256().equals(writeResultSha256(receipt, action, canonicalSuccess(receipt, action)))) {
+        };
+        requireActionDispatch(action, receipt, expected == ToolExecutionOutcome.Status.SUCCEEDED ? "APPLIED" : expected.name());
+        var descriptor = actionDescriptor(receipt, action);
+        var recorded = actionOutcome(action, descriptor);
+        if (recorded.status() != expected || !Objects.equals(outcome.errorCode(), recorded.errorCode())) throw closed();
+        if (expected == ToolExecutionOutcome.Status.SUCCEEDED && !outcome.resultSha256().equals(
+                toolCodec.runtimeWriteResultSha256(receipt.getIntentId().toString(), action.requestSha256(), descriptor, recorded))) {
             throw closed();
         }
-    }
-
-    private static String writeResultSha256(RuntimeCallReceiptBO receipt, ActionRowVO action, String canonicalOutcome) {
-        return OrchestrationRequestDigests.hash(List.of("TIANJI_RUNTIME_TOOL_RESULT_V2", receipt.getIntentId().toString(),
-                action.requestSha256(), canonicalOutcome), Map.of());
     }
 
     private static void requireActionDispatch(ActionRowVO action, RuntimeCallReceiptBO receipt, String state) {
@@ -485,14 +509,32 @@ public class AgentRuntimeCallReceiptStore {
     }
 
     private boolean sameRequest(RuntimeCallReceiptBO receipt, RuntimeCallReceiptBO request, String context) {
+        return sameRequestIdentity(receipt, request)
+                && codec.write(receipt.getContextMetadata(), MAX_CONTEXT_BYTES).equals(context)
+                && receipt.getDeadlineAt().equals(request.getDeadlineAt());
+    }
+
+    private RuntimeCallReceiptBO replayResultAccess(RuntimeCallReceiptBO original, RuntimeCallReceiptBO request, ActionRowVO action) {
+        if (!sameRequestIdentity(original, request)) throw error(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT);
+        if (original.getState() != State.SUCCEEDED || original.getFinishedAt() == null
+                || !request.getSourceResult().resultSha256().equals(original.getResultSha256())) throw closed();
+        verifySource(original, action, original.getFinishedAt());
+        var priorAudit = (Map<?, ?>) original.getContextMetadata().get("authorization");
+        var currentAudit = (Map<?, ?>) request.getContextMetadata().get("authorization");
+        if (!priorAudit.get("scopeSha256").equals(currentAudit.get("scopeSha256"))
+                || !Objects.equals(original.getContextMetadata().get("sources"), request.getContextMetadata().get("sources"))) {
+            throw error(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT);
+        }
+        return original;
+    }
+
+    private static boolean sameRequestIdentity(RuntimeCallReceiptBO receipt, RuntimeCallReceiptBO request) {
         return receipt.getKind() == request.getKind() && receipt.getOwner().equals(request.getOwner())
                 && receipt.getLeaseEpoch() == request.getLeaseEpoch()
                 && Objects.equals(receipt.getCapability(), request.getCapability())
                 && receipt.getInputSha256().equals(request.getInputSha256())
-                && codec.write(receipt.getContextMetadata(), MAX_CONTEXT_BYTES).equals(context)
                 && Objects.equals(receipt.getIntentId(), request.getIntentId())
-                && Objects.equals(receipt.getSourceResult(), request.getSourceResult())
-                && receipt.getDeadlineAt().equals(request.getDeadlineAt());
+                && Objects.equals(receipt.getSourceResult(), request.getSourceResult());
     }
 
     private RuntimeCallReceiptBO requireReceipt(long tenantId, String runId, UUID callId) {

@@ -37,6 +37,8 @@ public interface FixedBpmnStartToolTransport {
         StartObservation start();
         /** Implementations must opt in to deadline enforcement; unsupported hosts never fall back to an unbounded send. */
         default StartObservation start(Instant callDeadlineAt) { throw new Failure(FailureKind.OPERATION_NOT_SENT); }
+        /** Hosts with actual send observation must implement this separately from the historical entry points. */
+        default StartObservation start(Instant callDeadlineAt, Runnable beforeSend) { throw new Failure(FailureKind.OPERATION_NOT_SENT); }
     }
 
     record StartObservation(String hostReceiptReference, String instanceId) {

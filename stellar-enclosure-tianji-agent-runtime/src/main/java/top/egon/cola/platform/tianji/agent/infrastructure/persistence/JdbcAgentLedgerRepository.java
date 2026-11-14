@@ -30,6 +30,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 
 final class JdbcAgentLedgerRepository {
@@ -965,32 +966,25 @@ final class JdbcAgentLedgerRepository {
                 """, tenantId, runId);
     }
 
-    void closePendingRuntimeCalls(TrustedAgentActor owner, String runId, long leaseEpoch, int activeCalls, String reason) {
-        if (activeCalls == 0) return;
+    List<PendingCallVO> pendingRuntimeCalls(TrustedAgentActor owner, String runId, long leaseEpoch, int activeCalls) {
+        // The owning run and binding already serialize these rows. Discover keys before locking action and capability.
         var pending = jdbc.query("""
-                SELECT lease_epoch,owner_type,owner_issuer,owner_id,state,intent_id
+                SELECT call_id,revision,lease_epoch,owner_type,owner_issuer,owner_id,state,intent_id,kind
                 FROM tianji_agent.agent_runtime_call_receipt
                 WHERE tenant_id=? AND run_id=? AND state IN ('PREPARED','DISPATCHED')
-                FOR UPDATE
-                """, (row, index) -> new PendingCallVO(row.getLong("lease_epoch"), row.getString("owner_type"),
-                row.getString("owner_issuer"), row.getString("owner_id"), row.getString("state"), row.getObject("intent_id") != null),
+                ORDER BY intent_id NULLS LAST, call_id LIMIT 33
+                """, (row, index) -> {
+                    if (row.getLong("lease_epoch") != leaseEpoch
+                            || !owner.subjectType().name().equals(row.getString("owner_type"))
+                            || !owner.issuerFingerprint().equals(row.getString("owner_issuer"))
+                            || !owner.subjectId().equals(row.getString("owner_id"))) throw runtimeUnavailable();
+                    return new PendingCallVO(row.getObject("call_id", UUID.class), row.getLong("revision"),
+                            "DISPATCHED".equals(row.getString("state")) && "TOOL".equals(row.getString("kind"))
+                                    && row.getObject("intent_id") != null);
+                },
                 owner.tenantId(), runId);
-        if (pending.size() != activeCalls || pending.stream().anyMatch(call -> call.leaseEpoch() != leaseEpoch
-                || !owner.subjectType().name().equals(call.ownerType()) || !owner.issuerFingerprint().equals(call.ownerIssuer())
-                || !owner.subjectId().equals(call.ownerId()) || call.linkedIntent() && "DISPATCHED".equals(call.state()))) {
-            throw runtimeUnavailable();
-        }
-        int updated = jdbc.update("""
-                UPDATE tianji_agent.agent_runtime_call_receipt
-                SET state=CASE WHEN state='PREPARED' THEN 'FAILED' ELSE 'UNKNOWN' END,
-                    error_code=?,finished_at=clock_timestamp(),revision=revision+1
-                WHERE tenant_id=? AND run_id=? AND owner_type=? AND owner_issuer=? AND owner_id=?
-                  AND lease_epoch=? AND state IN ('PREPARED','DISPATCHED')
-                """, reason, owner.tenantId(), runId, owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), leaseEpoch);
-        if (updated != activeCalls || jdbc.update("""
-                UPDATE tianji_agent.agent_runtime_binding SET active_calls=0,revision=revision+?
-                WHERE tenant_id=? AND run_id=? AND active_calls=?
-                """, activeCalls, owner.tenantId(), runId, activeCalls) != 1) throw runtimeUnavailable();
+        if (pending.size() != activeCalls || pending.size() > 32) throw runtimeUnavailable();
+        return List.copyOf(pending);
     }
 
     private static AgentLedgerException runtimeUnavailable() {
@@ -1050,8 +1044,7 @@ final class JdbcAgentLedgerRepository {
 
     record DefinitionRow(String hash, top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO specification) { }
     record DefinitionEvidenceRow(String hash, String specification, Instant createdAt) { }
-    private record PendingCallVO(long leaseEpoch, String ownerType, String ownerIssuer, String ownerId, String state,
-                                 boolean linkedIntent) { }
+    record PendingCallVO(UUID callId, long revision, boolean dispatchedWrite) { }
     record StoredRun(AgentRunDTO run, String requestHash, String resultJson, String correlationId, String snapshotJson,
                      String leaseOwner, long leaseEpoch, Instant leaseExpiresAt, Instant cancelRequestedAt) { }
     record CancelReceipt(String requestHash, String resultJson) { }

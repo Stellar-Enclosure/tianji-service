@@ -19,7 +19,10 @@ import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartReceip
 import top.egon.cola.platform.tianji.agent.application.tool.HistoricalToolReceiptAuthorization;
 import top.egon.cola.platform.tianji.agent.application.tool.HistoricalToolReceiptAuthorization.Permit;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolActionIntentSql.HistoricalRuntimeStartVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolActionIntentSql.HistoricalStartReceiptVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolStartReceiptReconciliationSql.StoredReceiptVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -70,6 +73,7 @@ public final class ToolStartReceiptReconciliationService {
     private final LongSupplier nanoTime;
     private final TransactionTemplate reader;
     private final TransactionTemplate writer;
+    private volatile boolean runtimeStorage;
 
     public ToolStartReceiptReconciliationService(DataSource source, AgentLedgerService ledger,
                                                   HistoricalToolReceiptAuthorization authority, FixedBpmnStartReceiptRead process) {
@@ -77,7 +81,8 @@ public final class ToolStartReceiptReconciliationService {
                 new ToolStartReceiptReconciliationSql(source), authority, process, Clock.systemUTC(), System::nanoTime);
         requireNoTransaction();
         new AgentStorageVerifier(source).verify();
-        new ToolExecutionStorageVerifier(source).verify();
+        runtimeStorage = new ToolExecutionStorageVerifier(source).verifyAndReturnProfile()
+                == ToolExecutionStorageVerifier.SchemaProfile.V17;
     }
 
     ToolStartReceiptReconciliationService(DataSource source, JdbcTemplate jdbc, ToolActionIntentSql intents,
@@ -112,6 +117,11 @@ public final class ToolStartReceiptReconciliationService {
 
         var started = clock.instant();
         var window = new WindowVO(started, started.plus(WINDOW).truncatedTo(ChronoUnit.MICROS), nanoTime.getAsLong());
+        if (runtimeStorage) {
+            var runtime = transact(reader, window, window.deadline(),
+                    () -> intents.historicalRuntimeStart(owner, dispatchRunId, intentId, window.deadline()));
+            if (runtime.isPresent()) return observeRuntime(runtime.orElseThrow(), window);
+        }
         var historical = transact(reader, window, window.deadline(), () -> find(owner, dispatchRunId, intentId, window.deadline()));
         var action = historical.action();
         var dispatch = action.dispatch();
@@ -152,6 +162,54 @@ public final class ToolStartReceiptReconciliationService {
                 });
         check(window, deadline);
         return result;
+    }
+
+    private ReceiptVO observeRuntime(HistoricalRuntimeStartVO original, WindowVO window) {
+        var row = original.action();
+        var action = row.action();
+        var dispatch = row.dispatch();
+        var intentId = UUID.fromString(action.intentId());
+        var read = new FixedBpmnStartReceiptRead.Request(original.dispatchRun(), row.descriptor(), action, dispatch.executor());
+        var target = external(() -> process.bind(read));
+        if (!intentId.toString().equals(target.query().commandId())) throw unavailable();
+        String evidenceScope = OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_START_RECEIPT_RECONCILE_V2",
+                action.owner().identityFingerprint(), original.dispatchRun().snapshotSha256(), dispatch.runId(),
+                dispatch.callId().toString(), Long.toString(dispatch.epoch()), dispatch.nonceSha256(), dispatch.executor().identityFingerprint(),
+                action.requestSha256(), target.namespaceSha256(), ProcessStartReceiptClient.START_RECEIPT_RESOURCE_KEY,
+                target.query().commandId(), target.query().requestSha256()), Map.of());
+        var request = new HistoricalToolReceiptAuthorization.Request(action.owner(), dispatch.runId(), intentId, dispatch.executor(),
+                evidenceScope, row.revision(), original.callRevision(), row.state(), window.deadline());
+        var beforeRead = authorize(request, window);
+        var observation = external(() -> process.read(read, target, beforeRead.expiresAt())).orElseThrow(
+                () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_SIDE_EFFECT_UNKNOWN, "Historical START effect is still unknown"));
+        if (!target.equals(observation.target()) || !dispatch.executor().equals(observation.executor())) throw unavailable();
+        var observed = observation.receipt();
+        var readUntil = earlier(beforeRead.expiresAt(), observation.expiresAt());
+        check(window, readUntil);
+        var permit = authorize(request, window);
+        var deadline = earlier(readUntil, permit.expiresAt()).truncatedTo(ChronoUnit.MICROS);
+        var result = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED, Map.of("instanceId", observed.instanceId()),
+                observation.hostReceiptReference(), null, null).validated(row.descriptor());
+        if ("APPLIED".equals(row.state())) {
+            var current = transact(reader, window, deadline, () ->
+                    intents.historicalRuntimeStart(action.owner(), dispatch.runId(), intentId, deadline).orElseThrow(
+                            ToolStartReceiptReconciliationService::conflict));
+            original.requireSame(current);
+            if (!result.equals(row.outcome())) throw conflict();
+            return new ReceiptVO(intentId, dispatch.runId(), observed.instanceId(), observed.recordedAt(), original.finishedAt());
+        }
+        var runtimeCalls = new AgentRuntimeCallReceiptStore(source, new AgentRuntimeBindingStore(jdbc));
+        var technical = new RuntimeCallReceiptBO.OutcomeVO(RuntimeCallReceiptBO.State.SUCCEEDED,
+                new ToolExecutionJsonCodec().runtimeWriteResultSha256(action.intentId(), action.requestSha256(), row.descriptor(), result),
+                null, null, null);
+        var exactDispatch = new RuntimeCallReceiptBO.DispatchVO(dispatch.epoch(), dispatch.nonceSha256(),
+                dispatch.executor().issuerFingerprint(), dispatch.executor().subjectId());
+        var finished = transact(writer, window, deadline, () -> runtimeCalls.reconcile(action.owner(), dispatch.runId(), dispatch.callId(),
+                original.callRevision(), exactDispatch, technical, () -> {
+                    check(window, deadline);
+                    intents.completeRuntimeStart(original, result, deadline);
+                }));
+        return new ReceiptVO(intentId, dispatch.runId(), observed.instanceId(), observed.recordedAt(), finished.getFinishedAt());
     }
 
     private HistoricalStartReceiptVO find(TrustedAgentActor owner, String runId, UUID intent, Instant deadline) {

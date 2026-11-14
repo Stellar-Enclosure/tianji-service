@@ -5,12 +5,16 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.component.common.trace.TraceContext;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.RunProfileEnum;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.ToolRunEvidenceVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolCapabilityStore;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ExecutionAuthorizationContract;
@@ -120,7 +124,8 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
 
     private CheckResult evaluate(Request request, Boundary boundary, WindowVO window) {
         try {
-            var source = source(request.run(), AgentRunStatusEnum.RUNNING, window); if (source == null) return negative(request, boundary, Decision.UNAVAILABLE);
+            var source = source(request.run(), AgentRunStatusEnum.RUNNING, request.lease(), request.deadlineAt(), window);
+            if (source == null) return negative(request, boundary, Decision.UNAVAILABLE);
             var matches = source.tools().stream().filter(selected -> selected.descriptor().reference().equals(request.tool())).toList();
             if (matches.size() != 1) return negative(request, boundary, Decision.DENY);
             var selected = matches.getFirst();
@@ -139,7 +144,8 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
     private AgentRunAuthorization.Decision evaluateRun(AgentRunAuthorization.Request run, AgentRunAuthorization.Boundary boundary, WindowVO window) {
         try {
             var status = boundary == AgentRunAuthorization.Boundary.CLAIM ? AgentRunStatusEnum.QUEUED : AgentRunStatusEnum.RUNNING;
-            var source = source(run, status, window); if (source == null) return AgentRunAuthorization.Decision.UNAVAILABLE;
+            var source = source(run, status, null, window.deadlineAt(), window);
+            if (source == null) return AgentRunAuthorization.Decision.UNAVAILABLE;
             var checked = new ArrayList<VerifiedToolResult>();
             for (var selected : source.tools()) {
                 remaining(window); var current = verify(run, status, source, selected, window.deadlineAt(), window);
@@ -150,7 +156,7 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
             // An earlier tool may rotate while the last PDP call runs; the batch is not ALLOW until all stored evidence is still current.
             for (var result : checked) if (!unchanged(run, status, source, result, window.deadlineAt(), window)) return AgentRunAuthorization.Decision.UNAVAILABLE;
             if (checked.isEmpty()) {
-                var current = source(run, status, window);
+                var current = source(run, status, source.activeLease(), window.deadlineAt(), window);
                 if (current == null || !sameSource(source, current)) return AgentRunAuthorization.Decision.UNAVAILABLE;
             }
             remaining(window); return AgentRunAuthorization.Decision.ALLOW;
@@ -191,7 +197,8 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
                               VerifiedToolResult expected, Instant requiredThrough, WindowVO window) {
         remaining(window); var currentTrust = trust(run, client(run));
         if (currentTrust == null || !sameTrust(expected.trust(), currentTrust)) return false;
-        var current = source(run, status, window); if (current == null || !sameSource(expectedSource, current)) return false;
+        var current = source(run, status, expectedSource.activeLease(), requiredThrough, window);
+        if (current == null || !sameSource(expectedSource, current)) return false;
         var selected = expected.selected();
         var evidence = store.current(selected.binding(), selected.descriptor()).orElse(null);
         if (!expected.evidence().equals(evidence) || !usable(evidence, selected.binding(), requiredThrough, run, window)) return false;
@@ -200,12 +207,37 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
                 && (expected.expiresAt() == null || expected.expiresAt().isAfter(now));
     }
 
-    private SourceResult source(AgentRunAuthorization.Request run, AgentRunStatusEnum status, WindowVO window) {
-        remaining(window); var material = ledger.executionMaterial(run.actor(), new GetAgentRunQuery(run.runId()));
-        if (material == null || !run.equals(material.authorization()) || material.run() == null || material.run().status() != status || material.run().cancelRequested()) return null;
-        var result = new SourceResult(material.snapshot(), bindings.resolve(material));
-        remaining(window); Instant now = ledger.databaseNow(); remaining(window);
-        return window.deadlineAt().isAfter(now) && run.deadlineAt().isAfter(now) ? result : null;
+    private SourceResult source(AgentRunAuthorization.Request run, AgentRunStatusEnum status,
+                                AgentRunLease expectedLease, Instant requiredThrough, WindowVO window) {
+        remaining(window);
+        var query = new GetAgentRunQuery(run.runId());
+        var runtime = run.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE
+                ? ledger.toolRunEvidence(run.actor(), query) : null;
+        SourceResult source;
+        if (runtime != null && runtime.profile() == RunProfileEnum.RUNTIME_V2) {
+            if (!run.equals(runtime.authorization()) || !currentRun(runtime.run(), status)) return null;
+            var activeLease = runtime.activeLease();
+            if (status == AgentRunStatusEnum.RUNNING && (activeLease == null || !run.runId().equals(activeLease.runId())
+                    || activeLease.expiresAt().isBefore(requiredThrough) || expectedLease != null
+                    && (!activeLease.owner().equals(expectedLease.owner()) || activeLease.epoch() != expectedLease.epoch()))) {
+                return null;
+            }
+            source = new SourceResult(null, runtime, bindings.resolveRuntime(runtime));
+        } else {
+            if (run.actor().subjectType() == TrustedAgentActor.SubjectType.SERVICE
+                    && (runtime == null || runtime.profile() != RunProfileEnum.LEGACY_V1)) return null;
+            var legacy = ledger.executionMaterial(run.actor(), query);
+            if (legacy == null || !run.equals(legacy.authorization()) || !currentRun(legacy.run(), status)) return null;
+            source = new SourceResult(legacy.snapshot(), null, bindings.resolve(legacy));
+        }
+        remaining(window);
+        Instant now = ledger.databaseNow();
+        remaining(window);
+        return window.deadlineAt().isAfter(now) && requiredThrough.isAfter(now) && run.deadlineAt().isAfter(now) ? source : null;
+    }
+
+    private static boolean currentRun(AgentRunDTO run, AgentRunStatusEnum status) {
+        return run != null && run.status() == status && !run.cancelRequested();
     }
 
     private boolean usable(ToolExecutionGrant.EvidenceVO evidence, ToolExecutionGrant.BindingVO binding, Instant requiredThrough,
@@ -230,7 +262,15 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
         return expected.equals(actual) && expected.issuer().toASCIIString().equals(actual.issuer().toASCIIString()) && expected.jwksUri().toASCIIString().equals(actual.jwksUri().toASCIIString());
     }
     private static boolean sameSource(SourceResult expected, SourceResult actual) {
-        return expected.tools().equals(actual.tools()) && expected.snapshot().definition().equals(actual.snapshot().definition())
+        if (!expected.tools().equals(actual.tools())) return false;
+        if (expected.runtime() != null) {
+            var pinned = expected.runtime();
+            var current = actual.runtime();
+            return current != null && pinned.authorization().equals(current.authorization())
+                    && pinned.processLink().equals(current.processLink()) && pinned.toolRefs().equals(current.toolRefs())
+                    && pinned.maxToolCalls() == current.maxToolCalls();
+        }
+        return actual.snapshot() != null && expected.snapshot().definition().equals(actual.snapshot().definition())
                 && expected.snapshot().definitionContentSha256().equals(actual.snapshot().definitionContentSha256())
                 && expected.snapshot().effectivePolicy().equals(actual.snapshot().effectivePolicy()) && Objects.equals(expected.snapshot().processLink(), actual.snapshot().processLink());
     }
@@ -265,8 +305,13 @@ public final class TianjiToolGrantAuthorizer implements ToolExecutionAuthorizati
     }
     @Override public void close() { closed.set(true); calls.shutdownNow(); }
     private record WindowVO(Instant deadlineAt, long nanoDeadline) { }
-    private record SourceResult(AgentExecutionSnapshot snapshot, List<TianjiToolGrantBindings.ResolvedToolResult> tools) {
-        SourceResult { snapshot = Objects.requireNonNull(snapshot, "snapshot"); tools = List.copyOf(tools); }
+    private record SourceResult(AgentExecutionSnapshot snapshot, ToolRunEvidenceVO runtime,
+                                List<TianjiToolGrantBindings.ResolvedToolResult> tools) {
+        SourceResult {
+            if ((snapshot == null) == (runtime == null)) throw invalid();
+            tools = List.copyOf(tools);
+        }
+        AgentRunLease activeLease() { return runtime == null ? null : runtime.activeLease(); }
         @Override public String toString() { return "ToolGrantSource[redacted]"; }
     }
     private record VerifiedToolResult(TianjiToolGrantBindings.ResolvedToolResult selected, ToolExecutionGrant.EvidenceVO evidence,

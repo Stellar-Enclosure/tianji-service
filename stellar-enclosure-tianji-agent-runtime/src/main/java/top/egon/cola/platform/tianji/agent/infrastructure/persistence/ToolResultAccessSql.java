@@ -5,6 +5,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetRequest;
 import top.egon.cola.platform.tianji.agent.domain.AgentBudgetReservation;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.RuntimeCallReceiptBO;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
@@ -12,6 +14,7 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionOutcome;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.DisclosureWindowVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.RecordedAccessVO;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.RuntimeRecordedAccessVO;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolResultAccessStore.StartResultAccessRequestVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
@@ -44,6 +47,56 @@ final class ToolResultAccessSql {
         this.source = source; this.ledger = ledger; this.capabilities = capabilities;
         jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(5); intents = new ToolActionIntentSql(source, ledger);
     }
+
+    Instant requireRuntimeLease(TrustedAgentActor owner, AgentRunLease lease, long runRevision) {
+        var bindings = new AgentRuntimeBindingStore(jdbc);
+        var run = bindings.lockRun(owner, lease.runId());
+        var binding = bindings.lockBinding(owner.tenantId(), lease.runId());
+        bindings.requireCurrent(run, binding, lease, runRevision, bindings.now());
+        return run.leaseExpiresAt();
+    }
+
+    RuntimeRecordedAccessVO recordRuntimeStartResultAccess(StartResultAccessRequestVO request, long runRevision,
+            ToolExecutionGrant.EvidenceVO evidence, ToolExecutionAuthorization.AuditVO audit, DisclosureWindowVO window,
+            Runnable verifyCurrent) {
+        var run = request.binding().run();
+        var owner = run.actor();
+        var checked = ledger.runtimeExecutionMaterial(owner, new GetAgentRunQuery(run.runId()));
+        if (!run.equals(checked.authorization()) || runRevision != checked.run().revision()
+                || !evidence.reservation().binding().equals(request.binding())) throw unavailable();
+        if (window.deadlineAt().isAfter(requireRuntimeLease(owner, request.lease(), runRevision))) throw leaseLost();
+        var action = intents.lockForRuntimeWrite(request.action(), request.descriptor(), window.deadlineAt());
+        var outcome = action.outcome();
+        if (!"APPLIED".equals(action.state()) || outcome == null || outcome.status() != ToolExecutionOutcome.Status.SUCCEEDED) throw unavailable();
+        ToolResultAccessStore.knownStartOutcome(outcome);
+        var current = capabilities.currentInTransaction(request.binding(), request.descriptor()).orElseThrow(ToolResultAccessSql::unavailable);
+        if (!evidence.equals(current)) throw unavailable();
+        String fingerprint = codec.sourceResultSha256(action.action().intentId(), action.revision(), action.action().requestSha256(),
+                action.profile(), request.descriptor(), outcome);
+        var descriptor = request.descriptor();
+        var capability = new RuntimeCallReceiptBO.CapabilityVO(UUID.fromString(request.binding().capabilityId()),
+                request.binding().bindingSha256(), evidence.reservation().issueEpoch(), evidence.grantId(), descriptor.key(),
+                descriptor.version(), descriptor.reference().contentSha256(), request.binding().backendBindingSha256(), descriptor.policy().risk());
+        var receipt = new RuntimeCallReceiptBO().setTenantId(owner.tenantId()).setRunId(run.runId()).setCallId(request.accessId())
+                .setKind(RuntimeCallReceiptBO.Kind.TOOL_RESULT_READ).setOwner(owner).setLeaseEpoch(request.lease().epoch())
+                .setCapability(capability).setInputSha256(request.parametersSha256()).setIntentId(UUID.fromString(action.action().intentId()))
+                .setSourceResult(new RuntimeCallReceiptBO.SourceResultVO(action.revision(), fingerprint))
+                .setContextMetadata(Map.of("authorization", Map.of("decisionId", audit.localCheckId().toString(),
+                        "checkedAt", audit.checkedAt().truncatedTo(ChronoUnit.MICROS).toString(),
+                        "expiresAt", audit.expiresAt().truncatedTo(ChronoUnit.MICROS).toString(),
+                        "scopeSha256", resultAccessScopeSha256(request, action.revision(), fingerprint), "decision", "ALLOW")))
+                .setDeadlineAt(window.deadlineAt());
+        var runtimeReceipts = new AgentRuntimeCallReceiptStore(source, new AgentRuntimeBindingStore(jdbc));
+        runtimeReceipts.recordResultAccess(owner, request.lease(), runRevision, receipt, verifyCurrent);
+        return new RuntimeRecordedAccessVO(run.runId(), request.accessId(), action.revision(), fingerprint,
+                new ToolExecutionOutcome(outcome.status(), outcome.output(), outcome.businessReceiptId(), null, null));
+    }
+
+    private static String resultAccessScopeSha256(StartResultAccessRequestVO request, long sourceRevision, String sourceResultSha256) {
+        return OrchestrationRequestDigests.hash(List.of("TIANJI_RUNTIME_TOOL_RESULT_READ_SCOPE_V2", request.binding().bindingSha256(),
+                request.lease().runId(), Long.toString(request.lease().epoch()), request.action().intentId(),
+                request.parametersSha256(), Long.toString(sourceRevision), sourceResultSha256), Map.of());
+    }
     RecordedAccessVO recordKnownStartResultAccess(StartResultAccessRequestVO request, ToolExecutionGrant.EvidenceVO expected,
             ToolExecutionAuthorization.AuditVO originalAudit, Duration expectedToolTimeout, DisclosureWindowVO window) {
         Instant deadline = window.deadlineAt();
@@ -70,8 +123,8 @@ final class ToolResultAccessSql {
             outcome = outcome.validated(request.descriptor()); ToolResultAccessStore.knownStartOutcome(outcome);
         } catch (AgentLedgerException scopedFailure) { throw scopedFailure; }
         catch (RuntimeException privateSource) { throw unavailable(); }
-        String fingerprint = OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_RESULT_ACCESS_SOURCE_V1", action.action().intentId(), Long.toString(action.revision()),
-                action.action().requestSha256(), codec.outcome(action.profile(), request.descriptor(), outcome)), Map.of());
+        String fingerprint = codec.sourceResultSha256(action.action().intentId(), action.revision(),
+                action.action().requestSha256(), action.profile(), request.descriptor(), outcome);
         if (existing.isPresent()) {
             var stored = read(request, deadline, true).orElseThrow(ToolResultAccessSql::unavailable);
             sameSource(stored, action.revision(), fingerprint); requireRun(request, expectedToolTimeout, deadline);

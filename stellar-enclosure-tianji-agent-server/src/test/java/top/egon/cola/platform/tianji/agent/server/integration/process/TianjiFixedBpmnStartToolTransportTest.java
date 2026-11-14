@@ -264,6 +264,25 @@ class TianjiFixedBpmnStartToolTransportTest {
         }
     }
 
+    @Test void reports_dispatch_only_after_preflight_and_immediately_before_the_fixed_post() {
+        try (var fixture = new Fixture()) {
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            var observation = fixture.transport.withVerifiedCall(fixture.request(),
+                    (executor, operation) -> operation.start(NOW.plusSeconds(2), () -> {
+                        assertEquals(List.of("GET"), fixture.requests.stream().map(HttpRequest::method).toList());
+                        assertEquals(1, attempts.incrementAndGet());
+                    }));
+            assertEquals(INSTANCE_ID, observation.instanceId());
+            assertEquals(1, attempts.get());
+            assertEquals(1, fixture.posts());
+        }
+        try (var fixture = new Fixture()) {
+            assertFailure(OPERATION_NOT_SENT, () -> fixture.transport.withVerifiedCall(fixture.request(),
+                    (executor, operation) -> operation.start(NOW, () -> fail("expired call reported a send"))));
+            assertEquals(0, fixture.posts());
+        }
+    }
+
     @Test void null_nonmicro_expired_or_overwide_bounded_deadlines_are_not_sent() {
         for (String variant : List.of("null", "nonmicro", "expired", "window", "credential")) {
             try (var fixture = new Fixture()) {

@@ -142,9 +142,12 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
         requireRelease(release, backend); current(scope, backend);
         Thread owner = Thread.currentThread(); var callbackActive = new AtomicBoolean(true); var consumed = new AtomicBoolean();
         OneShotStart operation = new OneShotStart() {
-            @Override public StartObservation start() { return execute(false, null); }
-            @Override public StartObservation start(Instant callDeadlineAt) { return execute(true, callDeadlineAt); }
-            private StartObservation execute(boolean bounded, Instant callDeadlineAt) {
+            @Override public StartObservation start() { return execute(false, null, () -> {}); }
+            @Override public StartObservation start(Instant callDeadlineAt) { return execute(true, callDeadlineAt, () -> {}); }
+            @Override public StartObservation start(Instant callDeadlineAt, Runnable beforeSend) {
+                return execute(true, callDeadlineAt, Objects.requireNonNull(beforeSend, "before send"));
+            }
+            private StartObservation execute(boolean bounded, Instant callDeadlineAt, Runnable beforeSend) {
                 if (Thread.currentThread() != owner || !callbackActive.get() || TransactionSynchronizationManager.isActualTransactionActive()
                         || !consumed.compareAndSet(false, true)) throw failure(FailureKind.CANCELLED);
                 HttpProcessClient client; StartProcessCommand command;
@@ -153,7 +156,7 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
                     current(scope, backend);
                     client = client(backend, scope);
                     command = startCommand(backend, request.action());
-                    scope.beginOperation();
+                    scope.beginOperation(beforeSend);
                 } catch (RuntimeException notSent) { throw failure(FailureKind.OPERATION_NOT_SENT); }
                 return TianjiFixedBpmnStartToolTransport.this.start(backend, credential.actor(), client, command);
             }
@@ -290,8 +293,12 @@ public final class TianjiFixedBpmnStartToolTransport implements FixedBpmnStartTo
                 bearer.set(value);
             }
         }
-        void beginOperation() {
-            synchronized (publishLock) { remaining(); operationStarted.set(true); }
+        void beginOperation(Runnable beforeSend) {
+            synchronized (publishLock) {
+                remaining();
+                beforeSend.run();
+                operationStarted.set(true);
+            }
         }
         void clearBearer() { synchronized (publishLock) { bearer.set(null); } }
         void cancel() {

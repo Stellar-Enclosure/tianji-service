@@ -11,6 +11,7 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.RunProfileEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
@@ -28,6 +29,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -162,6 +164,41 @@ class TianjiToolGrantBindingsTest {
         when(services.require(material.authorization(), material.snapshot().processLink())).thenThrow(new IllegalStateException("private source context"));
         var failure = assertThrows(IllegalStateException.class, () -> bindings.resolve(material));
         assertEquals("TIANJI_TOOL_GRANT_BINDING_UNAVAILABLE", failure.getMessage()); assertNull(failure.getCause());
+    }
+
+    @Test void runtime_binding_requires_registered_exact_reference_and_operator_linked_source() {
+        URI sourceResource = URI.create("https://process.example/api");
+        var issuers = mock(TrustedIssuerRegistry.class);
+        var trust = new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER, URI.create("https://idp.example/jwks"), "tenant:21",
+                TrustedIssuerRegistry.RealmType.TENANT, "21", TrustedIssuerRegistry.Status.ACTIVE, 1);
+        when(issuers.findByIssuer(ISSUER.toASCIIString())).thenReturn(Optional.of(trust));
+        var linked = new TianjiLinkedDispatchProperties(true, true, List.of(new TianjiLinkedDispatchProperties.Binding(
+                ISSUER, 21, "worker", "process-app", "platform", "process", "test", "process-east",
+                Set.of(WorkerScopeTypeEnum.BPMN), List.of(new TianjiLinkedDispatchProperties.Definition(DEFINITION, 1, HASH)))));
+        var services = new TianjiServiceExecutionBindings(new TianjiServiceExecutionProperties(true,
+                List.of(new TianjiServiceExecutionProperties.Source(ISSUER, 21, "worker", sourceResource))), linked, issuers);
+        var bindings = new TianjiToolGrantBindings(List.of(READ, WRITE), List.of(mapping(SERVICE, READ)), RESOURCE, services);
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance", "occurrence", HASH, DEADLINE);
+        var source = material(SERVICE, List.of(READ.reference()), policy(Set.of(READ.versionKey()), 4),
+                policy(Set.of(READ.versionKey()), 4), link);
+        var runtime = new AgentLedgerService.ToolRunEvidenceVO(source.run(), source.authorization(), link,
+                List.of(READ.reference()), 4, null, RunProfileEnum.RUNTIME_V2, null);
+        var resolved = bindings.resolveRuntime(runtime);
+        assertEquals(bindings.resolve(source), resolved);
+        assertEquals(sourceResource, resolved.getFirst().binding().serviceSubject().resourceUri());
+        assertEquals("process-app", resolved.getFirst().binding().serviceSubject().appId());
+
+        var otherSource = new AgentProcessLink("process-west", WorkerScopeTypeEnum.BPMN, "instance", "occurrence", HASH, DEADLINE);
+        var otherDigest = new DefinitionResourceRef(READ.key(), READ.version(), "f".repeat(64));
+        for (var unavailable : List.of(
+                new AgentLedgerService.ToolRunEvidenceVO(source.run(), source.authorization(), otherSource,
+                        runtime.toolRefs(), 4, null, RunProfileEnum.RUNTIME_V2, null),
+                new AgentLedgerService.ToolRunEvidenceVO(source.run(), source.authorization(), link,
+                        List.of(otherDigest), 4, null, RunProfileEnum.RUNTIME_V2, null),
+                new AgentLedgerService.ToolRunEvidenceVO(source.run(), source.authorization(), link,
+                        List.of(WRITE.reference()), 4, null, RunProfileEnum.RUNTIME_V2, null))) {
+            assertThrows(IllegalStateException.class, () -> bindings.resolveRuntime(unavailable));
+        }
     }
 
     @Test void resolved_value_cannot_pair_another_descriptor_with_a_pinned_grant() {

@@ -102,6 +102,17 @@ final class ToolExecutionJsonCodec {
         } catch (RuntimeException | java.io.IOException malformed) { throw invalid(); }
     }
 
+    String sourceResultSha256(String intentId, long revision, String requestSha256, ActionProfile profile,
+                              ToolDescriptor descriptor, ToolExecutionOutcome result) {
+        return OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_RESULT_ACCESS_SOURCE_V1", intentId,
+                Long.toString(revision), requestSha256, outcome(profile, descriptor, result)), Map.of());
+    }
+
+    String runtimeWriteResultSha256(String intentId, String requestSha256, ToolDescriptor descriptor, ToolExecutionOutcome result) {
+        return OrchestrationRequestDigests.hash(List.of("TIANJI_RUNTIME_TOOL_RESULT_V2", intentId, requestSha256,
+                outcome(ActionProfile.RUNTIME_V2, descriptor, result)), Map.of());
+    }
+
     String outcome(ToolDescriptor descriptor, ToolExecutionOutcome value) {
         try { return write(value.validated(descriptor)); }
         catch (RuntimeException malformed) { throw invalid(); }
