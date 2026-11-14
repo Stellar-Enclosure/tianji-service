@@ -12,7 +12,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 
-import static top.egon.cola.platform.tianji.worker.AutomationWorkerHandlerDescriptor.CAPABILITY_ID;
 import static top.egon.cola.platform.tianji.worker.AutomationWorkerHandlerDescriptor.REGISTERED_ID;
 import static top.egon.cola.platform.tianji.worker.AutomationWorkerHandlerDescriptor.SHA256;
 
@@ -20,14 +19,16 @@ public record WorkerEffectEvidenceVO(@NotNull Status status, @NotNull @Pattern(r
                                      @NotNull @Pattern(regexp = SHA256) String effectFingerprint,
                                      @NotNull @Pattern(regexp = REGISTERED_ID) String targetId,
                                      @Positive @Max(ProcessTypedJson.V2_MAX_WIRE_INTEGER) long dispatchGeneration,
-                                     @NotNull @Pattern(regexp = CAPABILITY_ID) String authorityRef,
+                                     @NotNull @Pattern(regexp = AUTHORITY_ID_PATTERN) String authorityRef,
                                      @NotNull Instant observedAt, @NotNull Instant validUntil,
                                      @NotNull @Pattern(regexp = SHA256) String evidenceSha256,
                                      String businessReceiptId, Map<String, Object> output, String resultSha256) {
+    private static final String AUTHORITY_ID_PATTERN = "[A-Za-z][A-Za-z0-9_.:-]{0,127}";
+
     public WorkerEffectEvidenceVO {
         if (status == null || !matches(effectKey, REGISTERED_ID) || !matches(effectFingerprint, SHA256)
                 || !matches(targetId, REGISTERED_ID) || dispatchGeneration < 1
-                || dispatchGeneration > ProcessTypedJson.V2_MAX_WIRE_INTEGER || !matches(authorityRef, CAPABILITY_ID)
+                || dispatchGeneration > ProcessTypedJson.V2_MAX_WIRE_INTEGER || !matches(authorityRef, AUTHORITY_ID_PATTERN)
                 || !micros(observedAt) || !micros(validUntil) || !observedAt.isBefore(validUntil)
                 || Duration.between(observedAt, validUntil).compareTo(Duration.ofSeconds(60)) > 0
                 || !matches(evidenceSha256, SHA256)) throw invalid();

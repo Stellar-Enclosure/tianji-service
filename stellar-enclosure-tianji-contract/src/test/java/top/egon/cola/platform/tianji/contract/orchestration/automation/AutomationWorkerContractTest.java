@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.contract.orchestration.automation;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Pattern;
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnum;
@@ -136,6 +137,23 @@ class AutomationWorkerContractTest {
                 .effectMode(WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT).targetId("customer-system").inputSchemaSha256(A)
                 .outputSchemaSha256(B).effectFingerprint(A).input(Map.of()).inputSha256(A).effectKey("effect-101")
                 .attemptDeadlineAt(NOW.plusSeconds(60)).leaseExpiresAt(NOW.plusSeconds(30)).effectRecovery(recovery).build();
+    }
+
+    @Test
+    void capability_key_uses_the_logical_worker_topic_alphabet() throws NoSuchFieldException {
+        String pattern = AutomationWorkerAcquireCommand.class.getDeclaredField("capabilityKey")
+                .getAnnotation(Pattern.class).regexp();
+        assertTrue("_customer.lookup-2".matches(pattern));
+        assertFalse("customer:lookup".matches(pattern));
+        assertTrue(("_" + "k".repeat(127)).matches(pattern));
+        assertFalse(("_" + "k".repeat(128)).matches(pattern));
+        assertDoesNotThrow(() -> task(null).setCapabilityKey("_customer.lookup-2").contractSha256(20, "process-east"));
+        assertThrows(IllegalArgumentException.class,
+                () -> task(null).setCapabilityKey("customer:lookup").contractSha256(20, "process-east"));
+        assertDoesNotThrow(() -> new AutomationNodeBindingVO.CapabilityRefVO(
+                "_customer.lookup-2", 1, A, B, WorkerEffectSafetyEnum.READ_ONLY));
+        assertThrows(IllegalArgumentException.class, () -> new AutomationNodeBindingVO.CapabilityRefVO(
+                "customer:lookup", 1, A, B, WorkerEffectSafetyEnum.READ_ONLY));
     }
 
     private static WorkerEffectRecoveryVO replayApplied() {

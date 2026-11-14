@@ -70,15 +70,21 @@ public record AutomationNodeBindingVO(
         }
     }
 
+    public static final String CAPABILITY_KEY_PATTERN = "[A-Za-z_][A-Za-z0-9_.-]{0,127}";
+
+    public static boolean isCapabilityKey(String value) {
+        return value != null && value.matches(CAPABILITY_KEY_PATTERN);
+    }
+
     public record CapabilityRefVO(
-            @NotNull String capabilityKey,
+            @NotNull @jakarta.validation.constraints.Pattern(regexp = CAPABILITY_KEY_PATTERN) String capabilityKey,
             @Min(1) @Max(ProcessTypedJson.V2_MAX_WIRE_INTEGER) long version,
             @NotNull String inputSchemaSha256,
             @NotNull String outputSchemaSha256,
             @NotNull WorkerEffectSafetyEnum effectMode) {
 
         public CapabilityRefVO {
-            require(ProcessTypedJson.isId(capabilityKey) && version >= 1 && version <= ProcessTypedJson.V2_MAX_WIRE_INTEGER);
+            require(isCapabilityKey(capabilityKey) && version >= 1 && version <= ProcessTypedJson.V2_MAX_WIRE_INTEGER);
             require(ProcessTypedJson.isSha256(inputSchemaSha256) && ProcessTypedJson.isSha256(outputSchemaSha256) && effectMode != null);
         }
     }

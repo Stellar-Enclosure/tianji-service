@@ -123,6 +123,28 @@ class WorkerEffectReceiptIT {
     }
 
     @Test
+    void logical_worker_key_is_checked_by_the_handler_and_physical_receipt() {
+        var baseline = descriptor(WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT, null);
+        assertThrows(IllegalArgumentException.class, () -> new AutomationWorkerHandlerDescriptor(
+                "customer:check", 1, baseline.inputSchemaSha256(), baseline.outputSchemaSha256(),
+                baseline.effectMode(), baseline.handlerVersion(), null));
+        var descriptor = new AutomationWorkerHandlerDescriptor("_customer.check", 1, baseline.inputSchemaSha256(),
+                baseline.outputSchemaSha256(), baseline.effectMode(), baseline.handlerVersion(), null);
+        var registered = new AutomationWorkerHandlerRegistration(descriptor, EMPTY, EMPTY,
+                (context, operations) -> result("logical-worker-key"), null);
+        var acquired = task(fixture, descriptor, "job-key", "key-alphabet", 33, null);
+
+        assertEquals("logical-worker-key", fixture.store().executeAutomation(acquired, registered).businessReceiptId());
+        assertEquals("_customer.check", fixture.owner().queryForObject("""
+                SELECT capability_key FROM business.tianji_worker_effect_receipt WHERE effect_key='key-alphabet'
+                """, String.class));
+        assertThrows(DataIntegrityViolationException.class, () -> fixture.owner().update("""
+                UPDATE business.tianji_worker_effect_receipt SET capability_key='customer:check'
+                WHERE effect_key='key-alphabet'
+                """));
+    }
+
+    @Test
     void exact_v3_history_role_and_schema_drift_fail_closed() {
         var owner = fixture.owner();
         var verifier = new WorkerExecutionSchemaVerifier(fixture.runtime(), "business");

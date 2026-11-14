@@ -9,6 +9,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.experimental.Accessors;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
 @Data
@@ -18,7 +19,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTy
 @Builder
 public class AutomationWorkerAcquireCommand {
 
-    @NotNull @Pattern(regexp = "[A-Za-z][A-Za-z0-9_.:-]{0,127}")
+    @NotNull @Pattern(regexp = AutomationNodeBindingVO.CAPABILITY_KEY_PATTERN)
     private String capabilityKey;
     @Min(1) @Max(ProcessTypedJson.V2_MAX_WIRE_INTEGER)
     private long capabilityVersion;

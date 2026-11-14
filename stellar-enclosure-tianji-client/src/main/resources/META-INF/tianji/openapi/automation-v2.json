@@ -7136,6 +7136,11 @@
           }
         }
       },
+      "WorkerCapabilityKey": {
+        "type": "string",
+        "maxLength": 128,
+        "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,127}$"
+      },
       "CapabilityRefVO": {
         "type": "object",
         "additionalProperties": false,
@@ -7148,7 +7153,7 @@
         ],
         "properties": {
           "capabilityKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/WorkerCapabilityKey"
           },
           "version": {
             "$ref": "#/components/schemas/ExactPositiveInteger"
@@ -9586,7 +9591,7 @@
         ],
         "properties": {
           "capabilityKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/WorkerCapabilityKey"
           },
           "capabilityVersion": {
             "$ref": "#/components/schemas/ExactPositiveInteger"
@@ -9723,7 +9728,7 @@
             "$ref": "#/components/schemas/Base64UrlToken32"
           },
           "capabilityKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/WorkerCapabilityKey"
           },
           "capabilityVersion": {
             "$ref": "#/components/schemas/ExactPositiveInteger"

@@ -7,6 +7,7 @@ import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.Size;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
 public record AutomationWorkerHandlerDescriptor(
@@ -18,7 +19,7 @@ public record AutomationWorkerHandlerDescriptor(
         @NotBlank @Size(max = 128) String handlerVersion,
         @Pattern(regexp = REGISTERED_ID) String targetId) {
 
-    static final String CAPABILITY_ID = "[A-Za-z][A-Za-z0-9_.:-]{0,127}";
+    static final String CAPABILITY_ID = AutomationNodeBindingVO.CAPABILITY_KEY_PATTERN;
     static final String REGISTERED_ID = "[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}";
     static final String SHA256 = "[0-9a-f]{64}";
 

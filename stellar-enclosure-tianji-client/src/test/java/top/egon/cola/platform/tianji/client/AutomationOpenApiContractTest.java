@@ -166,6 +166,19 @@ class AutomationOpenApiContractTest {
     }
 
     @Test
+    void capabilityKeysUseTheSameLogicalWorkerTopicAlphabet() throws IOException {
+        JsonNode doc = mapper.readTree(artifact());
+        for (String name : List.of("CapabilityRefVO", "AutomationWorkerAcquireCommand", "AutomationWorkerTaskDTO")) {
+            var definition = resolve(doc, schema(doc, name).path("properties").path("capabilityKey"));
+            String pattern = definition.path("pattern").asText();
+            assertTrue("_customer.lookup-2".matches(pattern), name);
+            assertFalse("customer:lookup".matches(pattern), name);
+            assertTrue(("_" + "k".repeat(127)).matches(pattern), name);
+            assertFalse(("_" + "k".repeat(128)).matches(pattern), name);
+        }
+    }
+
+    @Test
     void processServerAndClientPublishIdenticalBytes() throws IOException {
         Path repo = repository();
         byte[] clientSource = Files.readAllBytes(repo.resolve(CLIENT_MODULE).resolve(SOURCE_RESOURCES).resolve(AUTOMATION));

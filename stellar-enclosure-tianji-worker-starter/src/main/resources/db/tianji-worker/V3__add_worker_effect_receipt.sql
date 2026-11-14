@@ -25,7 +25,7 @@ CREATE TABLE tianji_worker_effect_receipt (
     CONSTRAINT tianji_worker_effect_receipt_pkey PRIMARY KEY (source_id,tenant_id,effect_key),
     CONSTRAINT worker_effect_identity_check CHECK (
         source_id ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$' AND tenant_id>0
-        AND effect_key ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$' AND capability_key ~ '^[A-Za-z][A-Za-z0-9_.:-]{0,127}$'
+        AND effect_key ~ '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$' AND capability_key ~ '^[A-Za-z_][A-Za-z0-9_.-]{0,127}$'
         AND capability_version>=1 AND capability_version<='999999999999999'::bigint
         AND btrim(handler_version)<>'' AND handler_version !~ '[[:cntrl:]]'
         AND input_schema_sha256 ~ '^[0-9a-f]{64}$' AND output_schema_sha256 ~ '^[0-9a-f]{64}$'

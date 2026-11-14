@@ -16,6 +16,7 @@ import lombok.NoArgsConstructor;
 import lombok.ToString;
 import lombok.experimental.Accessors;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
 import java.nio.charset.StandardCharsets;
@@ -42,7 +43,7 @@ public class AutomationWorkerTaskDTO {
     private String nodeExecutionRef;
     @NotNull @Pattern(regexp = "[A-Za-z0-9_-]{43}") @ToString.Exclude
     private String leaseToken;
-    @NotNull @Pattern(regexp = "[A-Za-z][A-Za-z0-9_.:-]{0,127}")
+    @NotNull @Pattern(regexp = AutomationNodeBindingVO.CAPABILITY_KEY_PATTERN)
     private String capabilityKey;
     @Min(1) @Max(ProcessTypedJson.V2_MAX_WIRE_INTEGER)
     private long capabilityVersion;
@@ -122,7 +123,7 @@ public class AutomationWorkerTaskDTO {
 
     private Map<String, Object> taskWire() {
         if (!plainText(taskId, 255) || !plainText(activityOccurrenceId, 255) || !identifier(nodeExecutionRef)
-                || !identifier(capabilityKey) || capabilityVersion < 1 || capabilityVersion > ProcessTypedJson.V2_MAX_WIRE_INTEGER
+                || !AutomationNodeBindingVO.isCapabilityKey(capabilityKey) || capabilityVersion < 1 || capabilityVersion > ProcessTypedJson.V2_MAX_WIRE_INTEGER
                 || !plainText(handlerVersion, 128) || !registeredIdentifier(effectKey)
                 || !WorkerEffectRecoveryVO.utcMicros(attemptDeadlineAt) || !WorkerEffectRecoveryVO.utcMicros(leaseExpiresAt)
                 || !AutomationWorkerBusinessResultDTO.isHash(inputSha256)
