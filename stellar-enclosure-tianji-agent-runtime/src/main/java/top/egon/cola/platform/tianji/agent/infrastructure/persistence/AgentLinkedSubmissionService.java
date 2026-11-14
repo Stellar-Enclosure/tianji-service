@@ -5,6 +5,8 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import javax.sql.DataSource;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -22,6 +24,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 
 /** Atomically fences one service-owned process occurrence against late submission and cancellation. */
 public final class AgentLinkedSubmissionService {
@@ -44,14 +47,36 @@ public final class AgentLinkedSubmissionService {
         requireService(actor); Objects.requireNonNull(command, "command"); requireOwnedTransaction();
         var query = new LinkedAgentLookupQuery(command.start().idempotencyKey(), command.link());
         String requestHash = json.linkedRequestHash(command.start(), command.link());
+        return submit(actor, query, requestHash, false, () -> true, () -> ledger.startLinked(actor, command));
+    }
+
+    /** Invoked by the host after authorizing the exact current V2 source and its selected template. */
+    public AgentRunDTO submitRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command) {
+        return submitRuntimeV2(actor, command, () -> false);
+    }
+
+    public AgentRunDTO submitRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command, BooleanSupplier newAdmissionEnabled) {
+        requireService(actor); requireOwnedTransaction();
+        var input = json.immutableRuntimeCommand(command);
+        var query = new LinkedAgentLookupQuery(input.getIdempotencyKey(), input.getLink());
+        return submit(actor, query, json.runtimeRequestHash(input), true, Objects.requireNonNull(newAdmissionEnabled),
+                () -> ledger.startLinkedRuntimeV2(actor, input));
+    }
+
+    private AgentRunDTO submit(TrustedAgentActor actor, LinkedAgentLookupQuery query, String requestHash,
+                               boolean runtimeV2, BooleanSupplier newAdmissionEnabled, Supplier<AgentRunDTO> start) {
         return transact(() -> {
             lockTimeout();
-            ledger.requireDispatchTime(command.link());
+            if (!runtimeV2) ledger.requireDispatchTime(query.link());
             insertFence(actor, query, false);
             Fence fence = lockedFence(actor, query);
             if (fence.closed()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DISPATCH_CLOSED, "Linked Agent dispatch is closed");
             if (fence.runId() != null && !requestHash.equals(fence.requestSha256())) throw conflict();
-            AgentRunDTO run = ledger.startLinked(actor, command);
+            if (runtimeV2 && fence.runId() != null) return verifyRun(actor, query.link(), fence.runId(), requestHash, true);
+            if (runtimeV2 && !newAdmissionEnabled.getAsBoolean()) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "New Agent runtime admission is disabled");
+            }
+            AgentRunDTO run = start.get();
             if (fence.runId() != null && !fence.runId().equals(run.runId())) throw conflict();
             if (fence.runId() == null && jdbc.update("""
                     UPDATE tianji_agent.agent_process_dispatch SET run_id=?, request_sha256=?
@@ -60,21 +85,29 @@ public final class AgentLinkedSubmissionService {
                     """, run.runId(), requestHash, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), query.idempotencyKey()) != 1) {
                 throw conflict();
             }
-            verifyRun(actor, query.link(), run.runId(), requestHash);
-            ledger.requireDispatchTime(command.link());
+            verifyRun(actor, query.link(), run.runId(), requestHash, runtimeV2);
+            ledger.requireDispatchTime(query.link());
             return run;
         });
     }
 
     /** Returns empty only when the exact service-owned link has never been submitted or closed. */
     public Optional<LinkedAgentSubmissionDTO> resolve(TrustedAgentActor actor, LinkedAgentLookupQuery query) {
+        return resolve(actor, query, false);
+    }
+
+    public Optional<LinkedAgentSubmissionDTO> resolveRuntimeV2(TrustedAgentActor actor, LinkedAgentLookupQuery query) {
+        return resolve(actor, query, true);
+    }
+
+    private Optional<LinkedAgentSubmissionDTO> resolve(TrustedAgentActor actor, LinkedAgentLookupQuery query, boolean runtimeV2) {
         requireService(actor); Objects.requireNonNull(query, "query"); requireOwnedTransaction();
         return transact(() -> {
             List<Fence> rows = find(actor, query.idempotencyKey(), false);
             if (rows.isEmpty()) return Optional.empty();
             if (rows.size() != 1 || !matches(rows.getFirst(), query.link())) return Optional.empty();
             Fence fence = rows.getFirst();
-            AgentRunDTO run = fence.runId() == null ? null : verifyRun(actor, query.link(), fence.runId(), fence.requestSha256());
+            AgentRunDTO run = fence.runId() == null ? null : verifyRun(actor, query.link(), fence.runId(), fence.requestSha256(), runtimeV2);
             if (!fence.closed() && run == null) throw unavailable();
             return Optional.of(new LinkedAgentSubmissionDTO(fence.closed(), run));
         });
@@ -82,6 +115,14 @@ public final class AgentLinkedSubmissionService {
 
     /** Closes even an unknown submission; a concurrent start must finish before its run is cancelled. */
     public LinkedAgentSubmissionDTO close(TrustedAgentActor actor, LinkedAgentLookupQuery query) {
+        return close(actor, query, false);
+    }
+
+    public LinkedAgentSubmissionDTO closeRuntimeV2(TrustedAgentActor actor, LinkedAgentLookupQuery query) {
+        return close(actor, query, true);
+    }
+
+    private LinkedAgentSubmissionDTO close(TrustedAgentActor actor, LinkedAgentLookupQuery query, boolean runtimeV2) {
         requireService(actor); Objects.requireNonNull(query, "query"); requireOwnedTransaction();
         return transact(() -> {
             lockTimeout();
@@ -90,7 +131,7 @@ public final class AgentLinkedSubmissionService {
             AgentRunDTO run = null;
             if (fence.runId() != null) {
                 run = ledger.lockForLinkedClose(actor, fence.runId());
-                verifyRun(actor, query.link(), fence.runId(), fence.requestSha256());
+                verifyRun(actor, query.link(), fence.runId(), fence.requestSha256(), runtimeV2);
             }
             if (!fence.closed()) {
                 if (jdbc.update("""
@@ -145,7 +186,13 @@ public final class AgentLinkedSubmissionService {
                 && json.processLinkHash(link).equals(fence.linkSha256());
     }
 
-    private AgentRunDTO verifyRun(TrustedAgentActor actor, AgentProcessLink link, String runId, String requestHash) {
+    private AgentRunDTO verifyRun(TrustedAgentActor actor, AgentProcessLink link, String runId, String requestHash, boolean runtimeV2) {
+        if (runtimeV2) {
+            var material = ledger.runtimeExecutionMaterial(actor, new GetAgentRunQuery(runId));
+            if (!link.equals(material.command().getLink()) || requestHash == null
+                    || !requestHash.equals(material.authorization().requestSha256())) throw unavailable();
+            return material.run();
+        }
         var material = ledger.executionMaterial(actor, new GetAgentRunQuery(runId));
         if (!link.equals(material.snapshot().processLink()) || requestHash == null
                 || !requestHash.equals(material.authorization().requestSha256())) throw unavailable();

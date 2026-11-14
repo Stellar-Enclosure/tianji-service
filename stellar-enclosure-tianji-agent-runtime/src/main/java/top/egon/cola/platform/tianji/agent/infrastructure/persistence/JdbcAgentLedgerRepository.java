@@ -191,12 +191,17 @@ final class JdbcAgentLedgerRepository {
     }
 
     Optional<DefinitionRow> definition(long tenantId, String key, long version) {
+        return definitionEvidence(tenantId, key, version)
+                .map(row -> new DefinitionRow(row.hash(), json.readDefinition(row.specification())));
+    }
+
+    Optional<DefinitionEvidenceRow> definitionEvidence(long tenantId, String key, long version) {
         return jdbc.query("""
-                SELECT content_sha256, specification::text AS specification
+                SELECT content_sha256, specification::text AS specification, created_at
                 FROM tianji_agent.agent_definition_version
                 WHERE tenant_id = ? AND definition_key = ? AND version = ?
-                """, (rs, row) -> new DefinitionRow(rs.getString("content_sha256"),
-                json.readDefinition(rs.getString("specification"))), tenantId, key, version).stream().findFirst();
+                """, (rs, row) -> new DefinitionEvidenceRow(rs.getString("content_sha256"),
+                rs.getString("specification"), rs.getTimestamp("created_at").toInstant()), tenantId, key, version).stream().findFirst();
     }
 
     Optional<StoredRun> byIdempotencyKey(TrustedAgentActor actor, String key) {
@@ -960,6 +965,38 @@ final class JdbcAgentLedgerRepository {
                 """, tenantId, runId);
     }
 
+    void closePendingRuntimeCalls(TrustedAgentActor owner, String runId, long leaseEpoch, int activeCalls, String reason) {
+        if (activeCalls == 0) return;
+        var pending = jdbc.query("""
+                SELECT lease_epoch,owner_type,owner_issuer,owner_id,state,intent_id
+                FROM tianji_agent.agent_runtime_call_receipt
+                WHERE tenant_id=? AND run_id=? AND state IN ('PREPARED','DISPATCHED')
+                FOR UPDATE
+                """, (row, index) -> new PendingCallVO(row.getLong("lease_epoch"), row.getString("owner_type"),
+                row.getString("owner_issuer"), row.getString("owner_id"), row.getString("state"), row.getObject("intent_id") != null),
+                owner.tenantId(), runId);
+        if (pending.size() != activeCalls || pending.stream().anyMatch(call -> call.leaseEpoch() != leaseEpoch
+                || !owner.subjectType().name().equals(call.ownerType()) || !owner.issuerFingerprint().equals(call.ownerIssuer())
+                || !owner.subjectId().equals(call.ownerId()) || call.linkedIntent() && "DISPATCHED".equals(call.state()))) {
+            throw runtimeUnavailable();
+        }
+        int updated = jdbc.update("""
+                UPDATE tianji_agent.agent_runtime_call_receipt
+                SET state=CASE WHEN state='PREPARED' THEN 'FAILED' ELSE 'UNKNOWN' END,
+                    error_code=?,finished_at=clock_timestamp(),revision=revision+1
+                WHERE tenant_id=? AND run_id=? AND owner_type=? AND owner_issuer=? AND owner_id=?
+                  AND lease_epoch=? AND state IN ('PREPARED','DISPATCHED')
+                """, reason, owner.tenantId(), runId, owner.subjectType().name(), owner.issuerFingerprint(), owner.subjectId(), leaseEpoch);
+        if (updated != activeCalls || jdbc.update("""
+                UPDATE tianji_agent.agent_runtime_binding SET active_calls=0,revision=revision+?
+                WHERE tenant_id=? AND run_id=? AND active_calls=?
+                """, activeCalls, owner.tenantId(), runId, activeCalls) != 1) throw runtimeUnavailable();
+    }
+
+    private static AgentLedgerException runtimeUnavailable() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Agent runtime call evidence is unavailable");
+    }
+
     void insertEvent(long tenantId, AgentEventDTO event) {
         jdbc.update("""
                 INSERT INTO tianji_agent.agent_event
@@ -1012,6 +1049,9 @@ final class JdbcAgentLedgerRepository {
     }
 
     record DefinitionRow(String hash, top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO specification) { }
+    record DefinitionEvidenceRow(String hash, String specification, Instant createdAt) { }
+    private record PendingCallVO(long leaseEpoch, String ownerType, String ownerIssuer, String ownerId, String state,
+                                 boolean linkedIntent) { }
     record StoredRun(AgentRunDTO run, String requestHash, String resultJson, String correlationId, String snapshotJson,
                      String leaseOwner, long leaseEpoch, Instant leaseExpiresAt, Instant cancelRequestedAt) { }
     record CancelReceipt(String requestHash, String resultJson) { }

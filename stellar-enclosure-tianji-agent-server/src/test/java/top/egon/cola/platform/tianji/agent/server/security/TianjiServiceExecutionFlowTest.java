@@ -86,6 +86,8 @@ class TianjiServiceExecutionFlowTest {
         when(snapshot.processLink()).thenReturn(link); when(material.run()).thenReturn(run);
         when(material.snapshot()).thenReturn(snapshot); when(material.authorization()).thenReturn(request);
         when(ledger.executionMaterial(actor, new GetAgentRunQuery(runId))).thenReturn(material);
+        when(ledger.linkedRunEvidence(actor, new GetAgentRunQuery(runId)))
+                .thenReturn(new AgentLedgerService.LinkedRunEvidenceVO(run, link, request));
         when(ledger.databaseNow()).thenReturn(now);
         when(store.usesLedger(ledger)).thenReturn(true); when(userStore.usesLedger(ledger)).thenReturn(true);
         var saved = new AtomicReference<AgentServiceExecutionGrant.Ticket>();
@@ -121,6 +123,80 @@ class TianjiServiceExecutionFlowTest {
             saved.set(null);
             assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(request, AgentRunAuthorization.Boundary.MODEL));
             verify(decisionClient, times(2)).decideService(any(), any());
+        }
+    }
+
+    @Test void runtime_v2_uses_the_verified_template_and_source_fence_at_both_authorization_boundaries() {
+        URI issuer = URI.create("https://idp.example/tenants/21");
+        URI resource = URI.create("https://api.example/tianji");
+        URI sourceUri = URI.create("https://api.example/process");
+        Instant now = Instant.parse("2026-10-29T00:00:00Z");
+        String runId = "00000000-0000-0000-0000-000000000124";
+        String grantId = "8" + "2".repeat(62);
+        String templateSha256 = "a".repeat(64);
+        String configurationSha256 = "d".repeat(64);
+        var actor = TrustedAgentActor.verified(21, TrustedAgentActor.SubjectType.SERVICE, "worker", issuer.toASCIIString());
+        var linked = new TianjiLinkedDispatchProperties(true, true, List.of(new TianjiLinkedDispatchProperties.Binding(
+                issuer, 21, "worker", "process-app", "platform", "process", "test", "process-east",
+                Set.of(WorkerScopeTypeEnum.BPMN), List.of(new TianjiLinkedDispatchProperties.Definition("review-v2", 7, templateSha256)))));
+        var issuers = mock(TrustedIssuerRegistry.class);
+        var trust = new TrustedIssuerRegistry.TrustedIssuerVO(issuer, URI.create("https://idp.example/jwks"), "tenant:21",
+                TrustedIssuerRegistry.RealmType.TENANT, "21", TrustedIssuerRegistry.Status.ACTIVE, 1);
+        when(issuers.findByIssuer(issuer.toASCIIString())).thenReturn(Optional.of(trust));
+        var bindings = new TianjiServiceExecutionBindings(new TianjiServiceExecutionProperties(true,
+                List.of(new TianjiServiceExecutionProperties.Source(issuer, 21, "worker", sourceUri))), linked, issuers);
+        var link = new AgentProcessLink("process-east", WorkerScopeTypeEnum.BPMN, "instance-v2", "activity-v2",
+                templateSha256, now.plusSeconds(60));
+        var request = new AgentRunAuthorization.Request(actor, runId, "review-v2", 7, templateSha256, "b".repeat(64),
+                "c".repeat(64), configurationSha256, false, now.plusSeconds(120));
+        var subject = bindings.require(request, link);
+        var ticket = new AgentServiceExecutionGrant.Ticket(grantId, "ENC:v1:key:nonce:sealed", now.plusSeconds(75));
+        var ledger = mock(AgentLedgerService.class);
+        var store = mock(AgentServiceExecutionGrantStore.class);
+        var userStore = mock(AgentExecutionGrantStore.class);
+        var decisionClient = mock(HttpExecutionAuthorizationClient.class);
+        var run = new AgentRunDTO(runId, "review-v2", 7, null, AgentRunStatusEnum.QUEUED, null, false,
+                0, 0, 1, request.deadlineAt(), now, null);
+        var evidence = new AgentLedgerService.LinkedRunEvidenceVO(run, link, request);
+        var currentEvidence = new AtomicReference<>(evidence);
+        var query = new GetAgentRunQuery(runId);
+        when(ledger.linkedRunEvidence(actor, query)).thenAnswer(invocation -> currentEvidence.get());
+        when(ledger.executionMaterial(actor, query)).thenThrow(new IllegalStateException("The legacy snapshot reader rejects V2"));
+        when(ledger.databaseNow()).thenReturn(now);
+        when(store.usesLedger(ledger)).thenReturn(true);
+        when(userStore.usesLedger(ledger)).thenReturn(true);
+        when(store.current(request, resource, subject)).thenReturn(Optional.of(ticket));
+
+        String fingerprint = AgentServiceExecutionGrant.fingerprint(request, resource, subject);
+        var source = new ServiceExecutionAuthorizationContract.Subject("worker", "process-app", "platform", "process", "test", sourceUri.toASCIIString());
+        var authority = new ServiceExecutionAuthorizationContract.Decision(grantId, issuer.toASCIIString(), "21", "worker", source,
+                resource.toASCIIString(), AgentRunAuthorization.PURPOSE, runId, fingerprint, false, request.deadlineAt(), now.plusSeconds(30), 1, 2);
+        when(decisionClient.decideService(any(), any())).thenReturn(authority);
+        var clients = Map.of(actor.issuerFingerprint(), new TianjiExecutionGrantAuthorizer.BoundClient(issuer, "21", decisionClient));
+        var serviceAuthorizer = new TianjiServiceExecutionGrantAuthorizer(ledger, store, bindings, resource, "tianji", issuers, clients);
+        try (var authorizer = new TianjiExecutionGrantAuthorizer(ledger, userStore, resource, "tianji", issuers,
+                clients, Duration.ofSeconds(1), 2, Clock.fixed(now, ZoneOffset.UTC), serviceAuthorizer)) {
+            assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(request, AgentRunAuthorization.Boundary.CLAIM));
+            assertEquals(AgentRunAuthorization.Decision.ALLOW, authorizer.authorize(request, AgentRunAuthorization.Boundary.MODEL));
+            var selected = org.mockito.ArgumentCaptor.forClass(HttpExecutionAuthorizationClient.ServiceExpectation.class);
+            verify(decisionClient, times(2)).decideService(any(), selected.capture());
+            assertEquals(fingerprint, selected.getValue().intent().bindingSha256());
+            assertEquals(source, selected.getValue().subjectSource());
+            verify(ledger, never()).executionMaterial(actor, query);
+
+            var invalidLink = new AgentProcessLink(link.sourceId(), link.scopeType(), link.scopeInstanceId(), link.activityOccurrenceId(),
+                    "e".repeat(64), link.dispatchNotAfter());
+            currentEvidence.set(new AgentLedgerService.LinkedRunEvidenceVO(run, invalidLink, request));
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(request, AgentRunAuthorization.Boundary.MODEL));
+            verify(decisionClient, times(2)).decideService(any(), any());
+
+            currentEvidence.set(evidence);
+            when(decisionClient.decideService(any(), any())).thenAnswer(invocation -> {
+                currentEvidence.set(new AgentLedgerService.LinkedRunEvidenceVO(run, invalidLink, request));
+                return authority;
+            });
+            assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.authorize(request, AgentRunAuthorization.Boundary.MODEL));
+            verify(decisionClient, times(3)).decideService(any(), any());
         }
     }
 }

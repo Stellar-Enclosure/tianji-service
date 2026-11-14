@@ -10,6 +10,7 @@ import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentServiceExecutionGrantStore;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.ServiceExecutionAuthorizationContract;
 import top.egon.cola.platform.tianquan.jianshen.starter.autoconfigure.Rbac3StarterProperties;
 import top.egon.cola.platform.tianquan.jianshen.starter.client.HttpExecutionAuthorizationClient;
@@ -58,9 +59,10 @@ public final class TianjiServiceExecutionGrantAuthorizer {
         if (request == null || request.actor().subjectType() != TrustedAgentActor.SubjectType.SERVICE
                 || "LEGACY".equals(request.actor().issuerFingerprint())) return AgentRunAuthorization.Decision.UNAVAILABLE;
         try {
-            var material = ledger.executionMaterial(request.actor(), new GetAgentRunQuery(request.runId()));
+            var material = ledger.linkedRunEvidence(request.actor(), new GetAgentRunQuery(request.runId()));
             if (!request.equals(material.authorization())) return AgentRunAuthorization.Decision.UNAVAILABLE;
-            var binding = bindings.resolve(request, material.snapshot().processLink());
+            var link = material.processLink();
+            var binding = bindings.resolve(request, link);
             var bound = clients.get(request.actor().issuerFingerprint());
             if (bound == null || !bound.issuer().toASCIIString().equals(binding.issuer().toASCIIString())
                     || !bound.tenantId().equals(Long.toString(request.actor().tenantId()))) return AgentRunAuthorization.Decision.UNAVAILABLE;
@@ -79,22 +81,22 @@ public final class TianjiServiceExecutionGrantAuthorizer {
             try {
                 var result = bound.client().decideService(new ServiceExecutionAuthorizationContract.Request(systemCode,
                         ticket.grantId(), ticket.ciphertext()), expected);
-                if (!unchanged(request, binding, bound, trust, ticket) || !result.expiresAt().isAfter(ledger.databaseNow())
+                if (!unchanged(request, link, binding, bound, trust, ticket) || !result.expiresAt().isAfter(ledger.databaseNow())
                         || result.expiresAt().isAfter(ticket.expiresAt())) return AgentRunAuthorization.Decision.UNAVAILABLE;
                 return AgentRunAuthorization.Decision.ALLOW;
             } catch (HttpExecutionAuthorizationClient.ExecutionAuthorizationDeniedException denied) {
-                return unchanged(request, binding, bound, trust, ticket) ? AgentRunAuthorization.Decision.DENY : AgentRunAuthorization.Decision.UNAVAILABLE;
+                return unchanged(request, link, binding, bound, trust, ticket) ? AgentRunAuthorization.Decision.DENY : AgentRunAuthorization.Decision.UNAVAILABLE;
             }
         } catch (RuntimeException failure) { return AgentRunAuthorization.Decision.UNAVAILABLE; }
     }
 
-    private boolean unchanged(AgentRunAuthorization.Request request, TianjiServiceExecutionBindings.Bound binding,
+    private boolean unchanged(AgentRunAuthorization.Request request, AgentProcessLink link, TianjiServiceExecutionBindings.Bound binding,
             TianjiExecutionGrantAuthorizer.BoundClient bound, TrustedIssuerRegistry.TrustedIssuerVO trust,
             AgentServiceExecutionGrant.Ticket ticket) {
         if (!issuers.findByIssuer(bound.issuer().toASCIIString()).filter(trust::equals).isPresent()) return false;
-        var material = ledger.executionMaterial(request.actor(), new GetAgentRunQuery(request.runId()));
-        if (!request.equals(material.authorization())) return false;
-        var current = bindings.resolve(request, material.snapshot().processLink());
+        var material = ledger.linkedRunEvidence(request.actor(), new GetAgentRunQuery(request.runId()));
+        if (!request.equals(material.authorization()) || !link.equals(material.processLink())) return false;
+        var current = bindings.resolve(request, material.processLink());
         if (!binding.issuer().toASCIIString().equals(current.issuer().toASCIIString()) || !binding.subject().equals(current.subject())
                 || !binding.subject().resourceUri().toASCIIString().equals(current.subject().resourceUri().toASCIIString())
                 || store.current(request, resource, binding.subject()).filter(ticket::equals).isEmpty()) return false;

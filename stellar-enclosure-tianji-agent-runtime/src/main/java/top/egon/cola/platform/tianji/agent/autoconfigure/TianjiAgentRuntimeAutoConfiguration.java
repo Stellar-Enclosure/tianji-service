@@ -2,24 +2,46 @@ package top.egon.cola.platform.tianji.agent.autoconfigure;
 
 import com.google.adk.agents.BaseAgent;
 import io.reactivex.rxjava3.core.Scheduler;
+import jakarta.validation.Validator;
+import java.time.Clock;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Function;
 import javax.sql.DataSource;
 import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.beans.factory.ListableBeanFactory;
+import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Import;
 import org.springframework.core.env.Environment;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.component.agentflow.adapter.adk.AdkAgentExecutorAdapter;
+import top.egon.cola.component.agentflow.adapter.mcp.McpToolAdapter;
+import top.egon.cola.component.agentflow.adapter.springai.SpringAiExecutionModelAdapter;
+import top.egon.cola.component.agentflow.agentic.AgenticPlanCompiler;
+import top.egon.cola.component.agentflow.api.session.SessionStore;
+import top.egon.cola.component.agentflow.autoconfigure.AgentExecutionAutoConfiguration;
 import top.egon.cola.component.agentflow.autoconfigure.AgentFlowAutoConfiguration;
+import top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties;
 import top.egon.cola.component.agentflow.config.AgentFlowConfigValidator;
+import top.egon.cola.component.agentflow.execution.DefaultAgentExecutor;
 import top.egon.cola.component.agentflow.runtime.AgentFlowFactory;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
+import top.egon.cola.platform.tianji.agent.application.run.AgentRuntimeExecutionService;
+import top.egon.cola.platform.tianji.agent.application.run.AgenticTemplateConverter;
+import top.egon.cola.platform.tianji.agent.application.run.AgenticTemplateConverterImpl;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
+import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
+import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverterImpl;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkGovernedProcessToolBridge;
@@ -27,11 +49,14 @@ import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkReadOnlyDecisio
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentModelBudgetEstimator;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AgentContextRuntimeOptions;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeBindingStore;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeCallReceiptStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 
 /** Assembles the runtime only when the host supplies its storage, authorization and execution resources. */
-@AutoConfiguration(after = AgentFlowAutoConfiguration.class)
+@AutoConfiguration(after = {AgentFlowAutoConfiguration.class, AgentExecutionAutoConfiguration.class})
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.runtime", name = "enabled", havingValue = "true")
+@Import({AgenticTemplateConverterImpl.class, TianjiHostContextConverterImpl.class})
 public class TianjiAgentRuntimeAutoConfiguration {
     @Bean
     @ConditionalOnMissingBean(AgentLedgerService.class)
@@ -79,9 +104,46 @@ public class TianjiAgentRuntimeAutoConfiguration {
     @Bean(destroyMethod = "close")
     AgentRunDispatcher tianjiAgentRunDispatcher(@Qualifier("tianjiAgentDispatchExecutor") ThreadPoolExecutor dispatch,
             @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control,
-            AdkAgentRunExecutor worker, AgentLedgerService ledger) {
+            @Qualifier("tianjiAdkAgentRunExecutor") AdkAgentRunExecutor worker, AgentLedgerService ledger,
+            @Qualifier("agentRuntimeExecutionService") ObjectProvider<AgentRuntimeExecutionService> runtimeV2) {
         validateDispatchExecutor(dispatch, control);
-        return new AgentRunDispatcher(dispatch, worker, ledger);
+        return new AgentRunDispatcher(dispatch, worker, ledger, runtimeV2.getIfAvailable());
+    }
+
+    @Bean("agentRuntimeExecutionService")
+    @ConditionalOnBean(name = {"agentExecutor", "agentExecutionTemplateResolver"})
+    AgentRuntimeExecutionService agentRuntimeExecutionService(DataSource dataSource, AgentLedgerService ledger,
+            AgentRunAuthorization authorization,
+            @Qualifier("agentExecutionTemplateResolver") AdkAgentExecutorAdapter.TemplateResolver hostRegistry,
+            @Qualifier("agentExecutionClock") Clock clock, @Qualifier("defaultValidator") Validator validator,
+            @Qualifier("agentExecutionTimers") ScheduledExecutorService timers,
+            @Qualifier("agentFlowProperties") AgentFlowProperties flowProperties,
+            ListableBeanFactory beans,
+            @Qualifier("agenticTemplateConverter") AgenticTemplateConverter templateConverter,
+            @Qualifier("tianjiHostContextConverter") TianjiHostContextConverter hostConverter,
+            @Qualifier("tianjiAgentControlExecutor") ScheduledThreadPoolExecutor control) {
+        if (!ledger.usesDataSource(dataSource)) throw new IllegalStateException("TIANJI_RUNTIME_DATA_SOURCE_MISMATCH");
+        new AgentStorageVerifier(dataSource).verifyRuntimeStorage();
+        String storeRef = flowProperties.session().storeRef();
+        SessionStore sessions = beans.getBean("inMemory".equals(storeRef) ? "agentSessionStore" : storeRef, SessionStore.class);
+        var adk = new AdkAgentExecutorAdapter(new AgenticPlanCompiler(clock), new SpringAiExecutionModelAdapter(),
+                new McpToolAdapter(), AgentRuntimeExecutionService.verifiedTemplates(hostRegistry, templateConverter));
+        var executor = new DefaultAgentExecutor(clock, validator,
+                new top.egon.cola.component.agentflow.context.DefaultContextAssembler(clock, validator), timers, sessions,
+                Map.of(AgentRuntimeExecutionService.ADK_EXECUTOR_REF, adk));
+        var receipts = new AgentRuntimeCallReceiptStore(dataSource, new AgentRuntimeBindingStore(dataSource));
+        var receiptTransaction = new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+        receiptTransaction.setTimeout(5);
+        return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts, receiptTransaction);
+    }
+
+    @Bean("tianjiAgentRuntimeV2AdmissionGuard")
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.runtime-v2", name = "enabled", havingValue = "true")
+    SmartInitializingSingleton tianjiAgentRuntimeV2AdmissionGuard(
+            @Qualifier("agentRuntimeExecutionService") ObjectProvider<AgentRuntimeExecutionService> runtime) {
+        return () -> {
+            if (runtime.getIfAvailable() == null) throw new IllegalStateException("TIANJI_AGENT_RUNTIME_V2_NOT_READY");
+        };
     }
 
     private static void validateControlExecutor(ScheduledThreadPoolExecutor control) {

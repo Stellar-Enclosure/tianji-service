@@ -26,17 +26,29 @@ public final class AgentRunDispatcher implements AutoCloseable {
     private final Executor executor;
     private final AdkAgentRunExecutor worker;
     private final AgentLedgerService ledger;
+    private final AgentRuntimeExecutionService runtime;
     private final ConcurrentHashMap<RunKey, CompletableFuture<AgentRunDTO>> active = new ConcurrentHashMap<>();
     private final Object monitor = new Object();
     private boolean closed;
 
     public AgentRunDispatcher(Executor executor, AdkAgentRunExecutor worker, AgentLedgerService ledger) {
+        this(executor, worker, ledger, null);
+    }
+
+    public AgentRunDispatcher(Executor executor, AdkAgentRunExecutor worker, AgentLedgerService ledger,
+                              AgentRuntimeExecutionService runtime) {
         this.executor = Objects.requireNonNull(executor, "executor");
         this.worker = Objects.requireNonNull(worker, "worker");
         this.ledger = Objects.requireNonNull(ledger, "ledger");
+        if (runtime != null && !runtime.usesLedger(ledger)) {
+            throw new IllegalArgumentException("Agent Runtime executor requires the dispatcher ledger");
+        }
+        this.runtime = runtime;
     }
 
-    public boolean usesAuthorization(AgentRunAuthorization candidate) { return worker.usesAuthorization(candidate); }
+    public boolean usesAuthorization(AgentRunAuthorization candidate) {
+        return worker.usesAuthorization(candidate) && (runtime == null || runtime.usesAuthorization(candidate));
+    }
 
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && worker.usesLedger(candidate); }
 
@@ -62,7 +74,7 @@ public final class AgentRunDispatcher implements AutoCloseable {
             try {
                 executor.execute(() -> {
                     try {
-                        result.complete(worker.executeQueued(actor, query));
+                        result.complete(executeQueued(actor, query));
                     } catch (Throwable failure) {
                         result.completeExceptionally(failure);
                         if (failure instanceof Error error) throw error;
@@ -83,6 +95,14 @@ public final class AgentRunDispatcher implements AutoCloseable {
             }
             return result.minimalCompletionStage();
         }
+    }
+
+    private AgentRunDTO executeQueued(TrustedAgentActor actor, GetAgentRunQuery query) {
+        var profile = ledger.verifyPersistedProfile(actor, query);
+        if (profile == AgentLedgerService.RunProfileEnum.LEGACY_V1) return worker.executeQueued(actor, query);
+        if (profile == AgentLedgerService.RunProfileEnum.RUNTIME_V2 && runtime != null) return runtime.executeQueued(actor, query);
+        throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                "Agent run execution profile is unavailable");
     }
 
     /** Stops admission; the caller still owns the executor and the active runs. */

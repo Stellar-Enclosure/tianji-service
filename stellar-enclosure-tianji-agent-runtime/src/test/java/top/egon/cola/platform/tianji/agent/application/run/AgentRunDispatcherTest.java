@@ -7,6 +7,7 @@ import top.egon.cola.platform.tianji.agent.domain.PendingAgentRun;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.adk.AdkAgentRunExecutor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService.RunProfileEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
@@ -33,6 +34,7 @@ class AgentRunDispatcherTest {
         TrustedAgentActor owner = new TrustedAgentActor(42, USER, "owner");
         GetAgentRunQuery query = new GetAgentRunQuery("run-1");
         when(ledger.pendingRuns(5)).thenReturn(List.of(new PendingAgentRun(owner, query)));
+        when(ledger.verifyPersistedProfile(owner, query)).thenReturn(RunProfileEnum.LEGACY_V1);
         when(worker.executeQueued(owner, query)).thenReturn(result("run-1"));
         try (BoundedVirtualThreadExecutor pool = new BoundedVirtualThreadExecutor("agent-test", 1);
              AgentRunDispatcher dispatcher = new AgentRunDispatcher(pool, worker, ledger)) {
@@ -45,6 +47,7 @@ class AgentRunDispatcherTest {
     @Test
     void deduplicates_local_dispatch_and_rejects_excess_capacity_without_cancelling_the_run() throws Exception {
         AdkAgentRunExecutor worker = mock(AdkAgentRunExecutor.class);
+        AgentLedgerService ledger = mock(AgentLedgerService.class);
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
         AtomicInteger executions = new AtomicInteger();
@@ -55,9 +58,10 @@ class AgentRunDispatcherTest {
             return result("run-1");
         });
         try (BoundedVirtualThreadExecutor pool = new BoundedVirtualThreadExecutor("agent-test", 1);
-             AgentRunDispatcher dispatcher = new AgentRunDispatcher(pool, worker, mock(AgentLedgerService.class))) {
+             AgentRunDispatcher dispatcher = new AgentRunDispatcher(pool, worker, ledger)) {
             TrustedAgentActor actor = new TrustedAgentActor(1, USER, "alice");
             GetAgentRunQuery first = new GetAgentRunQuery("run-1");
+            when(ledger.verifyPersistedProfile(actor, first)).thenReturn(RunProfileEnum.LEGACY_V1);
             var waitA = dispatcher.dispatch(actor, first).toCompletableFuture();
             assertTrue(started.await(5, TimeUnit.SECONDS));
             var waitB = dispatcher.dispatch(actor, first).toCompletableFuture();

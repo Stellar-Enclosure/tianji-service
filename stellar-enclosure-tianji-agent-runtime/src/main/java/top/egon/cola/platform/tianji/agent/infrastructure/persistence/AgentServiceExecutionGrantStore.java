@@ -53,7 +53,7 @@ public final class AgentServiceExecutionGrantStore {
             lockTimeout();
             var fence = lockFence(actor, runId, true);
             if (fence.isEmpty() || !lockRun(actor, runId, true)) return Optional.empty();
-            var material = ledger.executionMaterial(actor, new GetAgentRunQuery(runId));
+            var material = ledger.linkedRunEvidence(actor, new GetAgentRunQuery(runId));
             if (!matches(fence.get(), material)) throw unavailable();
             var authorization = material.authorization();
             String binding = AgentServiceExecutionGrant.fingerprint(authorization, resource, subject);
@@ -102,7 +102,7 @@ public final class AgentServiceExecutionGrantStore {
             lockTimeout();
             var fence = lockFence(actor, runId, true);
             if (fence.isEmpty() || !lockRun(actor, runId, true) || !expires.isAfter(ledger.databaseNow())) return false;
-            var material = ledger.executionMaterial(actor, new GetAgentRunQuery(runId));
+            var material = ledger.linkedRunEvidence(actor, new GetAgentRunQuery(runId));
             if (!matches(fence.get(), material) || !material.authorization().equals(reservation.authorization())
                     || !reservation.bindingSha256().equals(AgentServiceExecutionGrant.fingerprint(material.authorization(), reservation.resource(), subject))) {
                 return false;
@@ -132,7 +132,7 @@ public final class AgentServiceExecutionGrantStore {
             lockTimeout();
             var fence = lockFence(actor, runId, false);
             if (fence.isEmpty() || !lockRun(actor, runId, false)) return Optional.empty();
-            var material = ledger.executionMaterial(actor, new GetAgentRunQuery(runId));
+            var material = ledger.linkedRunEvidence(actor, new GetAgentRunQuery(runId));
             if (!matches(fence.get(), material) || !material.authorization().equals(authorization)) return Optional.empty();
             return jdbc.query("""
                     SELECT grant_id, ciphertext, expires_at FROM tianji_agent.agent_run_service_execution_grant
@@ -166,12 +166,12 @@ public final class AgentServiceExecutionGrantStore {
                 SELECT 1 FROM tianji_agent.agent_run
                 WHERE tenant_id = ? AND subject_type = 'SERVICE' AND subject_issuer = ? AND subject_id = ? AND run_id = ?
                   AND cancel_requested_at IS NULL AND deadline_at > clock_timestamp() AND
-                """ + states + (queuedOnly ? " FOR UPDATE" : " FOR SHARE"), (rs, row) -> 1,
+                """ + states + " FOR UPDATE", (rs, row) -> 1,
                 actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), runId).isEmpty();
     }
 
-    private boolean matches(Fence fence, AgentLedgerService.ExecutionMaterial material) {
-        var link = material.snapshot().processLink();
+    private boolean matches(Fence fence, AgentLedgerService.LinkedRunEvidenceVO material) {
+        var link = material.processLink();
         return link != null && fence.linkSha256() != null && fence.linkSha256().equals(json.processLinkHash(link))
                 && fence.requestSha256() != null && fence.requestSha256().equals(material.authorization().requestSha256());
     }

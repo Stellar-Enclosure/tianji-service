@@ -12,7 +12,8 @@ import java.util.Objects;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
-/** Schedules bounded ledger reconciliation without starting or authorizing Agent executions. */
+/** Schedules bounded reconciliation. The ledger verifies each persisted profile under the run lock
+ * before expiring a deadline or settling a lost lease and its outstanding calls. */
 public final class AgentRunReconciler implements SmartLifecycle {
     private static final Logger log = LoggerFactory.getLogger(AgentRunReconciler.class);
     private final AgentLedgerService ledger;
