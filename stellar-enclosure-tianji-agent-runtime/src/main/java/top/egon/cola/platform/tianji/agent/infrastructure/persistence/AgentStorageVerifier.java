@@ -59,6 +59,17 @@ public final class AgentStorageVerifier {
     private static final List<String> CHECKPOINT_KEY = List.of("tenant_id", "run_id", "attempt", "checkpoint_no");
     private static final List<String> CHECKPOINT_SESSION_KEY = append(SESSION_OWNER, "session_event_sequence");
     private static final List<String> MODEL_USAGE_KEY = List.of("tenant_id", "run_id", "reservation_id");
+    private static final String RUNTIME_FILE = "V17__add_runtime_safety_receipts.sql";
+    private static final String RUNTIME_SHA256 = "fd049bac03c6c9ead463b457d15bc4670a6609dfe1dff648ca64300baf3c75d9";
+    private static final String RUNTIME_BINDING = "agent_runtime_binding";
+    private static final String RUNTIME_CALL = "agent_runtime_call_receipt";
+    private static final List<String> CALL_KEY = append(RUN_KEY, "call_id");
+    private static final List<String> CALL_DISPATCH = List.of("tenant_id", "run_id", "call_id", "intent_id",
+            "dispatch_epoch", "dispatch_nonce_sha256", "executor_issuer", "executor_id");
+    private static final List<String> CALL_CAPABILITY = List.of("tenant_id", "run_id", "capability_id",
+            "capability_binding_sha256", "tool_key", "tool_version", "tool_sha256", "backend_binding_sha256");
+    private static final List<String> CALL_ACTION = List.of("tenant_id", "intent_id", "owner_type", "owner_issuer",
+            "owner_id", "tool_key", "tool_version", "tool_sha256", "backend_binding_sha256", "risk");
     private final DataSource dataSource;
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
@@ -72,6 +83,129 @@ public final class AgentStorageVerifier {
     }
 
     /** Does not create, alter or repair schema objects; migration remains an operator action. */
+    public void verifyRuntimeStorage() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
+        String migration = pinnedMigration(RUNTIME_FILE, RUNTIME_SHA256);
+        // The Tool verifier owns its database transaction and verifies the complete, ordered V1–V17 history.
+        if (new ToolExecutionStorageVerifier(dataSource).verifyAndReturnProfile()
+                != ToolExecutionStorageVerifier.SchemaProfile.V17) throw invalid();
+        try {
+            transaction.executeWithoutResult(status -> {
+                verifyCheckpointPrimary("off");
+                jdbc.queryForObject("SELECT set_config('search_path','pg_catalog,tianji_agent,public',true)", String.class);
+                int expectedChecksum = checksum(RUNTIME_FILE);
+                var history = jdbc.query("""
+                        SELECT type,script,success,checksum FROM ONLY tianji_agent.flyway_schema_history
+                        WHERE version='17' LIMIT 2
+                        """, (rs, row) -> "SQL".equals(rs.getString("type"))
+                        && RUNTIME_FILE.equals(rs.getString("script")) && rs.getBoolean("success")
+                        && rs.getObject("checksum") != null && rs.getInt("checksum") == expectedChecksum);
+                if (history.size() != 1 || !history.getFirst()) throw invalid();
+                var tables = MemoryStorageVerifier.contract(migration);
+                if (!tables.keySet().equals(Set.of(RUNTIME_BINDING, RUNTIME_CALL))) throw invalid();
+                verifyRuntimeTable(RUNTIME_BINDING, tables.get(RUNTIME_BINDING));
+                verifyRuntimeTable(RUNTIME_CALL, tables.get(RUNTIME_CALL));
+                verifyRuntimeKeys();
+                verifyRuntimeIndexes(RUNTIME_BINDING, Map.of("agent_runtime_binding_pkey", RUN_KEY));
+                verifyRuntimeIndexes(RUNTIME_CALL, Map.of("agent_runtime_call_receipt_pkey", CALL_KEY,
+                        "runtime_call_dispatch_uq", CALL_DISPATCH,
+                        "runtime_call_pending_idx", List.of("tenant_id", "run_id", "state", "deadline_at")));
+            });
+        } catch (DataAccessException | org.springframework.transaction.TransactionException failure) {
+            throw invalid();
+        }
+    }
+
+    private void verifyRuntimeTable(String table, MemoryStorageVerifier.Table expected) {
+        var columns = new HashMap<String, UsageColumn>();
+        expected.columns().forEach((name, column) -> columns.put(name,
+                new UsageColumn(column.type(), column.notNull(), column.cCollation(), null)));
+        if (!columns.equals(readOptionalColumns(table))) throw invalid();
+        var checks = new HashMap<String, String>();
+        jdbc.query("""
+                SELECT c.conname,c.convalidated,c.connoinherit,pg_get_expr(c.conbin,c.conrelid,false) AS expression,
+                       COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='tianji_agent' AND t.relname=? AND c.contype='c'
+                """, rs -> {
+            if (!rs.getBoolean("convalidated") || !rs.getBoolean("enforced") || rs.getBoolean("connoinherit")
+                    || checks.put(rs.getString("conname"),
+                            MemoryStorageVerifier.booleanSignature(rs.getString("expression"))) != null) throw invalid();
+        }, table);
+        if (!expected.checks().equals(checks)) throw invalid();
+
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                  AND has_schema_privilege(n.oid,'USAGE') AND NOT has_schema_privilege(n.oid,'CREATE')
+                  AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user
+                                  AND (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication))
+                  AND NOT pg_has_role(c.relowner,'MEMBER') AND NOT pg_has_role(n.nspowner,'MEMBER')
+                  AND has_table_privilege(c.oid,'SELECT') AND has_table_privilege(c.oid,'INSERT') AND has_table_privilege(c.oid,'UPDATE')
+                  AND NOT has_table_privilege(c.oid,'DELETE,TRUNCATE,TRIGGER')
+                  AND NOT has_any_column_privilege(c.oid,'REFERENCES,SELECT WITH GRANT OPTION,INSERT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')
+                  AND CASE WHEN current_setting('server_version_num')::integer>=170000
+                      THEN NOT has_table_privilege(c.oid,'MAINTAIN') ELSE true END
+                  AND NOT EXISTS (SELECT 1 FROM pg_inherits h WHERE h.inhrelid=c.oid OR h.inhparent=c.oid)
+                  AND NOT EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class=c.oid)
+                  AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid AND (NOT tr.tgisinternal OR tr.tgenabled<>'O'))
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent' AND c.relname=? AND c.relkind='r'
+                """, Boolean.class, table))) throw invalid();
+    }
+
+    private void verifyRuntimeKeys() {
+        Set<Key> expected = Set.of(key(RUNTIME_BINDING, "p", RUN_KEY), key(RUNTIME_CALL, "p", CALL_KEY),
+                key(RUNTIME_CALL, "u", CALL_DISPATCH), foreign(RUNTIME_BINDING, RUN_KEY, "agent_run", RUN_KEY, "a"),
+                foreign(RUNTIME_CALL, RUN_KEY, RUNTIME_BINDING, RUN_KEY, "a"),
+                foreign(RUNTIME_CALL, CALL_CAPABILITY, "agent_tool_capability",
+                        List.of("tenant_id", "run_id", "capability_id", "binding_sha256", "tool_key", "tool_version",
+                                "tool_sha256", "backend_binding_sha256"), "a"),
+                foreign(RUNTIME_CALL, CALL_ACTION, "agent_tool_action_intent",
+                        List.of("tenant_id", "intent_id", "owner_type", "owner_issuer", "owner_id", "tool_key",
+                                "tool_version", "tool_sha256", "binding_sha256", "risk"), "a"));
+        var actual = readConstraints();
+        actual.removeIf(key -> !RUNTIME_BINDING.equals(key.table()) && !RUNTIME_CALL.equals(key.table()));
+        if (!expected.equals(actual)) throw invalid();
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT count(*)=7 AND bool_and(c.convalidated AND NOT c.condeferrable AND NOT c.condeferred
+                    AND COALESCE((to_jsonb(c)->>'conenforced')::boolean,true)
+                    AND (c.contype IN ('p','u') OR (c.contype='f' AND c.confupdtype='a' AND c.confdeltype='a'
+                         AND c.confmatchtype='s' AND (SELECT count(*)=4 AND bool_and(tr.tgisinternal AND tr.tgenabled='O')
+                              FROM pg_trigger tr WHERE tr.tgconstraint=c.oid))))
+                FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='tianji_agent' AND t.relname IN (?,?) AND c.contype NOT IN ('c','n')
+                """, Boolean.class, RUNTIME_BINDING, RUNTIME_CALL))) throw invalid();
+    }
+
+    private void verifyRuntimeIndexes(String table, Map<String, List<String>> expected) {
+        var found = new HashMap<String, List<String>>();
+        jdbc.query("""
+                SELECT x.relname,i.indisprimary,i.indisunique,pg_get_expr(i.indpred,i.indrelid,false) AS predicate,
+                       i.indisvalid AND i.indisready AND i.indislive AND i.indimmediate
+                       AND am.amname='btree' AND i.indexprs IS NULL AND i.indnkeyatts=i.indnatts
+                       AND NOT COALESCE((to_jsonb(i)->>'indnullsnotdistinct')::boolean,false)
+                       AND NOT EXISTS (SELECT 1 FROM unnest(i.indoption) k(flags) WHERE flags<>0)
+                       AND NOT EXISTS (SELECT 1 FROM unnest(i.indclass) k(oid)
+                                       JOIN pg_opclass o ON o.oid=k.oid WHERE NOT o.opcdefault) AS safe,
+                       ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(num,pos)
+                             JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num
+                             WHERE i.indcollation[(k.pos-1)::integer]=a.attcollation ORDER BY k.pos) AS columns
+                FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                JOIN pg_class x ON x.oid=i.indexrelid JOIN pg_am am ON am.oid=x.relam
+                WHERE n.nspname='tianji_agent' AND t.relname=?
+                """, rs -> {
+            String name = rs.getString("relname");
+            boolean pending = "runtime_call_pending_idx".equals(name);
+            String predicate = rs.getString("predicate");
+            if (!rs.getBoolean("safe") || rs.getBoolean("indisprimary") != name.endsWith("_pkey")
+                    || rs.getBoolean("indisunique") == pending
+                    || pending && (predicate == null || !MemoryStorageVerifier.booleanSignature(predicate).equals(
+                        MemoryStorageVerifier.booleanSignature("state = ANY (ARRAY['PREPARED','DISPATCHED'])")))
+                    || !pending && predicate != null || found.put(name, array(rs.getArray("columns"))) != null) throw invalid();
+        }, table);
+        if (!expected.equals(found)) throw invalid();
+    }
+
     public void verify() {
         try {
             transaction.executeWithoutResult(status -> {
@@ -640,8 +774,9 @@ public final class AgentStorageVerifier {
         try (InputStream input = AgentStorageVerifier.class.getClassLoader()
                 .getResourceAsStream("db/tianji-agent/" + file)) {
             if (input == null) throw invalid();
-            byte[] bytes = input.readNBytes(8193);
-            if (bytes.length > 8192 || !sha256.equals(HexFormat.of()
+            int limit = RUNTIME_FILE.equals(file) ? 32_768 : 8_192;
+            byte[] bytes = input.readNBytes(limit + 1);
+            if (bytes.length > limit || !sha256.equals(HexFormat.of()
                     .formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException | NoSuchAlgorithmException failure) {

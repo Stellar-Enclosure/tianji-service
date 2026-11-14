@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "scripts": [
+    {
+      "version": 17,
+      "file": "V17__add_runtime_safety_receipts.sql",
+      "sha256": "fd049bac03c6c9ead463b457d15bc4670a6609dfe1dff648ca64300baf3c75d9"
+    }
+  ]
+}
