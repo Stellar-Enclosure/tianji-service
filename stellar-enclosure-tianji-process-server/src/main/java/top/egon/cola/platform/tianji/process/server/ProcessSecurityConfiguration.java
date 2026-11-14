@@ -269,16 +269,32 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessModelValidator processModelValidator() { return new ProcessModelValidator(); }
 
-    @Bean
+    @Bean("processAutomationStorageReadiness")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.automation", name = "enabled", havingValue = "true")
+    SmartInitializingSingleton processAutomationStorageReadiness(ProcessEngine engine, Environment environment) {
+        return () -> {
+            if (environment.getProperty("stellar.tianji.process.api.enabled", Boolean.class, false)
+                    && !environment.getProperty("stellar.tianji.process.api.start-receipt-read-enabled", Boolean.class, false)) {
+                throw new IllegalStateException("Process automation requires START receipt recovery");
+            }
+            engineSchemaVerifier(engine).verifyAutomationV14();
+        };
+    }
+
+    @Bean("processApiSchemaVerifier")
     @ConditionalOnMissingBean(ProcessApiSchemaVerifier.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     ProcessApiSchemaVerifier processApiSchemaVerifier(ProcessEngine engine) {
+        var verifier = engineSchemaVerifier(engine);
+        verifier.verify();
+        return verifier;
+    }
+
+    private static ProcessApiSchemaVerifier engineSchemaVerifier(ProcessEngine engine) {
         var process = processConfiguration(engine);
         var source = process.getDataSource();
         if (source instanceof TransactionAwareDataSourceProxy proxy) source = proxy.getTargetDataSource();
-        var verifier = new ProcessApiSchemaVerifier(source, process.getDatabaseSchema());
-        verifier.verify();
-        return verifier;
+        return new ProcessApiSchemaVerifier(source, process.getDatabaseSchema());
     }
 
     @Bean

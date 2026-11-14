@@ -2,6 +2,11 @@ package top.egon.cola.platform.tianji.process.server;
 
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.TransactionException;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.process.server.task.HumanTaskStorageVerifier;
 
 import javax.sql.DataSource;
@@ -49,12 +54,24 @@ public final class ProcessApiSchemaVerifier {
     private static final String GOVERNED_START_FILE = "V13__add_governed_process_start_provenance.sql";
     private static final String GOVERNED_START_SHA256 = "e58af97ce341c41f79a8d79a1aa7b9da430e8b72cbe244ae1508c034180c6e21";
     private static final String GOVERNED_START = "tianji_governed_process_start";
+    private static final String AUTOMATION_FILE = "V14__add_automation_execution_bindings.sql";
+    private static final String AUTOMATION_SHA256 = "8347e8909e893f7b83ea4adf5c9bcfd213ed5044e2419dd0d250da884fe9f4b7";
+    private static final List<String> BASE_MIGRATION_FILES = List.of("V1__create_process_release_store.sql",
+            "V2__add_decision_receipt_result.sql", "V3__bind_process_receipts_to_issuer.sql", "V4__add_worker_lease_receipts.sql",
+            "V5__add_agent_dispatch_intent.sql", "V6__add_agent_result_inbox.sql", "V7__add_human_task_receipts.sql");
+    private static final Map<String, Integer> AUTOMATION_TABLES = Map.of(
+            "tianji_process_automation_release", 13, "tianji_process_draft", 20, "tianji_process_draft_command", 10,
+            "tianji_process_automation_activation", 21, "tianji_process_instance_binding", 20, "tianji_process_node_execution", 37);
+    private static final Set<String> AUTOMATION_MUTABLE_TABLES = Set.of(
+            "tianji_process_draft", "tianji_process_node_execution");
     private static final String DISPATCH = "tianji_process_agent_dispatch";
     private final JdbcTemplate jdbc;
+    private final DataSource source;
     private final String schema;
 
     public ProcessApiSchemaVerifier(DataSource source, String schema) {
         if (source == null || schema == null || !schema.matches("[a-z_][a-z0-9_]{0,62}")) throw invalid();
+        this.source = source;
         this.jdbc = new JdbcTemplate(source);
         this.schema = schema;
     }
@@ -68,6 +85,106 @@ public final class ProcessApiSchemaVerifier {
         } catch (DataAccessException failure) {
             throw new IllegalStateException("Process API schema verification failed", failure);
         }
+    }
+
+    /** Checks a pre-provisioned exact V14 catalog using the same role as the Process engine. */
+    public void verifyAutomationV14() {
+        if (TransactionSynchronizationManager.isActualTransactionActive()) throw invalid();
+        var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
+        transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        transaction.setTimeout(15);
+        try {
+            transaction.executeWithoutResult(status -> {
+                if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                        SELECT NOT pg_catalog.pg_is_in_recovery()
+                          AND pg_catalog.current_setting('transaction_read_only')='off'
+                          AND pg_catalog.current_setting('server_encoding')='UTF8'
+                          AND pg_catalog.current_setting('session_replication_role')='origin'
+                          AND pg_catalog.current_setting('standard_conforming_strings')='on'
+                        """, Boolean.class))) throw invalid();
+                jdbc.queryForObject("SELECT pg_catalog.set_config('search_path', ?, true)", String.class,
+                        "pg_catalog," + schema + ",pg_temp");
+                verifyAutomationHistory();
+                verify();
+                var catalogs = tableContracts(automationMigration(), AUTOMATION_TABLES, true);
+                for (var entry : catalogs.entrySet()) {
+                    String table = entry.getKey();
+                    var expected = entry.getValue();
+                    verifyCaseColumns(table, expected.columns(), true);
+                    verifyCaseChecks(table, expected.checks(), false, true);
+                    verifyCaseKeys(table, expected.keys(), true);
+                    verifyCaseIndexes(table, expected.indexes(), true, true);
+                    verifyAutomationRole(table);
+                }
+            });
+        } catch (DataAccessException | TransactionException failure) {
+            throw new IllegalStateException("Process automation storage schema verification failed", failure);
+        }
+    }
+
+    private void verifyAutomationHistory() {
+        var installed = jdbc.query("SELECT installed_rank,version,type,script,success,checksum FROM ONLY \"" + schema + "\".tianji_process_schema_history "
+                        + "ORDER BY installed_rank",
+                (rs, row) -> new AutomationHistoryRowVO(rs.getInt("installed_rank"), new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"),
+                        rs.getBoolean("success"), rs.getObject("checksum") == null ? null : rs.getInt("checksum"))));
+        var expected = new ArrayList<>(BASE_MIGRATION_FILES);
+        expected.addAll(List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE,
+                GOVERNED_START_FILE, AUTOMATION_FILE));
+        if (installed.size() != expected.size()) throw invalid();
+        for (int index = 0; index < installed.size(); index++) {
+            var migration = installed.get(index);
+            if (migration.installedRank() != index + 1) throw invalid();
+            requireMigration(migration.version(), Integer.toString(index + 1), expected.get(index));
+        }
+        caseMigration();
+        cancellationMigration();
+        recoveryMigration();
+        candidateReviewMigration();
+        platformActivationMigration();
+        governedStartMigration();
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                    AND NOT pg_has_role(c.relowner,'MEMBER')
+                    AND has_table_privilege(c.oid,'SELECT')
+                    AND NOT has_table_privilege(c.oid,'INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES')
+                    AND NOT has_any_column_privilege(c.oid,
+                        'INSERT,UPDATE,REFERENCES,SELECT WITH GRANT OPTION')
+                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent=c.oid OR i.inhrelid=c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid)
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=? AND c.relname='tianji_process_schema_history' AND c.relkind='r'
+                """, Boolean.class, schema))) throw invalid();
+    }
+
+    private void verifyAutomationRole(String table) {
+        if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT c.relpersistence='p' AND NOT c.relispartition AND NOT c.relrowsecurity AND NOT c.relforcerowsecurity
+                    AND has_schema_privilege(n.oid,'USAGE') AND NOT has_schema_privilege(n.oid,'CREATE')
+                    AND NOT pg_has_role(n.nspowner,'MEMBER') AND NOT pg_has_role(c.relowner,'MEMBER')
+                    AND NOT EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname=current_user
+                        AND (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication))
+                    AND has_table_privilege(c.oid,'SELECT') AND has_table_privilege(c.oid,'INSERT')
+                    AND CASE WHEN ? THEN has_table_privilege(c.oid,'UPDATE')
+                        WHEN c.relname='tianji_process_instance_binding' THEN
+                            NOT has_table_privilege(c.oid,'UPDATE')
+                            AND ARRAY(SELECT a.attname::text FROM pg_attribute a WHERE a.attrelid=c.oid
+                                AND a.attnum>0 AND NOT a.attisdropped AND has_column_privilege(c.oid,a.attnum,'UPDATE')
+                                ORDER BY a.attname)=ARRAY['created_at']
+                        ELSE NOT has_any_column_privilege(c.oid,'UPDATE') END
+                    AND NOT has_table_privilege(c.oid,'DELETE,TRUNCATE,TRIGGER')
+                    AND NOT has_any_column_privilege(c.oid,
+                        'REFERENCES,SELECT WITH GRANT OPTION,INSERT WITH GRANT OPTION,UPDATE WITH GRANT OPTION')
+                    AND CASE WHEN current_setting('server_version_num')::integer>=170000
+                        THEN NOT has_table_privilege(c.oid,'MAINTAIN') ELSE true END
+                    AND NOT EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhparent=c.oid OR i.inhrelid=c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class=c.oid)
+                    AND NOT EXISTS (SELECT 1 FROM pg_trigger tr WHERE tr.tgrelid=c.oid AND (NOT tr.tgisinternal OR tr.tgenabled<>'O'))
+                    AND NOT EXISTS (SELECT 1 FROM pg_constraint fk WHERE fk.conrelid=c.oid AND fk.contype='f'
+                        AND (SELECT count(*) FROM pg_trigger tr WHERE tr.tgconstraint=fk.oid AND tr.tgisinternal AND tr.tgenabled='O')<>4)
+                FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname=? AND c.relname=? AND c.relkind='r'
+                """, Boolean.class, AUTOMATION_MUTABLE_TABLES.contains(table), schema, table))) throw invalid();
     }
 
     /** Verifies only the recovery capability's audit and native storage. */
@@ -272,14 +389,13 @@ public final class ProcessApiSchemaVerifier {
                         + "WHERE version IS NULL OR version NOT IN ('1','2','3','4','5','6','7') ORDER BY installed_rank",
                 (rs, row) -> new CaseVersion(rs.getString("version"), rs.getString("type"), rs.getString("script"), rs.getBoolean("success"),
                         rs.getObject("checksum") == null ? null : rs.getInt("checksum")));
-        var numbers = List.of("8", "9", "10", "11", "12", "13");
-        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE, GOVERNED_START_FILE);
-        if (versions.size() > numbers.size()) throw invalid();
+        var files = List.of(CASE_FILE, CANCEL_FILE, RECOVERY_FILE, CANDIDATE_REVIEW_FILE, PLATFORM_ACTIVATION_FILE,
+                GOVERNED_START_FILE, AUTOMATION_FILE);
+        if (versions.size() > files.size()) throw invalid();
         for (int index = 0; index < versions.size(); index++) {
             var version = versions.get(index);
-            String number = numbers.get(index), file = files.get(index);
-            if (!number.equals(version.version()) || !"SQL".equals(version.type()) || !file.equals(version.script())
-                    || !version.success() || version.checksum() == null || version.checksum() != checksum(file)) throw invalid();
+            String number = Integer.toString(index + 8);
+            requireMigration(version, number, files.get(index));
             switch (number) {
                 case "8" -> caseMigration();
                 case "9" -> cancellationMigration();
@@ -287,17 +403,40 @@ public final class ProcessApiSchemaVerifier {
                 case "11" -> candidateReviewMigration();
                 case "12" -> platformActivationMigration();
                 case "13" -> governedStartMigration();
+                case "14" -> automationMigration();
                 default -> throw invalid();
             }
         }
         return versions;
     }
 
+    private static void requireMigration(CaseVersion version, String number, String file) {
+        if (!number.equals(version.version()) || !"SQL".equals(version.type()) || !file.equals(version.script())
+                || !version.success() || version.checksum() == null || version.checksum() != checksum(file)) throw invalid();
+    }
+
+    private static String automationMigration() {
+        try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + AUTOMATION_FILE)) {
+            if (input == null) throw invalid();
+            byte[] bytes = input.readNBytes(32_769);
+            if (bytes.length > 32_768 || !AUTOMATION_SHA256.equals(
+                    HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes)))) throw invalid();
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (IOException | NoSuchAlgorithmException failure) {
+            throw invalid();
+        }
+    }
+
     private void verifyCaseColumns(String table, Map<String, CaseColumn> expected) {
+        verifyCaseColumns(table, expected, false);
+    }
+
+    private void verifyCaseColumns(String table, Map<String, CaseColumn> expected, boolean automation) {
         var actual = new HashMap<String, CaseColumn>();
         jdbc.query("""
                 SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,a.attidentity,a.attgenerated,
                        CASE WHEN co.oid = 'pg_catalog."C"'::pg_catalog.regcollation THEN co.collname END AS collname,
+                       a.attcollation=0 OR a.attcollation='pg_catalog."C"'::pg_catalog.regcollation AS exact_collation,
                        pg_get_expr(d.adbin,d.adrelid) AS default_value
                 FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
                 JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum>0 AND NOT a.attisdropped
@@ -306,6 +445,7 @@ public final class ProcessApiSchemaVerifier {
                 WHERE n.nspname=? AND t.relname=? AND t.relkind='r'
                 """, rs -> {
             if (!rs.getString("attidentity").isEmpty() || !rs.getString("attgenerated").isEmpty()
+                    || automation && !rs.getBoolean("exact_collation")
                     || actual.put(rs.getString("attname"), new CaseColumn(rs.getString("type"), rs.getBoolean("attnotnull"),
                     "C".equals(rs.getString("collname")), rs.getString("default_value"))) != null) throw invalid();
         }, schema, table);
@@ -313,20 +453,32 @@ public final class ProcessApiSchemaVerifier {
     }
 
     private void verifyCaseChecks(String table, Map<String, String> expected, boolean modelAuthorityOnly) {
+        verifyCaseChecks(table, expected, modelAuthorityOnly, false);
+    }
+
+    private void verifyCaseChecks(String table, Map<String, String> expected, boolean modelAuthorityOnly, boolean automation) {
         var actual = new HashMap<String, String>();
         String authority = modelAuthorityOnly ? " AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=t.oid AND a.attnum=ANY(c.conkey) AND a.attname IN ('model_type','start_command_type'))" : "";
-        jdbc.query("SELECT c.conname,c.convalidated,pg_get_expr(c.conbin,c.conrelid) AS expression FROM pg_constraint c "
+        jdbc.query("SELECT c.conname,c.convalidated,c.connoinherit,COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced,"
+                        + "pg_get_expr(c.conbin,c.conrelid) AS expression FROM pg_constraint c "
                         + "JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace "
                         + "WHERE n.nspname=? AND t.relname=? AND c.contype='c'" + authority, rs -> {
-            if (!rs.getBoolean("convalidated") || actual.put(rs.getString("conname"), signature(rs.getString("expression"))) != null) throw invalid();
+            if (!rs.getBoolean("convalidated") || automation && (!rs.getBoolean("enforced") || rs.getBoolean("connoinherit"))
+                    || actual.put(rs.getString("conname"), automation ? automationCheckSignature(rs.getString("expression"))
+                        : signature(rs.getString("expression"))) != null) throw invalid();
         }, schema, table);
         if (!expected.equals(actual)) throw invalid();
     }
 
     private void verifyCaseKeys(String table, Set<CaseKey> expected) {
+        verifyCaseKeys(table, expected, false);
+    }
+
+    private void verifyCaseKeys(String table, Set<CaseKey> expected, boolean automation) {
         var actual = new HashSet<CaseKey>();
         jdbc.query("""
                 SELECT c.conname,c.contype,c.convalidated,c.condeferrable,c.condeferred,c.confupdtype,c.confmatchtype,
+                       COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced,
                        CASE WHEN c.contype='f' THEN c.confdeltype::text ELSE '' END AS deletion,
                        tn.nspname AS target_schema,tt.relname AS target,
                        ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(num,ord)
@@ -339,6 +491,7 @@ public final class ProcessApiSchemaVerifier {
                 """, rs -> {
             boolean foreign = "f".equals(rs.getString("contype"));
             if (!rs.getBoolean("convalidated") || rs.getBoolean("condeferrable") || rs.getBoolean("condeferred")
+                    || automation && !rs.getBoolean("enforced")
                     || foreign && (!"a".equals(rs.getString("confupdtype")) || !"a".equals(rs.getString("deletion")) || !"s".equals(rs.getString("confmatchtype")))) throw invalid();
             if (!actual.add(new CaseKey(rs.getString("conname"), rs.getString("contype"), caseArray(rs.getArray("fields")),
                     rs.getString("target_schema"), rs.getString("target"), caseArray(rs.getArray("target_fields"))))) throw invalid();
@@ -349,10 +502,21 @@ public final class ProcessApiSchemaVerifier {
     private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected) { verifyCaseIndexes(table, expected, true); }
 
     private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected, boolean exact) {
+        verifyCaseIndexes(table, expected, exact, false);
+    }
+
+    private void verifyCaseIndexes(String table, Map<String, CaseIndex> expected, boolean exact, boolean automation) {
         var actual = new HashMap<String, CaseIndex>();
         jdbc.query("""
                 SELECT x.relname,i.indisunique,i.indisprimary,i.indisvalid,i.indisready,i.indislive,am.amname,i.indnkeyatts,i.indnatts,
                        pg_get_expr(i.indpred,i.indrelid) AS predicate,
+                       i.indimmediate AND i.indexprs IS NULL
+                          AND NOT COALESCE((to_jsonb(i)->>'indnullsnotdistinct')::boolean,false)
+                          AND NOT EXISTS (SELECT 1 FROM unnest(i.indoption::smallint[]) o(flags) WHERE flags NOT IN (0,3))
+                          AS exact_order_options,
+                       ARRAY(SELECT a.attname::text || CASE WHEN i.indoption[(k.ord-1)::integer]=3 THEN ' DESC' ELSE '' END
+                             FROM unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ord)
+                             JOIN pg_attribute a ON a.attrelid=t.oid AND a.attnum=k.num ORDER BY k.ord) AS ordered_fields,
                        NOT EXISTS (SELECT 1 FROM unnest(i.indclass::oid[]) k(oid) JOIN pg_opclass o ON o.oid=k.oid WHERE NOT o.opcdefault) AS default_classes,
                        NOT EXISTS (SELECT 1 FROM unnest(i.indcollation::oid[]) WITH ORDINALITY co(oid,ord)
                          JOIN unnest(i.indkey::smallint[]) WITH ORDINALITY k(num,ord) USING(ord)
@@ -365,10 +529,11 @@ public final class ProcessApiSchemaVerifier {
                 WHERE n.nspname=? AND t.relname=?
                 """, rs -> {
             if (!rs.getBoolean("indisvalid") || !rs.getBoolean("indisready") || !rs.getBoolean("indislive") || !rs.getBoolean("default_classes")
-                    || !rs.getBoolean("column_collations") || !rs.getBoolean("ascending") || !"btree".equals(rs.getString("amname"))
+                    || !rs.getBoolean("column_collations") || !(automation ? rs.getBoolean("exact_order_options") : rs.getBoolean("ascending"))
+                    || !"btree".equals(rs.getString("amname"))
                     || rs.getInt("indnkeyatts") != rs.getInt("indnatts")) throw invalid();
             String predicate = rs.getString("predicate");
-            if (actual.put(rs.getString("relname"), new CaseIndex(caseArray(rs.getArray("fields")), rs.getBoolean("indisunique"),
+            if (actual.put(rs.getString("relname"), new CaseIndex(caseArray(rs.getArray(automation ? "ordered_fields" : "fields")), rs.getBoolean("indisunique"),
                     rs.getBoolean("indisprimary"), predicate == null ? null : signature(predicate))) != null) throw invalid();
         }, schema, table);
         if (exact ? !expected.equals(actual) : !actual.entrySet().containsAll(expected.entrySet())) throw invalid();
@@ -413,24 +578,29 @@ public final class ProcessApiSchemaVerifier {
     }
 
     private Map<String, CaseTable> tableContracts(String sql, Map<String, Integer> sizes) {
+        return tableContracts(sql, sizes, false);
+    }
+
+    private Map<String, CaseTable> tableContracts(String sql, Map<String, Integer> sizes, boolean automation) {
         var contracts = new HashMap<String, CaseTable>();
         var tables = Pattern.compile("CREATE TABLE ([a-z_]+) \\(").matcher(sql);
         while (tables.find()) {
             String table = tables.group(1); int open = tables.end() - 1; String body = sql.substring(open + 1, caseClosing(sql, open));
             var columns = new HashMap<String, CaseColumn>();
-            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz\\(6\\))([^\\n]*)").matcher(body);
+            var fields = Pattern.compile("(?m)^    ([a-z_0-9]+) (bigint|integer|boolean|bytea|jsonb|varchar\\(\\d+\\)|char\\(\\d+\\)|timestamptz(?:\\(6\\))?)([^\\n]*)").matcher(body);
             while (fields.find()) {
-                String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(").replace("timestamptz(6)", "timestamp(6) with time zone");
-                if (columns.put(fields.group(1), new CaseColumn(type, fields.group(3).contains("NOT NULL"), fields.group(3).contains("COLLATE \"C\""), null)) != null) throw invalid();
+                String type = fields.group(2).replace("varchar(", "character varying(").replace("char(", "character(")
+                        .replace("timestamptz(6)", "timestamp(6) with time zone").replace("timestamptz", "timestamp with time zone");
+                String tail = fields.group(3);
+                String defaultValue = automation && tail.contains("DEFAULT false") ? "false" : null;
+                if (columns.put(fields.group(1), new CaseColumn(type, tail.contains("NOT NULL"),
+                        tail.contains("COLLATE \"C\""), defaultValue)) != null) throw invalid();
             }
             var keys = new HashSet<CaseKey>(); var indexes = new HashMap<String, CaseIndex>();
-            var keyMatcher = Pattern.compile("CONSTRAINT ([a-z_]+)\\s+(PRIMARY KEY|FOREIGN KEY)\\s*\\(([^)]+)\\)").matcher(body);
-            while (keyMatcher.find()) {
-                String name = keyMatcher.group(1); var names = caseFields(keyMatcher.group(3)); boolean foreign = "FOREIGN KEY".equals(keyMatcher.group(2));
-                if (foreign) {
-                    var reference = Pattern.compile("\\s*REFERENCES ([a-z_]+)\\s*\\(([^)]+)\\)").matcher(body.substring(keyMatcher.end()));
-                    if (!reference.lookingAt()) throw invalid(); keys.add(new CaseKey(name, "f", names, schema, reference.group(1), caseFields(reference.group(2))));
-                } else { keys.add(new CaseKey(name, "p", names, null, null, List.of())); indexes.put(name, new CaseIndex(names, true, true, null)); }
+            addCatalogKeys(body, keys, indexes);
+            if (automation) {
+                var alters = Pattern.compile("ALTER TABLE " + Pattern.quote(table) + " ADD ([^;]+);").matcher(sql);
+                while (alters.find()) addCatalogKeys(alters.group(1), keys, indexes);
             }
             var indexMatcher = Pattern.compile("CREATE (UNIQUE )?INDEX ([a-z_]+)\\s+ON ([a-z_]+)\\s*\\(([^)]+)\\)(?:\\s+WHERE ([^;]+))?;").matcher(sql);
             while (indexMatcher.find()) if (table.equals(indexMatcher.group(3))) {
@@ -438,17 +608,52 @@ public final class ProcessApiSchemaVerifier {
                 if (indexes.put(indexMatcher.group(2), new CaseIndex(caseFields(indexMatcher.group(4)), indexMatcher.group(1) != null, false,
                         predicate == null ? null : signature(predicate))) != null) throw invalid();
             }
-            contracts.put(table, new CaseTable(Map.copyOf(columns), Map.copyOf(caseChecks(body)), Set.copyOf(keys), Map.copyOf(indexes)));
+            var checks = caseChecks(body, automation);
+            contracts.put(table, new CaseTable(Map.copyOf(columns), Map.copyOf(checks), Set.copyOf(keys), Map.copyOf(indexes)));
         }
         if (!contracts.keySet().equals(sizes.keySet())) throw invalid();
         for (var entry : sizes.entrySet()) if (contracts.get(entry.getKey()).columns().size() != entry.getValue()) throw invalid();
         return Map.copyOf(contracts);
     }
 
+    private void addCatalogKeys(String ddl, Set<CaseKey> keys, Map<String, CaseIndex> indexes) {
+        var matcher = Pattern.compile("CONSTRAINT ([a-z_]+)\\s+(PRIMARY KEY|UNIQUE|FOREIGN KEY)\\s*\\(([^)]+)\\)").matcher(ddl);
+        while (matcher.find()) {
+            String name = matcher.group(1);
+            var fields = caseFields(matcher.group(3));
+            String kind = matcher.group(2);
+            if ("FOREIGN KEY".equals(kind)) {
+                var reference = Pattern.compile("\\s*REFERENCES ([a-z_]+)\\s*\\(([^)]+)\\)").matcher(ddl.substring(matcher.end()));
+                if (!reference.lookingAt() || !keys.add(new CaseKey(name, "f", fields, schema, reference.group(1),
+                        caseFields(reference.group(2))))) throw invalid();
+            } else {
+                boolean primary = "PRIMARY KEY".equals(kind);
+                if (!keys.add(new CaseKey(name, primary ? "p" : "u", fields, null, null, List.of()))
+                        || indexes.put(name, new CaseIndex(fields, true, primary, null)) != null) throw invalid();
+            }
+        }
+    }
+
     private static HashMap<String, String> caseChecks(String sql) {
-        var checks = new HashMap<String, String>(); var matcher = Pattern.compile("CONSTRAINT ([a-z_0-9]+)\\s+CHECK\\s*\\(").matcher(sql);
-        while (matcher.find()) { int open = matcher.end() - 1; if (checks.put(matcher.group(1), signature(sql.substring(open + 1, caseClosing(sql, open)))) != null) throw invalid(); }
+        return caseChecks(sql, false);
+    }
+
+    private static HashMap<String, String> caseChecks(String sql, boolean automation) {
+        var checks = new HashMap<String, String>();
+        var matcher = Pattern.compile("CONSTRAINT ([a-z_0-9]+)\\s+CHECK\\s*\\(").matcher(sql);
+        while (matcher.find()) {
+            int open = matcher.end() - 1;
+            String expression = sql.substring(open + 1, caseClosing(sql, open));
+            if (checks.put(matcher.group(1), automation ? automationCheckSignature(expression) : signature(expression)) != null) throw invalid();
+        }
         return checks;
+    }
+
+    private static String automationCheckSignature(String expression) {
+        // Every V14 timestamp is compared as a timestamp by the byte-pinned migration.
+        // The legacy signature intentionally ignores text casts, so reject casts sourced at these operands first.
+        if (Pattern.compile("(?i)\\b[a-z][a-z_0-9]*(?:_at|_until)\\s*\\)*\\s*::").matcher(expression).find()) throw invalid();
+        return signature(expression);
     }
     private static String caseMigration() {
         try (var input = ProcessApiSchemaVerifier.class.getResourceAsStream("/db/tianji-process/" + CASE_FILE)) {
@@ -521,6 +726,7 @@ public final class ProcessApiSchemaVerifier {
     }
     private static List<String> caseFields(String value) { return Arrays.stream(value.split(",")).map(String::trim).toList(); }
     private static List<String> caseArray(java.sql.Array value) throws java.sql.SQLException { return value == null ? List.of() : List.copyOf(Arrays.asList((String[]) value.getArray())); }
+    private record AutomationHistoryRowVO(int installedRank, CaseVersion version) { }
     private record CaseVersion(String version, String type, String script, boolean success, Integer checksum) { }
     private record CaseColumn(String type, boolean required, boolean cCollation, String defaultValue) { }
     private record CaseKey(String name, String type, List<String> fields, String targetSchema, String target, List<String> targetFields) { }

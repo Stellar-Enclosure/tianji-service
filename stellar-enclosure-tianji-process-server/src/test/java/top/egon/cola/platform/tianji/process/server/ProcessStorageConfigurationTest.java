@@ -2,9 +2,11 @@ package top.egon.cola.platform.tianji.process.server;
 
 import jakarta.servlet.Filter;
 import jakarta.servlet.http.HttpServletResponse;
+import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -37,16 +39,63 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
 class ProcessStorageConfigurationTest {
+    @Test
+    void automation_readiness_uses_the_existing_engine_source_and_rejects_unready_v14_when_enabled() {
+        var engine = mock(ProcessEngine.class);
+        var spring = mock(SpringProcessEngineConfiguration.class);
+        var source = mock(DataSource.class);
+        when(engine.getProcessEngineConfiguration()).thenReturn(spring);
+        when(spring.getDatabaseSchema()).thenReturn("tianji_process");
+        when(spring.getDataSource()).thenReturn(new TransactionAwareDataSourceProxy(source));
+        var configuration = new ProcessSecurityConfiguration();
+        var compatible = safeEnvironment();
+        var enabled = safeEnvironment().withProperty("stellar.tianji.process.automation.enabled", "true")
+                .withProperty("stellar.tianji.process.api.enabled", "true")
+                .withProperty("stellar.tianji.process.api.start-receipt-read-enabled", "true");
+        var missingRecovery = safeEnvironment().withProperty("stellar.tianji.process.automation.enabled", "true")
+                .withProperty("stellar.tianji.process.api.enabled", "true");
+        var internalOnly = safeEnvironment().withProperty("stellar.tianji.process.automation.enabled", "true");
+        var hostVerifier = mock(ProcessApiSchemaVerifier.class);
+
+        try (var verifiers = mockConstruction(ProcessApiSchemaVerifier.class, (verifier, context) -> {
+            assertSame(source, context.arguments().getFirst());
+            assertEquals("tianji_process", context.arguments().get(1));
+            doThrow(new IllegalStateException("V14 storage unavailable")).when(verifier).verifyAutomationV14();
+        })) {
+            assertDoesNotThrow(() -> guard(compatible));
+            var verifier = configuration.processApiSchemaVerifier(engine);
+            verify(verifier).verify();
+            verify(verifier, never()).verifyAutomationV14();
+
+            assertThrows(IllegalStateException.class,
+                    () -> configuration.processAutomationStorageReadiness(engine, missingRecovery).afterSingletonsInstantiated());
+            assertEquals(1, verifiers.constructed().size());
+            for (var environment : java.util.List.of(enabled, internalOnly)) {
+                assertThrows(IllegalStateException.class,
+                        () -> configuration.processAutomationStorageReadiness(engine, environment).afterSingletonsInstantiated());
+                verify(verifiers.constructed().getLast()).verifyAutomationV14();
+            }
+            assertEquals(3, verifiers.constructed().size());
+            verifyNoInteractions(source, hostVerifier);
+        }
+    }
+
     @Test
     void rejects_automatic_schema_changes_or_unvalidated_outbox_before_initializing_engines() {
         assertDoesNotThrow(() -> guard(safeEnvironment()));

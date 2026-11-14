@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "scripts": [
+    {
+      "version": 14,
+      "file": "V14__add_automation_execution_bindings.sql",
+      "sha256": "8347e8909e893f7b83ea4adf5c9bcfd213ed5044e2419dd0d250da884fe9f4b7"
+    }
+  ]
+}

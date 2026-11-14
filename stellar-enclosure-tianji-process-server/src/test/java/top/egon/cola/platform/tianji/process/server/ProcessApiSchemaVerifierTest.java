@@ -50,6 +50,7 @@ class ProcessApiSchemaVerifierTest {
     private static final String PLATFORM_ACTIVATION = "tianji_platform_release_activation";
     private static final String V12 = "V12__add_platform_release_activations.sql";
     private static final String GOVERNED_START = "tianji_governed_process_start";
+    private static final String V14 = "V14__add_automation_execution_bindings.sql";
     private static final String V13 = "V13__add_governed_process_start_provenance.sql";
     private static final String V10_SHA256 = "5a3511659af4c44b2455e55e15d373d6c643fea29ed513b658c59595b5ef6dc9";
     private static final String RECOVERY_RECEIPT = "tianji_process_worker_recovery_receipt";
@@ -59,6 +60,43 @@ class ProcessApiSchemaVerifierTest {
     private static final String CASE_INBOX = "tianji_case_completion_inbox";
     private static final String CANCEL_RECEIPT = "tianji_process_cancel_receipt";
     private static final String DISPATCH = "tianji_process_agent_dispatch";
+
+    @Test
+    void v13_legacy_reader_passes_but_automation_writer_requires_v14_history() throws Exception {
+        var catalog = Catalog.governedStartReady();
+        try (var construction = mockConstruction(JdbcTemplate.class, withSettings().defaultAnswer(catalog::answer))) {
+            var verifier = spy(new ProcessApiSchemaVerifier(mock(DataSource.class), "tianji_process"));
+            doNothing().when(verifier).verify();
+            assertTrue(verifier.hasCaseMigration());
+            assertDoesNotThrow(verifier::verifyGovernedProcessStart);
+            assertThrows(IllegalStateException.class, verifier::verifyAutomationV14);
+        }
+    }
+
+    @Test
+    void later_history_accepts_v14_only_as_a_validated_extension_of_v13() throws Exception {
+        try (var resource = ProcessApiSchemaVerifierTest.class.getResourceAsStream("/db/tianji-process/" + V14)) {
+            assertNotNull(resource, "Process automation V14 must be packaged");
+        }
+        var prefix = new ArrayList<>(Catalog.governedStartReady().history);
+        var good = history("14", V14, true, checksum(V14));
+        prefix.add(good);
+        assertTrue(checkHistory(prefix));
+        for (var bad : List.of(history("14", V14, false, checksum(V14)),
+                history("14", V14, true, checksum(V14) + 1),
+                history("14", V14, true, null),
+                history("14", "V14__unexpected.sql", true, checksum(V14)))) {
+            var invalid = new ArrayList<>(prefix);
+            invalid.set(6, bad);
+            assertThrows(IllegalStateException.class, () -> checkHistory(invalid));
+        }
+        var gap = new ArrayList<>(prefix);
+        gap.remove(5);
+        assertThrows(IllegalStateException.class, () -> checkHistory(gap));
+        var duplicate = new ArrayList<>(prefix);
+        duplicate.add(good);
+        assertThrows(IllegalStateException.class, () -> checkHistory(duplicate));
+    }
 
     @Test
     void history_accepts_only_exact_v8_through_v12_prefixes() throws Exception {
