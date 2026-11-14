@@ -9,8 +9,16 @@ import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.KindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionBO;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -23,20 +31,28 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.Type;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
+import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels.VerifiedAutomationModelsVO;
 
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /** Standalone decision application service; the caller must authorize the trusted actor and release. */
 public final class ProcessDecisionService {
     private static final int MAX_RESULT_BYTES = 1_048_576;
+    private static final int MAX_AUTOMATION_NODE_BYTES = 64 * 1024;
+    private static final Pattern PATH_SEGMENT = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*|\\[(?:0|[1-9][0-9]{0,2})\\]");
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
     private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() { };
     private final SpringDmnEngineConfiguration engine;
@@ -64,6 +80,140 @@ public final class ProcessDecisionService {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(command, "command");
         return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(actor, command)));
+    }
+
+    /** Executes a fixed rule in the caller's native instance command and returns its typed node-local output. */
+    public static Map<String, Object> evaluateAutomation(SpringDmnEngineConfiguration engine, VerifiedAutomationModelsVO verified,
+            AutomationNodeBindingVO binding, ProcessNodeExecutionBO node, FlowablePinnedDecisionExecutor.ProcessReference reference) {
+        AutomationInstanceGuardCommandInterceptor.requireHeld(node.getTenantId(), node.getInstanceId());
+        if (!(engine.getTransactionManager() instanceof DataSourceTransactionManager manager)
+                || !TransactionSynchronizationManager.hasResource(manager.getDataSource())
+                || TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                || !engine.isHistoryEnabled() || engine.getDmnHistoryService() == null) {
+            throw new IllegalStateException("Automation decision requires the owning process transaction and synchronous history");
+        }
+        if (binding.rule() == null) throw unavailable();
+        String key = binding.rule().definitionKey();
+        return evaluateAutomation(new FlowablePinnedDecisionExecutor(engine), binding, node,
+                verified.decisionDefinitions().get(key), verified.decisions().get(key), reference);
+    }
+
+    static Map<String, Object> evaluateAutomation(FlowablePinnedDecisionExecutor executor, AutomationNodeBindingVO binding,
+            ProcessNodeExecutionBO node, Definition definition, ValidatedProcessModel model,
+            FlowablePinnedDecisionExecutor.ProcessReference reference) {
+        var rule = binding.rule();
+        if (rule == null || node.getKind() != KindEnum.RULE || node.getState() != StateEnum.RUNNING || node.isExcluded()
+                || !binding.nodeId().equals(node.getNodeId()) || !reference.instanceId().equals(node.getInstanceId())
+                || !ProcessNodeLifecycleListener.schemaSha256(binding.inputSchema()).equals(node.getInputSchemaSha256())
+                || !ProcessNodeLifecycleListener.schemaSha256(binding.outputSchema()).equals(node.getOutputSchemaSha256())
+                || definition == null || model == null || definition.type() != Type.DMN || model.type() != Type.DMN
+                || !rule.definitionKey().equals(definition.definitionKey()) || !rule.definitionKey().equals(model.definitionKey())
+                || !rule.modelSha256().equals(definition.modelSha256()) || !rule.modelSha256().equals(modelSha256(model))
+                || !definition.inputs().equals(model.inputs())) throw unavailable();
+
+        var typedInput = binding.inputSchema().normalizeValue(node.getInput());
+        ProcessTypedJson.canonicalBytes(typedInput, MAX_AUTOMATION_NODE_BYTES);
+        var dmnInput = new LinkedHashMap<String, Object>();
+        for (var mapping : rule.inputMapping()) {
+            dmnInput.put(mapping.target(), readLocalPath(typedInput, stripScope(mapping.source(), "input.")));
+        }
+        var input = ProcessValues.inputs(model.inputs(), dmnInput);
+        var selected = new FlowablePinnedDecisionExecutor.Binding(node.getTenantId(), definition.engineDefinitionId(),
+                definition.engineDeploymentId(), definition.engineVersion(), model);
+        var result = executor.evaluateAutomationForProcess(selected, input, reference);
+        if (result == null || !selected.definitionId().equals(result.definitionId())
+                || selected.definitionVersion() != result.definitionVersion()) throw evaluationFailed();
+        return automationOutput(binding, model, result.outputs());
+    }
+
+    private static Map<String, Object> automationOutput(AutomationNodeBindingVO binding, ValidatedProcessModel model,
+                                                         List<Map<String, Object>> outputs) {
+        try {
+            var output = new LinkedHashMap<String, Object>();
+            if (!outputs.isEmpty()) {
+                var row = ProcessValues.outputs(model.outputs(), outputs.getFirst());
+                if (outputs.stream().anyMatch(candidate -> !row.equals(ProcessValues.outputs(model.outputs(), candidate)))) {
+                    throw evaluationFailed();
+                }
+                for (var mapping : binding.rule().outputMapping()) {
+                    String key = stripScope(mapping.source(), "scope.");
+                    if (!row.containsKey(key)) throw evaluationFailed();
+                    writeLocalPath(output, mapping.target(), row.get(key));
+                }
+            }
+            var normalized = binding.outputSchema().normalizeValue(output);
+            ProcessTypedJson.canonicalBytes(normalized, MAX_AUTOMATION_NODE_BYTES);
+            return typedObject(normalized);
+        } catch (IllegalArgumentException failure) {
+            throw evaluationFailed();
+        }
+    }
+
+    private static Object readLocalPath(Object object, String path) {
+        Object value = object;
+        for (String segment : segments(path)) {
+            if (segment.startsWith("[")) {
+                int index = arrayIndex(segment);
+                if (!(value instanceof List<?> array) || index >= array.size()) throw invalid();
+                value = array.get(index);
+            } else {
+                if (!(value instanceof Map<?, ?> fields) || !fields.containsKey(segment)) throw invalid();
+                value = fields.get(segment);
+            }
+        }
+        return value;
+    }
+
+    private static void writeLocalPath(Map<String, Object> object, String path, Object value) {
+        var segments = segments(path);
+        Object parent = object;
+        for (int index = 0; index < segments.size(); index++) {
+            String segment = segments.get(index);
+            Object child = index + 1 == segments.size() ? value
+                    : segments.get(index + 1).startsWith("[") ? new ArrayList<>() : new LinkedHashMap<>();
+            if (segment.startsWith("[")) {
+                var array = typedArray(parent);
+                int item = arrayIndex(segment);
+                while (array.size() <= item) array.add(null);
+                if (array.get(item) == null) array.set(item, child);
+                parent = array.get(item);
+            } else {
+                parent = typedObject(parent).computeIfAbsent(segment, ignored -> child);
+            }
+        }
+    }
+
+    private static List<String> segments(String path) {
+        return PATH_SEGMENT.matcher(path).results().map(match -> match.group()).toList();
+    }
+
+    private static String stripScope(String source, String scope) {
+        if (!source.startsWith(scope)) throw invalid();
+        return source.substring(scope.length());
+    }
+
+    private static int arrayIndex(String segment) {
+        return Integer.parseInt(segment, 1, segment.length() - 1, 10);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> typedObject(Object value) {
+        if (!(value instanceof Map<?, ?> object)) throw invalid();
+        return (Map<String, Object>) object;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Object> typedArray(Object value) {
+        if (!(value instanceof List<?> array)) throw invalid();
+        return (List<Object>) array;
+    }
+
+    private static String modelSha256(ValidatedProcessModel model) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(model.xml()));
+        } catch (NoSuchAlgorithmException failure) {
+            throw new IllegalStateException("SHA-256 is unavailable", failure);
+        }
     }
 
     private Result evaluateInTransaction(ProcessActor actor, EvaluateCommand command) {

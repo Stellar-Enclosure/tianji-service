@@ -4,6 +4,7 @@ import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotNull;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.support.SqlArrayValue;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.validation.annotation.Validated;
 import tools.jackson.core.type.TypeReference;
@@ -26,6 +27,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,6 +44,8 @@ public class ProcessNodeExecutionStore {
     private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() { };
     private static final Set<String> RECOVERY_FIELDS = Set.of("mode", "observedGeneration", "observedAt", "validUntil",
             "authorityRef", "evidenceSha256", "businessReceiptId", "resultSha256");
+    private static final Set<KindEnum> LOCAL_RESULT_KINDS = Set.of(KindEnum.RULE, KindEnum.AND_JOIN, KindEnum.LOOP,
+            KindEnum.MULTI_INSTANCE, KindEnum.SUBPROCESS);
     private static final String COLUMNS = """
             tenant_id,instance_id,occurrence_id,attempt,node_execution_ref,node_id,kind,parent_scope_id,attempt_scope_id,
             branch_index,iteration_index,excluded,native_job_id,native_subscription_id,capability_key,capability_version,effect_key,
@@ -163,6 +167,16 @@ public class ProcessNodeExecutionStore {
         requireTransaction();
         return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
                         + " AND occurrence_id = ? ORDER BY attempt DESC LIMIT 1", this::row, tenantId, instanceId, occurrenceId));
+    }
+
+    ProcessNodeExecutionBO requireCompletedSource(long tenantId, String instanceId, String configurationSha256,
+                                                    String parentScopeId, String nodeId) {
+        requireWrite(tenantId, instanceId);
+        return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
+                        + " AND configuration_sha256=? AND parent_scope_id=? AND node_id=?"
+                        + " AND state='COMPLETED' AND NOT excluded AND output_json IS NOT NULL AND accepted_at IS NOT NULL LIMIT 2",
+                this::row, tenantId, instanceId, configurationSha256, parentScopeId, nodeId))
+                .orElseThrow(ProcessNodeExecutionStore::unavailable);
     }
 
     public ProcessNodeExecutionBO requireWorkerAttempt(long tenantId, String instanceId, String nativeJobId) {
@@ -323,6 +337,57 @@ public class ProcessNodeExecutionStore {
                         + SCOPED + " AND node_execution_ref=? AND revision=? AND state='WAITING' AND NOT excluded",
                 json(normalizedOutput, MAX_DATA), digest("AUTOMATION_NODE_OUTPUT_V2", row.getOutputSchemaSha256(), normalizedOutput),
                 utc(timestamp), tenantId, instanceId, nodeExecutionRef, expectedRevision) == 1;
+    }
+
+    void completeLocal(ProcessNodeExecutionBO row, Map<String, Object> normalizedOutput) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        if (!LOCAL_RESULT_KINDS.contains(row.getKind()) || row.getCapabilityKey() != null
+                || row.getState() != StateEnum.RUNNING || row.isExcluded()) throw unavailable();
+        var timestamp = now();
+        if (timestamp.isBefore(row.getStartedAt()) || !timestamp.isBefore(row.getAttemptDeadlineAt())
+                || !timestamp.isBefore(row.getNodeDeadlineAt())) throw unavailable();
+        int changed = jdbc.update("UPDATE " + table + " SET state='COMPLETED',revision=revision+1,"
+                        + "output_json=?::jsonb,output_sha256=?,accepted_at=?,finished_at=?" + SCOPED
+                        + " AND configuration_sha256=? AND parent_scope_id=? AND node_id=? AND kind=?"
+                        + " AND occurrence_id=? AND attempt=? AND node_execution_ref=? AND attempt_scope_id=? AND revision=?"
+                        + " AND state='RUNNING' AND NOT excluded AND capability_key IS NULL"
+                        + " AND output_json IS NULL AND output_sha256 IS NULL AND accepted_at IS NULL",
+                json(normalizedOutput, MAX_DATA), digest("AUTOMATION_NODE_OUTPUT_V2", row.getOutputSchemaSha256(), normalizedOutput),
+                utc(timestamp), utc(timestamp), row.getTenantId(), row.getInstanceId(), row.getConfigurationSha256(),
+                row.getParentScopeId(), row.getNodeId(), row.getKind().name(), row.getOccurrenceId(), row.getAttempt(),
+                row.getNodeExecutionRef(), row.getAttemptScopeId(), row.getRevision());
+        if (changed != 1) throw unavailable();
+    }
+
+    void excludeMultiChildren(long tenantId, String instanceId, String configurationSha256, Collection<String> nodeExecutionRefs) {
+        requireWrite(tenantId, instanceId);
+        if (nodeExecutionRefs.isEmpty()) return;
+        var references = Set.copyOf(nodeExecutionRefs);
+        if (references.size() != nodeExecutionRefs.size() || !ProcessInstanceBindingStore.sha256(configurationSha256)) {
+            throw unavailable();
+        }
+        var timestamp = utc(now());
+        // V14 ties finished_at to terminal state. Keep previously accepted and terminal evidence.
+        var matched = jdbc.queryForObject("""
+                WITH targets AS (
+                    SELECT node_execution_ref,finished_at FROM %1$s
+                    WHERE tenant_id=? AND instance_id=? AND configuration_sha256=? AND node_execution_ref=ANY(?)
+                ), updated AS (
+                    UPDATE %1$s node
+                    SET excluded=true,revision=node.revision+1,
+                        state=CASE WHEN target.finished_at IS NULL THEN 'CANCELLED' ELSE node.state END,
+                        finished_at=COALESCE(target.finished_at,?)
+                    FROM targets target
+                    WHERE node.tenant_id=? AND node.instance_id=? AND node.configuration_sha256=?
+                        AND node.node_execution_ref=target.node_execution_ref AND (NOT node.excluded OR target.finished_at IS NULL)
+                        AND (SELECT count(*) FROM targets)=?
+                    RETURNING node.node_execution_ref
+                )
+                SELECT count(*) FROM targets
+                """.formatted(table), Long.class, tenantId, instanceId, configurationSha256,
+                new SqlArrayValue("varchar", references.toArray()), timestamp, tenantId, instanceId, configurationSha256,
+                references.size());
+        if (!Objects.equals(matched, (long) references.size())) throw unavailable();
     }
 
     public int cancelOpen(long tenantId, String instanceId) {

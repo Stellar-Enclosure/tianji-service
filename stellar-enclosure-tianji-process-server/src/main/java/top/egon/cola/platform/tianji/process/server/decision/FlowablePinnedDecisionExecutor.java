@@ -31,7 +31,7 @@ import java.util.Objects;
 
 /** Internal adapter; its binding must be loaded from an already authorized tenant-scoped release. */
 public final class FlowablePinnedDecisionExecutor {
-    private static final int MAX_XML_BYTES = 512 * 1024;
+    private static final int LEGACY_MAX_XML_BYTES = 512 * 1024;
     private final SpringDmnEngineConfiguration engine;
     private final TransactionTemplate transaction;
 
@@ -58,26 +58,37 @@ public final class FlowablePinnedDecisionExecutor {
             throw new IllegalArgumentException("Decision execution reference is invalid");
         }
         Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
-        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, executionReference, null)));
+        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, executionReference, null, false)));
     }
 
     /** Associates a decision with its Flowable process execution in the same local transaction. */
     public Result evaluateForProcess(Binding binding, Map<String, Object> inputs, ProcessReference reference) {
+        return evaluateForProcess(binding, inputs, reference, false);
+    }
+
+    /** The sealed automation archive has already bounded and verified the exact bytes for this binding. */
+    Result evaluateAutomationForProcess(Binding binding, Map<String, Object> inputs, ProcessReference reference) {
+        return evaluateForProcess(binding, inputs, reference, true);
+    }
+
+    private Result evaluateForProcess(Binding binding, Map<String, Object> inputs, ProcessReference reference, boolean automation) {
         Objects.requireNonNull(binding, "binding");
         Objects.requireNonNull(reference, "reference");
         Map<String, Object> checked = ProcessValues.inputs(binding.model().inputs(), inputs);
-        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, null, reference)));
+        return Objects.requireNonNull(transaction.execute(status -> evaluateInTransaction(binding, checked, null, reference, automation)));
     }
 
     private Result evaluateInTransaction(Binding binding, Map<String, Object> inputs, String executionReference,
-                                         ProcessReference processReference) {
+                                         ProcessReference processReference, boolean automation) {
         var repository = engine.getDmnRepositoryService();
         DmnDecision definition = repository.createDecisionQuery().decisionId(binding.definitionId())
                 .deploymentId(binding.deploymentId()).decisionVersion(binding.definitionVersion())
                 .decisionKey(binding.model().definitionKey()).decisionTenantId(Long.toString(binding.tenantId())).singleResult();
         if (definition == null) throw unavailable();
+        byte[] expected = binding.model().xml();
+        if (!automation && expected.length > LEGACY_MAX_XML_BYTES) throw unavailable();
         try (InputStream source = repository.getDmnResource(binding.definitionId())) {
-            if (source == null || !MessageDigest.isEqual(source.readNBytes(MAX_XML_BYTES + 1), binding.model().xml())) throw unavailable();
+            if (source == null || !MessageDigest.isEqual(source.readNBytes(expected.length + 1), expected)) throw unavailable();
         } catch (FlowableObjectNotFoundException missing) {
             throw unavailable();
         } catch (IOException failure) {

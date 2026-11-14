@@ -42,11 +42,15 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.Dra
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DraftModelSourceVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.PublishProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.SaveProcessDraftCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO;
+import top.egon.cola.platform.tianji.process.server.AutomationControlFlowIT;
+import top.egon.cola.platform.tianji.process.server.AutomationControlFlowIT.Harness;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.release.AutomationActivationConverter;
 import top.egon.cola.platform.tianji.process.server.release.AutomationActivationService;
@@ -90,6 +94,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 @Isolated("Owns one explicitly provisioned empty Process database")
@@ -198,6 +203,58 @@ class AutomationConcurrencyIT {
             assertNotNull(process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(second.getInstanceId())
                     .singleResult().getEndTime());
         }
+        try (var workerHarness = Harness.openOnProvisionedDatabase(database.owner(), database.url(), database.role())) {
+            verifyAcceptedWorkerResultOrdering(workerHarness);
+        }
+    }
+
+    private static void verifyAcceptedWorkerResultOrdering(Harness fixture) {
+        String definition = "workerDeadlineRace";
+        fixture.publishService(definition, fixture.transactional, false);
+        for (boolean cancel : List.of(false, true)) {
+            String root = fixture.start(definition, "accepted-race-" + cancel, 12);
+            // Shorten the pending attempt before any lease binds its immutable deadline.
+            assertEquals(1, fixture.owner.update("""
+                    UPDATE tianji_process.tianji_process_node_execution
+                       SET attempt_deadline_at=clock_timestamp()+interval '4 seconds'
+                     WHERE instance_id=? AND node_id='work' AND state='WAITING'
+                    """, root));
+            var task = fixture.acquire(fixture.transactional);
+            var request = AutomationControlFlowIT.complete(task, "accept-race-" + cancel, "business-race-" + cancel,
+                    Map.of("approved", true));
+            var accepted = fixture.worker.completeAutomation(fixture.transactional.actor(), request);
+            assertEquals(AutomationWorkerReportDTO.OutcomeEnum.COMPLETED, accepted.getOutcome());
+            assertEquals("RESULT_ACCEPTED", fixture.nodeState(root, "work"));
+            await().atMost(Duration.ofSeconds(8)).until(() -> fixture.owner.queryForObject("""
+                    SELECT attempt_deadline_at<=clock_timestamp()
+                    FROM tianji_process.tianji_process_node_execution WHERE instance_id=? AND node_id='work'
+                    """, Boolean.class, root));
+            fixture.fireTimeout(root, false);
+            assertEquals("RESULT_ACCEPTED", fixture.nodeState(root, "work"), "A committed result wins over the elapsed attempt timer");
+            if (cancel) fixture.cancel(root);
+            else fixture.runJob(root);
+            assertEquals(cancel ? "CANCELLED" : "COMPLETED", fixture.nodeState(root, "work"));
+            assertEquals(accepted, fixture.worker.completeAutomation(fixture.transactional.actor(), request));
+            assertEquals(1, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND output_json->>'approved'='true' AND output_sha256 IS NOT NULL", root));
+            assertEquals(0, fixture.process.getManagementService().createTimerJobQuery().processInstanceId(root).count());
+        }
+        String overdue = fixture.start(definition, "late-report-race", 12);
+        var late = fixture.acquire(fixture.transactional);
+        assertEquals(1, fixture.owner.update("""
+                UPDATE tianji_process.tianji_process_node_execution
+                   SET started_at=clock_timestamp()-interval '5 seconds',
+                       attempt_deadline_at=clock_timestamp()-interval '2 seconds'
+                 WHERE instance_id=? AND node_id='work' AND state='WAITING'
+                """, overdue));
+        assertThrows(WorkerLeaseLostException.class, () -> fixture.worker.completeAutomation(fixture.transactional.actor(),
+                AutomationControlFlowIT.complete(late, "late-complete", "late-receipt", Map.of("approved", true))));
+        assertEquals("WAITING", fixture.nodeState(overdue, "work"));
+        assertEquals(0, fixture.count("tianji_process.tianji_process_node_execution",
+                "WHERE instance_id=? AND output_sha256 IS NOT NULL", overdue));
+        fixture.fireTimeout(overdue, false);
+        assertEquals("WAIT_RECOVERY", fixture.nodeState(overdue, "work"));
+        fixture.cancel(overdue);
     }
 
     private static void verifyTypedCancellation(DatabaseVO database, ProcessExecutionService execution,
@@ -554,7 +611,8 @@ class AutomationConcurrencyIT {
         owner.execute("GRANT USAGE ON SCHEMA " + SCHEMA + " TO " + quoted);
         grant(owner, quoted, "SELECT", "tianji_process_schema_history", "tianji_platform_release_activation", "tianji_case_start_provenance");
         grant(owner, quoted, "SELECT,INSERT,UPDATE", "tianji_process_release", "tianji_process_release_definition",
-                "tianji_process_command_receipt", "tianji_process_draft", "tianji_process_node_execution", "tianji_process_agent_dispatch");
+                "tianji_process_command_receipt", "tianji_process_draft", "tianji_process_node_execution", "tianji_process_agent_dispatch",
+                "tianji_worker_lease_receipt");
         grant(owner, quoted, "SELECT,INSERT", "tianji_governed_process_start", "tianji_process_automation_release",
                 "tianji_process_draft_command", "tianji_process_automation_activation", "tianji_process_instance_binding",
                 "tianji_human_task_receipt", "tianji_process_cancel_receipt");

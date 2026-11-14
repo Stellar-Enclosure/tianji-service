@@ -4,15 +4,25 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.flowable.bpmn.model.BaseElement;
 import org.flowable.bpmn.model.BoundaryEvent;
+import org.flowable.bpmn.model.EndEvent;
 import org.flowable.bpmn.model.ExternalWorkerServiceTask;
+import org.flowable.bpmn.model.ExclusiveGateway;
 import org.flowable.bpmn.model.TimerEventDefinition;
 import org.flowable.bpmn.model.FlowableListener;
+import org.flowable.bpmn.model.FlowElement;
+import org.flowable.bpmn.model.FlowElementsContainer;
+import org.flowable.bpmn.model.FlowNode;
+import org.flowable.bpmn.model.ParallelGateway;
+import org.flowable.bpmn.model.SequenceFlow;
 import org.flowable.bpmn.model.ServiceTask;
 import org.flowable.bpmn.model.SubProcess;
 import org.flowable.bpmn.model.UserTask;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.common.engine.api.delegate.Expression;
 import org.flowable.common.engine.impl.interceptor.CommandContext;
+import org.flowable.common.engine.impl.javax.el.ELContext;
+import org.flowable.common.engine.impl.javax.el.ELResolver;
+import org.flowable.engine.delegate.BpmnError;
 import org.flowable.engine.delegate.DelegateExecution;
 import org.flowable.engine.delegate.ExecutionListener;
 import org.flowable.engine.impl.bpmn.behavior.AbstractBpmnActivityBehavior;
@@ -45,13 +55,26 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionLiteralVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionOperationVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionPathVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.ConditionVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.LoopControlVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.MergeVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.MultiInstanceControlVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.SubprocessControlVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.KindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.SideEffectOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
+import top.egon.cola.platform.tianji.process.server.decision.FlowablePinnedDecisionExecutor.ProcessReference;
+import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.ControlPredicate;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.OccurrenceSlotVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.ImmutableReleaseVO;
@@ -60,25 +83,31 @@ import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseServic
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 
+import java.math.BigDecimal;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 @Slf4j
 @RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class ProcessNodeLifecycleListener {
+    private static final Pattern FIELD_SEGMENTS = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*|\\[[0-9]+\\]");
     private static final String MODEL_NAMESPACE = "urn:stellar-enclosure:tianji:automation:2";
     private static final String ENTER = "${tianjiAutomationScopeEnter}";
     private static final String EXIT = "${tianjiAutomationScopeExit}";
@@ -91,6 +120,16 @@ public class ProcessNodeLifecycleListener {
     private static final String INPUT_SHA = "inputSha256";
     private static final String CONFIGURATION_SHA = "configurationSha256";
     private static final String RESULT_REF = "resultRef";
+    private static final String LOCAL_INPUT = "tianjiAutomationLocalInput";
+    private static final String BRANCH_SCOPE = "tianjiAutomationBranchScope_";
+    private static final String JOIN_ARRIVAL = "tianjiAutomationJoinArrival_";
+    private static final String MULTI_ITEMS = "tianjiAutomationMultiItems";
+    private static final String MULTI_FINISHED = "tianjiAutomationMultiFinished";
+    private static final String MULTI_SELECTED = "tianjiAutomationMultiSelected";
+    private static final String MULTI_NODE_REF = "tianjiAutomationMultiNodeRef_";
+    private static final String LOOP_CARRY = "tianjiAutomationLoopCarry";
+    private static final String LOOP_INDEX = "tianjiAutomationLoopIndex";
+    private static final String LOOP_ITERATIONS = "tianjiAutomationLoopIterations";
     private static final String OCCURRENCE_DEADLINE = "tianjiAutomationWorkerDeadline";
     private static final String RECOVERY_MESSAGE = "tianji-v2:worker-recovery:";
     private static final String ATTEMPT_TIMEOUT = "ATTEMPT_TIMEOUT";
@@ -116,6 +155,541 @@ public class ProcessNodeLifecycleListener {
         processors.add(new WorkerCompletionJobCapture(listener));
         configuration.setJobProcessors(List.copyOf(processors));
         configuration.addCustomJobHandler(new WorkerRetryJobHandler(listener));
+        configuration.addPreDefaultELResolver(new ControlExpressionResolver(listener));
+    }
+
+    private boolean onCondition(LifecycleContextVO context, DelegateExecution execution, String flowId) {
+        var predicate = context.verified().controlBindings().conditions().get(flowId);
+        if (!(execution.getCurrentFlowElement() instanceof ExclusiveGateway gateway)
+                || predicate == null || gateway.getOutgoingFlows().stream().noneMatch(flow -> flowId.equals(flow.getId())
+                        && ControlPredicate.XOR.expression(flowId).equals(flow.getConditionExpression()))) {
+            throw unavailable();
+        }
+        var parent = requireParent(execution);
+        var localInput = localInput(context, parent);
+        var localScope = visibleScope(context, parent, gateway);
+        return test(predicate, path -> localField(localInput, localScope, path));
+    }
+
+    private boolean continueLoop(LifecycleContextVO context, DelegateExecution execution, String flowId) {
+        var parent = requireParent(execution);
+        var slot = controlScope(context, parent);
+        var definition = binding(context.release(), slot.getKey());
+        if (!(definition.control() instanceof LoopControlVO loop)
+                || !AutomationModelCompiler.loopContinuationFlowId(slot.getKey()).equals(flowId)
+                || !(execution.getCurrentFlowElement() instanceof ExclusiveGateway gateway)
+                || gateway.getOutgoingFlows().stream().noneMatch(flow -> flowId.equals(flow.getId())
+                        && ControlPredicate.LOOP_CONTINUATION.expression(flowId).equals(flow.getConditionExpression()))) throw unavailable();
+        var condition = context.verified().controlBindings().conditions().get(flowId);
+        if (!loop.condition().equals(condition) || !(parent.getVariableLocal(LOOP_ITERATIONS) instanceof Integer completed)
+                || completed < 1 || completed > loop.maxIterations()) throw unavailable();
+        var carry = nativeObject(context, parent.getVariableLocal(LOOP_CARRY));
+        boolean proceed = test(condition, path -> lookup(carry, path));
+        if (proceed && completed == loop.maxIterations()) throw unavailable();
+        return proceed;
+    }
+
+    private List<Object> multiItems(LifecycleContextVO context, DelegateExecution execution, String bodyId) {
+        var slot = bodySlot(context, bodyId);
+        var definition = binding(context.release(), slot.getKey());
+        if (!(definition.control() instanceof MultiInstanceControlVO multi) || !insideBody(execution, bodyId)) {
+            throw unavailable();
+        }
+        var occurrence = exactOccurrence(execution, slot.getValue());
+        var items = frozenItems(context, occurrence, multi);
+        return items.stream().map(value -> context.engine().getVariableJsonMapper()
+                .readTree(ProcessTypedJson.canonicalBytes(value, ProcessNodeExecutionStore.MAX_DATA))).toList();
+    }
+
+    private boolean completeMulti(LifecycleContextVO context, DelegateExecution execution, String bodyId) {
+        var slot = bodySlot(context, bodyId);
+        var definition = binding(context.release(), slot.getKey());
+        var predicate = context.verified().controlBindings().conditions().get(bodyId);
+        if (!(definition.control() instanceof MultiInstanceControlVO multi) || !insideBody(execution, bodyId)
+                || predicate == null || !predicate.equals(multi.completionCondition())) throw unavailable();
+        var occurrence = exactOccurrence(execution, slot.getValue());
+        var children = finishedChildren(context, occurrence);
+        if (children.isEmpty()) return false;
+        var output = mergeOutput(definition, merge -> multiValues(context, children, merge));
+        if (!test(predicate, path -> lookup(output, path))) return false;
+        Object existing = occurrence.getVariableLocal(MULTI_SELECTED);
+        if (existing != null) {
+            if (!selectedIndices(context, existing).equals(children.keySet())) throw unavailable();
+            return true;
+        }
+        storeNativeObject(context, occurrence, MULTI_SELECTED, Map.of("indices", new ArrayList<>(children.keySet())));
+        excludeUnselectedMultiChildren(context, execution, bodyId, children.keySet());
+        return true;
+    }
+
+    private void excludeUnselectedMultiChildren(LifecycleContextVO context, DelegateExecution execution, String bodyId,
+                                                Set<Integer> retained) {
+        var references = execution.getExecutions().stream().filter(child -> bodyId.equals(child.getCurrentActivityId())
+                && child.getVariableLocal(AutomationModelCompiler.MULTI_INSTANCE_INDEX) instanceof Integer index
+                && !retained.contains(index))
+                .flatMap(child -> child.getVariablesLocal().entrySet().stream())
+                .filter(entry -> entry.getKey().startsWith(MULTI_NODE_REF))
+                .map(entry -> {
+                    String reference = entry.getKey().substring(MULTI_NODE_REF.length());
+                    if (!reference.equals(entry.getValue())) throw unavailable();
+                    return reference;
+                }).toList();
+        if (!references.isEmpty()) {
+            var root = context.binding();
+            nodes.excludeMultiChildren(root.getTenantId(), root.getInstanceId(), root.getConfigurationSha256(), references);
+        }
+    }
+
+    private static boolean insideBody(DelegateExecution execution, String bodyId) {
+        for (var current = execution; current != null; current = current.getParent()) {
+            if (bodyId.equals(current.getCurrentActivityId())) return true;
+        }
+        return false;
+    }
+
+    private static List<?> frozenItems(LifecycleContextVO context, DelegateExecution occurrence, MultiInstanceControlVO multi) {
+        Object raw = occurrence.getVariableLocal(MULTI_ITEMS);
+        if (raw == null || !(nativeObject(context, raw).get("items") instanceof List<?> items)
+                || items.size() > multi.maxItems()) throw unavailable();
+        return items;
+    }
+
+    private Map.Entry<String, OccurrenceSlotVO> bodySlot(LifecycleContextVO context, String bodyId) {
+        return context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> bodyId.equals(entry.getValue().attemptOrBodyId()))
+                .findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+    }
+
+    private Map.Entry<String, OccurrenceSlotVO> controlScope(LifecycleContextVO context, DelegateExecution execution) {
+        return context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> execution.getCurrentActivityId().equals(entry.getValue().scopeId()))
+                .findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+    }
+
+    private ProcessNodeExecutionBO exactExecutionRow(LifecycleContextVO context, DelegateExecution scope) {
+        return nodes.findAttempt(context.binding().getTenantId(), context.binding().getInstanceId(), scope.getId())
+                .filter(row -> !row.isExcluded() && context.binding().getConfigurationSha256().equals(row.getConfigurationSha256()))
+                .orElseThrow(ProcessNodeLifecycleListener::unavailable);
+    }
+
+    private void onControlBody(DelegateExecution body, boolean enter) {
+        var context = context(body);
+        var slot = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> body.getCurrentActivityId().equals(entry.getValue().attemptOrBodyId())).findFirst().orElse(null);
+        if (slot == null) return;
+        var definition = binding(context.release(), slot.getKey());
+        if (!(definition.control() instanceof LoopControlVO loop)) return;
+        var parent = exactOccurrence(requireParent(body), slot.getValue());
+        Object count = parent.getVariableLocal(LOOP_ITERATIONS);
+        if (!(count instanceof Integer completed) || completed < 0 || completed >= loop.maxIterations()) throw unavailable();
+        var current = nativeObject(context, parent.getVariableLocal(LOOP_CARRY));
+        if (enter) {
+            body.setVariableLocal(LOOP_INDEX, completed);
+            storeNativeObject(context, body, LOCAL_INPUT, current);
+            storeNativeObject(context, body, AutomationBootstrapBehavior.SCOPE, current);
+            return;
+        }
+        if (!Integer.valueOf(completed).equals(body.getVariableLocal(LOOP_INDEX))) throw unavailable();
+        if (!(body.getCurrentFlowElement() instanceof SubProcess iteration)) throw unavailable();
+        var updated = mutableObject(current);
+        var result = visibleScope(context, body);
+        for (var mapping : loop.carryMapping()) {
+            assign(updated, mapping.target(), mappedValue(context, body, iteration, result, mapping.source()));
+        }
+        var carry = object(loop.carrySchema().normalizeValue(updated));
+        if (completed + 1 == loop.maxIterations() && test(loop.condition(), path -> lookup(carry, path))) {
+            var policy = context.verified().controlBindings().policySlots().get(slot.getKey());
+            var row = exactExecutionRow(context, parent);
+            if (policy == null || policy.failureBoundaryId() == null
+                    || !Set.of("BRANCH", "END").contains(definition.policy().onFailure().action())) throw unavailable();
+            nodes.finish(row, StateEnum.FAILED);
+            captureBoundary(row, policy.failureBoundaryId(), "FAILURE", slot.getValue().scopeId());
+            throw new BpmnError("TIANJI_AUTOMATION_NODE_FAILURE");
+        }
+        storeNativeObject(context, parent, LOOP_CARRY, carry);
+        parent.setVariableLocal(LOOP_ITERATIONS, completed + 1);
+    }
+
+    private void beforeScopeExit(DelegateExecution execution) {
+        var context = context(execution);
+        var end = (EndEvent) execution.getCurrentFlowElement();
+        if (!end.getEventDefinitions().isEmpty()) return;
+        var parent = requireParent(execution);
+        if (parent.getCurrentFlowElement() instanceof SubProcess) {
+            finishNativeScope(context, parent);
+        } else if (parent.getId().equals(context.binding().getInstanceId())) {
+            var output = projectScope(context.release().source().outputSchema(), visibleScope(context, parent));
+            storeNativeObject(context, parent, AutomationBootstrapBehavior.ROOT_OUTPUT, output);
+        }
+    }
+
+    private void finishNativeScope(LifecycleContextVO context, DelegateExecution scope) {
+        var slot = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> scope.getCurrentActivityId().equals(entry.getValue().scopeId())
+                        || scope.getCurrentActivityId().equals(entry.getValue().attemptOrBodyId())).findFirst().orElse(null);
+        if (slot == null) return;
+        var definition = binding(context.release(), slot.getKey());
+        if (scope.getCurrentActivityId().equals(slot.getValue().attemptOrBodyId())) {
+            if (definition.control() instanceof LoopControlVO) onControlBody(scope, false);
+            if (definition.control() instanceof MultiInstanceControlVO) finishMultiBody(context, scope, slot.getValue());
+            return;
+        }
+        if (definition.control() instanceof LoopControlVO) {
+            var output = projectScope(definition.outputSchema(), nativeObject(context, scope.getVariableLocal(LOOP_CARRY)));
+            completeLocal(context, definition, exactExecutionRow(context, scope), scope, output);
+        } else if (definition.control() instanceof SubprocessControlVO) {
+            var output = projectScope(definition.outputSchema(), visibleScope(context, scope));
+            completeLocal(context, definition, exactExecutionRow(context, scope), scope, output);
+        }
+    }
+
+    private static Map<String, Object> projectScope(ProcessSchemaVO schema, Map<String, Object> scope) {
+        var output = new LinkedHashMap<String, Object>();
+        for (var key : schema.properties().keySet()) {
+            if (scope.containsKey(key)) output.put(key, scope.get(key));
+        }
+        return object(schema.normalizeValue(output));
+    }
+
+    private void finishMultiBody(LifecycleContextVO context, DelegateExecution body, OccurrenceSlotVO slot) {
+        var occurrence = exactOccurrence(requireParent(body), slot);
+        if (!(body.getVariable(AutomationModelCompiler.MULTI_INSTANCE_INDEX) instanceof Integer index) || index < 0) {
+            throw unavailable();
+        }
+        Object previous = occurrence.getVariableLocal(MULTI_FINISHED);
+        var finished = previous == null ? new LinkedHashMap<String, Object>() : mutableObject(nativeObject(context, previous));
+        if (finished.putIfAbsent(index.toString(), body.getId()) != null) throw unavailable();
+        storeNativeObject(context, occurrence, MULTI_FINISHED, finished);
+    }
+
+    private static Map<Integer, String> finishedChildren(LifecycleContextVO context, DelegateExecution occurrence) {
+        var nativeValue = occurrence.getVariableLocal(MULTI_FINISHED);
+        if (nativeValue == null) return Map.of();
+        var finished = new java.util.TreeMap<Integer, String>();
+        var children = nativeObject(context, nativeValue);
+        children.forEach((index, child) -> {
+            if (!index.matches("0|[1-9][0-9]{0,2}") || !(child instanceof String reference) || reference.isBlank()) throw unavailable();
+            finished.put(Integer.parseInt(index), reference);
+        });
+        return finished;
+    }
+
+    private static void storeNativeObject(LifecycleContextVO context, DelegateExecution owner, String variable, Object value) {
+        var bytes = ProcessTypedJson.canonicalBytes(value, ProcessNodeExecutionStore.MAX_DATA);
+        owner.setVariableLocal(variable, context.engine().getVariableJsonMapper().readTree(bytes));
+    }
+
+    private static Object localField(Map<String, Object> input, Map<String, Object> scope, String path) {
+        var first = fieldRoot(path);
+        return lookup(scope.containsKey(first) ? scope : input, path);
+    }
+
+    private static String fieldRoot(String path) {
+        int end = path.indexOf('.');
+        int index = path.indexOf('[');
+        if (index != -1 && (end == -1 || index < end)) end = index;
+        return end == -1 ? path : path.substring(0, end);
+    }
+
+    private static boolean test(ConditionVO predicate, Function<String, Object> resolve) {
+        Object value = evaluate(predicate, resolve);
+        if (!(value instanceof Boolean result)) throw unavailable();
+        return result;
+    }
+
+    private static Object evaluate(ConditionVO predicate, Function<String, Object> resolve) {
+        return switch (predicate) {
+            case ConditionPathVO path -> resolve.apply(path.path());
+            case ConditionLiteralVO literal -> literal.literal();
+            case ConditionOperationVO operation -> {
+                var arguments = operation.args();
+                yield switch (operation.op()) {
+                    case "AND" -> arguments.stream().allMatch(argument -> test(argument, resolve));
+                    case "OR" -> arguments.stream().anyMatch(argument -> test(argument, resolve));
+                    case "NOT" -> !test(arguments.getFirst(), resolve);
+                    default -> compare(operation.op(), evaluate(arguments.getFirst(), resolve),
+                            evaluate(arguments.getLast(), resolve));
+                };
+            }
+        };
+    }
+
+    private static boolean compare(String operation, Object left, Object right) {
+        if ("EQ".equals(operation) || "NE".equals(operation)) {
+            boolean equal = left instanceof Number && right instanceof Number
+                    ? numeric(left).compareTo(numeric(right)) == 0 : Objects.equals(left, right);
+            return "EQ".equals(operation) == equal;
+        }
+        int order = numeric(left).compareTo(numeric(right));
+        return switch (operation) {
+            case "GT" -> order > 0;
+            case "GE" -> order >= 0;
+            case "LT" -> order < 0;
+            case "LE" -> order <= 0;
+            default -> throw unavailable();
+        };
+    }
+
+    private static BigDecimal numeric(Object value) {
+        if (!(value instanceof String) && !(value instanceof Number)) throw unavailable();
+        try {
+            return new BigDecimal(value.toString());
+        } catch (NumberFormatException malformed) {
+            throw unavailable();
+        }
+    }
+
+    private static DelegateExecution requireParent(DelegateExecution execution) {
+        var parent = execution.getParent();
+        if (parent == null || !execution.getRootProcessInstanceId().equals(parent.getRootProcessInstanceId())) {
+            throw unavailable();
+        }
+        return parent;
+    }
+
+    private static Map<String, Object> localInput(LifecycleContextVO context, DelegateExecution parent) {
+        Object value = parent.getVariable(LOCAL_INPUT);
+        return value == null ? rootInput(context) : nativeObject(context, value);
+    }
+
+    private static Map<String, Object> visibleScope(LifecycleContextVO context, DelegateExecution execution) {
+        Object value = execution.getVariable(AutomationBootstrapBehavior.SCOPE);
+        return value == null ? Map.of() : nativeObject(context, value);
+    }
+
+    private static Map<String, Object> visibleScope(LifecycleContextVO context, DelegateExecution owner, FlowElement current) {
+        for (var branch : branchScopes(context, current)) {
+            Object value = owner.getVariableLocal(branch.variable());
+            if (value != null) return nativeObject(context, value);
+        }
+        return visibleScope(context, owner);
+    }
+
+    private static Integer currentBranchIndex(LifecycleContextVO context, DelegateExecution occurrence) {
+        var local = branchScopes(context, occurrence.getCurrentFlowElement());
+        if (!local.isEmpty()) return local.getFirst().index();
+        for (var parent = occurrence.getParent(); parent != null; parent = parent.getParent()) {
+            if (parent.getVariableLocal(AutomationModelCompiler.MULTI_INSTANCE_INDEX) instanceof Integer index) return index;
+            var enclosing = branchScopes(context, parent.getCurrentFlowElement());
+            if (!enclosing.isEmpty()) return enclosing.getFirst().index();
+        }
+        return null;
+    }
+
+    private static List<BranchScopeVO> branchScopes(LifecycleContextVO context, FlowElement current) {
+        if (current == null || current.getParentContainer() == null
+                || context.verified().controlBindings().branchIndices().isEmpty()) return List.of();
+        var scopes = new ArrayList<BranchScopeVO>();
+        for (var join : current.getParentContainer().getFlowElements().stream()
+                .filter(ParallelGateway.class::isInstance).map(ParallelGateway.class::cast)
+                .filter(gateway -> gateway.getIncomingFlows().size() > 1).toList()) {
+            for (var branch : parallelBranches(context, join)) {
+                if (branch.members().contains(current.getId())) scopes.add(branch);
+            }
+        }
+        scopes.sort(java.util.Comparator.comparingInt(branch -> branch.members().size()));
+        return scopes;
+    }
+
+    private static List<BranchScopeVO> parallelBranches(LifecycleContextVO context, ParallelGateway join) {
+        var archive = context.verified().controlBindings().branchIndices();
+        for (FlowElement candidate : join.getParentContainer().getFlowElements()) {
+            if (!(candidate instanceof ParallelGateway split) || split.getOutgoingFlows().size() < 2
+                    || split.getOutgoingFlows().stream().anyMatch(flow -> !archive.containsKey(flow.getId()))) continue;
+            var branches = new ArrayList<BranchScopeVO>();
+            var covered = new LinkedHashSet<String>();
+            var arrivals = new LinkedHashSet<String>();
+            for (SequenceFlow entry : split.getOutgoingFlows()) {
+                var members = regionBefore(entry.getTargetFlowElement(), join);
+                var exits = join.getIncomingFlows().stream().filter(flow -> flow.getId().equals(entry.getId())
+                        || members.contains(flow.getSourceRef())).toList();
+                if (exits.size() != 1 || !arrivals.add(exits.getFirst().getId()) || !Collections.disjoint(covered, members)) {
+                    branches.clear();
+                    break;
+                }
+                covered.addAll(members);
+                int index = archive.get(entry.getId());
+                branches.add(new BranchScopeVO(split.getId(), index, exits.getFirst().getId(), Set.copyOf(members)));
+            }
+            if (branches.size() == arrivals.size() && arrivals.size() == join.getIncomingFlows().size()) {
+                var ordered = branches.stream().sorted(java.util.Comparator.comparingInt(BranchScopeVO::index)).toList();
+                for (int index = 0; index < ordered.size(); index++) {
+                    if (index != ordered.get(index).index()) throw unavailable();
+                }
+                return ordered;
+            }
+        }
+        throw unavailable();
+    }
+
+    private static Set<String> regionBefore(FlowElement start, ParallelGateway join) {
+        var seen = new LinkedHashSet<String>();
+        if (!(start instanceof FlowNode node)) return seen;
+        var pending = new ArrayDeque<FlowNode>();
+        pending.add(node);
+        while (!pending.isEmpty()) {
+            var next = pending.removeFirst();
+            if (join.getId().equals(next.getId()) || !seen.add(next.getId())) continue;
+            for (var flow : next.getOutgoingFlows()) {
+                if (flow.getTargetFlowElement() instanceof FlowNode child) pending.addLast(child);
+            }
+        }
+        return seen;
+    }
+
+    private record BranchScopeVO(String splitId, int index, String arrivalId, Set<String> members) {
+        String variable() { return BRANCH_SCOPE + splitId + "_" + index; }
+    }
+
+    private static Map<String, Object> nativeObject(LifecycleContextVO context, Object value) {
+        return object(ProcessExecutionService.decodeNativeJson(context.engine(), value, ProcessNodeExecutionStore.MAX_DATA));
+    }
+
+    private void onBranchArrival(DelegateExecution execution, SequenceFlow flow) {
+        if (!(flow.getTargetFlowElement() instanceof ParallelGateway join) || join.getIncomingFlows().size() < 2) return;
+        var context = context(execution);
+        if (context.verified().controlBindings().occurrenceSlots().values().stream()
+                .noneMatch(slot -> join.getId().equals(slot.scopeId()))) throw unavailable();
+        var branch = parallelBranches(context, join).stream().filter(item -> flow.getId().equals(item.arrivalId()))
+                .findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        var parent = requireParent(execution);
+        String arrival = joinArrival(join.getId(), branch.index());
+        if (parent.getVariableLocal(arrival) != null) throw unavailable();
+        parent.setVariableLocal(arrival, flow.getId());
+    }
+
+    private static String joinArrival(String joinId, int index) {
+        return JOIN_ARRIVAL + joinId + "_" + index;
+    }
+
+    private void onMerge(DelegateExecution execution) {
+        var context = context(execution);
+        String mergeId = execution.getCurrentActivityId();
+        var slot = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> mergeId.equals(entry.getValue().mergeId())
+                        || mergeId.equals(entry.getValue().attemptOrBodyId()) && entry.getValue().activityId() == null)
+                .findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        var definition = binding(context.release(), slot.getKey());
+        if (definition.control() instanceof MultiInstanceControlVO multi) {
+            var scope = exactOccurrence(requireParent(execution), slot.getValue());
+            var finished = finishedChildren(context, scope);
+            var count = frozenItems(context, scope, multi).size();
+            Object selected = scope.getVariableLocal(MULTI_SELECTED);
+            if (selected == null && finished.size() != count) throw unavailable();
+            if (selected != null && !finished.keySet().equals(selectedIndices(context, selected))) throw unavailable();
+            var result = mergeOutput(definition, merge -> multiValues(context, finished, merge));
+            completeLocal(context, definition, exactExecutionRow(context, scope), scope, result);
+            return;
+        }
+        if (!"AND_JOIN".equals(definition.kind()) || !(execution.getCurrentFlowElement() instanceof ServiceTask task)
+                || !(task.getParentContainer().getFlowElement(slot.getValue().scopeId()) instanceof ParallelGateway join)) {
+            throw unavailable();
+        }
+        var parent = requireParent(execution);
+        var branches = parallelBranches(context, join);
+        for (var branch : branches) {
+            if (!branch.arrivalId().equals(parent.getVariableLocal(joinArrival(join.getId(), branch.index())))) {
+                throw unavailable();
+            }
+        }
+        var result = mergeOutput(definition, merge -> branches.stream().flatMap(branch -> merge.sourceNodeIds().stream()
+                .filter(id -> branch.members().contains(context.verified().controlBindings().occurrenceSlots().get(id).scopeId()))
+                .map(id -> {
+                    var row = completedSource(context, parent, id);
+                    if (!Integer.valueOf(branch.index()).equals(row.getBranchIndex())) throw unavailable();
+                    return lookup(row.getOutput(), merge.target());
+                })).toList());
+        insert(context, definition, slot.getKey(), execution, execution, slot.getValue(), null);
+        completeLocal(context, definition, exactExecutionRow(context, execution), execution, result);
+        for (var branch : branches) {
+            parent.removeVariableLocal(joinArrival(join.getId(), branch.index()));
+            parent.removeVariableLocal(branch.variable());
+        }
+    }
+
+    private static Set<Integer> selectedIndices(LifecycleContextVO context, Object selected) {
+        if (!(nativeObject(context, selected).get("indices") instanceof List<?> values)) throw unavailable();
+        var result = new LinkedHashSet<Integer>();
+        for (Object index : values) {
+            long value = integerValue(index);
+            if (value < 0 || value > 255 || !result.add((int) value)) throw unavailable();
+        }
+        return Set.copyOf(result);
+    }
+
+    private List<Object> multiValues(LifecycleContextVO context, Map<Integer, String> finished, MergeVO merge) {
+        var result = new ArrayList<Object>();
+        finished.forEach((index, bodyId) -> {
+            for (String id : merge.sourceNodeIds()) {
+                var row = completedSource(context, bodyId, id);
+                if (!index.equals(row.getBranchIndex())) throw unavailable();
+                result.add(lookup(row.getOutput(), merge.target()));
+            }
+        });
+        return Collections.unmodifiableList(result);
+    }
+
+    private void onRule(DelegateExecution execution) {
+        var context = context(execution);
+        var slot = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                .filter(entry -> execution.getCurrentActivityId().equals(entry.getValue().activityId()))
+                .findFirst().orElseThrow(ProcessNodeLifecycleListener::unavailable);
+        var definition = binding(context.release(), slot.getKey());
+        if (definition.rule() == null || !(execution.getCurrentFlowElement() instanceof ServiceTask task)
+                || !definition.rule().definitionKey().equals(task.getAttributeValue(MODEL_NAMESPACE, "decisionKey"))
+                || !(CommandContextUtil.getDmnEngineConfiguration() instanceof SpringDmnEngineConfiguration dmn)) throw unavailable();
+        var attempt = ancestor(execution.getParent(), slot.getValue().attemptOrBodyId());
+        var scope = exactOccurrence(requireParent(attempt), slot.getValue());
+        var row = exactExecutionRow(context, attempt);
+        var result = ProcessDecisionService.evaluateAutomation(dmn, context.verified(), definition, row,
+                new ProcessReference(context.binding().getInstanceId(), execution.getId(), execution.getCurrentActivityId()));
+        completeLocal(context, definition, row, scope, result);
+    }
+
+    private Map<String, Object> mergeOutput(AutomationNodeBindingVO definition, Function<MergeVO, List<Object>> sources) {
+        var result = new LinkedHashMap<String, Object>();
+        for (var merge : definition.merge()) {
+            var inputs = sources.apply(merge);
+            if (inputs.isEmpty() && !"COLLECT_INDEXED".equals(merge.reducer())) throw unavailable();
+            Object value = switch (merge.reducer()) {
+                case "EXCLUSIVE" -> {
+                    if (inputs.size() != 1) throw unavailable();
+                    yield inputs.getFirst();
+                }
+                case "COLLECT_INDEXED" -> inputs;
+                case "ALL" -> inputs.stream().map(ProcessNodeLifecycleListener::booleanValue).allMatch(Boolean::booleanValue);
+                case "ANY" -> inputs.stream().map(ProcessNodeLifecycleListener::booleanValue).anyMatch(Boolean::booleanValue);
+                case "SUM" -> {
+                    long sum = 0;
+                    for (Object input : inputs) sum = Math.addExact(sum, integerValue(input));
+                    yield sum;
+                }
+                default -> throw unavailable();
+            };
+            assign(result, merge.target(), value);
+        }
+        return object(definition.outputSchema().normalizeValue(result));
+    }
+
+    private static long integerValue(Object value) {
+        if (!(value instanceof Number)) throw unavailable();
+        try {
+            return numeric(value).longValueExact();
+        } catch (ArithmeticException overflow) {
+            throw unavailable();
+        }
+    }
+
+    private static boolean booleanValue(Object value) {
+        if (!(value instanceof Boolean result)) throw unavailable();
+        return result;
+    }
+
+    private void completeLocal(LifecycleContextVO context, AutomationNodeBindingVO definition, ProcessNodeExecutionBO row,
+                               DelegateExecution scope, Map<String, Object> result) {
+        var output = object(definition.outputSchema().normalizeValue(result));
+        nodes.completeLocal(row, output);
+        applyNodeOutput(context, definition, output, scope);
     }
 
     private void onWorkerJobCreated(CreateExternalWorkerJobAfterContext created) {
@@ -143,7 +717,7 @@ public class ProcessNodeLifecycleListener {
                 || !ProcessNodeExecutionStore.resultRef(row, row.getOutputSha256()).equals(execution.getVariableLocal(RESULT_REF))) {
             throw unavailable();
         }
-        applyNodeOutput(context, attempt.binding(), row, attempt.occurrence());
+        applyNodeOutput(context, attempt.binding(), row.getOutput(), attempt.occurrence());
         nodes.finish(row, StateEnum.COMPLETED);
         execution.removeVariableLocal(RESULT_REF);
     }
@@ -238,6 +812,7 @@ public class ProcessNodeLifecycleListener {
                 .setStartedAt(now).setNodeDeadlineAt(prior.getNodeDeadlineAt()).setAttemptDeadlineAt(attemptDeadline)
                 .setRetryCommandId(commandId).setRetryRequestSha256(requestSha).setWorkerEffectRecovery(proof);
         nodes.insertRecoveredAttempt(prior, next);
+        registerMultiChildNode(occurrence, nextRef);
         // The normal agenda replaces a subprocess's incoming execution with a new scope ID.
         // The recovered row already names this exact scope, so enter it directly.
         CommandContextUtil.getAgenda().planContinueProcessSynchronousOperation(nextScope);
@@ -480,6 +1055,25 @@ public class ProcessNodeLifecycleListener {
         if (scope.getValue().attemptOrBodyId() == null || isControl(binding.kind())) {
             insert(context, binding, scope.getKey(), target, target, scope.getValue(), null);
         }
+        if (binding.control() instanceof LoopControlVO loop) {
+            storeNativeObject(context, target, LOOP_CARRY, loop.initialCarry());
+            target.setVariableLocal(LOOP_ITERATIONS, 0);
+        } else if (binding.control() instanceof MultiInstanceControlVO multi) {
+            var parent = requireParent(target);
+            var items = mappedValue(context, parent, target.getCurrentFlowElement().getParentContainer(),
+                    visibleScope(context, parent, target.getCurrentFlowElement()), multi.itemsSource());
+            if (!(items instanceof List<?> values) || values.size() > multi.maxItems()) throw unavailable();
+            storeNativeObject(context, target, MULTI_ITEMS, Map.of("items", values));
+            initializeChildScope(context, target);
+        } else if (binding.control() instanceof SubprocessControlVO) {
+            initializeChildScope(context, target);
+        }
+    }
+
+    private void initializeChildScope(LifecycleContextVO context, DelegateExecution target) {
+        var input = exactExecutionRow(context, target).getInput();
+        storeNativeObject(context, target, LOCAL_INPUT, input);
+        storeNativeObject(context, target, AutomationBootstrapBehavior.SCOPE, input);
     }
 
     void onAttempt(DelegateExecution event) {
@@ -488,7 +1082,10 @@ public class ProcessNodeLifecycleListener {
                 .filter(item -> event.getCurrentActivityId().equals(item.getValue().attemptOrBodyId())).findFirst().orElse(null);
         if (scope == null) return;
         var binding = binding(context.release(), scope.getKey());
-        if (isControl(binding.kind())) return;
+        if (isControl(binding.kind())) {
+            if (binding.control() instanceof LoopControlVO) onControlBody(event, true);
+            return;
+        }
         var occurrence = exactOccurrence(event.getParent(), scope.getValue());
         insert(context, binding, scope.getKey(), occurrence, event, scope.getValue(), null);
     }
@@ -722,6 +1319,8 @@ public class ProcessNodeLifecycleListener {
         var row = new ProcessNodeExecutionBO().setTenantId(root.getTenantId()).setInstanceId(root.getInstanceId())
                 .setOccurrenceId(occurrenceId).setAttempt(attemptNumber).setNodeExecutionRef(executionRef).setNodeId(nodeId)
                 .setKind(KindEnum.valueOf(binding.kind())).setParentScopeId(occurrence.getParentId()).setAttemptScopeId(attempt.getId())
+                .setBranchIndex(currentBranchIndex(context, occurrence))
+                .setIterationIndex(occurrence.getParent().getVariable(LOOP_INDEX) instanceof Integer index ? index : null)
                 .setNativeJobId(nativeJobId).setInput(input).setInputSchemaSha256(inputSchema)
                 .setInputSha256(ProcessNodeExecutionStore.digest("AUTOMATION_NODE_INPUT_V2", inputSchema, input))
                 .setOutputSchemaSha256(schemaSha256(binding.outputSchema())).setConfigurationSha256(root.getConfigurationSha256())
@@ -741,13 +1340,22 @@ public class ProcessNodeLifecycleListener {
                     || !row.getConfigurationSha256().equals(previous.getConfigurationSha256())) throw unavailable();
         }
         nodes.insertOccurrence(row);
+        registerMultiChildNode(occurrence, executionRef);
         occurrence.setVariableLocal("tianjiAutomationNodeOccurrence", occurrence.getId());
+    }
+
+    private static void registerMultiChildNode(DelegateExecution occurrence, String nodeExecutionRef) {
+        for (var parent = occurrence.getParent(); parent != null; parent = parent.getParent()) {
+            if (parent.getVariableLocal(AutomationModelCompiler.MULTI_INSTANCE_INDEX) instanceof Integer) {
+                parent.setVariableLocal(MULTI_NODE_REF + nodeExecutionRef, nodeExecutionRef);
+            }
+        }
     }
 
     private void finishExit(LifecycleContextVO context, AutomationNodeBindingVO binding, ProcessNodeExecutionBO row,
                             DelegateExecution occurrence) {
         if (row.getState() == StateEnum.RESULT_ACCEPTED) {
-            if (binding.human() != null && row.getOutput() != null) applyNodeOutput(context, binding, row, occurrence);
+            if (binding.human() != null && row.getOutput() != null) applyNodeOutput(context, binding, row.getOutput(), occurrence);
             nodes.finish(row, StateEnum.COMPLETED);
         } else if (row.getState() == StateEnum.RUNNING || row.getState() == StateEnum.WAITING && "TIMER".equals(binding.kind())) {
             nodes.finish(row, StateEnum.COMPLETED);
@@ -756,63 +1364,84 @@ public class ProcessNodeLifecycleListener {
         }
     }
 
-    private void applyNodeOutput(LifecycleContextVO context, AutomationNodeBindingVO binding, ProcessNodeExecutionBO row,
+    private void applyNodeOutput(LifecycleContextVO context, AutomationNodeBindingVO binding, Map<String, Object> output,
                                   DelegateExecution occurrence) {
         if (binding.outputMapping().isEmpty()) return;
         var parent = occurrence.getParent();
         if (parent == null || !context.binding().getInstanceId().equals(parent.getRootProcessInstanceId())) throw unavailable();
-        var engine = context.engine();
-        Object previous = parent.getVariableLocal(AutomationBootstrapBehavior.SCOPE);
-        var data = previous == null ? new LinkedHashMap<String, Object>()
-                : mutableObject(object(ProcessExecutionService.decodeNativeJson(engine, previous, ProcessNodeExecutionStore.MAX_DATA)));
+        var current = occurrence.getCurrentFlowElement();
+        var placement = branchScopes(context, current);
+        String variable = placement.isEmpty() ? AutomationBootstrapBehavior.SCOPE : placement.getFirst().variable();
+        var priorScope = visibleScope(context, parent, current);
+        var data = mutableObject(priorScope);
         String outputPrefix = "nodes." + binding.nodeId() + ".output.";
         for (var mapping : binding.outputMapping()) {
             String source = mapping.source();
             Object value;
             if (source.startsWith(outputPrefix)) {
-                value = lookup(row.getOutput(), source.substring(outputPrefix.length()));
+                value = lookup(output, source.substring(outputPrefix.length()));
             } else if (source.startsWith("output.")) {
-                value = lookup(row.getOutput(), source.substring(7));
-            } else if (source.startsWith("input.")) {
-                value = lookup(rootInput(context), source.substring(6));
-            } else if (source.startsWith("scope.")) {
-                value = lookup(data, source.substring(6));
+                value = lookup(output, source.substring(7));
             } else {
-                throw unavailable();
+                value = mappedValue(context, parent, current.getParentContainer(), priorScope, source);
             }
             String target = mapping.target().startsWith("scope.") ? mapping.target().substring(6) : mapping.target();
             assign(data, target, value);
         }
-        parent.setVariableLocal(AutomationBootstrapBehavior.SCOPE,
-                engine.getVariableJsonMapper().readTree(ProcessTypedJson.canonicalBytes(data, ProcessNodeExecutionStore.MAX_DATA)));
+        storeNativeObject(context, parent, variable, data);
     }
 
     private static LinkedHashMap<String, Object> mutableObject(Map<String, Object> data) {
         var result = new LinkedHashMap<String, Object>();
-        data.forEach((key, value) -> result.put(key, value instanceof Map<?, ?> ? mutableObject(object(value)) : value));
+        data.forEach((key, value) -> result.put(key, mutableValue(value)));
         return result;
     }
 
+    private static Object mutableValue(Object value) {
+        if (value instanceof Map<?, ?> map) return mutableObject(object(map));
+        if (value instanceof List<?> list) {
+            var copy = new ArrayList<Object>(list.size());
+            for (Object item : list) copy.add(mutableValue(item));
+            return copy;
+        }
+        return value;
+    }
+
     private Map<String, Object> formInput(LifecycleContextVO context, AutomationNodeBindingVO binding, DelegateExecution occurrence) {
-        var engine = context.engine();
-        var roots = rootInput(context);
-        var parent = occurrence.getParent();
-        if (parent == null) throw unavailable();
-        Object scopeRef = parent.getVariable(AutomationBootstrapBehavior.SCOPE);
-        Map<String, Object> scope = scopeRef == null ? Map.of()
-                : object(ProcessExecutionService.decodeNativeJson(engine, scopeRef, ProcessNodeExecutionStore.MAX_DATA));
+        var parent = requireParent(occurrence);
+        var scope = visibleScope(context, parent, occurrence.getCurrentFlowElement());
+        var container = occurrence.getCurrentFlowElement().getParentContainer();
         var form = new LinkedHashMap<String, Object>();
         for (var mapping : binding.inputMapping()) {
-            int separator = mapping.source().indexOf('.');
-            String root = mapping.source().substring(0, separator);
-            Object value = lookup(switch (root) {
-                case "input" -> roots;
-                case "scope" -> scope;
-                default -> throw unavailable();
-            }, mapping.source().substring(separator + 1));
-            assign(form, mapping.target(), value);
+            assign(form, mapping.target(), mappedValue(context, parent, container, scope, mapping.source()));
         }
         return object(binding.inputSchema().normalizeValue(form));
+    }
+
+    private Object mappedValue(LifecycleContextVO context, DelegateExecution parent, FlowElementsContainer container,
+                               Map<String, Object> scope, String path) {
+        if (path.startsWith("input.")) return lookup(rootInput(context), path.substring("input.".length()));
+        if (path.startsWith("scope.")) return lookup(scope, path.substring("scope.".length()));
+        if (path.startsWith("nodes.")) {
+            var reference = path.substring("nodes.".length());
+            var sources = context.verified().controlBindings().occurrenceSlots().entrySet().stream()
+                    .filter(entry -> reference.startsWith(entry.getKey() + ".output.")
+                            && container.getFlowElements().stream().anyMatch(element -> entry.getValue().scopeId().equals(element.getId())))
+                    .limit(2).toList();
+            if (sources.size() != 1) throw unavailable();
+            var source = sources.getFirst().getKey();
+            return lookup(completedSource(context, parent, source).getOutput(), reference.substring(source.length() + ".output.".length()));
+        }
+        throw unavailable();
+    }
+
+    private ProcessNodeExecutionBO completedSource(LifecycleContextVO context, DelegateExecution parent, String nodeId) {
+        return completedSource(context, parent.getId(), nodeId);
+    }
+
+    private ProcessNodeExecutionBO completedSource(LifecycleContextVO context, String parentId, String nodeId) {
+        var root = context.binding();
+        return nodes.requireCompletedSource(root.getTenantId(), root.getInstanceId(), root.getConfigurationSha256(), parentId, nodeId);
     }
 
     private static Map<String, Object> rootInput(LifecycleContextVO context) {
@@ -823,7 +1452,7 @@ public class ProcessNodeLifecycleListener {
 
     private static Object lookup(Map<String, Object> object, String path) {
         Object current = object;
-        var segments = java.util.regex.Pattern.compile("[A-Za-z_][A-Za-z0-9_]*|\\[[0-9]+\\]").matcher(path);
+        var segments = FIELD_SEGMENTS.matcher(path);
         while (segments.find()) {
             String component = segments.group();
             if (component.startsWith("[")) {
@@ -841,14 +1470,49 @@ public class ProcessNodeLifecycleListener {
     }
 
     private static void assign(Map<String, Object> target, String path, Object value) {
-        var parts = path.split("\\.");
-        Map<String, Object> current = target;
-        for (int index = 0; index < parts.length - 1; index++) {
-            if (parts[index].contains("[")) throw unavailable();
-            current = object(current.computeIfAbsent(parts[index], ignored -> new LinkedHashMap<String, Object>()));
+        var parts = FIELD_SEGMENTS.matcher(path).results().map(java.util.regex.MatchResult::group).toList();
+        if (parts.isEmpty()) throw unavailable();
+        Object current = target;
+        for (int index = 0; index + 1 < parts.size(); index++) {
+            String key = parts.get(index);
+            boolean array = parts.get(index + 1).startsWith("[");
+            Object child = getOrCreate(current, key, array);
+            if (array ? !(child instanceof List<?>) : !(child instanceof Map<?, ?>)) throw unavailable();
+            current = child;
         }
-        if (parts[parts.length - 1].contains("[")) throw unavailable();
-        current.put(parts[parts.length - 1], value);
+        putValue(current, parts.getLast(), mutableValue(value));
+    }
+
+    private static Object getOrCreate(Object container, String key, boolean nextIsArray) {
+        Object item;
+        if (container instanceof List<?> list) {
+            int index = arrayIndex(key);
+            item = index < list.size() ? list.get(index) : null;
+        } else {
+            item = object(container).get(key);
+        }
+        if (item != null) return item;
+        Object created = nextIsArray ? new ArrayList<>() : new LinkedHashMap<>();
+        putValue(container, key, created);
+        return created;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void putValue(Object container, String key, Object value) {
+        if (container instanceof List<?> list) {
+            int index = arrayIndex(key);
+            var target = (List<Object>) list;
+            while (target.size() <= index) target.add(null);
+            target.set(index, value);
+        } else {
+            if (key.startsWith("[")) throw unavailable();
+            object(container).put(key, value);
+        }
+    }
+
+    private static int arrayIndex(String segment) {
+        if (!segment.startsWith("[") || !segment.endsWith("]")) throw unavailable();
+        return Integer.parseInt(segment.substring(1, segment.length() - 1));
     }
 
     private LifecycleContextVO context(DelegateExecution execution) {
@@ -1070,10 +1734,74 @@ public class ProcessNodeLifecycleListener {
         }
     }
 
+    private static final class ControlExpressionResolver extends ELResolver {
+        private final Supplier<ProcessNodeLifecycleListener> listener;
+        private final Object control = new Object();
+
+        private ControlExpressionResolver(Supplier<ProcessNodeLifecycleListener> listener) {
+            this.listener = listener;
+        }
+
+        @Override
+        public Object getValue(ELContext context, Object base, Object property) {
+            if (base == null && AutomationModelCompiler.CONTROL_EXPRESSION_ROOT.equals(property)) {
+                context.setPropertyResolved(true);
+                return control;
+            }
+            if (base == control) throw unavailable();
+            return null;
+        }
+
+        @Override
+        public Object invoke(ELContext context, Object base, Object method, Class<?>[] types, Object[] arguments) {
+            if (base != control) return null;
+            context.setPropertyResolved(true);
+            if (arguments == null || arguments.length != 2 || !(arguments[0] instanceof DelegateExecution execution)
+                    || !(arguments[1] instanceof String id)) throw unavailable();
+            var runtime = listener.get();
+            var activity = runtime.context(execution);
+            if (ControlPredicate.XOR.methodName().equals(method)) return runtime.onCondition(activity, execution, id);
+            if (ControlPredicate.LOOP_CONTINUATION.methodName().equals(method)) return runtime.continueLoop(activity, execution, id);
+            if (ControlPredicate.MULTI_INSTANCE_ITEMS.methodName().equals(method)) return runtime.multiItems(activity, execution, id);
+            if (ControlPredicate.MULTI_INSTANCE_COMPLETION.methodName().equals(method)) {
+                return runtime.completeMulti(activity, execution, id);
+            }
+            throw unavailable();
+        }
+
+        @Override
+        public Class<?> getType(ELContext context, Object base, Object property) {
+            if (base == control) throw unavailable();
+            return null;
+        }
+
+        @Override
+        public void setValue(ELContext context, Object base, Object property, Object value) {
+            if (base == control || base == null && AutomationModelCompiler.CONTROL_EXPRESSION_ROOT.equals(property)) {
+                throw unavailable();
+            }
+        }
+
+        @Override
+        public boolean isReadOnly(ELContext context, Object base, Object property) {
+            if (base == control || base == null && AutomationModelCompiler.CONTROL_EXPRESSION_ROOT.equals(property)) {
+                context.setPropertyResolved(true);
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public Class<?> getCommonPropertyType(ELContext context, Object base) {
+            return null;
+        }
+    }
+
     private record LifecycleParseHandler(Supplier<ProcessNodeLifecycleListener> listener) implements BpmnParseHandler {
         @Override
         public Collection<Class<? extends BaseElement>> getHandledTypes() {
-            return List.of(SubProcess.class, UserTask.class, ServiceTask.class, ExternalWorkerServiceTask.class, BoundaryEvent.class);
+            return List.of(SubProcess.class, UserTask.class, ServiceTask.class, ExternalWorkerServiceTask.class,
+                    BoundaryEvent.class, EndEvent.class, SequenceFlow.class);
         }
 
         @Override
@@ -1082,8 +1810,7 @@ public class ProcessNodeLifecycleListener {
                     || !"AUTOMATION_V2".equals(parse.getCurrentProcess().getAttributeValue(MODEL_NAMESPACE, "profile"))) return;
             if (element instanceof SubProcess subprocess) {
                 var listeners = new ArrayList<>(subprocess.getExecutionListeners());
-                if (subprocess.getAttributeValue(MODEL_NAMESPACE, "occurrence") != null
-                        && listeners.stream().noneMatch(item -> ENTER.equals(item.getImplementation()))) {
+                if (subprocess.getId().startsWith("ta_") && listeners.stream().noneMatch(item -> ENTER.equals(item.getImplementation()))) {
                     listeners.add(nativeListener("start", (ExecutionListener) execution -> listener.get().onAttempt(execution)));
                 }
                 listeners.replaceAll(item -> switch (item.getImplementation() == null ? "" : item.getImplementation()) {
@@ -1092,6 +1819,16 @@ public class ProcessNodeLifecycleListener {
                     default -> item;
                 });
                 subprocess.setExecutionListeners(listeners);
+            }
+            if (element instanceof SequenceFlow flow && flow.getId().startsWith("ta_")) {
+                var listeners = new ArrayList<>(flow.getExecutionListeners());
+                listeners.add(nativeListener("take", (ExecutionListener) execution -> listener.get().onBranchArrival(execution, flow)));
+                flow.setExecutionListeners(listeners);
+            }
+            if (element instanceof EndEvent end && end.getId().startsWith("ta_")) {
+                var listeners = new ArrayList<>(end.getExecutionListeners());
+                listeners.add(nativeListener("start", (ExecutionListener) execution -> listener.get().beforeScopeExit(execution)));
+                end.setExecutionListeners(listeners);
             }
             if (element instanceof UserTask task && task.getId().startsWith("ta_")) {
                 var listeners = new ArrayList<>(task.getTaskListeners());
@@ -1112,12 +1849,25 @@ public class ProcessNodeLifecycleListener {
                         .getExpressionManager().createExpression(task.getTopic());
                 task.setBehavior(new GuardedWorkerActivity(listener, task, topic));
             }
+            if (element instanceof ServiceTask task && marker(AutomationModelCompiler.DECISION_DELEGATE).equals(task.getImplementation())
+                    && task.getId().startsWith("ta_")) {
+                task.setBehavior(PinnedDecisionActivityBehaviorFactory.createAutomationRuleBehavior(task,
+                        execution -> listener.get().onRule(execution)));
+            }
+            if (element instanceof ServiceTask task && marker(AutomationModelCompiler.MERGE_DELEGATE).equals(task.getImplementation())
+                    && task.getId().startsWith("ta_")) {
+                task.setBehavior(new MergeActivity(listener));
+            }
             if (element instanceof ServiceTask task && POLICY.equals(task.getImplementation()) && task.getId().startsWith("ta_")) {
                 String outcome = task.getAttributeValue(MODEL_NAMESPACE, "outcome");
                 String action = task.getAttributeValue(MODEL_NAMESPACE, "action");
                 String occurrence = task.getAttributeValue(MODEL_NAMESPACE, "occurrence");
                 task.setBehavior(new PolicyActivity(listener, outcome, action, occurrence));
             }
+        }
+
+        private static String marker(String id) {
+            return "${" + id + "}";
         }
 
         private static FlowableListener nativeListener(String event, Object implementation) {
@@ -1172,6 +1922,20 @@ public class ProcessNodeLifecycleListener {
         @Override
         public void trigger(DelegateExecution execution, String signal, Object data) {
             if (listener.get().beforeBoundaryTimer(execution, boundary)) super.trigger(execution, signal, data);
+        }
+    }
+
+    private static final class MergeActivity extends AbstractBpmnActivityBehavior {
+        private final Supplier<ProcessNodeLifecycleListener> listener;
+
+        private MergeActivity(Supplier<ProcessNodeLifecycleListener> listener) {
+            this.listener = listener;
+        }
+
+        @Override
+        public void execute(DelegateExecution execution) {
+            listener.get().onMerge(execution);
+            leave(execution);
         }
     }
 

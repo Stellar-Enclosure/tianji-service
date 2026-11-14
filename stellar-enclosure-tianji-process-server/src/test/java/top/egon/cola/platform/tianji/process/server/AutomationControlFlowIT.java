@@ -4,6 +4,7 @@ import org.flywaydb.core.Flyway;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.job.api.Job;
 import org.flowable.spring.SpringProcessEngineConfiguration;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
@@ -93,6 +94,7 @@ import top.egon.cola.platform.tianji.worker.JdbcWorkerExecutionStore;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
 import java.security.Signature;
 import java.time.Duration;
 import java.time.Instant;
@@ -109,6 +111,7 @@ import java.util.Properties;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson.V2_MAX_WIRE_INTEGER;
 
 @Isolated("Owns one explicitly provisioned empty Process database")
 @Timeout(120)
@@ -120,6 +123,8 @@ public class AutomationControlFlowIT {
     private static final ProcessActor OWNER = ProcessActor.verified(20, ProcessActor.SubjectType.USER, "starter", ISSUER);
     private static final ProcessSchemaVO AMOUNT = schema("amount", "integer");
     private static final ProcessSchemaVO APPROVED = schema("approved", "boolean");
+    private static final ProcessSchemaVO NESTED_REVIEW_RESULT = schema(Map.of("shadow",
+            schema(Map.of("output", AMOUNT.toWire())).toWire()));
     private static final ProcessSchemaVO EMPTY = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
             "required", List.of(), "additionalProperties", false));
     private static final Map<String, String> CANDIDATES = Map.of("firstLane", "a".repeat(64), "secondLane", "b".repeat(64));
@@ -136,9 +141,16 @@ public class AutomationControlFlowIT {
             </definitions>
             """;
 
+    private static DatabaseVO database;
+
+    @BeforeAll
+    static void provisionControlFlowDatabase() {
+        database = provision(true);
+    }
+
     @Test
     void seventeen_artifact_human_service_human_replays_actions_and_commits_one_business_effect() throws Exception {
-        try (var fixture = Harness.open(true)) {
+        try (var fixture = Harness.open(database)) {
             var registration = fixture.transactional;
             var firstResult = schema("reviewedAmount", "integer");
             var secondResult = schema("decision", "string");
@@ -150,7 +162,7 @@ public class AutomationControlFlowIT {
             fixture.publish("reviewChain", sources, AMOUNT, rootOutput, List.of(
                     human("first", AMOUNT, firstResult, List.of(new MappingVO("amount", "input.amount")),
                             List.of(new MappingVO("reviewedAmount", "nodes.first.output.reviewedAmount")), "firstLane"),
-                    service(registration, List.of(new MappingVO("amount", "scope.reviewedAmount")),
+                    service(registration, List.of(new MappingVO("amount", "nodes.first.output.reviewedAmount")),
                             List.of(new MappingVO("approved", "nodes.work.output.approved")), false),
                     human("second", APPROVED, secondResult, List.of(new MappingVO("approved", "scope.approved")),
                             List.of(new MappingVO("decision", "nodes.second.output.decision")), "secondLane")));
@@ -201,6 +213,11 @@ public class AutomationControlFlowIT {
             assertEquals("accept", fixture.nodeValue(root, "second", "decision", true));
             assertNotNull(fixture.process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(root)
                     .singleResult().getEndTime());
+            var read = new ProcessExecutionService.AutomationObservationPermitVO(true, false, true, false, false);
+            var metadataOnly = new ProcessExecutionService.AutomationObservationPermitVO(true, false, false, false, false);
+            assertEquals(Map.of("approved", true, "decision", "accept", "reviewedAmount", 17L),
+                    fixture.execution.observeAutomation(OWNER, root, read).getOutput());
+            assertNull(fixture.execution.observeAutomation(OWNER, root, metadataOnly).getOutput());
             assertEquals(report, fixture.worker.completeAutomation(registration.actor(), request));
             var replay = fixture.execution.startAutomation(OWNER, start);
             assertEquals(root, replay.getInstanceId());
@@ -208,6 +225,526 @@ public class AutomationControlFlowIT {
             assertEquals(1, fixture.count("tianji_process.tianji_process_instance_binding", "WHERE release_key=?", replay.getReleaseVersion()));
             assertEquals(1, fixture.count("worker_business.effect_probe", "WHERE effect_key=?", task.getEffectKey()));
         }
+    }
+
+    @Test
+    void node_output_mappings_read_scope_before_any_mapped_write() throws Exception {
+        String definition = "snapshotMapping";
+        String xml = model(definition, """
+                <startEvent id="start"/><userTask id="review"/><endEvent id="end"/>
+                <sequenceFlow id="toReview" sourceRef="start" targetRef="review"/>
+                <sequenceFlow id="toEnd" sourceRef="review" targetRef="end"/>
+                """);
+        var output = schema(Map.of("amount", Map.of("type", "integer"), "previousAmount", Map.of("type", "integer")));
+        var read = new ProcessExecutionService.AutomationObservationPermitVO(true, false, true, false, false);
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, output, List.of(
+                    human("review", EMPTY, AMOUNT, List.of(), List.of(
+                            new MappingVO("amount", "nodes.review.output.amount"),
+                            new MappingVO("previousAmount", "scope.amount")), "firstLane")));
+            String root = fixture.start(definition, "snapshot-mapping", 5);
+            fixture.completeHuman(fixture.humanTask(root, "review"), "snapshot-reviewer", "901", Map.of("amount", 41));
+            fixture.requireFinished(root);
+            assertEquals(Map.of("amount", 41L, "previousAmount", 5L),
+                    fixture.execution.observeAutomation(OWNER, root, read).getOutput());
+        }
+    }
+
+    @Test
+    void predecessor_reference_ignores_longer_node_identifier_in_another_scope() throws Exception {
+        String definition = "qualifiedPredecessor";
+        String child = "qualifiedChild";
+        String xml = model(definition, """
+                <startEvent id="start"/><serviceTask id="review"/><userTask id="read"/>
+                <callActivity id="review.output" calledElement="qualifiedChild"/><endEvent id="end"/>
+                <sequenceFlow id="toReview" sourceRef="start" targetRef="review"/>
+                <sequenceFlow id="toRead" sourceRef="review" targetRef="read"/>
+                <sequenceFlow id="toCall" sourceRef="read" targetRef="review.output"/>
+                <sequenceFlow id="toEnd" sourceRef="review.output" targetRef="end"/>
+                """);
+        String childXml = model(child, """
+                <startEvent id="begin"/><userTask id="shadow"/><endEvent id="end"/>
+                <sequenceFlow id="toShadow" sourceRef="begin" targetRef="shadow"/>
+                <sequenceFlow id="toEnd" sourceRef="shadow" targetRef="end"/>
+                """);
+        var call = new AutomationNodeBindingVO("review.output", "SUBPROCESS", EMPTY, EMPTY,
+                List.of(), List.of(), policy(false), null, null, null, null,
+                new AutomationNodeBindingVO.SubprocessControlVO(child, sha256(childXml)), null);
+        try (var fixture = Harness.open(database)) {
+            var registration = fixture.nestedResult;
+            var review = new AutomationNodeBindingVO("review", "SERVICE", AMOUNT, NESTED_REVIEW_RESULT,
+                    List.of(new MappingVO("amount", "input.amount")), List.of(), policy(false),
+                    registration.capability(), null, null, null, null, null);
+            fixture.publish(definition, List.of(rootModel(definition, xml), rootModel(child, childXml)),
+                    AMOUNT, EMPTY, List.of(call, review,
+                            human("read", AMOUNT, EMPTY, List.of(new MappingVO("amount", "nodes.review.output.shadow.output.amount")),
+                                    List.of(), "secondLane"),
+                            human("review.output.shadow", EMPTY, AMOUNT, List.of(), List.of(), "firstLane")));
+            String root = fixture.start(definition, "qualified-predecessor", 0);
+            var task = fixture.acquire(registration);
+            var request = complete(task, "qualified-predecessor-result", "source-receipt",
+                    Map.of("shadow", Map.of("output", Map.of("amount", 41))));
+            assertEquals(AutomationWorkerReportDTO.OutcomeEnum.COMPLETED,
+                    fixture.worker.completeAutomation(registration.actor(), request).getOutcome());
+            fixture.runJob(root);
+            assertEquals("41", fixture.nodeValue(root, "read", "amount", false));
+            fixture.cancel(root);
+        }
+    }
+
+    @Test
+    void parallel_results_are_ordered_by_published_branch_after_restart() throws Exception {
+        var values = schema(Map.of("value", Map.of("type", "array", "items", Map.of("type", "integer"), "maxItems", 2)));
+        String root;
+        String first;
+        try (var fixture = Harness.open(database)) {
+            fixture.publish("parallelCollect", List.of(rootModel("parallelCollect", parallelModel("parallelCollect"))),
+                    AMOUNT, values, parallelBindings(values, "COLLECT_INDEXED"));
+            root = fixture.start("parallelCollect", "reverse-order", 0);
+            first = fixture.humanTask(root, "left");
+            fixture.completeHuman(fixture.humanTask(root, "right"), "right-reviewer", "902", Map.of("value", 22));
+            assertEquals("COMPLETED", fixture.nodeState(root, "right"));
+            assertEquals("22", fixture.nodeValue(root, "right", "value", true));
+            assertNull(fixture.nodeValue(root, "left", "value", false));
+            assertNotNull(fixture.process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root).singleResult());
+            assertEquals(0, fixture.count("tianji_process.act_ru_task", "WHERE id_<>? AND proc_inst_id_=?", first, root));
+            assertEquals(0, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='join' AND state='COMPLETED'", root));
+        }
+        try (var restarted = Harness.open(database)) {
+            assertEquals(first, restarted.humanTask(root, "left"));
+            restarted.completeHuman(first, "left-reviewer", "901", Map.of("value", 11));
+            assertEquals(List.of(Map.of("node_id", "left", "branch_index", 0), Map.of("node_id", "right", "branch_index", 1)),
+                    restarted.owner.queryForList("""
+                            SELECT node_id,branch_index FROM tianji_process.tianji_process_node_execution
+                            WHERE instance_id=? AND node_id IN ('left','right') AND state='COMPLETED' ORDER BY branch_index
+                            """, root));
+            assertEquals("[11, 22]", restarted.nodeValue(root, "join", "value", true));
+            restarted.requireFinished(root);
+        }
+    }
+
+    @Test
+    void parallel_branch_local_writes_do_not_change_the_sibling_or_root_input_after_restart() throws Exception {
+        String definition = "parallelScope";
+        String xml = model(definition, """
+                <startEvent id="start"/><parallelGateway id="split"/><userTask id="leftWrite"/><userTask id="rightStart"/>
+                <userTask id="leftRead"/><userTask id="rightRead"/><parallelGateway id="join"/><endEvent id="end"/>
+                <sequenceFlow id="toSplit" sourceRef="start" targetRef="split"/>
+                <sequenceFlow id="firstBranch" sourceRef="split" targetRef="leftWrite"/>
+                <sequenceFlow id="secondBranch" sourceRef="split" targetRef="rightStart"/>
+                <sequenceFlow id="toLeftRead" sourceRef="leftWrite" targetRef="leftRead"/>
+                <sequenceFlow id="toRightRead" sourceRef="rightStart" targetRef="rightRead"/>
+                <sequenceFlow id="leftJoin" sourceRef="leftRead" targetRef="join"/>
+                <sequenceFlow id="rightJoin" sourceRef="rightRead" targetRef="join"/>
+                <sequenceFlow id="toEnd" sourceRef="join" targetRef="end"/>
+                """);
+        var observed = schema(Map.of("scoped", Map.of("type", "integer"), "original", Map.of("type", "integer")));
+        var read = List.of(new MappingVO("scoped", "scope.amount"), new MappingVO("original", "input.amount"));
+        var join = new AutomationNodeBindingVO("join", "AND_JOIN", EMPTY, EMPTY, List.of(), List.of(), policy(false),
+                null, null, null, null, null, List.of());
+        String root;
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, AMOUNT, List.of(
+                    human("leftWrite", EMPTY, AMOUNT, List.of(), List.of(new MappingVO("amount", "nodes.leftWrite.output.amount")), "firstLane"),
+                    human("rightStart", EMPTY, EMPTY, List.of(), List.of(), "secondLane"),
+                    human("leftRead", observed, EMPTY, read, List.of(), "firstLane"),
+                    human("rightRead", observed, EMPTY, read, List.of(), "secondLane"), join));
+            root = fixture.start(definition, "branch-scope-restart", 5);
+            fixture.completeHuman(fixture.humanTask(root, "leftWrite"), "left-reviewer", "901", Map.of("amount", 41));
+            assertEquals("41", fixture.nodeValue(root, "leftRead", "scoped", false));
+            assertEquals("5", fixture.nodeValue(root, "leftRead", "original", false));
+        }
+        try (var fixture = Harness.open(database)) {
+            fixture.completeHuman(fixture.humanTask(root, "rightStart"), "right-reviewer", "902", Map.of());
+            assertEquals("5", fixture.nodeValue(root, "rightRead", "scoped", false));
+            assertEquals("5", fixture.nodeValue(root, "rightRead", "original", false));
+            assertEquals("41", fixture.nodeValue(root, "leftRead", "scoped", false));
+            assertEquals(2, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+            fixture.cancel(root);
+        }
+    }
+
+    @Test
+    void parallel_sum_outside_wire_integer_bound_rolls_back_second_branch() throws Exception {
+        var value = schema("value", "integer");
+        try (var fixture = Harness.open(database)) {
+            fixture.publish("parallelSum", List.of(rootModel("parallelSum", parallelModel("parallelSum"))), AMOUNT,
+                    value, parallelBindings(value, "SUM"));
+            String root = fixture.start("parallelSum", "sum-overflow", 0);
+            fixture.completeHuman(fixture.humanTask(root, "right"), "right-reviewer", "902", Map.of("value", V2_MAX_WIRE_INTEGER));
+            String first = fixture.humanTask(root, "left");
+            assertThrows(RuntimeException.class,
+                    () -> fixture.completeHuman(first, "left-reviewer", "901", Map.of("value", 1)));
+            assertEquals(first, fixture.humanTask(root, "left"));
+            assertEquals("WAITING", fixture.nodeState(root, "left"));
+            assertEquals(0, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='join' AND output_sha256 IS NOT NULL", root));
+            fixture.cancel(root);
+        }
+    }
+
+    @Test
+    void two_distinct_pinned_decisions_feed_typed_downstream_mapping() throws Exception {
+        var small = decisionModel("fixtureRouteOne", "review", "route-one");
+        String padded = small.xml() + "<!--" + "bounded-fixture".repeat(35_000) + "-->";
+        var first = new AutomationModelSourceVO.ModelSourceVO("DMN", small.definitionKey(), padded);
+        assertTrue(first.xml().getBytes(StandardCharsets.UTF_8).length > 512 * 1024);
+        var second = decisionModel("fixtureRouteTwo", "review", "route-two");
+        String definition = "pinnedDecisions";
+        String xml = model(definition, """
+                <startEvent id="start"/><businessRuleTask id="ruleOne"/><businessRuleTask id="ruleTwo"/><userTask id="finalReview"/><endEvent id="end"/>
+                <sequenceFlow id="toFirst" sourceRef="start" targetRef="ruleOne"/>
+                <sequenceFlow id="toSecond" sourceRef="ruleOne" targetRef="ruleTwo"/>
+                <sequenceFlow id="toReview" sourceRef="ruleTwo" targetRef="finalReview"/>
+                <sequenceFlow id="toEnd" sourceRef="finalReview" targetRef="end"/>
+                """);
+        var routes = schema(Map.of("firstRoute", Map.of("type", "string"), "secondRoute", Map.of("type", "string")));
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml), first, second), AMOUNT, EMPTY,
+                    List.of(rule("ruleOne", first), rule("ruleTwo", second), human("finalReview", routes, EMPTY,
+                            List.of(new MappingVO("firstRoute", "nodes.ruleOne.output.route"),
+                                    new MappingVO("secondRoute", "nodes.ruleTwo.output.route")), List.of(), "firstLane")));
+            fixture.deployCompetingDecision(first.definitionKey(), decisionModel(first.definitionKey(), "review", "newer-first").xml());
+            fixture.deployCompetingDecision(second.definitionKey(), decisionModel(second.definitionKey(), "review", "newer-second").xml());
+            String root = fixture.start(definition, "two-decisions", 17);
+            assertEquals("route-one", fixture.nodeValue(root, "ruleOne", "route", true));
+            assertEquals("route-two", fixture.nodeValue(root, "ruleTwo", "route", true));
+            assertEquals("route-one", fixture.nodeValue(root, "finalReview", "firstRoute", false));
+            assertEquals("route-two", fixture.nodeValue(root, "finalReview", "secondRoute", false));
+            fixture.completeHuman(fixture.humanTask(root, "finalReview"), "rule-reviewer", "901", Map.of());
+            fixture.requireFinished(root);
+        }
+    }
+
+    @Test
+    void xor_uses_a_closed_typed_predicate_and_the_published_default() throws Exception {
+        String definition = "fixedChoice";
+        String xml = model(definition, """
+                <startEvent id="start"/><exclusiveGateway id="choice" default="normal"/>
+                <userTask id="escalated"/><userTask id="routine"/><exclusiveGateway id="join"/><endEvent id="end"/>
+                <sequenceFlow id="toChoice" sourceRef="start" targetRef="choice"/>
+                <sequenceFlow id="high" sourceRef="choice" targetRef="escalated">
+                  <conditionExpression>{"op":"GT","args":[{"path":"amount"},{"literal":10}]}</conditionExpression>
+                </sequenceFlow>
+                <sequenceFlow id="normal" sourceRef="choice" targetRef="routine"/>
+                <sequenceFlow id="escalateJoin" sourceRef="escalated" targetRef="join"/>
+                <sequenceFlow id="routineJoin" sourceRef="routine" targetRef="join"/>
+                <sequenceFlow id="toEnd" sourceRef="join" targetRef="end"/>
+                """);
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, EMPTY,
+                    List.of(human("escalated", EMPTY, EMPTY, List.of(), List.of(), "firstLane"),
+                            human("routine", EMPTY, EMPTY, List.of(), List.of(), "secondLane")));
+            String high = fixture.start(definition, "choice-high", 11);
+            String ordinary = fixture.start(definition, "choice-default", 10);
+            assertEquals(1, fixture.process.getTaskService().createTaskQuery().processInstanceId(high).count());
+            assertEquals(1, fixture.process.getTaskService().createTaskQuery().processInstanceId(ordinary).count());
+            fixture.completeHuman(fixture.humanTask(high, "escalated"), "high-reviewer", "901", Map.of());
+            fixture.completeHuman(fixture.humanTask(ordinary, "routine"), "routine-reviewer", "902", Map.of());
+            fixture.requireFinished(high);
+            fixture.requireFinished(ordinary);
+        }
+    }
+
+    @Test
+    void bounded_loop_updates_carry_in_three_distinct_native_scopes() throws Exception {
+        String definition = "boundedLoop";
+        String xml = model(definition, """
+                <startEvent id="start"/><subProcess id="loop"><startEvent id="begin"/><userTask id="step"/><endEvent id="stepEnd"/>
+                <sequenceFlow id="toStep" sourceRef="begin" targetRef="step"/><sequenceFlow id="endStep" sourceRef="step" targetRef="stepEnd"/>
+                </subProcess><endEvent id="end"/><sequenceFlow id="toLoop" sourceRef="start" targetRef="loop"/>
+                <sequenceFlow id="endLoop" sourceRef="loop" targetRef="end"/>
+                """);
+        var rounds = schema("round", "integer");
+        var condition = new AutomationNodeBindingVO.ConditionOperationVO("LT", List.of(
+                new AutomationNodeBindingVO.ConditionPathVO("round"), new AutomationNodeBindingVO.ConditionLiteralVO(3)));
+        var loop = new AutomationNodeBindingVO("loop", "LOOP", EMPTY, rounds, List.of(), List.of(), policy(false),
+                null, null, null, null, new AutomationNodeBindingVO.LoopControlVO(3, condition, rounds, Map.of("round", 0),
+                List.of(new MappingVO("round", "nodes.loop.step.output.round"))), null);
+        var step = human("loop.step", rounds, rounds, List.of(new MappingVO("round", "scope.round")), List.of(), "firstLane");
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, EMPTY, List.of(loop, step));
+            String root = fixture.start(definition, "three-iterations", 0);
+            var taskRefs = new ArrayList<String>();
+            for (int iteration = 0; iteration < 3; iteration++) {
+                String task = fixture.humanTask(root, "loop.step");
+                assertFalse(taskRefs.contains(task));
+                if (iteration > 0) {
+                    String stale = taskRefs.getLast();
+                    assertThrows(ProcessResourceNotFoundException.class, () -> fixture.human.completeAction(
+                            context("loop-reviewer", "complete.v2", "901"), stale,
+                            new CompleteEngineHumanTaskCommand("stale-" + stale, "stale-revision", Map.of("round", 3))));
+                }
+                taskRefs.add(task);
+                assertEquals(Integer.toString(iteration), fixture.owner.queryForObject("""
+                        SELECT input_json->>'round' FROM tianji_process.tianji_process_node_execution
+                        WHERE instance_id=? AND node_id='loop.step' AND state='WAITING'
+                        """, String.class, root));
+                fixture.completeHuman(task, "loop-reviewer", "901", Map.of("round", iteration + 1));
+            }
+            assertEquals(List.of(0, 1, 2), fixture.owner.queryForList("""
+                    SELECT iteration_index FROM tianji_process.tianji_process_node_execution
+                    WHERE instance_id=? AND node_id='loop.step' AND state='COMPLETED' ORDER BY iteration_index
+                    """, Integer.class, root));
+            assertEquals(3, fixture.owner.queryForObject("""
+                    SELECT count(DISTINCT parent_scope_id) FROM tianji_process.tianji_process_node_execution
+                    WHERE instance_id=? AND node_id='loop.step' AND state='COMPLETED'
+                    """, Integer.class, root));
+            fixture.requireFinished(root);
+        }
+    }
+
+    @Test
+    void loop_limit_routes_to_the_published_failure_end_without_a_fourth_attempt() throws Exception {
+        String definition = "loopLimit";
+        String xml = model(definition, """
+                <startEvent id="start"/><subProcess id="loop"><startEvent id="begin"/><userTask id="step"/><endEvent id="stepEnd"/>
+                <sequenceFlow id="toStep" sourceRef="begin" targetRef="step"/><sequenceFlow id="endStep" sourceRef="step" targetRef="stepEnd"/>
+                </subProcess><endEvent id="end"/><sequenceFlow id="toLoop" sourceRef="start" targetRef="loop"/>
+                <sequenceFlow id="endLoop" sourceRef="loop" targetRef="end"/>
+                """);
+        var rounds = schema("round", "integer");
+        var continueUntilFourth = new AutomationNodeBindingVO.ConditionOperationVO("LT", List.of(
+                new AutomationNodeBindingVO.ConditionPathVO("round"), new AutomationNodeBindingVO.ConditionLiteralVO(4)));
+        var loop = new AutomationNodeBindingVO("loop", "LOOP", EMPTY, rounds, List.of(), List.of(), policy(false),
+                null, null, null, null, new AutomationNodeBindingVO.LoopControlVO(3, continueUntilFourth, rounds,
+                Map.of("round", 0), List.of(new MappingVO("round", "nodes.loop.step.output.round"))), null);
+        var stepInput = schema(Map.of("round", Map.of("type", "integer"), "rootAmount", Map.of("type", "integer")));
+        var step = human("loop.step", stepInput, rounds,
+                List.of(new MappingVO("round", "scope.round"), new MappingVO("rootAmount", "input.amount")),
+                List.of(), "firstLane");
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, EMPTY, List.of(loop, step));
+            String root = fixture.start(definition, "fourth-iteration-blocked", 23);
+            for (int round = 1; round <= 3; round++) {
+                assertEquals(List.of(Integer.toString(round - 1), "23"), fixture.owner.queryForObject("""
+                        SELECT input_json->>'round',input_json->>'rootAmount'
+                        FROM tianji_process.tianji_process_node_execution
+                        WHERE instance_id=? AND node_id='loop.step' AND state='WAITING'
+                        """, (row, index) -> List.of(row.getString(1), row.getString(2)), root));
+                fixture.completeHuman(fixture.humanTask(root, "loop.step"), "loop-reviewer", "901", Map.of("round", round));
+            }
+            assertEquals("FAILED", fixture.nodeState(root, "loop"));
+            assertEquals(3, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='loop.step' AND state='COMPLETED'", root));
+            assertEquals(0, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+            fixture.requireFinished(root);
+        }
+    }
+
+    @Test
+    void loop_limit_enters_the_published_failure_branch_after_restart() throws Exception {
+        String definition = "loopLimitBranch";
+        String xml = model(definition, """
+                <startEvent id="start"/><subProcess id="loop"><startEvent id="begin"/><userTask id="step"/><endEvent id="stepEnd"/>
+                <sequenceFlow id="toStep" sourceRef="begin" targetRef="step"/><sequenceFlow id="endStep" sourceRef="step" targetRef="stepEnd"/>
+                </subProcess><userTask id="fallback"/><endEvent id="end"/>
+                <sequenceFlow id="toLoop" sourceRef="start" targetRef="loop"/>
+                <sequenceFlow id="endLoop" sourceRef="loop" targetRef="end"/>
+                <sequenceFlow id="endFallback" sourceRef="fallback" targetRef="end"/>
+                """);
+        var rounds = schema("round", "integer");
+        var policy = new NodePolicyVO(Duration.ofMinutes(5), Duration.ofMinutes(2), Duration.ofSeconds(30),
+                new NodePolicyVO.PolicyActionVO("BRANCH", "fallback"), new NodePolicyVO.PolicyActionVO("END", null),
+                new NodePolicyVO.PolicyActionVO("END", null), policy(false).retry(), "BEST_EFFORT_STOP", "WAIT_RECOVERY");
+        var loop = new AutomationNodeBindingVO("loop", "LOOP", EMPTY, rounds, List.of(), List.of(), policy,
+                null, null, null, null, new AutomationNodeBindingVO.LoopControlVO(2,
+                new AutomationNodeBindingVO.ConditionLiteralVO(true), rounds, Map.of("round", 0),
+                List.of(new MappingVO("round", "nodes.loop.step.output.round"))), null);
+        var step = human("loop.step", rounds, rounds, List.of(new MappingVO("round", "scope.round")), List.of(), "firstLane");
+        var fallback = human("fallback", AMOUNT, EMPTY, List.of(new MappingVO("amount", "input.amount")),
+                List.of(), "secondLane");
+        String root;
+        String second;
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml)), AMOUNT, EMPTY, List.of(loop, step, fallback));
+            root = fixture.start(definition, "handle-loop-limit", 23);
+            fixture.completeHuman(fixture.humanTask(root, "loop.step"), "loop-reviewer", "901", Map.of("round", 1));
+            second = fixture.humanTask(root, "loop.step");
+            assertEquals(0, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='fallback'", root));
+        }
+        try (var fixture = Harness.open(database)) {
+            assertEquals(second, fixture.humanTask(root, "loop.step"));
+            fixture.completeHuman(second, "loop-reviewer", "901", Map.of("round", 2));
+            assertEquals("FAILED", fixture.nodeState(root, "loop"));
+            assertEquals(2, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='loop.step' AND state='COMPLETED'", root));
+            assertEquals(1, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+            assertEquals("23", fixture.nodeValue(root, "fallback", "amount", false));
+            fixture.completeHuman(fixture.humanTask(root, "fallback"), "fallback-reviewer", "902", Map.of());
+            fixture.requireFinished(root);
+        }
+    }
+
+    @Test
+    void multi_instance_and_local_subprocess_keep_three_child_slots_in_one_root() throws Exception {
+        String definition = "multiParent";
+        String xml = model(definition, """
+                <startEvent id="start"/><subProcess id="multi"><startEvent id="begin"/><callActivity id="call" calledElement="pinnedChild"/>
+                <endEvent id="childEnd"/><sequenceFlow id="enterChild" sourceRef="begin" targetRef="call"/>
+                <sequenceFlow id="returnChild" sourceRef="call" targetRef="childEnd"/></subProcess><endEvent id="end"/>
+                <sequenceFlow id="toMulti" sourceRef="start" targetRef="multi"/><sequenceFlow id="endMulti" sourceRef="multi" targetRef="end"/>
+                """);
+        String childXml = model("pinnedChild", """
+                <startEvent id="start"/><userTask id="step"/><endEvent id="end"/>
+                <sequenceFlow id="toStep" sourceRef="start" targetRef="step"/><sequenceFlow id="toEnd" sourceRef="step" targetRef="end"/>
+                """);
+        var items = schema(Map.of("items", Map.of("type", "array", "items", Map.of("type", "integer"), "maxItems", 3)));
+        var collected = schema(Map.of("value", Map.of("type", "array", "items", Map.of("type", "integer"), "maxItems", 3)));
+        var value = schema("value", "integer");
+        var multi = new AutomationNodeBindingVO("multi", "MULTI_INSTANCE", EMPTY, collected, List.of(), List.of(), policy(false),
+                null, null, null, null, new AutomationNodeBindingVO.MultiInstanceControlVO("input.items", true, 3, null),
+                List.of(new AutomationNodeBindingVO.MergeVO("value", List.of("multi.call"), "COLLECT_INDEXED")));
+        var call = new AutomationNodeBindingVO("multi.call", "SUBPROCESS", EMPTY, value, List.of(), List.of(), policy(false),
+                null, null, null, null, new AutomationNodeBindingVO.SubprocessControlVO("pinnedChild", sha256(childXml)), null);
+        var child = human("multi.call.step", EMPTY, value, List.of(),
+                List.of(new MappingVO("value", "nodes.multi.call.step.output.value")), "firstLane");
+        try (var fixture = Harness.open(database)) {
+            fixture.publish(definition, List.of(rootModel(definition, xml), rootModel("pinnedChild", childXml)), items, EMPTY,
+                    List.of(multi, call, child));
+            String root = fixture.start(startRequest(definition, "three-child-slots", Map.of("items", List.of(4, 8, 6))));
+            for (int result : List.of(4, 8, 6)) {
+                fixture.completeHuman(fixture.humanTask(root, "multi.call.step"), "child-reviewer", "901", Map.of("value", result));
+            }
+            assertEquals("[4, 8, 6]", fixture.nodeValue(root, "multi", "value", true));
+            assertEquals(List.of(0, 1, 2), fixture.owner.queryForList("""
+                    SELECT branch_index FROM tianji_process.tianji_process_node_execution
+                    WHERE instance_id=? AND node_id='multi.call' AND state='COMPLETED' ORDER BY branch_index
+                    """, Integer.class, root));
+            assertEquals(3, fixture.count("tianji_process.tianji_process_node_execution",
+                    "WHERE instance_id=? AND node_id='multi.call.step' AND state='COMPLETED'", root));
+            assertEquals(0, fixture.count("tianji_process.act_hi_procinst", "WHERE super_process_instance_id_=?", root));
+            fixture.requireFinished(root);
+        }
+    }
+
+    @Test
+    void parallel_multi_instance_early_completion_freezes_the_two_included_indices() throws Exception {
+        String definition = "parallelEarly";
+        String graph = """
+                <startEvent id="start"/><subProcess id="multi"><startEvent id="begin"/>
+                <callActivity id="child" calledElement="earlyChild"/><userTask id="step"/><endEvent id="stepEnd"/>
+                <sequenceFlow id="toChild" sourceRef="begin" targetRef="child"/>
+                <sequenceFlow id="toStep" sourceRef="child" targetRef="step"/><sequenceFlow id="endStep" sourceRef="step" targetRef="stepEnd"/>
+                </subProcess><endEvent id="end"/><sequenceFlow id="toMulti" sourceRef="start" targetRef="multi"/>
+                <sequenceFlow id="endMulti" sourceRef="multi" targetRef="end"/>
+                """;
+        String childXml = model("earlyChild", """
+                <startEvent id="begin"/><userTask id="review"/><endEvent id="end"/>
+                <sequenceFlow id="toReview" sourceRef="begin" targetRef="review"/>
+                <sequenceFlow id="toEnd" sourceRef="review" targetRef="end"/>
+                """);
+        var items = schema(Map.of("items", Map.of("type", "array", "items", Map.of("type", "integer"), "maxItems", 3)));
+        var collected = schema(Map.of("value", Map.of("type", "array", "items", Map.of("type", "integer"), "maxItems", 3),
+                "accepted", Map.of("type", "boolean")));
+        var result = schema(Map.of("value", Map.of("type", "integer"), "accepted", Map.of("type", "boolean")));
+        var step = human("multi.step", EMPTY, result, List.of(), List.of(), "firstLane");
+        var child = new AutomationNodeBindingVO("multi.child", "SUBPROCESS", EMPTY, EMPTY, List.of(), List.of(), policy(false),
+                null, null, null, null, new AutomationNodeBindingVO.SubprocessControlVO("earlyChild", sha256(childXml)), null);
+        var review = human("multi.child.review", EMPTY, EMPTY, List.of(), List.of(), "firstLane");
+        var merges = List.of(new AutomationNodeBindingVO.MergeVO("value", List.of("multi.step"), "COLLECT_INDEXED"),
+                new AutomationNodeBindingVO.MergeVO("accepted", List.of("multi.step"), "ANY"));
+        var early = new AutomationNodeBindingVO.ConditionPathVO("accepted");
+        try (var fixture = Harness.open(database)) {
+            for (boolean earlyCompletion : List.of(true, false)) {
+                String modelKey = earlyCompletion ? definition : "parallelAll";
+                var multi = new AutomationNodeBindingVO("multi", "MULTI_INSTANCE", EMPTY, collected, List.of(), List.of(), policy(false),
+                        null, null, null, null, new AutomationNodeBindingVO.MultiInstanceControlVO("input.items", false, 3,
+                        earlyCompletion ? early : null), merges);
+                fixture.publish(modelKey, List.of(rootModel(modelKey, model(modelKey, graph)), rootModel("earlyChild", childXml)),
+                        items, EMPTY, List.of(multi, child, review, step));
+                String root = fixture.start(startRequest(modelKey, modelKey + "-indexes", Map.of("items", List.of(0, 1, 2))));
+                for (int index : List.of(0, 1, 2)) {
+                    fixture.completeHuman(fixture.humanTask(root, "multi.child.review", index), "child-reviewer", "901", Map.of());
+                }
+                String spared = fixture.humanTask(root, "multi.step", 1);
+                assertEquals(3, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+                fixture.completeHuman(fixture.humanTask(root, "multi.step", 2), "multi-reviewer", "901", Map.of("accepted", false, "value", 22));
+                assertEquals(2, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+                fixture.completeHuman(fixture.humanTask(root, "multi.step", 0), "multi-reviewer", "901", Map.of("accepted", true, "value", 11));
+                if (!earlyCompletion) {
+                    assertEquals(spared, fixture.humanTask(root, "multi.step", 1));
+                    fixture.completeHuman(spared, "multi-reviewer", "901", Map.of("accepted", false, "value", 17));
+                }
+                assertEquals(earlyCompletion ? "[11, 22]" : "[11, 17, 22]", fixture.nodeValue(root, "multi", "value", true));
+                assertEquals("true", fixture.nodeValue(root, "multi", "accepted", true));
+                assertEquals(earlyCompletion ? List.of(0, 2) : List.of(0, 1, 2), fixture.owner.queryForList("""
+                        SELECT branch_index FROM tianji_process.tianji_process_node_execution
+                        WHERE instance_id=? AND node_id='multi.step' AND state='COMPLETED' AND NOT excluded ORDER BY branch_index
+                        """, Integer.class, root));
+                if (earlyCompletion) {
+                    assertEquals(1, fixture.count("tianji_process.tianji_process_node_execution",
+                            "WHERE instance_id=? AND node_id='multi.step' AND branch_index=1 AND state='CANCELLED' AND excluded AND output_sha256 IS NULL", root));
+                    assertEquals(1, fixture.count("tianji_process.tianji_process_node_execution",
+                            "WHERE instance_id=? AND node_id='multi.child.review' AND branch_index=1 AND state='COMPLETED' AND excluded AND output_sha256 IS NOT NULL", root));
+                    assertThrows(ProcessResourceNotFoundException.class, () -> fixture.human.completeAction(
+                            context("multi-reviewer", "complete.v2", "901"), spared,
+                            new CompleteEngineHumanTaskCommand("late-" + spared, "stale-revision", Map.of("accepted", true, "value", 100))));
+                }
+                assertEquals(earlyCompletion ? 2 : 3, fixture.count("tianji_process.tianji_process_node_execution",
+                        "WHERE instance_id=? AND node_id='multi.child.review' AND state='COMPLETED' AND NOT excluded", root));
+                assertEquals(0, fixture.process.getTaskService().createTaskQuery().processInstanceId(root).count());
+                fixture.requireFinished(root);
+            }
+        }
+    }
+
+    private static List<AutomationNodeBindingVO> parallelBindings(ProcessSchemaVO output, String reducer) {
+        var value = schema("value", "integer");
+        var join = new AutomationNodeBindingVO("join", "AND_JOIN", EMPTY, output, List.of(),
+                List.of(new MappingVO("value", "nodes.join.output.value")), policy(false), null, null, null, null, null,
+                List.of(new AutomationNodeBindingVO.MergeVO("value", List.of("left", "right"), reducer)));
+        return List.of(human("left", EMPTY, value, List.of(), List.of(), "firstLane"),
+                human("right", EMPTY, value, List.of(), List.of(), "secondLane"), join);
+    }
+
+    private static String parallelModel(String definition) {
+        return model(definition, """
+                <startEvent id="start"/><parallelGateway id="split"/><userTask id="left"/><userTask id="right"/>
+                <parallelGateway id="join"/><endEvent id="end"/>
+                <sequenceFlow id="toSplit" sourceRef="start" targetRef="split"/>
+                <sequenceFlow id="firstBranch" sourceRef="split" targetRef="left"/>
+                <sequenceFlow id="secondBranch" sourceRef="split" targetRef="right"/>
+                <sequenceFlow id="leftJoin" sourceRef="left" targetRef="join"/>
+                <sequenceFlow id="rightJoin" sourceRef="right" targetRef="join"/>
+                <sequenceFlow id="toEnd" sourceRef="join" targetRef="end"/>
+                """);
+    }
+
+    private static String model(String definition, String graph) {
+        return """
+                <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" targetNamespace="urn:step30">
+                  <process id="%s" isExecutable="true">%s</process>
+                </definitions>
+                """.formatted(definition, graph);
+    }
+
+    private static AutomationModelSourceVO.ModelSourceVO rootModel(String definition, String xml) {
+        return new AutomationModelSourceVO.ModelSourceVO("BPMN", definition, xml);
+    }
+
+    private static AutomationModelSourceVO.ModelSourceVO decisionModel(String key, String before, String after) throws java.io.IOException {
+        String xml = new ClassPathResource("fixtures/baseline.dmn").getContentAsString(StandardCharsets.UTF_8);
+        return new AutomationModelSourceVO.ModelSourceVO("DMN", key, xml.replace("baselineDecision", key)
+                .replace("'" + before + "'", "'" + after + "'"));
+    }
+
+    private static AutomationNodeBindingVO rule(String node, AutomationModelSourceVO.ModelSourceVO model) throws Exception {
+        var input = List.of(new MappingVO("amount", "input.amount"));
+        var route = schema("route", "string");
+        return new AutomationNodeBindingVO(node, "RULE", AMOUNT, route, input, List.of(), policy(false), null,
+                new AutomationNodeBindingVO.DecisionRefVO(model.definitionKey(), sha256(model.xml()), input,
+                        List.of(new MappingVO("route", "scope.route"))), null, null, null, null);
+    }
+
+    private static String sha256(String xml) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(xml.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static AutomationStartCommand startRequest(String definition, String key, Map<String, Object> values) {
+        return new AutomationStartCommand(definition, "business-" + key, "start-" + key, "trace-" + key, values, Map.of());
     }
 
     private static List<AutomationModelSourceVO.ModelSourceVO> archiveSources(String definition) throws java.io.IOException {
@@ -228,8 +765,12 @@ public class AutomationControlFlowIT {
     }
 
     private static ProcessSchemaVO schema(String property, String type) {
-        return ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(property, Map.of("type", type)),
-                "required", List.of(property), "additionalProperties", false));
+        return schema(Map.of(property, Map.of("type", type)));
+    }
+
+    private static ProcessSchemaVO schema(Map<String, Object> properties) {
+        return ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", properties,
+                "required", properties.keySet().stream().sorted().toList(), "additionalProperties", false));
     }
 
     private static NodePolicyVO policy(boolean retry) {
@@ -268,6 +809,10 @@ public class AutomationControlFlowIT {
                 Duration.ofSeconds(4));
         public final AutomationRegistrationVO external = registration("externalRisk", WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT, "risk-system");
         public final AutomationRegistrationVO readOnly = registration("readRisk", WorkerEffectSafetyEnum.READ_ONLY, "risk-reader");
+        private final AutomationRegistrationVO nestedResult = new AutomationRegistrationVO(20, ISSUER,
+                "typed-worker", "worker-source", "nestedRisk", 1, ProcessNodeLifecycleListener.schemaSha256(AMOUNT),
+                ProcessNodeLifecycleListener.schemaSha256(NESTED_REVIEW_RESULT),
+                WorkerEffectSafetyEnum.READ_ONLY, "handler-1", "risk-reader", 8, Duration.ofMinutes(2));
         public final WorkerTopicRegistry.Registration legacy = new WorkerTopicRegistry.Registration(20, ISSUER, "legacy-worker",
                 "riskCheck", "1", Map.of("requestedAmount", ValueType.INTEGER), Map.of("approved", ValueType.BOOLEAN),
                 Map.of("requestedAmount", Set.of("amount")), Map.of("approved", Set.of("approved")), 1,
@@ -297,7 +842,7 @@ public class AutomationControlFlowIT {
             var transaction = new TransactionTemplate(manager);
             transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
             var environment = new MockEnvironment().withProperty("stellar.tianji.process.automation.enabled", "true");
-            var registry = new WorkerTopicRegistry(List.of(legacy), List.of(transactional, shortLease, external, readOnly));
+            var registry = new WorkerTopicRegistry(List.of(legacy), List.of(transactional, shortLease, external, readOnly, nestedResult));
             var validator = new ProcessModelValidator();
             releases = new ProcessReleaseService(process, dmn, validator, false, registry);
             var sealed = wiring.releases;
@@ -345,7 +890,14 @@ public class AutomationControlFlowIT {
         }
 
         public static Harness open(boolean installBusiness) throws Exception {
-            var database = provision(installBusiness);
+            return open(provision(installBusiness));
+        }
+
+        public static Harness openOnProvisionedDatabase(JdbcTemplate owner, String url, String role) throws Exception {
+            return open(new DatabaseVO(owner, url, role, null));
+        }
+
+        private static Harness open(DatabaseVO database) throws Exception {
             var application = context(database.url(), database.role(), false);
             try {
                 return new Harness(database, application);
@@ -379,6 +931,17 @@ public class AutomationControlFlowIT {
             assertEquals(release, drafts.publish(OWNER, new PublishProcessDraftCommand(saved.getDraftId(), saved.getRevision(),
                     saved.getContentSha256(), release, "publish-" + definition), Instant.now().plusSeconds(60)).releaseVersion());
             activation.activate(OWNER, definition, new ActivationCommand(release, 0L, "activate-" + definition));
+        }
+
+        private void deployCompetingDecision(String key, String xml) {
+            var repository = application.getBean(SpringDmnEngineConfiguration.class).getDmnRepositoryService();
+            String tenant = Long.toString(OWNER.tenantId());
+            var deployed = repository.createDeployment().tenantId(tenant).name("fixture-competing-" + key)
+                    .addDmnBytes(key + ".dmn", xml.getBytes(StandardCharsets.UTF_8)).deploy();
+            var latest = repository.createDecisionQuery().decisionKey(key).decisionTenantId(tenant).latestVersion().singleResult();
+            assertNotNull(latest);
+            assertEquals(deployed.getId(), latest.getDeploymentId());
+            assertTrue(latest.getVersion() > 1);
         }
 
         private void requireNativeArchive(String release, List<AutomationModelSourceVO.ModelSourceVO> models) {
@@ -503,14 +1066,33 @@ public class AutomationControlFlowIT {
             return task.getId();
         }
 
+        private String humanTask(String root, String node) {
+            return humanTask(root, node, null);
+        }
+
+        private String humanTask(String root, String node, Integer branch) {
+            return owner.queryForObject("""
+                    SELECT t.id_ FROM tianji_process.act_ru_task t
+                     JOIN tianji_process.act_ru_execution e ON e.id_=t.execution_id_
+                     JOIN tianji_process.tianji_process_node_execution n ON n.attempt_scope_id=e.parent_id_
+                    WHERE n.instance_id=? AND n.node_id=? AND n.state='WAITING'
+                      AND (?::integer IS NULL OR n.branch_index=?)
+                    """, String.class, root, node, branch, branch);
+        }
+
+        private void requireFinished(String root) {
+            assertNotNull(process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(root).singleResult().getEndTime());
+            assertEquals(0, process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root).count());
+        }
+
         private void completeHuman(String task, String subject, String role, Map<String, Object> output) {
             var reader = context(subject, "get.v2", role);
             var initial = human.observeAction(reader, task);
             assertEquals(List.of("CLAIM"), initial.getAvailableActions());
-            human.claim(context(subject, "claim", role), new ClaimHumanTaskCommand("claim-" + subject, task, initial.getVersion()));
+            human.claim(context(subject, "claim", role), new ClaimHumanTaskCommand("claim-" + task, task, initial.getVersion()));
             String version = human.observeAction(reader, task).getVersion();
             var completer = context(subject, "complete.v2", role);
-            var command = new CompleteEngineHumanTaskCommand("complete-" + subject, version, output);
+            var command = new CompleteEngineHumanTaskCommand("complete-" + task, version, output);
             var original = human.completeAction(completer, task, command);
             assertEquals(original, human.completeAction(completer, task, command));
         }

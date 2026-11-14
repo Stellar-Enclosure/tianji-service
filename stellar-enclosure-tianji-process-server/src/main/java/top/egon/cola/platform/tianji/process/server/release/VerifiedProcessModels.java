@@ -180,6 +180,7 @@ public final class VerifiedProcessModels {
             var controls = ProcessModelValidator.validateCompiledAutomationBpmn(bpmn, document, evidence);
 
             var verified = new LinkedHashMap<String, ValidatedProcessModel>();
+            var decisionDefinitions = new LinkedHashMap<String, Definition>();
             for (var expectedDecision : expectedDecisions.entrySet()) {
                 String key = expectedDecision.getKey();
                 String resource = key + ".dmn";
@@ -190,8 +191,9 @@ public final class VerifiedProcessModels {
                 var decision = automationDecision(tenantId, resource, binding);
                 if (!decision.inputs().equals(binding.inputs())) throw unavailable();
                 verified.put(key, decision);
+                decisionDefinitions.put(key, binding);
             }
-            return new VerifiedAutomationModelsVO(rootBinding, verified, evidence.nativeIds(), controls);
+            return new VerifiedAutomationModelsVO(rootBinding, verified, decisionDefinitions, evidence.nativeIds(), controls);
         } catch (FlowableObjectNotFoundException | IllegalArgumentException missing) {
             throw unavailable();
         } catch (IOException failure) {
@@ -264,10 +266,13 @@ public final class VerifiedProcessModels {
     }
 
     public record VerifiedAutomationModelsVO(Definition root, Map<String, ValidatedProcessModel> decisions,
-                                             Map<String, String> nativeIds, CompiledControlBindingsVO controlBindings) {
+                                             Map<String, Definition> decisionDefinitions, Map<String, String> nativeIds,
+                                             CompiledControlBindingsVO controlBindings) {
         public VerifiedAutomationModelsVO {
             Objects.requireNonNull(root, "root");
             decisions = Map.copyOf(decisions);
+            decisionDefinitions = Map.copyOf(decisionDefinitions);
+            if (!decisions.keySet().equals(decisionDefinitions.keySet())) throw unavailable();
             nativeIds = Map.copyOf(nativeIds);
             Objects.requireNonNull(controlBindings, "controlBindings");
         }

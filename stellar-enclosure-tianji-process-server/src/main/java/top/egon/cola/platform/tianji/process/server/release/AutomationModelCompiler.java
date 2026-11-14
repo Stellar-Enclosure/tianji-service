@@ -38,6 +38,11 @@ public class AutomationModelCompiler {
     static final String METADATA = "urn:stellar-enclosure:tianji:automation:2";
     private static final String TOPIC_PREFIX = "tianji-v2:worker:";
     static final String BOOTSTRAP = "tianji_automation_bootstrap";
+    public static final String CONTROL_EXPRESSION_ROOT = "tianjiAutomationControl";
+    public static final String DECISION_DELEGATE = "tianjiAutomationDecision";
+    public static final String MERGE_DELEGATE = "tianjiAutomationMerge";
+    public static final String MULTI_INSTANCE_ITEM = "ta_item";
+    public static final String MULTI_INSTANCE_INDEX = "ta_itemIndex";
     private static final int MAX_DEPENDENCY_MANIFEST_BYTES = 256 * 1024;
     private static final String SOURCE_DOMAIN = "AUTOMATION_SOURCE_MANIFEST_V2";
     private static final String DEPENDENCY_DOMAIN = "AUTOMATION_DEPENDENCY_MANIFEST_V2";
@@ -136,6 +141,33 @@ public class AutomationModelCompiler {
         return "ta_" + ProcessTypedJson.sha256("AUTOMATION_NATIVE_ID_V2", utf8(purpose), utf8(qualifiedId)).substring(0, 40);
     }
 
+    /** The loop condition in the sealed BPMN is keyed by its outgoing continuation flow. */
+    public static String loopContinuationFlowId(String logicalNodeId) {
+        return id("loop-next", logicalNodeId);
+    }
+
+    /** Server-owned expression entry points shared with the native runtime. */
+    public enum ControlPredicate {
+        XOR("condition"),
+        LOOP_CONTINUATION("continueLoop"),
+        MULTI_INSTANCE_ITEMS("items"),
+        MULTI_INSTANCE_COMPLETION("completeMultiInstance");
+
+        private final String methodName;
+
+        ControlPredicate(String methodName) {
+            this.methodName = methodName;
+        }
+
+        public String methodName() {
+            return methodName;
+        }
+
+        public String expression(String generatedId) {
+            return "${" + CONTROL_EXPRESSION_ROOT + "." + methodName + "(execution, '" + generatedId + "')}";
+        }
+    }
+
     private static final class NativeBpmn {
         private final ValidatedAutomationModelVO model;
         private final StringBuilder process = new StringBuilder();
@@ -182,7 +214,7 @@ public class AutomationModelCompiler {
                 String expression = null;
                 if (edge.condition() != null) {
                     conditions.put(edgeId, edge.condition());
-                    expression = predicate("condition", edgeId);
+                    expression = ControlPredicate.XOR.expression(edgeId);
                 }
                 Integer branch = scope.branchIndices().get(edge.id());
                 if (branch != null) branchIndices.put(edgeId, branch);
@@ -209,7 +241,7 @@ public class AutomationModelCompiler {
                 case "AND_JOIN" -> {
                     tag(process, "parallelGateway", metadata);
                     String merge = id("merge", node.id());
-                    task(merge, "tianjiAutomationMerge", attrs("ta:occurrence", nativeId));
+                    task(merge, MERGE_DELEGATE, attrs("ta:occurrence", nativeId));
                     sequence(id("merge-flow", node.id()), nativeId, merge, null, Map.of());
                     occurrenceSlots.put(node.id(), new OccurrenceSlotVO(nativeId, merge, null, null, null));
                     emitBoundaries(node, merge, null);
@@ -235,7 +267,7 @@ public class AutomationModelCompiler {
             String gate = id("loop-gate", node.id());
             String end = id("loop-end", node.id());
             String exit = id("loop-exit", node.id());
-            String next = id("loop-next", node.id());
+            String next = loopContinuationFlowId(node.id());
             var control = (LoopControlVO) node.binding().control();
             conditions.put(next, control.condition());
             open(process, "subProcess", metadata);
@@ -248,7 +280,7 @@ public class AutomationModelCompiler {
             tag(process, "endEvent", attrs("id", end));
             sequence(id("loop-enter", node.id()), start, body, null, Map.of());
             sequence(id("loop-test", node.id()), body, gate, null, Map.of());
-            sequence(next, gate, body, predicate("continueLoop", next), Map.of());
+            sequence(next, gate, body, ControlPredicate.LOOP_CONTINUATION.expression(next), Map.of());
             sequence(exit, gate, end, null, Map.of());
             close(process, "subProcess");
             occurrenceSlots.put(node.id(), new OccurrenceSlotVO(scope, body, null, null, null));
@@ -267,16 +299,16 @@ public class AutomationModelCompiler {
             tag(process, "startEvent", attrs("id", start));
             open(process, "subProcess", attrs("id", body, "ta:occurrence", scope, "ta:maxItems", Integer.toString(control.maxItems())));
             open(process, "multiInstanceLoopCharacteristics", attrs("isSequential", Boolean.toString(control.sequential()),
-                    "flowable:collection", predicate("items", body), "flowable:elementVariable", "ta_item",
-                    "flowable:elementIndexVariable", "ta_itemIndex"));
+                    "flowable:collection", ControlPredicate.MULTI_INSTANCE_ITEMS.expression(body),
+                    "flowable:elementVariable", MULTI_INSTANCE_ITEM, "flowable:elementIndexVariable", MULTI_INSTANCE_INDEX));
             if (control.completionCondition() != null) {
                 conditions.put(body, control.completionCondition());
-                textElement(process, "completionCondition", predicate("completeMultiInstance", body));
+                textElement(process, "completionCondition", ControlPredicate.MULTI_INSTANCE_COMPLETION.expression(body));
             }
             close(process, "multiInstanceLoopCharacteristics");
             emitScope(node.body(), false);
             close(process, "subProcess");
-            task(merge, "tianjiAutomationMerge", attrs("ta:occurrence", scope));
+            task(merge, MERGE_DELEGATE, attrs("ta:occurrence", scope));
             tag(process, "endEvent", attrs("id", end));
             sequence(id("multi-enter", node.id()), start, body, null, Map.of());
             sequence(id("multi-collect", node.id()), body, merge, null, Map.of());
@@ -304,7 +336,7 @@ public class AutomationModelCompiler {
             switch (node.kind()) {
                 case "SERVICE", "RULE" -> {
                     if (node.binding().service() == null) {
-                        task(activity, "tianjiAutomationDecision", attrs("ta:decisionKey", node.binding().rule().definitionKey()));
+                        task(activity, DECISION_DELEGATE, attrs("ta:decisionKey", node.binding().rule().definitionKey()));
                     } else {
                         emitWorker(node, activity);
                     }
@@ -459,10 +491,6 @@ public class AutomationModelCompiler {
         }
 
         private static String nativeNode(String logicalId) { return id("node", logicalId); }
-
-        private static String predicate(String operation, String generatedId) {
-            return "${tianjiAutomationControl." + operation + "(execution, '" + generatedId + "')}";
-        }
     }
 
     private static Map<String, String> attrs(String... pairs) {

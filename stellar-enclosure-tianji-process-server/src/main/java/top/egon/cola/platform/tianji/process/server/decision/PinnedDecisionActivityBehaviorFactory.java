@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.process.server.decision;
 
+import org.flowable.bpmn.model.ImplementationType;
 import org.flowable.bpmn.model.SendTask;
 import org.flowable.bpmn.model.ServiceTask;
 import org.flowable.bpmn.model.Task;
@@ -7,12 +8,15 @@ import org.flowable.bpmn.model.UserTask;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.delegate.DelegateExecution;
 import org.flowable.engine.impl.bpmn.behavior.DmnActivityBehavior;
+import org.flowable.engine.impl.bpmn.behavior.TaskActivityBehavior;
 import org.flowable.engine.impl.bpmn.behavior.UserTaskActivityBehavior;
 import org.flowable.engine.impl.bpmn.parser.factory.DefaultActivityBehaviorFactory;
+import org.flowable.engine.impl.delegate.ActivityBehavior;
 import org.flowable.engine.impl.util.CommandContextUtil;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.error.ProcessDecisionFailedException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
@@ -22,9 +26,13 @@ import top.egon.cola.platform.tianji.process.server.task.PinnedHumanTaskActivity
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 /** Binds native decision execution and governed user-task assignment to the immutable process release. */
 public final class PinnedDecisionActivityBehaviorFactory extends DefaultActivityBehaviorFactory {
+    private static final String AUTOMATION_NAMESPACE = "urn:stellar-enclosure:tianji:automation:2";
+    private static final String RULE_EXPRESSION = "${" + AutomationModelCompiler.DECISION_DELEGATE + "}";
     private final java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService> sourceServices;
     private final java.util.function.Supplier<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> sourceRegistries;
 
@@ -58,6 +66,34 @@ public final class PinnedDecisionActivityBehaviorFactory extends DefaultActivity
     @Override
     public DmnActivityBehavior createDmnActivityBehavior(SendTask task) {
         return new PinnedDecisionActivityBehavior(task);
+    }
+
+    /** Called by the automation parse hook for the compiler-owned RULE service task. */
+    public static ActivityBehavior createAutomationRuleBehavior(ServiceTask task, Consumer<DelegateExecution> evaluate) {
+        if (!ImplementationType.IMPLEMENTATION_TYPE_DELEGATEEXPRESSION.equals(task.getImplementationType())
+                || !RULE_EXPRESSION.equals(task.getImplementation()) || !task.getId().startsWith("ta_")
+                || task.getAttributeValue(AUTOMATION_NAMESPACE, "decisionKey") == null) {
+            throw new IllegalArgumentException("Invalid compiled automation rule task");
+        }
+        return new AutomationRuleActivityBehavior(task.getId(), Objects.requireNonNull(evaluate, "evaluate"));
+    }
+
+    private static final class AutomationRuleActivityBehavior extends TaskActivityBehavior {
+        private static final long serialVersionUID = 1L;
+        private final String activityId;
+        private final Consumer<DelegateExecution> evaluate;
+
+        private AutomationRuleActivityBehavior(String activityId, Consumer<DelegateExecution> evaluate) {
+            this.activityId = Objects.requireNonNull(activityId, "activityId");
+            this.evaluate = evaluate;
+        }
+
+        @Override
+        public void execute(DelegateExecution execution) {
+            if (!activityId.equals(execution.getCurrentActivityId())) throw new ProcessResourceNotFoundException();
+            evaluate.accept(execution);
+            leave(execution);
+        }
     }
 
     private static final class PinnedDecisionActivityBehavior extends DmnActivityBehavior {
