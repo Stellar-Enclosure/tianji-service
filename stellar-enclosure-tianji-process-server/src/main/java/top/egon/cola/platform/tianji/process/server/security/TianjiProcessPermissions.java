@@ -246,6 +246,9 @@ public final class TianjiProcessPermissions {
     public static final String WORKER_ACQUIRE_API = "tianji.api.process.worker.acquire";
     public static final String WORKER_COMPLETE_API = "tianji.api.process.worker.complete";
     public static final String WORKER_FAIL_API = "tianji.api.process.worker.fail";
+    public static final String AUTOMATION_WORKER_ACQUIRE_API = "tianji.api.process.worker.acquire.v2";
+    public static final String AUTOMATION_WORKER_COMPLETE_API = "tianji.api.process.worker.complete.v2";
+    public static final String AUTOMATION_WORKER_FAIL_API = "tianji.api.process.worker.fail.v2";
     public static final String AGENT_RESULT_RECEIVE_API = "tianji.api.process.agent.result.receive";
     public static final String RELEASE_PUBLISH_SCOPE = "tianji:process:publish";
     public static final String RELEASE_READ_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessReleaseClient.READ_SCOPE;

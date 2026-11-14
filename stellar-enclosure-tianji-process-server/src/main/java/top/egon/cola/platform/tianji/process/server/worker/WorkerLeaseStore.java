@@ -56,6 +56,17 @@ public final class WorkerLeaseStore {
 
     public List<RecoveryLeaseEvidence> readRecoveryHistory(long tenantId, String jobId) {
         requireTransaction();
+        return queryRecoveryHistory(jdbc, table, tenantId, jobId);
+    }
+
+    public static List<RecoveryLeaseEvidence> readRecoveryHistory(JdbcTemplate jdbc, String schema, long tenantId, String jobId) {
+        if (schema == null || !schema.matches("[a-z_][a-z0-9_]{0,62}")
+                || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())) throw invalid();
+        return queryRecoveryHistory(jdbc, '"' + schema + "\".tianji_worker_lease_receipt", tenantId, jobId);
+    }
+
+    private static List<RecoveryLeaseEvidence> queryRecoveryHistory(JdbcTemplate jdbc, String table, long tenantId, String jobId) {
         if (tenantId <= 0) throw invalid();
         id(jobId, 255);
         var rows = jdbc.query("SELECT tenant_id,subject_issuer,subject_id,topic,schema_version,job_id,occurrence_id,"
@@ -137,17 +148,28 @@ public final class WorkerLeaseStore {
 
     /** Serializes an identity's acquisitions before enforcing both its topic and overall limits. */
     public boolean hasCapacity(ProcessActor actor, String topic, String schemaVersion, int limit) {
+        ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
+        return checkCapacity(actor, topic, schemaVersion, limit, false);
+    }
+
+    public boolean hasAutomationCapacity(ProcessActor actor, String capabilityKey, long capabilityVersion, int limit) {
+        if (!top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.isCapabilityKey(capabilityKey)
+                || capabilityVersion < 1 || capabilityVersion > top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson.V2_MAX_WIRE_INTEGER) throw invalid();
+        return checkCapacity(actor, capabilityKey, Long.toString(capabilityVersion), limit, true);
+    }
+
+    private boolean checkCapacity(ProcessActor actor, String topic, String schemaVersion, int limit, boolean automation) {
         requireTransaction();
         requireWorker(actor);
-        ProcessModelValidator.nativeWorkerTopic(topic, schemaVersion);
         if (limit < 1 || limit > 32) throw invalid();
         String key = ProcessRequestDigest.hash(List.of("worker-capacity-v1", Long.toString(actor.tenantId()),
                 actor.issuerFingerprint(), actor.subjectId()), Map.of());
         jdbc.query("SELECT pg_advisory_xact_lock(hashtextextended(?, 0))", rs -> { }, "tianji:worker:" + key);
-        int[] active = jdbc.queryForObject("SELECT count(*) AS total, count(*) FILTER (WHERE topic=? AND schema_version=?) AS topic_total FROM "
+        int[] active = jdbc.queryForObject("SELECT count(*) AS total, count(*) FILTER (WHERE topic=? AND schema_version=? "
+                        + "AND (occurrence_id<>job_id)=?) AS topic_total FROM "
                         + table + " WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND state='LEASED' "
                         + "AND lease_expires_at>clock_timestamp()",
-                (rs, row) -> new int[] {rs.getInt("total"), rs.getInt("topic_total")}, topic, schemaVersion,
+                (rs, row) -> new int[] {rs.getInt("total"), rs.getInt("topic_total")}, topic, schemaVersion, automation,
                 actor.tenantId(), actor.issuerFingerprint(), actor.subjectId());
         if (active == null) throw new IllegalStateException("Worker lease capacity could not be checked");
         return active[0] < 32 && active[1] < limit;
@@ -199,6 +221,13 @@ public final class WorkerLeaseStore {
         } catch (NoSuchAlgorithmException missing) {
             throw new IllegalStateException("SHA-256 is unavailable");
         }
+    }
+
+    public static String automationPhysicalInputSha256(String jobId, String instanceId, String definitionId, String elementId,
+            String capabilityKey, long version, String nodeRef, String inputSha256, String configurationSha256) {
+        return ProcessRequestDigest.hash(List.of("worker-input-v2", jobId, instanceId, definitionId, elementId,
+                capabilityKey, Long.toString(version)), Map.of("nodeExecutionRef", nodeRef, "inputSha256", inputSha256,
+                "configurationSha256", configurationSha256));
     }
 
     private static Lease read(ResultSet rs) throws SQLException {

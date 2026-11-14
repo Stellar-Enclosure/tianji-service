@@ -1,8 +1,17 @@
 package top.egon.cola.platform.tianji.process.server.worker;
 
+import jakarta.validation.Valid;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO.CapabilityRefVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.VersionedRefVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.WorkerRegistrationVO;
+
+import java.util.Arrays;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerTask;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
@@ -19,9 +28,16 @@ import java.util.stream.Collectors;
 public final class WorkerTopicRegistry {
     private final Map<Key, Registration> registrations;
     private final Map<TopicKey, Schema> schemas;
+    private final Map<AutomationActorKeyVO, AutomationRegistrationVO> automationGrants;
+    private final Map<AutomationTopicKeyVO, AutomationRegistrationVO> automationTopics;
 
     public WorkerTopicRegistry(List<Registration> registrations) {
-        if (registrations == null || registrations.isEmpty() || registrations.size() > 1_000) throw invalid();
+        this(registrations, List.of());
+    }
+
+    public WorkerTopicRegistry(List<Registration> registrations, List<@Valid AutomationRegistrationVO> automation) {
+        if (registrations == null || automation == null || (long) registrations.size() + automation.size() < 1
+                || (long) registrations.size() + automation.size() > 1_000) throw invalid();
         Map<Key, Registration> entries = new HashMap<>();
         Map<TopicKey, Schema> topics = new HashMap<>();
         for (Registration registration : registrations) {
@@ -37,6 +53,18 @@ public final class WorkerTopicRegistry {
         }
         this.registrations = Map.copyOf(entries);
         this.schemas = Map.copyOf(topics);
+        var grants = new HashMap<AutomationActorKeyVO, AutomationRegistrationVO>();
+        var capabilities = new HashMap<AutomationTopicKeyVO, AutomationRegistrationVO>();
+        for (var registration : automation) {
+            if (registration == null) throw invalid();
+            var actor = registration.actor();
+            var key = new AutomationTopicKeyVO(actor.tenantId(), registration.capabilityKey(), registration.capabilityVersion());
+            if (grants.putIfAbsent(new AutomationActorKeyVO(actor, key), registration) != null) throw invalid();
+            var previous = capabilities.putIfAbsent(key, registration);
+            if (previous != null && !previous.contractSha256().equals(registration.contractSha256())) throw invalid();
+        }
+        automationGrants = Map.copyOf(grants);
+        automationTopics = Map.copyOf(capabilities);
     }
 
     public Registration require(ProcessActor actor, String topic, String schemaVersion) {
@@ -66,6 +94,29 @@ public final class WorkerTopicRegistry {
     }
 
     public List<Registration> registrations() { return List.copyOf(registrations.values()); }
+
+    public boolean hasAutomationRegistrations() { return !automationTopics.isEmpty(); }
+
+    public AutomationRegistrationVO requireAutomation(ProcessActor actor, String capabilityKey, long capabilityVersion) {
+        if (actor == null || actor.subjectType() != ProcessActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw unavailable();
+        }
+        var capability = new AutomationTopicKeyVO(actor.tenantId(), capabilityKey, capabilityVersion);
+        var registration = automationGrants.get(new AutomationActorKeyVO(actor, capability));
+        if (registration == null) throw unavailable();
+        return registration;
+    }
+
+    public Map<VersionedRefVO, WorkerRegistrationVO> automationReleaseRegistrations(long tenantId) {
+        var result = new HashMap<VersionedRefVO, WorkerRegistrationVO>();
+        automationTopics.forEach((key, registration) -> {
+            if (key.tenantId() == tenantId) {
+                result.put(new VersionedRefVO(key.capabilityKey(), key.version()),
+                        new WorkerRegistrationVO(registration.capability(), registration.contractSha256()));
+            }
+        });
+        return Map.copyOf(result);
+    }
 
     public boolean acceptsModel(long tenantId, WorkerTask worker) {
         if (tenantId <= 0 || worker == null) return false;
@@ -147,6 +198,46 @@ public final class WorkerTopicRegistry {
 
     private record Key(long tenantId, String issuer, String subject, String topic, String version) { }
     private record TopicKey(long tenantId, String topic, String version) { }
+    private record AutomationTopicKeyVO(long tenantId, String capabilityKey, long version) { }
+    private record AutomationActorKeyVO(ProcessActor actor, AutomationTopicKeyVO capability) { }
+
+    public record AutomationRegistrationVO(long tenantId, String issuer, String subjectId, String sourceId,
+            String capabilityKey, long capabilityVersion, String inputSchemaSha256, String outputSchemaSha256,
+            WorkerEffectSafetyEnum effectMode, String handlerVersion, String targetId, int maxConcurrent, Duration leaseDuration) {
+        public AutomationRegistrationVO {
+            ProcessActor.verified(tenantId, ProcessActor.SubjectType.SERVICE, subjectId, issuer);
+            new CapabilityRefVO(capabilityKey, capabilityVersion, inputSchemaSha256, outputSchemaSha256, effectMode);
+            if (!registeredId(sourceId) || handlerVersion == null || handlerVersion.isBlank() || handlerVersion.length() > 128
+                    || handlerVersion.chars().anyMatch(Character::isISOControl)
+                    || (effectMode == WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT ? targetId != null : !registeredId(targetId))
+                    || maxConcurrent < 1 || maxConcurrent > 32 || leaseDuration == null || !wholeMillis(leaseDuration)
+                    || leaseDuration.compareTo(Duration.ofSeconds(1)) < 0 || leaseDuration.compareTo(Duration.ofMinutes(15)) > 0) {
+                throw invalid();
+            }
+            ProcessTypedJson.canonicalBytes(handlerVersion);
+        }
+
+        public ProcessActor actor() { return ProcessActor.verified(tenantId, ProcessActor.SubjectType.SERVICE, subjectId, issuer); }
+
+        public CapabilityRefVO capability() {
+            return new CapabilityRefVO(capabilityKey, capabilityVersion, inputSchemaSha256, outputSchemaSha256, effectMode);
+        }
+
+        public String contractSha256() {
+            return ProcessTypedJson.sha256("AUTOMATION_WORKER_REGISTRATION_V2", ProcessTypedJson.canonicalBytes(Arrays.asList(
+                    tenantId, sourceId, capabilityKey, capabilityVersion, inputSchemaSha256, outputSchemaSha256,
+                    effectMode.name(), handlerVersion, targetId)));
+        }
+
+        public String physicalTopic() {
+            return AutomationModelCompiler.physicalWorkerTopic(tenantId, capabilityKey, capabilityVersion, contractSha256());
+        }
+    }
+
+    private static boolean registeredId(String value) {
+        return value != null && value.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}");
+    }
+
     private record Schema(Map<String, ValueType> inputs, Map<String, ValueType> outputs,
                           Map<String, Set<String>> inputSources, Map<String, Set<String>> outputTargets, WorkerEffect effectSafety,
                           boolean internalAgentDispatch) {

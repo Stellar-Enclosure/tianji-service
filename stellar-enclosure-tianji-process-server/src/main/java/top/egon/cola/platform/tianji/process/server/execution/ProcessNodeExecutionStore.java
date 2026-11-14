@@ -12,7 +12,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNo
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.SideEffectOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerBusinessResultDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
@@ -43,13 +46,16 @@ public class ProcessNodeExecutionStore {
             """;
     private static final String SCOPED = " WHERE tenant_id=? AND instance_id=?";
     private static final String OPEN = " AND state NOT IN ('COMPLETED','FAILED','TIMED_OUT','CANCELLED')";
+    private static final String WORKER = " AND kind IN ('SERVICE','RULE') AND capability_key IS NOT NULL AND NOT excluded";
     private final JdbcTemplate jdbc;
+    private final String schema;
     private final String table;
     private final String executions;
 
     public ProcessNodeExecutionStore(JdbcTemplate jdbc, String schema) {
         this.jdbc = Objects.requireNonNull(jdbc);
         if (schema == null || !schema.matches("[a-z_][a-z0-9_]{0,62}")) throw new IllegalArgumentException("Invalid Process schema");
+        this.schema = schema;
         table = schema + ".tianji_process_node_execution";
         executions = schema + ".act_ru_execution";
     }
@@ -109,6 +115,114 @@ public class ProcessNodeExecutionStore {
         requireTransaction();
         return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
                         + " AND occurrence_id = ? ORDER BY attempt DESC LIMIT 1", this::row, tenantId, instanceId, occurrenceId));
+    }
+
+    public ProcessNodeExecutionBO requireWorkerAttempt(long tenantId, String instanceId, String nativeJobId) {
+        requireWrite(tenantId, instanceId);
+        return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
+                + WORKER + " AND native_job_id=? LIMIT 2", this::row, tenantId, instanceId, nativeJobId))
+                .orElseThrow(ProcessNodeExecutionStore::unavailable);
+    }
+
+    public ProcessNodeExecutionBO requireWorkerAttempt(long tenantId, String instanceId, String nodeExecutionRef,
+                                                        String nativeJobId) {
+        requireWrite(tenantId, instanceId);
+        return findWorkerAttempt(tenantId, instanceId, nodeExecutionRef, nativeJobId)
+                .orElseThrow(ProcessNodeExecutionStore::unavailable);
+    }
+
+    public Optional<ProcessNodeExecutionBO> findWorkerAttempt(long tenantId, String instanceId, String nodeExecutionRef,
+                                                               String nativeJobId) {
+        requireTransaction();
+        return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
+                + WORKER + " AND node_execution_ref=? AND native_job_id=? LIMIT 2",
+                this::row, tenantId, instanceId, nodeExecutionRef, nativeJobId));
+    }
+
+    void bindWorkerJob(ProcessNodeExecutionBO row, String nativeJobId) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        if (nativeJobId == null || nativeJobId.isBlank() || row.getNativeJobId() != null) throw unavailable();
+        int changed = jdbc.update("UPDATE " + table + " SET native_job_id=?,revision=revision+1" + SCOPED + WORKER
+                        + " AND occurrence_id=? AND attempt=? AND node_execution_ref=? AND attempt_scope_id=? AND revision=?"
+                        + " AND state='WAITING' AND native_job_id IS NULL",
+                nativeJobId, row.getTenantId(), row.getInstanceId(), row.getOccurrenceId(), row.getAttempt(),
+                row.getNodeExecutionRef(), row.getAttemptScopeId(), row.getRevision());
+        if (changed != 1) throw unavailable();
+    }
+
+    void lockWorkerJob(ProcessNodeExecutionBO row) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        List<String> found = jdbc.queryForList("SELECT id_ FROM " + schema + ".act_ru_external_job"
+                        + " WHERE id_=? AND tenant_id_=? AND process_instance_id_=? FOR UPDATE", String.class,
+                row.getNativeJobId(), Long.toString(row.getTenantId()), row.getInstanceId());
+        if (found.size() != 1) throw unavailable();
+    }
+
+    public String acceptWorkerResult(ProcessNodeExecutionBO row, String nativeJobId,
+                                     Map<String, Object> normalizedOutput, boolean confirmedWrite) {
+        Instant timestamp = requireWaitingWorker(row, nativeJobId, true);
+        String outputSha256 = AutomationWorkerBusinessResultDTO.nodeOutputSha256(row.getOutputSchemaSha256(), normalizedOutput);
+        int changed = jdbc.update("UPDATE " + table + " SET state='RESULT_ACCEPTED',revision=revision+1,"
+                        + "output_json=?::jsonb,output_sha256=?,accepted_at=?,side_effect_outcome=?" + workerCas(),
+                json(normalizedOutput, MAX_DATA), outputSha256, utc(timestamp),
+                confirmedWrite ? SideEffectOutcomeEnum.CONFIRMED.name() : SideEffectOutcomeEnum.NONE.name(),
+                row.getTenantId(), row.getInstanceId(), row.getOccurrenceId(), row.getAttempt(), row.getNodeExecutionRef(),
+                row.getAttemptScopeId(), nativeJobId, row.getRevision());
+        if (changed != 1) throw unavailable();
+        return resultRef(row, outputSha256);
+    }
+
+    public void acceptWorkerFailure(ProcessNodeExecutionBO row, String nativeJobId, AutomationWorkerFailureCommand.KindEnum kind,
+                                    String errorCode, boolean retryScheduled) {
+        if (kind == null || kind == AutomationWorkerFailureCommand.KindEnum.UNKNOWN || retryScheduled) throw unavailable();
+        Instant timestamp = requireWaitingWorker(row, nativeJobId, true);
+        finishWorkerWait(row, nativeJobId, StateEnum.FAILED, SideEffectOutcomeEnum.NONE, errorCode, null, timestamp);
+    }
+
+    List<WorkerLeaseStore.RecoveryLeaseEvidence> workerHistory(ProcessNodeExecutionBO row) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        return WorkerLeaseStore.readRecoveryHistory(jdbc, schema, row.getTenantId(), row.getNativeJobId());
+    }
+
+    void retireWorkerAttempt(ProcessNodeExecutionBO row, StateEnum state, SideEffectOutcomeEnum outcome,
+                             String errorCode, String subscriptionId) {
+        Instant timestamp = requireWaitingWorker(row, row.getNativeJobId(), false);
+        finishWorkerWait(row, row.getNativeJobId(), state, outcome, errorCode, subscriptionId, timestamp);
+    }
+
+    private void finishWorkerWait(ProcessNodeExecutionBO row, String nativeJobId, StateEnum state,
+                                  SideEffectOutcomeEnum outcome, String errorCode, String subscriptionId, Instant timestamp) {
+        if (errorCode == null || !errorCode.matches("[A-Z][A-Z0-9_]{0,127}$")
+                || state != StateEnum.FAILED && state != StateEnum.TIMED_OUT && state != StateEnum.WAIT_RECOVERY
+                || (state == StateEnum.WAIT_RECOVERY) != (subscriptionId != null)) throw unavailable();
+        int changed = jdbc.update("UPDATE " + table + " SET state=?,revision=revision+1,side_effect_outcome=?,error_code=?,"
+                        + "native_subscription_id=?,finished_at=?" + workerCas(),
+                state.name(), outcome.name(), errorCode, subscriptionId, state == StateEnum.WAIT_RECOVERY ? null : utc(timestamp),
+                row.getTenantId(), row.getInstanceId(), row.getOccurrenceId(), row.getAttempt(), row.getNodeExecutionRef(),
+                row.getAttemptScopeId(), nativeJobId, row.getRevision());
+        if (changed != 1) throw unavailable();
+    }
+
+    private Instant requireWaitingWorker(ProcessNodeExecutionBO row, String nativeJobId, boolean beforeDeadline) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        if (nativeJobId == null || !nativeJobId.equals(row.getNativeJobId()) || row.getState() != StateEnum.WAITING
+                || row.isExcluded() || row.getCapabilityKey() == null) throw unavailable();
+        Instant timestamp = now();
+        if (beforeDeadline && (!timestamp.isBefore(row.getAttemptDeadlineAt()) || !timestamp.isBefore(row.getNodeDeadlineAt()))) {
+            throw unavailable();
+        }
+        return timestamp;
+    }
+
+    private static String workerCas() {
+        return SCOPED + WORKER + " AND occurrence_id=? AND attempt=? AND node_execution_ref=? AND attempt_scope_id=?"
+                + " AND native_job_id=? AND revision=? AND state='WAITING'";
+    }
+
+    public static String resultRef(ProcessNodeExecutionBO row, String outputSha256) {
+        return "result-" + ProcessTypedJson.sha256("AUTOMATION_WORKER_NODE_RESULT_REF_V2", ProcessTypedJson.canonicalBytes(
+                List.of(row.getTenantId(), row.getInstanceId(), row.getOccurrenceId(), row.getAttempt(),
+                        row.getNodeExecutionRef(), row.getNativeJobId(), outputSha256)));
     }
 
     public List<ProcessNodeExecutionBO> list(long tenantId, String instanceId, String nodeId, Instant notAfter,
@@ -201,7 +315,8 @@ public class ProcessNodeExecutionStore {
             if (recovery != null) item.setWorkerEffectRecovery(JSON.readValue(recovery, WorkerEffectRecoveryVO.class));
             if (!digest("AUTOMATION_NODE_INPUT_V2", item.getInputSchemaSha256(), item.getInput()).equals(item.getInputSha256())
                     || (item.getOutput() == null) != (item.getOutputSha256() == null)
-                    || item.getOutput() != null && !digest("AUTOMATION_NODE_OUTPUT_V2", item.getOutputSchemaSha256(), item.getOutput()).equals(item.getOutputSha256())) {
+                    || item.getOutput() != null && !digest("AUTOMATION_NODE_OUTPUT_V2", item.getOutputSchemaSha256(),
+                            item.getOutput()).equals(item.getOutputSha256())) {
                 throw unavailable();
             }
             return item;

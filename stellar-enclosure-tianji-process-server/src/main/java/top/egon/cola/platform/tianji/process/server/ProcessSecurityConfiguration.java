@@ -42,6 +42,7 @@ import org.flowable.dmn.engine.DmnEngine;
 import org.flowable.engine.ProcessEngine;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import top.egon.cola.platform.tianji.process.server.api.ProcessController;
+import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.api.EngineTaskController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessNodeExecutionController;
 import top.egon.cola.platform.tianji.process.server.api.ProcessDraftController;
@@ -60,6 +61,12 @@ import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilot
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.GovernedStartAuthority;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationModelSourceVO;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.DependencySnapshotVO;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
@@ -119,6 +126,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 
 /** The process API is opt-in and requires both identity and authorization filters. */
@@ -147,6 +156,17 @@ public class ProcessSecurityConfiguration {
     private static final List<RequestMatcher> AUTOMATION_ACTION_ROUTES = List.of(
             MATCHER.matcher(HttpMethod.GET, EngineTaskController.TASK_PATH),
             MATCHER.matcher(HttpMethod.POST, EngineTaskController.COMPLETION_PATH));
+    private static final List<RequestMatcher> AUTOMATION_WORKER_ROUTES = List.of(
+            MATCHER.matcher(HttpMethod.POST, WorkerController.ACQUIRE_AUTOMATION_PATH),
+            MATCHER.matcher(HttpMethod.POST, WorkerController.COMPLETE_AUTOMATION_PATH),
+            MATCHER.matcher(HttpMethod.POST, WorkerController.FAIL_AUTOMATION_PATH));
+
+    @Bean("automationWorkerMediaErrors")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "worker.enabled"}, havingValue = "true")
+    HandlerExceptionResolver automationWorkerMediaErrors() {
+        return ProcessApiErrors.automationWorkerMediaErrors(request -> AUTOMATION_WORKER_ROUTES.stream()
+                .anyMatch(route -> route.matches(request)));
+    }
 
     @Bean("processActivationMediaErrors")
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
@@ -200,7 +220,8 @@ public class ProcessSecurityConfiguration {
                             .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(AUTOMATION_NODE_ROUTE).authenticated();
-                    if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
+                    if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated()
+                            .requestMatchers(AUTOMATION_WORKER_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated()
                             .requestMatchers(AUTOMATION_ACTION_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
@@ -234,7 +255,7 @@ public class ProcessSecurityConfiguration {
             http.addFilterAfter(new VerifiedProcessIssuerFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(authorization, VerifiedProcessIssuerFilter.class);
             http.addFilterBefore(new ClosedProcessSecurityErrors(startReceiptReadEnabled, ownerOutcomesEnabled,
-                    workerEnabled && workerRecoveryEnabled), RequestContextFilter.class);
+                    workerEnabled && workerRecoveryEnabled, workerEnabled), RequestContextFilter.class);
         }
         return http.build();
     }
@@ -246,6 +267,11 @@ public class ProcessSecurityConfiguration {
         private final List<RequestMatcher> routes;
 
         ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled) {
+            this(startReceiptReadEnabled, ownerOutcomesEnabled, workerRecoveryEnabled, false);
+        }
+
+        ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled,
+                                    boolean workerEnabled) {
             var selected = new ArrayList<RequestMatcher>();
             addRead(selected, CORRELATION);
             if (startReceiptReadEnabled) addRead(selected, ProcessStartReceiptController.PATH);
@@ -259,6 +285,7 @@ public class ProcessSecurityConfiguration {
             selected.addAll(AUTOMATION_INSTANCE_ROUTES);
             selected.add(AUTOMATION_NODE_ROUTE);
             selected.addAll(AUTOMATION_ACTION_ROUTES);
+            if (workerEnabled) selected.addAll(AUTOMATION_WORKER_ROUTES);
             routes = List.copyOf(selected);
         }
 
@@ -307,7 +334,8 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy processEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
-                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH),
+                List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH,
+                        WorkerController.ACQUIRE_AUTOMATION_PATH, WorkerController.COMPLETE_AUTOMATION_PATH, WorkerController.FAIL_AUTOMATION_PATH),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1" + ProcessController.CORRELATION_PATH, ProcessStartReceiptController.PATH,
@@ -389,8 +417,22 @@ public class ProcessSecurityConfiguration {
 
         @Bean("automationReleaseDependencies")
         @ConditionalOnMissingBean(name = "automationReleaseDependencies")
-        AutomationReleaseStore.DependencyResolver automationReleaseDependencies() {
-            return (actor, source) -> AutomationModelValidator.DependencySnapshotVO.empty(actor.tenantId());
+        AutomationReleaseStore.DependencyResolver automationReleaseDependencies(
+                @Qualifier("workerTopicRegistry") ObjectProvider<WorkerTopicRegistry> workers) {
+            return new AutomationReleaseStore.DependencyResolver() {
+                @Override
+                public DependencySnapshotVO resolve(ProcessActor actor, AutomationModelSourceVO source) {
+                    var registry = workers.getIfAvailable();
+                    if (registry == null) return DependencySnapshotVO.empty(actor.tenantId());
+                    return new DependencySnapshotVO(actor.tenantId(), registry.automationReleaseRegistrations(actor.tenantId()),
+                            Map.of(), Set.of(), Map.of(), Map.of());
+                }
+
+                @Override
+                public boolean isCurrent(ProcessActor actor, AutomationModelSourceVO source, DependencySnapshotVO snapshot) {
+                    return resolve(actor, source).equals(snapshot);
+                }
+            };
         }
 
         @Bean("processDraftTransactionTemplate")
@@ -680,18 +722,29 @@ public class ProcessSecurityConfiguration {
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "worker.enabled"}, havingValue = "true")
     @EnableConfigurationProperties(WorkerTopicProperties.class)
     static class WorkerConfiguration {
-        @Bean
+        @Bean("workerTopicRegistry")
         @ConditionalOnMissingBean(WorkerTopicRegistry.class)
         WorkerTopicRegistry workerTopicRegistry(WorkerTopicProperties properties) {
-            return new WorkerTopicRegistry(properties.registrations());
+            return new WorkerTopicRegistry(properties.registrations(), properties.automationRegistrations());
         }
 
-        @Bean
+        @Bean("flowableWorkerService")
         @ConditionalOnMissingBean(FlowableWorkerService.class)
-        FlowableWorkerService flowableWorkerService(ProcessEngine process, DmnEngine dmn,
-                                                     ProcessModelValidator validator, WorkerTopicRegistry registry) {
+        FlowableWorkerService flowableWorkerService(ProcessEngine process, DmnEngine dmn, ProcessModelValidator validator,
+                WorkerTopicRegistry registry,
+                @Qualifier("processInstanceBindingStore") ObjectProvider<ProcessInstanceBindingStore> bindings,
+                @Qualifier("automationReleaseStore") ObjectProvider<AutomationReleaseStore> releases,
+                @Qualifier("automationInstanceGuardCommandInterceptor") ObjectProvider<AutomationInstanceGuardCommandInterceptor> guard,
+                @Qualifier("processNodeExecutionStore") ObjectProvider<ProcessNodeExecutionStore> nodes,
+                @Qualifier("processNodeLifecycleListener") ObjectProvider<ProcessNodeLifecycleListener> lifecycle) {
             var configuration = processConfiguration(process);
             WorkerNativeAvailability.requireConfigured(configuration);
+            if (registry.hasAutomationRegistrations()) {
+                engineSchemaVerifier(process).verifyAutomationV14();
+                var automation = new FlowableWorkerService.AutomationWorkerParticipants(bindings.getObject(), releases.getObject(),
+                        guard.getObject(), nodes.getObject(), lifecycle.getObject());
+                return new FlowableWorkerService(configuration, decisionConfiguration(dmn), validator, registry, automation);
+            }
             return new FlowableWorkerService(configuration, decisionConfiguration(dmn), validator, registry);
         }
     }

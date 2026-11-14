@@ -33,6 +33,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerFailureKindEnu
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
@@ -101,6 +102,15 @@ class FlowableWorkerServiceTest {
         when(configuration.isAsyncJobAcquisitionEnabled()).thenReturn(true);
         when(executor.isActive()).thenReturn(false);
         assertThrows(IllegalStateException.class, () -> WorkerNativeAvailability.require(engine));
+    }
+
+    @Test
+    void a_legacy_grant_for_the_same_capability_cannot_acquire_a_typed_job() throws Exception {
+        try (var fixture = new Fixture(false)) {
+            assertThrowsExactly(ProcessResourceNotFoundException.class,
+                    () -> fixture.service.acquireAutomation(ACTOR, new AutomationWorkerAcquireCommand("riskCheck", 1)));
+            verifyNoInteractions(fixture.management, fixture.store());
+        }
     }
 
     @Test

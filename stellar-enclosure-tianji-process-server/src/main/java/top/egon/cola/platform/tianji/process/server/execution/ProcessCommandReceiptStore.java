@@ -14,7 +14,7 @@ import java.util.Optional;
 
 /** Local transaction participant for scoped idempotency receipts. */
 public final class ProcessCommandReceiptStore {
-    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE, PROCESS_CANCEL, PROCESS_WORKER_RECOVER }
+    public enum Kind { START, DECISION, AGENT_RESULT, TASK_CLAIM, TASK_UNCLAIM, TASK_TRANSFER, TASK_COMPLETE, CASE_START, CASE_PLAN_ITEM, CASE_COMPLETION_SERVICE, PROCESS_CANCEL, PROCESS_WORKER_RECOVER, WORKER_REPORT_V2 }
 
     private static final String CORRELATION_SCOPE = " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
             + " AND command_type='START' AND state='APPLIED' AND resource_id IS NOT NULL"
@@ -54,6 +54,23 @@ public final class ProcessCommandReceiptStore {
                         rs.getString("state"), rs.getString("resource_id"), rs.getTimestamp("created_at").toInstant(),
                         rs.getString("decision_result")), actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), kind.name(), commandId);
         if (rows.size() > 1) throw new IllegalStateException("Process command receipt is ambiguous"); return rows.isEmpty() ? Optional.empty() : Optional.of(rows.getFirst());
+    }
+
+    public Optional<Receipt> findWorkerReport(ProcessActor actor, String commandId) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(jdbc.getDataSource())
+                || actor == null || actor.subjectType() != ProcessActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
+                || commandId == null || !commandId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) {
+            throw new IllegalArgumentException("Invalid Worker report lookup");
+        }
+        var rows = jdbc.query("SELECT request_sha256,release_key,correlation_id,state,resource_id,created_at FROM " + table
+                        + " WHERE tenant_id=? AND subject_type='SERVICE' AND subject_issuer=? AND subject_id=?"
+                        + " AND command_type='WORKER_REPORT_V2' AND command_id=?",
+                (rs, row) -> new Receipt(rs.getString("request_sha256"), rs.getString("release_key"),
+                        rs.getString("correlation_id"), rs.getString("state"), rs.getString("resource_id"),
+                        rs.getObject("created_at", OffsetDateTime.class).toInstant(), null),
+                actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), commandId);
+        if (rows.size() > 1) throw new IllegalStateException("Process Worker report receipt is ambiguous");
+        return rows.stream().findFirst();
     }
 
     public Receipt startByInstance(ProcessActor actor, String instanceId) {

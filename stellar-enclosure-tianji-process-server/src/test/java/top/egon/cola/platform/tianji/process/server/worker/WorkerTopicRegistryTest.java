@@ -1,6 +1,8 @@
 package top.egon.cola.platform.tianji.process.server.worker;
 
 import org.junit.jupiter.api.Test;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
+import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator.VersionedRefVO;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
@@ -15,6 +17,40 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 
 class WorkerTopicRegistryTest {
+    @Test
+    void same_capability_is_isolated_by_profile_and_exact_service_grant() {
+        var legacy = registration("https://idp.example/20", "worker-a", "1", Map.of("requestedAmount", ValueType.INTEGER));
+        var typed = typed("worker-a", "worker-east", "handler-v1");
+        var registry = new WorkerTopicRegistry(List.of(legacy), List.of(typed));
+        assertEquals(legacy, registry.require(typed.actor(), "riskCheck", "1"));
+        assertEquals(typed, registry.requireAutomation(typed.actor(), "riskCheck", 1));
+        assertTrue(typed.physicalTopic().startsWith("tianji-v2:worker:"));
+        assertNotEquals(ProcessModelValidator.nativeWorkerTopic(legacy.topic(), legacy.schemaVersion()), typed.physicalTopic());
+        assertEquals(typed.contractSha256(), registry.automationReleaseRegistrations(20)
+                .get(new VersionedRefVO("riskCheck", 1)).contractSha256());
+        assertEquals(Map.of(), registry.automationReleaseRegistrations(21));
+        for (var foreign : List.of(
+                ProcessActor.verified(20, ProcessActor.SubjectType.USER, "worker-a", "https://idp.example/20"),
+                ProcessActor.verified(21, ProcessActor.SubjectType.SERVICE, "worker-a", "https://idp.example/20"),
+                ProcessActor.verified(20, ProcessActor.SubjectType.SERVICE, "worker-a", "https://other.example/20"))) {
+            assertThrows(ProcessResourceNotFoundException.class, () -> registry.requireAutomation(foreign, "riskCheck", 1));
+        }
+        assertThrows(ProcessResourceNotFoundException.class, () -> registry.requireAutomation(typed.actor(), "riskCheck", 2));
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry(List.of(legacy), List.of(typed, typed)));
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry(List.of(legacy),
+                List.of(typed, typed("worker-b", "worker-west", "handler-v1"))));
+        assertThrows(IllegalArgumentException.class, () -> new WorkerTopicRegistry(List.of(legacy),
+                List.of(typed, typed("worker-b", "worker-east", "handler-drift"))));
+        var typedOnly = new WorkerTopicRegistry(List.of(), List.of(typed));
+        assertThrows(ProcessResourceNotFoundException.class, () -> typedOnly.require(typed.actor(), "riskCheck", "1"));
+    }
+
+    private static WorkerTopicRegistry.AutomationRegistrationVO typed(String subject, String source, String handler) {
+        return new WorkerTopicRegistry.AutomationRegistrationVO(20, "https://idp.example/20", subject, source,
+                "riskCheck", 1, "a".repeat(64), "b".repeat(64), WorkerEffectSafetyEnum.TRANSACTIONAL_RECEIPT,
+                handler, null, 2, Duration.ofSeconds(30));
+    }
+
     @Test
     void internal_agent_topics_cannot_share_a_public_registration_or_an_unrelated_result_contract() {
         var internal = new WorkerTopicRegistry.Registration(20, "https://idp.example/20", "worker-a", "agentStart", "1",

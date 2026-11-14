@@ -1,10 +1,15 @@
 package top.egon.cola.platform.tianji.process.server.worker;
 
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.json.JsonMapper;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.runtime.ProcessInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
@@ -19,6 +24,16 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcome
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerBusinessResultDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerCompletionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerTaskDTO;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
@@ -27,11 +42,19 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessConflictExcepti
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceBindingBO;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionBO;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess.RecoveryDeadletter;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessValues;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService;
 import top.egon.cola.platform.tianji.process.server.release.ProcessReleaseService.Definition;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel;
@@ -43,22 +66,33 @@ import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModel
 
 import javax.sql.DataSource;
 import java.security.SecureRandom;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Base64;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Date;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /** Secured callers provide a verified SERVICE actor; all native job changes share the lease transaction. */
+@Slf4j
 public final class FlowableWorkerService {
+    private static final JsonMapper REPORT_JSON = JsonMapper.builder().build();
+    private static final TypeReference<Map<String, Object>> REPORT_OBJECT = new TypeReference<>() { };
     private final SpringProcessEngineConfiguration process;
     private final DataSource source;
     private final ProcessModelValidator validator;
@@ -70,10 +104,19 @@ public final class FlowableWorkerService {
     private final JdbcTemplate jdbc;
     private final TransactionTemplate transaction;
     private final String schema;
+    private final AutomationWorkerParticipants automation;
+    private final ProcessCommandReceiptStore commands;
+    private final ProcessApiSchemaVerifier schemaVerifier;
+    private final TransactionTemplate automationRead;
     private final SecureRandom random = new SecureRandom();
 
     public FlowableWorkerService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
                                  ProcessModelValidator validator, WorkerTopicRegistry registry) {
+        this(process, dmn, validator, registry, null);
+    }
+
+    public FlowableWorkerService(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                 ProcessModelValidator validator, WorkerTopicRegistry registry, AutomationWorkerParticipants automation) {
         this.process = Objects.requireNonNull(process, "process");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.registry = Objects.requireNonNull(registry, "registry");
@@ -84,10 +127,17 @@ public final class FlowableWorkerService {
                 || process.getManagementService() == null || process.getRuntimeService() == null) throw invalidConfiguration();
         this.source = manager.getDataSource();
         this.schema = process.getDatabaseSchema();
-        new ProcessApiSchemaVerifier(manager.getDataSource(), schema).verifyWorker();
+        this.schemaVerifier = new ProcessApiSchemaVerifier(source, schema);
+        schemaVerifier.verifyWorker();
+        this.automation = automation;
         this.leases = new WorkerLeaseStore(manager.getDataSource(), manager, schema);
         this.jdbc = new JdbcTemplate(manager.getDataSource());
+        this.commands = new ProcessCommandReceiptStore(jdbc, schema);
         this.transaction = new TransactionTemplate(manager);
+        automationRead = new TransactionTemplate(manager);
+        automationRead.setReadOnly(true);
+        automationRead.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+        automationRead.setTimeout(10);
     }
 
     public boolean usesRecoveryStorage(SpringProcessEngineConfiguration engine, DataSource candidate) {
@@ -242,6 +292,467 @@ public final class FlowableWorkerService {
         return acquire(actor, command, false);
     }
 
+    public AutomationWorkerAcquireDTO acquireAutomation(ProcessActor actor, @Valid AutomationWorkerAcquireCommand command) {
+        if (command == null || !AutomationNodeBindingVO.isCapabilityKey(command.getCapabilityKey())
+                || command.getCapabilityVersion() < 1 || command.getCapabilityVersion() > ProcessTypedJson.V2_MAX_WIRE_INTEGER) {
+            throw invalidAutomation();
+        }
+        var registration = registry.requireAutomation(actor, command.getCapabilityKey(), command.getCapabilityVersion());
+        requireAutomationStorage();
+        WorkerNativeAvailability.require(process);
+        return Objects.requireNonNull(transaction.execute(status -> {
+            var candidate = automationCandidate(registration);
+            if (candidate.isEmpty()) return emptyAutomation();
+            var selected = candidate.orElseThrow();
+            var root = automation.guard().lockKnownRoot(actor.tenantId(), selected.instanceId());
+            var nativeJob = lockNative(actor.tenantId(), selected.jobId());
+            if (nativeJob == null || nativeJob.live() || !root.getInstanceId().equals(nativeJob.processInstanceId())
+                    || !registration.physicalTopic().equals(nativeJob.topic())) return emptyAutomation();
+            var node = automation.nodes().requireWorkerAttempt(actor.tenantId(), root.getInstanceId(), nativeJob.id());
+            var scope = automationScope(root, node, registration, nativeJob.definitionId(), nativeJob.elementId());
+            if (node.getState() != StateEnum.WAITING || node.isExcluded()) return emptyAutomation();
+            Instant now = automation.nodes().now();
+            Instant expiresAt = earlier(now.plus(registration.leaseDuration()), node.getAttemptDeadlineAt());
+            expiresAt = earlier(expiresAt, node.getNodeDeadlineAt());
+            var proof = node.getWorkerEffectRecovery();
+            if (proof != null) {
+                if (proof.observedAt().isAfter(now)) return emptyAutomation();
+                expiresAt = earlier(expiresAt, proof.validUntil());
+            }
+            expiresAt = expiresAt.truncatedTo(ChronoUnit.MILLIS);
+            if (!now.isBefore(expiresAt) || !leases.hasAutomationCapacity(actor, registration.capabilityKey(),
+                    registration.capabilityVersion(), registration.maxConcurrent())) return emptyAutomation();
+            process.getManagementService().executeCommand(context -> {
+                automation.lifecycle().verifyWorkerJob(node, nativeJob.id());
+                return null;
+            });
+            byte[] bytes = new byte[32];
+            random.nextBytes(bytes);
+            String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+            Arrays.fill(bytes, (byte) 0);
+            String tokenHash = WorkerLeaseStore.tokenHash(token);
+            String owner = "tianji-" + tokenHash;
+            lockAutomationJob(root, nativeJob, owner, expiresAt);
+            var claimed = new WorkerLeaseStore.Claim(actor, tokenHash, registration.capabilityKey(),
+                    Long.toString(registration.capabilityVersion()), nativeJob.id(), node.getOccurrenceId(), WorkerScopeTypeEnum.BPMN,
+                    root.getInstanceId(), root.getReleaseKey(), scope.definition().engineDefinitionId(), scope.nativeElementId(),
+                    node.getEffectKey(), scope.definition().modelSha256(), physicalInputSha256(scope), owner, expiresAt, registration.leaseDuration());
+            var lease = leases.claim(claimed);
+            return new AutomationWorkerAcquireDTO(AutomationWorkerAcquireDTO.StatusEnum.ACQUIRED, automationTask(scope, lease, token));
+        }));
+    }
+
+    public AutomationWorkerReportDTO completeAutomation(ProcessActor actor, @Valid AutomationWorkerCompletionCommand command) {
+        if (command == null || !command.isCompletionValid() || !validOpaqueId(command.getBusinessReceiptId(), 255)
+                || command.getEffectKey() == null || !command.getEffectKey().matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) {
+            throw invalidAutomation();
+        }
+        Map<String, Object> output = REPORT_JSON.readValue(ProcessTypedJson.canonicalBytes(command.getOutput(), 64 * 1024), REPORT_OBJECT);
+        return reportAutomation(actor, new WorkerReportCommandVO(command.getCommandId(), command.getTaskId(),
+                command.getActivityOccurrenceId(), command.getNodeExecutionRef(), command.getLeaseToken(), command.getEffectKey(),
+                command.getBusinessReceiptId(), output, null, null));
+    }
+
+    public AutomationWorkerReportDTO failAutomation(ProcessActor actor, @Valid AutomationWorkerFailureCommand command) {
+        if (command == null || command.getKind() == null || !command.isFailureValid() || command.getErrorCode() == null
+                || !command.getErrorCode().matches("[A-Z][A-Z0-9_]{0,127}")) throw invalidAutomation();
+        return reportAutomation(actor, new WorkerReportCommandVO(command.getCommandId(), command.getTaskId(),
+                command.getActivityOccurrenceId(), command.getNodeExecutionRef(), command.getLeaseToken(), null,
+                command.getBusinessReceiptId(), null, command.getKind(), command.getErrorCode()));
+    }
+
+    private AutomationWorkerReportDTO reportAutomation(ProcessActor actor, WorkerReportCommandVO command) {
+        if (actor == null || actor.subjectType() != ProcessActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())) {
+            throw unavailable();
+        }
+        requireAutomationStorage();
+        String tokenHash = WorkerLeaseStore.tokenHash(command.leaseToken());
+        var discovered = Objects.requireNonNull(automationRead.execute(status -> {
+            var original = commands.findWorkerReport(actor, command.commandId());
+            var lease = findReportedLease(actor, command, tokenHash, original.isPresent());
+            var registration = automationGrant(actor, lease);
+            if (original.isPresent() && !command.nodeRef().equals(original.orElseThrow().resourceId())) throw conflict();
+            var root = automation.bindings().find(actor.tenantId(), lease.scopeId()).orElseThrow(FlowableWorkerService::unavailable);
+            var scope = reportScope(root, lease, registration, command.nodeRef(), false);
+            var task = automationTask(scope, lease, command.leaseToken());
+            var digest = reportDigest(actor, command, task, tokenHash);
+            var replay = original.map(receipt -> replayAutomation(receipt, command, scope, lease, digest)).orElse(null);
+            return new WorkerReportDiscoveryVO(root, lease, registration, task.getTaskContractSha256(), digest, replay);
+        }));
+        if (discovered.replay() != null) return discovered.replay();
+        return Objects.requireNonNull(transaction.execute(status -> {
+            var root = automation.guard().lockKnownRoot(actor.tenantId(), discovered.root().getInstanceId());
+            if (!root.equals(discovered.root())) throw conflict();
+            var nativeJob = lockNative(actor.tenantId(), command.taskId());
+            var lease = leases.lock(actor, command.taskId(), tokenHash);
+            var scope = reportScope(root, lease, discovered.registration(), command.nodeRef(), true);
+            var task = automationTask(scope, lease, command.leaseToken());
+            if (!discovered.taskContractSha256().equals(task.getTaskContractSha256())) throw conflict();
+            var original = commands.lockIfPresent(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId());
+            if (original.isPresent()) return replayAutomation(original.orElseThrow(), command, scope, lease, discovered.digest());
+            if ("EXPIRED".equals(lease.state())) throw lost();
+            if (!"LEASED".equals(lease.state())) throw conflict();
+            verifyAutomationNative(nativeJob, lease, scope);
+            process.getManagementService().executeCommand(context -> {
+                automation.lifecycle().verifyWorkerJob(scope.node(), lease.jobId());
+                return null;
+            });
+            Instant now = automation.nodes().now();
+            if (!now.isBefore(scope.node().getAttemptDeadlineAt()) || !now.isBefore(scope.node().getNodeDeadlineAt())
+                    || !leases.isLive(actor, lease.jobId(), tokenHash)) throw lost();
+            if (!commands.insert(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId(), discovered.digest(),
+                    root.getReleaseKey(), scope.correlationId())) {
+                var concurrent = commands.lock(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId());
+                return replayAutomation(concurrent, command, scope, lease, discovered.digest());
+            }
+            var finish = command.completion() ? completeAutomationNative(command, scope, nativeJob)
+                    : failAutomationNative(command, scope, nativeJob, now);
+            var decided = leases.finish(actor, command.taskId(), tokenHash, finish);
+            commands.apply(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId(), command.nodeRef(), null);
+            return typedReceipt(decided);
+        }));
+    }
+
+    private WorkerLeaseStore.Lease findReportedLease(ProcessActor actor, WorkerReportCommandVO command, String tokenHash,
+                                                     boolean knownCommand) {
+        try {
+            return leases.find(actor, command.taskId(), tokenHash);
+        } catch (ProcessResourceNotFoundException absent) {
+            if (knownCommand) throw conflict();
+            throw absent;
+        }
+    }
+
+    private WorkerTopicRegistry.AutomationRegistrationVO automationGrant(ProcessActor actor, WorkerLeaseStore.Lease lease) {
+        if (!automationLease(lease)) throw unavailable();
+        try {
+            long version = Long.parseLong(lease.schemaVersion());
+            if (!Long.toString(version).equals(lease.schemaVersion())) throw unavailable();
+            return registry.requireAutomation(actor, lease.topic(), version);
+        } catch (NumberFormatException malformed) {
+            throw unavailable();
+        }
+    }
+
+    private WorkerAttemptScopeVO reportScope(AutomationInstanceBindingBO root, WorkerLeaseStore.Lease lease,
+            WorkerTopicRegistry.AutomationRegistrationVO registration, String nodeRef, boolean guarded) {
+        var node = guarded ? automation.nodes().requireWorkerAttempt(root.getTenantId(), root.getInstanceId(), nodeRef, lease.jobId())
+                : automation.nodes().findWorkerAttempt(root.getTenantId(), root.getInstanceId(), nodeRef, lease.jobId())
+                        .orElseThrow(FlowableWorkerService::unavailable);
+        var scope = automationScope(root, node, registration, lease.definitionId(), lease.elementId());
+        if (!root.getReleaseKey().equals(lease.releaseKey()) || !node.getOccurrenceId().equals(lease.occurrenceId())
+                || !node.getEffectKey().equals(lease.idempotencyKey()) || !scope.definition().modelSha256().equals(lease.modelSha256())
+                || !physicalInputSha256(scope).equals(lease.inputSha256()) || lease.scopeType() != WorkerScopeTypeEnum.BPMN
+                || !root.getInstanceId().equals(lease.scopeId()) || lease.tenantId() != root.getTenantId()
+                || !registration.capabilityKey().equals(lease.topic())
+                || !Long.toString(registration.capabilityVersion()).equals(lease.schemaVersion())) throw conflict();
+        return scope;
+    }
+
+    private WorkerAttemptScopeVO automationScope(AutomationInstanceBindingBO root, ProcessNodeExecutionBO node,
+            WorkerTopicRegistry.AutomationRegistrationVO registration, String engineDefinitionId, String nativeElementId) {
+        if (node.getTenantId() != registration.tenantId() || node.getTenantId() != root.getTenantId()
+                || !root.getInstanceId().equals(node.getInstanceId())
+                || !root.getConfigurationSha256().equals(node.getConfigurationSha256())
+                || !registration.capabilityKey().equals(node.getCapabilityKey())
+                || !Objects.equals(registration.capabilityVersion(), node.getCapabilityVersion())
+                || !registration.inputSchemaSha256().equals(node.getInputSchemaSha256())
+                || !registration.outputSchemaSha256().equals(node.getOutputSchemaSha256())) throw conflict();
+        var release = automation.releases().find(root.getTenantId(), root.getReleaseKey()).orElseThrow(FlowableWorkerService::automationUnavailable);
+        if (!root.getDefinitionKey().equals(release.rootDefinitionKey())) throw automationUnavailable();
+        var verified = releases.verifiedAutomation(release);
+        var slot = verified.controlBindings().occurrenceSlots().get(node.getNodeId());
+        if (slot == null || !nativeElementId.equals(slot.activityId()) || !engineDefinitionId.equals(verified.root().engineDefinitionId())) {
+            throw automationUnavailable();
+        }
+        var binding = release.source().nodeBindings().stream().filter(item -> item.nodeId().equals(node.getNodeId())).findFirst()
+                .orElseThrow(FlowableWorkerService::automationUnavailable);
+        if (!registration.capability().equals(binding.service())
+                || !(release.dependencies().get("workerCapabilities") instanceof Map<?, ?> workers)
+                || !(workers.get(node.getNodeId()) instanceof Map<?, ?> worker)
+                || !registration.contractSha256().equals(worker.get("contractSha256"))) throw unavailable();
+        Map<String, Object> input = typedObject(binding.inputSchema().normalizeValue(node.getInput()));
+        byte[] canonical = ProcessTypedJson.canonicalBytes(input, 64 * 1024);
+        if (!Arrays.equals(canonical, ProcessTypedJson.canonicalBytes(node.getInput(), 64 * 1024))
+                || !ProcessTypedJson.sha256("AUTOMATION_NODE_INPUT_V2", utf8(node.getInputSchemaSha256()), canonical)
+                    .equals(node.getInputSha256())) throw automationUnavailable();
+        String fingerprint = ProcessTypedJson.sha256("AUTOMATION_WORKER_EFFECT_V2", utf8(registration.capabilityKey()),
+                utf8(Long.toString(registration.capabilityVersion())), utf8(registration.inputSchemaSha256()),
+                utf8(registration.outputSchemaSha256()), utf8(registration.effectMode().name()), utf8(registration.handlerVersion()),
+                ProcessTypedJson.canonicalBytes(registration.targetId()), canonical);
+        var start = commands.startByInstance(root.getOwner(), root.getInstanceId());
+        if (!root.getReleaseKey().equals(start.releaseKey()) || !root.getResolvedStartSha256().equals(start.requestHash())
+                || !root.getSubmittedAt().equals(start.createdAt()) || !root.getInstanceId().equals(start.resourceId())) throw automationUnavailable();
+        return new WorkerAttemptScopeVO(node, registration, binding, verified.root(), nativeElementId,
+                start.correlationId(), input, rawSha256(canonical), fingerprint);
+    }
+
+    private AutomationWorkerTaskDTO automationTask(WorkerAttemptScopeVO scope, WorkerLeaseStore.Lease lease, String token) {
+        var node = scope.node();
+        var registration = scope.registration();
+        var task = new AutomationWorkerTaskDTO(lease.jobId(), lease.occurrenceId(), node.getNodeExecutionRef(), token,
+                registration.capabilityKey(), registration.capabilityVersion(), scope.input(), scope.inputSha256(),
+                node.getEffectKey(), node.getAttemptDeadlineAt(), lease.leaseExpiresAt(), registration.handlerVersion(),
+                registration.effectMode(), registration.targetId(), registration.inputSchemaSha256(), registration.outputSchemaSha256(),
+                scope.effectFingerprint(), node.getWorkerEffectRecovery(), null);
+        if (!lease.tokenSha256().equals(task.leaseTokenSha256())) throw conflict();
+        return task.setTaskContractSha256(task.contractSha256(registration.tenantId(), registration.sourceId()));
+    }
+
+    private Optional<WorkerCandidateVO> automationCandidate(WorkerTopicRegistry.AutomationRegistrationVO registration) {
+        var rows = jdbc.query("""
+                SELECT j.id_,j.process_instance_id_ FROM %1$s.act_ru_external_job j
+                JOIN %1$s.act_ru_execution root ON root.id_=j.process_instance_id_ AND root.parent_id_ IS NULL
+                    AND root.tenant_id_=j.tenant_id_ AND root.proc_def_id_=j.proc_def_id_ AND root.suspension_state_=1
+                JOIN %1$s.tianji_process_node_execution n ON n.native_job_id=j.id_ AND n.instance_id=j.process_instance_id_
+                    AND n.tenant_id=? AND n.state='WAITING' AND NOT n.excluded AND n.attempt_deadline_at>clock_timestamp()
+                    AND n.node_deadline_at>clock_timestamp()
+                WHERE j.tenant_id_=? AND j.handler_cfg_=? AND j.process_instance_id_ IS NOT NULL
+                    AND (j.lock_exp_time_ IS NULL OR j.lock_exp_time_<=clock_timestamp()) AND j.retries_>0
+                    AND (j.duedate_ IS NULL OR j.duedate_<=clock_timestamp())
+                ORDER BY j.create_time_, j.id_ COLLATE "C" LIMIT 1
+                """.formatted(schema),
+                (rs, index) -> new WorkerCandidateVO(rs.getString(1), rs.getString(2)),
+                registration.tenantId(), Long.toString(registration.tenantId()), registration.physicalTopic());
+        return rows.stream().findFirst();
+    }
+
+    private void lockAutomationJob(AutomationInstanceBindingBO root, NativeJob nativeJob, String owner, Instant expiresAt) {
+        AutomationInstanceGuardCommandInterceptor.requireHeld(root.getTenantId(), root.getInstanceId());
+        process.getManagementService().executeCommand(context -> {
+            var configuration = process.getJobServiceConfiguration();
+            var entity = configuration.getExternalWorkerJobEntityManager().findById(nativeJob.id());
+            if (entity == null || !Long.toString(root.getTenantId()).equals(entity.getTenantId())
+                    || !root.getInstanceId().equals(entity.getProcessInstanceId())
+                    || !nativeJob.definitionId().equals(entity.getProcessDefinitionId())
+                    || !nativeJob.executionId().equals(entity.getExecutionId())
+                    || !nativeJob.elementId().equals(entity.getElementId())
+                    || !nativeJob.topic().equals(entity.getJobHandlerConfiguration())
+                    || entity.getRetries() < 1 || !Objects.equals(nativeJob.owner(), entity.getLockOwner())) throw conflict();
+            entity.setLockOwner(owner);
+            entity.setLockExpirationTime(Date.from(expiresAt));
+            if (entity.isExclusive()) configuration.getInternalJobManager().lockJobScope(entity);
+            return null;
+        });
+    }
+
+    private static void verifyAutomationNative(NativeJob job, WorkerLeaseStore.Lease lease, WorkerAttemptScopeVO scope) {
+        if (job == null || !job.live() || !lease.nativeOwner().equals(job.owner())
+                || !lease.jobId().equals(job.id()) || !lease.definitionId().equals(job.definitionId())
+                || !lease.scopeId().equals(job.processInstanceId()) || !lease.elementId().equals(job.elementId())
+                || !scope.registration().physicalTopic().equals(job.topic())
+                || scope.node().getState() != StateEnum.WAITING || scope.node().isExcluded()) throw lost();
+    }
+
+    private WorkerLeaseStore.Finish completeAutomationNative(WorkerReportCommandVO command, WorkerAttemptScopeVO scope, NativeJob job) {
+        var output = normalizeWorkerOutput(command, scope);
+        var node = scope.node();
+        var resultRef = automation.nodes().acceptWorkerResult(node, job.id(), output,
+                scope.registration().effectMode() != WorkerEffectSafetyEnum.READ_ONLY);
+        process.getManagementService().createExternalWorkerCompletionBuilder(job.id(), job.owner())
+                .variables(Map.of("resultRef", resultRef)).complete();
+        return completePhysicalReceipt(command, resultRef);
+    }
+
+    private WorkerLeaseStore.Finish failAutomationNative(WorkerReportCommandVO command, WorkerAttemptScopeVO scope, NativeJob job, Instant now) {
+        var policy = scope.binding().policy();
+        var node = scope.node();
+        boolean reportedRetry = command.kind() == AutomationWorkerFailureCommand.KindEnum.RETRYABLE;
+        boolean uncertainEffect = command.kind() == AutomationWorkerFailureCommand.KindEnum.UNKNOWN
+                || reportedRetry && scope.registration().effectMode() != WorkerEffectSafetyEnum.READ_ONLY;
+        boolean retry = reportedRetry && !uncertainEffect
+                && "RETRY".equals(policy.onFailure().action())
+                && policy.retry().retryableCodes().contains(command.errorCode())
+                && node.getAttempt() < policy.retry().maxAttempts()
+                && now.plus(policy.retry().backoff()).isBefore(node.getNodeDeadlineAt());
+        if (uncertainEffect) {
+            process.getManagementService().executeCommand(context -> {
+                automation.lifecycle().parkWorkerFailure(node, job.id(), command.errorCode());
+                return null;
+            });
+        } else if (retry) {
+            process.getManagementService().executeCommand(context -> {
+                automation.lifecycle().scheduleWorkerRetry(node, job.id(), command.errorCode());
+                return null;
+            });
+        } else if ("WAIT_RECOVERY".equals(policy.onFailure().action()) || "RETRY".equals(policy.onFailure().action())) {
+            process.getManagementService().executeCommand(context -> {
+                automation.lifecycle().parkKnownWorkerFailure(node, job.id(), command.errorCode());
+                return null;
+            });
+        } else {
+            automation.nodes().acceptWorkerFailure(node, job.id(), command.kind(), command.errorCode(), false);
+            process.getManagementService().createExternalWorkerCompletionBuilder(job.id(), job.owner()).bpmnError("TIANJI_AUTOMATION_NODE_FAILURE");
+        }
+        return failPhysicalReceipt(command, retry ? WorkerReceiptOutcomeEnum.RETRY_SCHEDULED : WorkerReceiptOutcomeEnum.NEEDS_MANUAL);
+    }
+
+    private static WorkerLeaseStore.Finish completePhysicalReceipt(WorkerReportCommandVO command, String resultRef) {
+        String hash = ProcessRequestDigest.hash(List.of("worker-complete-v1", command.taskId(), command.occurrenceId(),
+                command.businessReceiptId()), Map.of("resultRef", resultRef));
+        return new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.COMPLETED, hash, command.businessReceiptId(), null, null);
+    }
+
+    private static WorkerLeaseStore.Finish failPhysicalReceipt(WorkerReportCommandVO command, WorkerReceiptOutcomeEnum outcome) {
+        var kind = switch (command.kind()) {
+            case RETRYABLE -> WorkerFailureKindEnum.RETRYABLE;
+            case PERMANENT -> WorkerFailureKindEnum.BUSINESS_REJECTED;
+            case UNKNOWN -> WorkerFailureKindEnum.UNKNOWN;
+        };
+        String error = switch (command.kind()) {
+            case RETRYABLE -> "V2_RETRYABLE";
+            case PERMANENT -> "V2_PERMANENT";
+            case UNKNOWN -> "V2_EFFECT_UNKNOWN";
+        };
+        String hash = ProcessRequestDigest.hash(List.of("worker-fail-v1", command.taskId(), command.occurrenceId(), kind.name(), error), Map.of());
+        return new WorkerLeaseStore.Finish(outcome, hash, null, kind, error);
+    }
+
+    private static AutomationWorkerReportDTO replayAutomation(ProcessCommandReceiptStore.Receipt original, WorkerReportCommandVO command,
+            WorkerAttemptScopeVO scope, WorkerLeaseStore.Lease lease, String digest) {
+        if (!digest.equals(original.requestHash()) || !command.nodeRef().equals(original.resourceId())) throw conflict();
+        if (!"APPLIED".equals(original.state()) || !lease.releaseKey().equals(original.releaseKey())
+                || !scope.correlationId().equals(original.correlationId()) || lease.decidedAt() == null) throw automationUnavailable();
+        WorkerLeaseStore.Finish expected;
+        if (command.completion()) {
+            if (!"COMPLETED".equals(lease.state())) throw automationUnavailable();
+            var normalized = normalizeWorkerOutput(command, scope);
+            var row = scope.node();
+            var outputSha = AutomationWorkerBusinessResultDTO.nodeOutputSha256(row.getOutputSchemaSha256(), normalized);
+            if (!outputSha.equals(row.getOutputSha256())) throw automationUnavailable();
+            expected = completePhysicalReceipt(command, ProcessNodeExecutionStore.resultRef(row, outputSha));
+        } else {
+            if (!Set.of("RETRY_SCHEDULED", "NEEDS_MANUAL").contains(lease.state())) throw automationUnavailable();
+            expected = failPhysicalReceipt(command, WorkerReceiptOutcomeEnum.valueOf(lease.state()));
+        }
+        if (!expected.outcome().name().equals(lease.state()) || !expected.resultSha256().equals(lease.resultSha256())
+                || !Objects.equals(expected.businessReceiptId(), lease.businessReceiptId()) || expected.failureKind() != lease.failureKind()
+                || !Objects.equals(expected.failureCode(), lease.failureCode())) throw automationUnavailable();
+        return typedReceipt(lease);
+    }
+
+    private static Map<String, Object> normalizeWorkerOutput(WorkerReportCommandVO command, WorkerAttemptScopeVO scope) {
+        var output = typedObject(scope.binding().outputSchema().normalizeValue(command.output()));
+        var effectHash = AutomationWorkerBusinessResultDTO.resultSha256(scope.effectFingerprint(), command.businessReceiptId(), output);
+        var proof = scope.node().getWorkerEffectRecovery();
+        if (proof != null && proof.mode() == top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO.Mode.REPLAY_APPLIED
+                && (!command.businessReceiptId().equals(proof.businessReceiptId()) || !effectHash.equals(proof.resultSha256()))) throw conflict();
+        return output;
+    }
+
+    private static String reportDigest(ProcessActor actor, WorkerReportCommandVO report, AutomationWorkerTaskDTO task, String tokenHash) {
+        if (!task.getActivityOccurrenceId().equals(report.occurrenceId())
+                || report.completion() && !task.getEffectKey().equals(report.effectKey())) throw conflict();
+        var fields = new LinkedHashMap<String, Object>();
+        fields.put("operation", report.completion() ? "COMPLETE" : "FAIL");
+        fields.put("actor", Map.of("tenantId", actor.tenantId(), "subjectType", actor.subjectType().name(),
+                "issuerFingerprint", actor.issuerFingerprint(), "subjectId", actor.subjectId()));
+        fields.put("commandId", report.commandId());
+        fields.put("taskId", report.taskId());
+        fields.put("activityOccurrenceId", report.occurrenceId());
+        fields.put("nodeExecutionRef", report.nodeRef());
+        fields.put("leaseTokenSha256", tokenHash);
+        fields.put("taskContractSha256", task.getTaskContractSha256());
+        fields.put("effectKey", task.getEffectKey());
+        fields.put("businessReceiptId", report.businessReceiptId());
+        if (report.completion()) {
+            fields.put("output", report.output());
+        } else {
+            fields.put("kind", report.kind().name());
+            fields.put("errorCode", report.errorCode());
+        }
+        return ProcessTypedJson.sha256("AUTOMATION_WORKER_REPORT_V2", ProcessTypedJson.canonicalBytes(fields, 72 * 1024));
+    }
+
+    private void requireAutomationStorage() {
+        if (automation == null || TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()) throw automationUnavailable();
+    }
+
+    private static AutomationWorkerAcquireDTO emptyAutomation() {
+        return new AutomationWorkerAcquireDTO(AutomationWorkerAcquireDTO.StatusEnum.EMPTY, null);
+    }
+
+    private static AutomationWorkerReportDTO typedReceipt(WorkerLeaseStore.Lease lease) {
+        var outcome = switch (lease.state()) {
+            case "COMPLETED" -> AutomationWorkerReportDTO.OutcomeEnum.COMPLETED;
+            case "RETRY_SCHEDULED" -> AutomationWorkerReportDTO.OutcomeEnum.RETRY_SCHEDULED;
+            case "NEEDS_MANUAL" -> switch (lease.failureCode()) {
+                case "V2_PERMANENT" -> AutomationWorkerReportDTO.OutcomeEnum.PERMANENT;
+                case "V2_EFFECT_UNKNOWN" -> AutomationWorkerReportDTO.OutcomeEnum.UNKNOWN;
+                case "V2_RETRYABLE" -> AutomationWorkerReportDTO.OutcomeEnum.NEEDS_MANUAL;
+                default -> throw automationUnavailable();
+            };
+            default -> throw automationUnavailable();
+        };
+        return new AutomationWorkerReportDTO(lease.jobId(), lease.occurrenceId(), outcome, lease.decidedAt());
+    }
+
+    private static Instant earlier(Instant left, Instant right) { return left.isBefore(right) ? left : right; }
+    private static byte[] utf8(String value) { return value.getBytes(StandardCharsets.UTF_8); }
+    private static String rawSha256(byte[] data) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(data));
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw automationUnavailable();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> typedObject(Object value) {
+        if (!(value instanceof Map<?, ?> object)) throw invalidAutomation();
+        return (Map<String, Object>) object;
+    }
+
+    private static boolean validOpaqueId(String value, int max) {
+        return value != null && !value.isBlank() && value.length() <= max && value.equals(value.trim())
+                && value.chars().noneMatch(Character::isISOControl);
+    }
+
+    private static boolean automationLease(WorkerLeaseStore.Lease lease) {
+        return !lease.jobId().equals(lease.occurrenceId());
+    }
+
+    private static String physicalInputSha256(WorkerAttemptScopeVO scope) {
+        var node = scope.node();
+        var registration = scope.registration();
+        return WorkerLeaseStore.automationPhysicalInputSha256(node.getNativeJobId(), node.getInstanceId(),
+                scope.definition().engineDefinitionId(), scope.nativeElementId(), registration.capabilityKey(),
+                registration.capabilityVersion(), node.getNodeExecutionRef(), node.getInputSha256(), node.getConfigurationSha256());
+    }
+
+    private static IllegalArgumentException invalidAutomation() { return new IllegalArgumentException("Invalid typed Worker command"); }
+    private static IllegalStateException automationUnavailable() { return new IllegalStateException("Typed Worker evidence is unavailable"); }
+
+    public record AutomationWorkerParticipants(ProcessInstanceBindingStore bindings, AutomationReleaseStore releases,
+            AutomationInstanceGuardCommandInterceptor guard, ProcessNodeExecutionStore nodes, ProcessNodeLifecycleListener lifecycle) {
+        public AutomationWorkerParticipants {
+            Objects.requireNonNull(bindings);
+            Objects.requireNonNull(releases);
+            Objects.requireNonNull(guard);
+            Objects.requireNonNull(nodes);
+            Objects.requireNonNull(lifecycle);
+        }
+    }
+
+    private record WorkerCandidateVO(String jobId, String instanceId) { }
+    private record WorkerAttemptScopeVO(ProcessNodeExecutionBO node, WorkerTopicRegistry.AutomationRegistrationVO registration,
+            AutomationNodeBindingVO binding, Definition definition, String nativeElementId, String correlationId,
+            Map<String, Object> input, String inputSha256, String effectFingerprint) { }
+    private record WorkerReportDiscoveryVO(AutomationInstanceBindingBO root, WorkerLeaseStore.Lease lease,
+            WorkerTopicRegistry.AutomationRegistrationVO registration, String taskContractSha256, String digest,
+            AutomationWorkerReportDTO replay) { }
+    private record WorkerReportCommandVO(String commandId, String taskId, String occurrenceId, String nodeRef, String leaseToken,
+            String effectKey, String businessReceiptId, Map<String, Object> output, AutomationWorkerFailureCommand.KindEnum kind, String errorCode) {
+        private WorkerReportCommandVO {
+            if (commandId == null || !commandId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+                    || !validOpaqueId(taskId, 255) || !validOpaqueId(occurrenceId, 255)
+                    || nodeRef == null || !nodeRef.matches("[A-Za-z][A-Za-z0-9_.:-]{0,127}")) throw invalidAutomation();
+        }
+        private boolean completion() { return kind == null; }
+        @Override public String toString() { return "WorkerReportCommandVO[redacted]"; }
+    }
+
     public AcquireWorkerTaskResult acquireAgentDispatch(AgentDispatchBinding binding) {
         Objects.requireNonNull(binding, "binding");
         FlowableAgentWaitInspector.requireHistory(process);
@@ -302,6 +813,7 @@ public final class FlowableWorkerService {
         var finish = new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.COMPLETED, resultHash, command.businessReceiptId(), null, null);
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
+            if (automationLease(current)) throw unavailable();
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
             requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();
@@ -396,6 +908,7 @@ public final class FlowableWorkerService {
                 command.kind().name(), command.errorCode()), Map.of());
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
+            if (automationLease(current)) throw unavailable();
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
             requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();

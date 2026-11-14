@@ -3,7 +3,10 @@ package top.egon.cola.platform.tianji.process.server.api;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.validation.ConstraintViolationException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.servlet.HandlerMapping;
 import java.util.concurrent.RejectedExecutionException;
 import org.springframework.dao.DataAccessException;
@@ -80,6 +83,36 @@ public final class ProcessApiErrors {
     @ExceptionHandler({IllegalArgumentException.class, HttpMessageNotReadableException.class})
     ResponseEntity<OrchestrationErrorDTO> invalid() { return error(HttpStatus.BAD_REQUEST, "TIANJI_INVALID_COMMAND"); }
 
+    @ExceptionHandler({MethodArgumentNotValidException.class, ConstraintViolationException.class})
+    ResponseEntity<OrchestrationErrorDTO> invalidValidation() { return invalid(); }
+
+    @ExceptionHandler(HandlerMethodValidationException.class)
+    ResponseEntity<OrchestrationErrorDTO> invalidMethod(HandlerMethodValidationException failure) {
+        return failure.isForReturnValue() ? error(HttpStatus.INTERNAL_SERVER_ERROR, "TIANJI_INTERNAL_ERROR") : invalid();
+    }
+
+    public static HandlerExceptionResolver automationWorkerMediaErrors(RequestMatcher route) {
+        return new AbstractHandlerExceptionResolver() {
+            @Override
+            protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,
+                                                      Object handler, Exception failure) {
+                if (response.isCommitted() || !route.matches(request)) return null;
+                if (failure instanceof HttpMediaTypeNotSupportedException) {
+                    return closedMediaResponse(response, HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE, "TIANJI_UNSUPPORTED_MEDIA_TYPE");
+                }
+                if (failure instanceof HttpMediaTypeNotAcceptableException) {
+                    return closedMediaResponse(response, HttpServletResponse.SC_BAD_REQUEST, "TIANJI_INVALID_COMMAND");
+                }
+                return null;
+            }
+
+            @Override
+            public int getOrder() {
+                return -1;
+            }
+        };
+    }
+
     /** Media selection can fail before MVC has selected a controller for package-scoped advice. */
     public static HandlerExceptionResolver closedJsonMediaErrors(RequestMatcher route) {
         return closedJsonMediaErrors(route, request -> false);
@@ -94,16 +127,7 @@ public final class ProcessApiErrors {
                         && (route.matches(request) || acceptOnlyRoute.matches(request));
                 boolean unsupportedType = failure instanceof HttpMediaTypeNotSupportedException && route.matches(request);
                 if ((!unsupportedAccept && !unsupportedType) || response.isCommitted()) return null;
-                response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-                response.setContentType(MediaType.APPLICATION_JSON_VALUE);
-                response.setCharacterEncoding(StandardCharsets.UTF_8.name());
-                response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
-                try {
-                    response.getWriter().write("{\"code\":\"TIANJI_INVALID_COMMAND\",\"correlationId\":null}");
-                } catch (java.io.IOException unavailable) {
-                    throw new UncheckedIOException(unavailable);
-                }
-                return new ModelAndView();
+                return closedMediaResponse(response, HttpServletResponse.SC_BAD_REQUEST, "TIANJI_INVALID_COMMAND");
             }
 
             @Override
@@ -111,6 +135,19 @@ public final class ProcessApiErrors {
                 return -1;
             }
         };
+    }
+
+    private static ModelAndView closedMediaResponse(HttpServletResponse response, int status, String code) {
+        response.setStatus(status);
+        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        response.setCharacterEncoding(StandardCharsets.UTF_8.name());
+        response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+        try {
+            response.getWriter().write("{\"code\":\"" + code + "\",\"correlationId\":null}");
+        } catch (java.io.IOException unavailable) {
+            throw new UncheckedIOException(unavailable);
+        }
+        return new ModelAndView();
     }
 
     @ExceptionHandler({ProcessRequestBodyAdvice.TooLarge.class, CaseRequestBodyAdvice.TooLarge.class})
@@ -134,7 +171,9 @@ public final class ProcessApiErrors {
         if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler) {
             if (failure instanceof RejectedExecutionException
                     && (EngineTaskController.class.isAssignableFrom(handler.getBeanType())
-                        || ProcessNodeExecutionController.class.isAssignableFrom(handler.getBeanType()))) {
+                        || ProcessNodeExecutionController.class.isAssignableFrom(handler.getBeanType())
+                        || WorkerController.class.isAssignableFrom(handler.getBeanType())
+                        && handler.getMethod().getName().endsWith("AutomationWorkerTask"))) {
                 return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
             }
             if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())

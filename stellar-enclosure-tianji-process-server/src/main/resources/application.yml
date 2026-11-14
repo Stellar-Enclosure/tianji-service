@@ -83,6 +83,10 @@ stellar:
       migration-preflight:
         enabled: false
         http-enabled: false
+      worker:
+        enabled: false
+        registrations: []
+        automation-registrations: []
       worker-recovery:
         enabled: false
       cases:

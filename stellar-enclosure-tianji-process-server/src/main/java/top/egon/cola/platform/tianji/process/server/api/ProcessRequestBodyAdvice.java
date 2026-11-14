@@ -33,6 +33,9 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.Dis
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.PublishProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.SaveProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.ValidateProcessDraftQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerCompletionCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftContentCodec;
 
 import java.io.ByteArrayInputStream;
@@ -59,6 +62,13 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     private static final int MAX_ACTIVATION_COMMAND_BYTES = 4 * 1024;
     private static final int MAX_AUTOMATION_START_BYTES = 384 * 1024;
     private static final int MAX_ENGINE_TASK_COMPLETION_BYTES = 68 * 1024;
+    private static final int MAX_AUTOMATION_WORKER_ACQUIRE_BYTES = 4 * 1024;
+    private static final int MAX_AUTOMATION_WORKER_REPORT_BYTES = 68 * 1024;
+    private static final Set<String> WORKER_ACQUIRE_FIELDS = Set.of("capabilityKey", "capabilityVersion");
+    private static final Set<String> WORKER_COMPLETE_FIELDS = Set.of("taskId", "activityOccurrenceId", "nodeExecutionRef",
+            "leaseToken", "commandId", "effectKey", "businessReceiptId", "output");
+    private static final Set<String> WORKER_FAIL_FIELDS = Set.of("taskId", "activityOccurrenceId", "nodeExecutionRef",
+            "leaseToken", "commandId", "kind", "errorCode", "businessReceiptId");
     private static final Set<String> ENGINE_TASK_COMPLETION_FIELDS = Set.of("commandId", "expectedVersion", "result");
     private static final Set<String> ACTIVATION_FIELDS = Set.of("releaseVersion", "expectedActivationRevision", "commandId");
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
@@ -88,14 +98,14 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
                 || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
                 || type == RecoverProcessWorkerCommand.class || draftCommand(type) || type == ActivationCommand.class
-                || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class;
+                || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class || automationWorkerCommand(type);
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
         if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class
-                || type == CompleteEngineHumanTaskCommand.class) {
+                || type == CompleteEngineHumanTaskCommand.class || automationWorkerCommand(type)) {
             var contentType = input.getHeaders().getContentType();
             if (contentType != null && contentType.getCharset() != null
                     && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
@@ -106,6 +116,8 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
                 : draftCommand(type) ? MAX_DRAFT_COMMAND_BYTES
                 : type == AutomationStartCommand.class ? MAX_AUTOMATION_START_BYTES
                 : type == CompleteEngineHumanTaskCommand.class ? MAX_ENGINE_TASK_COMPLETION_BYTES
+                : type == AutomationWorkerAcquireCommand.class ? MAX_AUTOMATION_WORKER_ACQUIRE_BYTES
+                : automationWorkerCommand(type) ? MAX_AUTOMATION_WORKER_REPORT_BYTES
                 : type == ActivationCommand.class ? MAX_ACTIVATION_COMMAND_BYTES
                 : type == RecoverProcessWorkerCommand.class ? MAX_PROCESS_WORKER_RECOVERY_BYTES
                 : type == CancelProcessCommand.class ? MAX_PROCESS_CANCEL_BYTES
@@ -114,6 +126,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         byte[] body = input.getBody().readNBytes(maxBytes + 1);
         if (body.length > maxBytes) throw new TooLarge();
         if (workerCommand(type)) validateWorkerBody(body, type);
+        if (automationWorkerCommand(type)) validateAutomationWorkerBody(body, type);
         if (type == AgentTerminalEvent.class) validateAgentResult(body);
         if (type == CancelProcessCommand.class) validateProcessCancel(body);
         if (type == RecoverProcessWorkerCommand.class) validateProcessWorkerRecovery(body);
@@ -132,6 +145,51 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
 
     private static boolean workerCommand(Type type) {
         return type == AcquireWorkerTaskCommand.class || type == CompleteWorkerTaskCommand.class || type == FailWorkerTaskCommand.class;
+    }
+
+    private static boolean automationWorkerCommand(Type type) {
+        return type == AutomationWorkerAcquireCommand.class || type == AutomationWorkerCompletionCommand.class
+                || type == AutomationWorkerFailureCommand.class;
+    }
+
+    private static void validateAutomationWorkerBody(byte[] body, Type type) {
+        Set<String> expected = type == AutomationWorkerAcquireCommand.class ? WORKER_ACQUIRE_FIELDS
+                : type == AutomationWorkerCompletionCommand.class ? WORKER_COMPLETE_FIELDS : WORKER_FAIL_FIELDS;
+        try {
+            var json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var root = STRICT_AUTOMATION_START_JSON.readTree(json);
+            if (root == null || !root.isObject() || !Set.copyOf(root.propertyNames()).equals(expected)) {
+                throw invalidWorkerBody();
+            }
+            for (String name : expected) {
+                var field = root.path(name);
+                if ("capabilityVersion".equals(name)) {
+                    if (!field.isIntegralNumber() || !field.canConvertToLong()
+                            || field.longValue() < 1 || field.longValue() > ProcessTypedJson.V2_MAX_WIRE_INTEGER) {
+                        throw invalidWorkerBody();
+                    }
+                } else if ("output".equals(name)) {
+                    if (!field.isObject()) throw invalidWorkerBody();
+                    validateAutomationWorkerOutput(field);
+                } else if (!(type == AutomationWorkerFailureCommand.class && "businessReceiptId".equals(name) && field.isNull())
+                        && !field.isString()) {
+                    throw invalidWorkerBody();
+                }
+            }
+        } catch (CharacterCodingException | RuntimeException invalid) {
+            throw invalidWorkerBody();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void validateAutomationWorkerOutput(JsonNode output) {
+        var values = (Map<String, Object>) STRICT_AUTOMATION_START_JSON.treeToValue(output, Map.class);
+        ProcessTypedJson.validateTypedIntegerLeaves(values);
+        ProcessTypedJson.canonicalBytes(values, 64 * 1024);
+    }
+
+    private static IllegalArgumentException invalidWorkerBody() {
+        return new IllegalArgumentException("Invalid automation Worker request");
     }
 
     private static boolean draftCommand(Type type) {
