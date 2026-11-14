@@ -4,10 +4,12 @@ import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptClient;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSession;
+import java.io.IOException;
 import java.net.Authenticator;
 import java.net.CookieHandler;
 import java.net.ProxySelector;
@@ -34,6 +36,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static top.egon.cola.platform.tianji.client.HttpProcessAutomationClientTest.startGolden;
+import static top.egon.cola.platform.tianji.client.HttpProcessDraftClientTest.JSON;
 
 class ProcessStartReceiptHttpTest {
     private static final String TOKEN = "fixture-private-bearer";
@@ -156,6 +160,47 @@ class ProcessStartReceiptHttpTest {
         redirect.redirect = HttpClient.Redirect.ALWAYS;
         assertThrows(IllegalArgumentException.class, () -> client(redirect));
         assertEquals(0, redirect.sent);
+    }
+
+    @Test
+    void recovers_the_exact_v2_start_digest_through_the_unchanged_v1_receipt_query() throws IOException {
+        String exact = "7cfa4c0086eaadc9837ce74cbf54d7420a290d50fdad3d30db4ed485ff411323";
+        long max = ProcessTypedJson.V2_MAX_WIRE_INTEGER;
+        var command = startGolden("1.00", max);
+        var query = HttpProcessAutomationClient.startReceiptQuery(command);
+        assertEquals(new GetProcessStartReceiptQuery("start-101", exact), query);
+        assertEquals("8758777d98df5e731e4ac50e896692e0cec31a15d4b00236c0d388399c82bac2",
+                HttpProcessAutomationClient.startReceiptQuery(startGolden("1.0", max)).requestSha256());
+        assertThrows(IllegalArgumentException.class, () -> HttpProcessAutomationClient.startReceiptQuery(
+                command.setVariables(Map.of("overflow", 9_007_199_254_740_993L))));
+
+        try (var fixture = new HttpProcessDraftClientTest.Fixture(); var http = HttpClient.newHttpClient();
+             var automation = new HttpProcessAutomationClient(fixture.base, http, () -> TOKEN, Duration.ofSeconds(3))) {
+            fixture.handler = request -> "POST".equals(request.method()) ? null : HttpProcessDraftClientTest.Reply.json(RECEIPT);
+            var original = startGolden("1.00", max);
+            assertEquals("TIANJI_DEPENDENCY_UNAVAILABLE", assertThrows(ProcessClientException.class, () -> automation.start(original)).code());
+            var post = fixture.take();
+            assertEquals("/api/tianji/v2/process-instances", post.path());
+            var actualWire = JSON.readTree(post.body());
+            assertEquals("1.00", actualWire.path("variables").path("amount").asString());
+            assertEquals("十", actualWire.path("variables").path("10").asString());
+            assertEquals(max, actualWire.path("agentTaskOverrides").path("agentNode").path("templateRef").path("version").asLong());
+            @SuppressWarnings("unchecked")
+            Map<String, Object> originalWire = JSON.readValue(post.body(), Map.class);
+            assertEquals(exact, ProcessTypedJson.startRequestSha256(originalWire));
+            assertNull(fixture.poll());
+
+            var receiptClient = new HttpProcessClient(fixture.base, http, () -> TOKEN, Duration.ofSeconds(3));
+            assertEquals("instance-1", receiptClient.getStartReceipt(query).instanceId());
+            var lookup = fixture.take();
+            assertEquals("GET", lookup.method());
+            assertEquals(ProcessStartReceiptClient.START_RECEIPT_PATH, lookup.path());
+            assertEquals("commandId=start-101&requestSha256=" + exact, lookup.query());
+            fixture.handler = request -> new HttpProcessDraftClientTest.Reply(404, "application/json", error("TIANJI_RESOURCE_NOT_FOUND"));
+            assertEquals(404, assertThrows(ProcessClientException.class, () -> receiptClient.getStartReceipt(query)).httpStatus());
+            assertEquals("GET", fixture.take().method());
+            assertNull(fixture.poll());
+        }
     }
 
     private static ProcessStartReceiptClient client(FakeHttpClient wire) {
