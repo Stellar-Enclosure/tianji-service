@@ -1,5 +1,10 @@
 package top.egon.cola.platform.tianji.process.server.api;
 
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
@@ -19,24 +24,21 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionResource;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.RequiresPermissions;
 
-import java.util.Objects;
+import java.io.IOException;
 import java.util.Set;
 
-@RestController
+@Slf4j
+@RestController("processStartReceiptController")
 @RequestMapping(path = ProcessStartReceiptController.PATH, produces = MediaType.APPLICATION_JSON_VALUE)
 @ConditionalOnProperty(prefix = "stellar.tianji.process.api",
         name = {"enabled", "start-receipt-read-enabled"}, havingValue = "true")
+@RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class ProcessStartReceiptController {
     public static final String PATH = "/api/tianji/v1/process-start-receipts";
     private static final Set<String> QUERY_PARAMETERS = Set.of("commandId", "requestSha256");
 
-    private final ProcessExecutionService processes;
-    private final TianjiProcessAccess access;
-
-    public ProcessStartReceiptController(ProcessExecutionService processes, TianjiProcessAccess access) {
-        this.processes = Objects.requireNonNull(processes, "processes");
-        this.access = Objects.requireNonNull(access, "access");
-    }
+    @Qualifier("processExecutionService") private final ProcessExecutionService processes;
+    @Qualifier("tianjiProcessAccess") private final TianjiProcessAccess access;
 
     @PermissionResource(key = TianjiProcessPermissions.START_RECEIPT_GET_API, type = ResourceType.API,
             labelPage = "tianji.process.permissions", labelKey = "api.process.startReceipt",
@@ -44,13 +46,25 @@ public class ProcessStartReceiptController {
             oauthScopes = TianjiProcessPermissions.READ_SCOPE)
     @RequiresPermissions(codes = TianjiProcessPermissions.READ)
     @GetMapping
-    public ResponseEntity<ProcessStartReceiptDTO> receipt(@RequestParam MultiValueMap<String, String> parameters) {
+    public ResponseEntity<ProcessStartReceiptDTO> receipt(@RequestParam MultiValueMap<String, String> parameters,
+                                                          HttpServletRequest request) {
         var actor = access.require(TianjiProcessPermissions.START_RECEIPT_GET_API);
+        requireNoBody(request);
         if (!parameters.keySet().equals(QUERY_PARAMETERS)
                 || parameters.values().stream().anyMatch(values -> values.size() != 1)) {
             throw new IllegalArgumentException("Process START receipt query is invalid");
         }
         var query = new GetProcessStartReceiptQuery(parameters.getFirst("commandId"), parameters.getFirst("requestSha256"));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(processes.getStartReceipt(actor, query));
+    }
+
+    private static void requireNoBody(HttpServletRequest request) {
+        try {
+            if (request.getContentLengthLong() > 0 || request.getInputStream().read() != -1) {
+                throw new IllegalArgumentException("Process START receipt does not accept a request body");
+            }
+        } catch (IOException unavailable) {
+            throw new IllegalArgumentException("Process START receipt query is invalid");
+        }
     }
 }

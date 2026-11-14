@@ -10,6 +10,12 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         labelPage = "tianji.process.permissions", labelKey = "permission.release.read")
 @PermissionDefinition(code = TianjiProcessPermissions.RELEASE_ACTIVATE, meaning = "Activate an immutable process release",
         labelPage = "tianji.process.permissions", labelKey = "permission.release.activate")
+@PermissionDefinition(code = TianjiProcessPermissions.OBSERVE, meaning = "Observe automation instance metadata in the current tenant",
+        labelPage = "tianji.process.permissions", labelKey = "permission.process.observe")
+@PermissionDefinition(code = TianjiProcessPermissions.DATA_READ, meaning = "Read specifically authorized automation business data",
+        labelPage = "tianji.process.permissions", labelKey = "permission.process.data.read")
+@PermissionDefinition(code = TianjiProcessPermissions.DIAGNOSTIC_READ, meaning = "Read authorized automation diagnostic references",
+        labelPage = "tianji.process.permissions", labelKey = "permission.process.diagnostic.read")
 @PermissionDefinition(code = TianjiProcessPermissions.START, meaning = "Start a process from a fixed release",
         labelPage = "tianji.process.permissions", labelKey = "permission.process.start")
 @PermissionDefinition(code = TianjiProcessPermissions.READ, meaning = "Read an owned process instance",
@@ -56,10 +62,20 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         defaults = @LocalizedText(locale = "en-US", text = "Read an immutable automation release source"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.release.activate", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Activate a process release"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.process.observe", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Observe automation instances"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.process.data.read", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read authorized automation business data"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.process.diagnostic.read", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read automation diagnostic references"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.release.activate", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Activate an immutable automation release"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.activation.list", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Read current and historical automation activations"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.instance.start", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Start an instance from the active process release"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.instance.get", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Read an authorized automation instance"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.create", defaultLocale = "en-US",
         defaults = @LocalizedText(locale = "en-US", text = "Create an owned process draft"))
 @PermissionMessage(pageCode = "tianji.process.permissions", key = "api.draft.get", defaultLocale = "en-US",
@@ -184,6 +200,9 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_ACTIVATE = "TIANJI_PROCESS_RELEASE_ACTIVATE";
     public static final String START = "TIANJI_PROCESS_START";
     public static final String READ = "TIANJI_PROCESS_READ";
+    public static final String OBSERVE = "TIANJI_PROCESS_OBSERVE";
+    public static final String DATA_READ = "TIANJI_PROCESS_DATA_READ";
+    public static final String DIAGNOSTIC_READ = "TIANJI_PROCESS_DIAGNOSTIC_READ";
     public static final String CANCEL = "TIANJI_PROCESS_CANCEL";
     public static final String WORKER_RECOVER = "TIANJI_PROCESS_WORKER_RECOVER";
     public static final String DECISION_EXECUTE = "TIANJI_DECISION_EXECUTE";
@@ -196,6 +215,8 @@ public final class TianjiProcessPermissions {
     public static final String AUTOMATION_RELEASE_GET_API = "tianji.api.process.release.get.v2";
     public static final String AUTOMATION_RELEASE_ACTIVATE_API = "tianji.api.process.release.activate.v2";
     public static final String AUTOMATION_ACTIVATION_LIST_API = "tianji.api.process.activation.list.v2";
+    public static final String AUTOMATION_INSTANCE_START_API = "tianji.api.process.instance.start.v2";
+    public static final String AUTOMATION_INSTANCE_GET_API = "tianji.api.process.instance.get.v2";
     public static final String DRAFT_CREATE_API = "tianji.api.process.draft.create.v2";
     public static final String DRAFT_GET_API = "tianji.api.process.draft.get.v2";
     public static final String DRAFT_SAVE_API = "tianji.api.process.draft.save.v2";
@@ -222,6 +243,9 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_ACTIVATE_SCOPE = "tianji:process:activate";
     public static final String START_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_SCOPE;
     public static final String READ_SCOPE = "tianji:process:read";
+    public static final String OBSERVE_SCOPE = "tianji:process:observe";
+    public static final String DATA_READ_SCOPE = "tianji:process:data:read";
+    public static final String DIAGNOSTIC_READ_SCOPE = "tianji:process:diagnostic:read";
     public static final String CANCEL_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessControlClient.CANCEL_SCOPE;
     public static final String WORKER_RECOVER_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessWorkerRecoveryClient.WORKER_RECOVER_SCOPE;
     public static final String DECISION_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.DecisionClient.EXECUTE_SCOPE;

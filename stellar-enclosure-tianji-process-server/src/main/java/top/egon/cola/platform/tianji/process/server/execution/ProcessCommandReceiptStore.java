@@ -66,6 +66,31 @@ public final class ProcessCommandReceiptStore {
         return one(rows);
     }
 
+    Optional<Receipt> findOwnedStart(ProcessActor actor, String commandId) {
+        return jdbc.query("SELECT request_sha256,release_key,correlation_id,state,resource_id,created_at FROM " + table
+                        + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
+                        + " AND command_type='START' AND command_id=?",
+                (rs, number) -> new Receipt(rs.getString("request_sha256"), rs.getString("release_key"), rs.getString("correlation_id"),
+                        rs.getString("state"), rs.getString("resource_id"), rs.getObject("created_at", OffsetDateTime.class).toInstant(), null),
+                actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(), commandId).stream().findFirst();
+    }
+
+    boolean hasAutomationRelease(long tenantId, String releaseKey) {
+        String extensions = schema + ".tianji_process_automation_release";
+        return Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT pg_catalog.has_table_privilege(pg_catalog.to_regclass(?)::oid,'SELECT')", Boolean.class, extensions))
+                && Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + extensions + " s"
+                        + " WHERE s.tenant_id=? AND s.release_key=?)", Boolean.class, tenantId, releaseKey));
+    }
+
+    boolean hasAutomationRootInput(long tenantId, String releaseKey) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS (SELECT 1 FROM %s.tianji_process_release_definition
+                  WHERE tenant_id=? AND release_key=? AND model_type='BPMN'
+                    AND input_schema=jsonb_build_object('automationBindingRef','STRING'))
+                """.formatted(schema), Boolean.class, tenantId, releaseKey));
+    }
+
     Optional<StartReceiptObservation> findAppliedStart(ProcessActor actor, String commandId, String requestSha256) {
         var rows = jdbc.query("SELECT resource_id, created_at FROM " + table
                         + " WHERE tenant_id=? AND subject_type=? AND subject_issuer=? AND subject_id=?"
@@ -107,16 +132,16 @@ public final class ProcessCommandReceiptStore {
     }
 
     boolean hasCorrelationAnchor(ProcessActor actor, String correlationId, Instant from, Instant until,
-                                 Instant submittedAt, String instanceId) {
-        return Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + table + CORRELATION_SCOPE
+                                 Instant submittedAt, String instanceId, boolean automationAware) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("SELECT EXISTS (SELECT 1 FROM " + correlationScope(automationAware)
                         + " AND created_at=? AND resource_id COLLATE \"C\"=?)", Boolean.class,
                 actor.tenantId(), actor.subjectType().name(), actor.issuerFingerprint(), actor.subjectId(),
                 correlationId, utc(from), utc(until), utc(submittedAt), instanceId));
     }
 
     List<CorrelationReceipt> listCorrelationReceipts(ProcessActor actor, String correlationId, Instant from, Instant until,
-                                                     Instant beforeSubmittedAt, String beforeInstanceId) {
-        String sql = "SELECT resource_id, release_key, created_at FROM " + table + CORRELATION_SCOPE;
+                                                     Instant beforeSubmittedAt, String beforeInstanceId, boolean automationAware) {
+        String sql = "SELECT resource_id, release_key, created_at FROM " + correlationScope(automationAware);
         String order = " ORDER BY created_at DESC, resource_id COLLATE \"C\" DESC LIMIT "
                 + (ProcessInstanceCorrelationPageDTO.PAGE_SIZE + 1);
         var fromUtc = utc(from);
@@ -129,6 +154,16 @@ public final class ProcessCommandReceiptStore {
         return jdbc.query(sql + " AND (created_at,resource_id COLLATE \"C\") < (?,?)" + order,
                 ProcessCommandReceiptStore::readCorrelationReceipt, actor.tenantId(), actor.subjectType().name(),
                 actor.issuerFingerprint(), actor.subjectId(), correlationId, fromUtc, untilUtc, utc(beforeSubmittedAt), beforeInstanceId);
+    }
+
+    private String correlationScope(boolean automationAware) {
+        String extensions = schema + ".tianji_process_automation_release";
+        if (!automationAware || !Boolean.TRUE.equals(jdbc.queryForObject(
+                "SELECT pg_catalog.has_table_privilege(pg_catalog.to_regclass(?)::oid,'SELECT')", Boolean.class, extensions))) {
+            return table + CORRELATION_SCOPE;
+        }
+        return table + " stored" + CORRELATION_SCOPE + " AND NOT EXISTS (SELECT 1 FROM " + extensions
+                + " a WHERE a.tenant_id=stored.tenant_id AND a.release_key=stored.release_key)";
     }
 
     private static CorrelationReceipt readCorrelationReceipt(java.sql.ResultSet rs, int number) throws java.sql.SQLException {

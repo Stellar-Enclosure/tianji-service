@@ -46,6 +46,7 @@ egon:
           register-filter: false
         jianshen:
           register-filter: false
+          service-any-scope-resources: ["tianji.api.process.instance.get.v2"]
           user-scope-policy:
             enabled: true
             permission-scopes:
@@ -54,6 +55,9 @@ egon:
               TIANJI_PROCESS_RELEASE_ACTIVATE: ["tianji:process:activate"]
               TIANJI_PROCESS_START: ["tianji:process:start"]
               TIANJI_PROCESS_READ: ["tianji:process:read"]
+              TIANJI_PROCESS_OBSERVE: ["tianji:process:observe"]
+              TIANJI_PROCESS_DATA_READ: ["tianji:process:data:read"]
+              TIANJI_PROCESS_DIAGNOSTIC_READ: ["tianji:process:diagnostic:read"]
               TIANJI_PROCESS_CANCEL: ["tianji:process:cancel"]
               TIANJI_PROCESS_WORKER_RECOVER: ["tianji:process:worker-recover"]
               TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]

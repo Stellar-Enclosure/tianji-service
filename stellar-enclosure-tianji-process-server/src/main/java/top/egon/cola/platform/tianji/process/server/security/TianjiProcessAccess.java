@@ -7,8 +7,11 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import top.egon.cola.platform.tianji.process.server.error.ProcessTenantChangedException;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.AutomationObservationPermitVO;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianquan.jianshen.contract.authorization.Decision;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.UserPermissionScopePolicy;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
 import top.egon.cola.platform.tianquan.shoubing.contract.IdpPrincipal;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
@@ -17,6 +20,17 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticati
 import java.time.Clock;
 import java.util.Collections;
 import java.util.Objects;
+import java.util.Set;
+
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_INSTANCE_GET_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DATA_READ;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DATA_READ_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DIAGNOSTIC_READ;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.DIAGNOSTIC_READ_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.READ;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.READ_SCOPE;
 
 /** Tenant and subject come exclusively from the verified identity after the resource policy allows access. */
 public final class TianjiProcessAccess {
@@ -26,6 +40,52 @@ public final class TianjiProcessAccess {
     public TianjiProcessAccess(PermissionExecutionGuard permissions, Clock clock) {
         this.permissions = Objects.requireNonNull(permissions, "permissions");
         this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    public AutomationInstanceAccessVO observeAutomationInstance() {
+        var actor = require(AUTOMATION_INSTANCE_GET_API);
+        var current = SecurityContextHolder.getContext().getAuthentication();
+        if (current instanceof Rbac3AuthenticationToken user) {
+            var snapshot = user.getPrincipal().snapshot();
+            if (!snapshot.expiresAt().isAfter(clock.instant())
+                    || !snapshot.resourceCodes().contains(AUTOMATION_INSTANCE_GET_API)) {
+                throw new IllegalStateException("Current instance authorization is unavailable");
+            }
+            Set<String> scopes = UserPermissionScopePolicy.currentScopes();
+            Set<String> granted = snapshot.permissions();
+            boolean ownerRead = grants(granted, scopes, READ, READ_SCOPE);
+            boolean observe = grants(granted, scopes, OBSERVE, OBSERVE_SCOPE);
+            requireReadOrObserve(ownerRead, observe);
+
+            var data = snapshot.dataScopes().get(DATA_READ);
+            boolean currentData = grants(granted, scopes, DATA_READ, DATA_READ_SCOPE) && data != null
+                    && data.decision() == Decision.ALLOW && DATA_READ.equals(data.permissionCode())
+                    && snapshot.tenantId().equals(data.tenantId()) && snapshot.rbac3UserId().equals(data.subjectId())
+                    && snapshot.authVersion() == data.authVersion() && snapshot.policyVersion() == data.policyVersion()
+                    && !data.decidedAt().isAfter(clock.instant());
+            boolean allInTenant = currentData && data.allInTenant();
+            boolean ownerData = currentData && data.includeSelf() && snapshot.rbac3UserId().equals(data.selfUserId());
+            boolean diagnostic = grants(granted, scopes, DIAGNOSTIC_READ, DIAGNOSTIC_READ_SCOPE);
+            return new AutomationInstanceAccessVO(actor, new AutomationObservationPermitVO(
+                    ownerRead, observe, allInTenant, diagnostic, false, ownerData));
+        }
+        if (current instanceof IdpAuthenticationToken token && token.getPrincipal() instanceof ServiceIdentityPrincipal service) {
+            boolean ownerRead = service.scopes().contains(READ_SCOPE);
+            boolean observe = service.scopes().contains(OBSERVE_SCOPE);
+            requireReadOrObserve(ownerRead, observe);
+            return new AutomationInstanceAccessVO(actor, new AutomationObservationPermitVO(ownerRead, observe, false, false, false));
+        }
+        throw new AuthenticationCredentialsNotFoundException("Current instance identity is required");
+    }
+
+    public record AutomationInstanceAccessVO(ProcessActor actor, AutomationObservationPermitVO permit) { }
+
+    private static boolean grants(Set<String> permissions, Set<String> scopes, String permission, String scope) {
+        return permissions.contains(permission) && scopes.contains(scope);
+    }
+
+    private static void requireReadOrObserve(boolean ownerRead, boolean observe) {
+        if (!ownerRead && !observe) throw new AccessDeniedException("Current instance read or observe permission is required");
     }
 
     public ProcessActor require(String resourceKey) {

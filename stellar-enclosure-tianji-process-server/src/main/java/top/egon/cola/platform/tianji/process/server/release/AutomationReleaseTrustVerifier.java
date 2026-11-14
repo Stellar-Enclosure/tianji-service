@@ -62,7 +62,7 @@ public final class AutomationReleaseTrustVerifier {
         }
     }
 
-    static void verify(ImmutableReleaseVO release, AutomationAdmissionQuery query, AutomationAdmissionProofVO proof,
+    public static void verify(ImmutableReleaseVO release, AutomationAdmissionQuery query, AutomationAdmissionProofVO proof,
                        TrustObservationVO observation) {
         byte[] exactPayload = canonicalPayload(release);
         if (observation == null || observation.key().tenantId() != release.tenantId()
@@ -79,7 +79,7 @@ public final class AutomationReleaseTrustVerifier {
                 observation.currentGeneration(), proof.observedAt());
     }
 
-    static void requireWindow(AutomationAdmissionProofVO proof, TrustObservationVO observation, Instant databaseNow) {
+    public static void requireWindow(AutomationAdmissionProofVO proof, TrustObservationVO observation, Instant databaseNow) {
         if (observation.key().notBefore().isAfter(databaseNow) || !databaseNow.isBefore(observation.key().notAfter())
                 || !databaseNow.isBefore(observation.envelope().expiresAt()) || observation.envelope().issuedAt().isAfter(databaseNow)
                 || proof.validUntil().isAfter(observation.envelope().expiresAt())

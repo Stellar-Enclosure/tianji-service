@@ -13,6 +13,7 @@ import org.flowable.spring.boot.EngineConfigurationConfigurer;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.SmartInitializingSingleton;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -27,7 +28,10 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 import top.egon.cola.platform.tianji.process.server.decision.PinnedDecisionActivityBehaviorFactory;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationBootstrapBehavior;
 import top.egon.cola.platform.tianji.process.server.execution.FlowableCaseService;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.task.PinnedCaseActivityBehaviorFactory;
 
 import javax.sql.DataSource;
@@ -119,8 +123,6 @@ public class ProcessStorageConfiguration {
         };
     }
 
-    @Bean
-    @Order(Ordered.LOWEST_PRECEDENCE)
     EngineConfigurationConfigurer<SpringProcessEngineConfiguration> processStorageGuard(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
             Environment environment, ObjectProvider<FlowableCaseService> services,
             ObjectProvider<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> registries) {
@@ -132,6 +134,32 @@ public class ProcessStorageConfiguration {
             config.setActivityBehaviorFactory(environment.getProperty("stellar.tianji.process.cases.enabled", Boolean.class, false)
                     ? new PinnedDecisionActivityBehaviorFactory(services::getObject, registries::getObject)
                     : new PinnedDecisionActivityBehaviorFactory());
+        };
+    }
+
+    @Bean("processInstanceBindingStore")
+    ProcessInstanceBindingStore processInstanceBindingStore(OutboxInfrastructure outbox, TransactionalOutboxProperties properties) {
+        return new ProcessInstanceBindingStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
+    }
+
+    @Bean("automationBootstrapBehavior")
+    AutomationBootstrapBehavior automationBootstrapBehavior(OutboxInfrastructure outbox, TransactionalOutboxProperties properties,
+            @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings) {
+        var releaseStore = new AutomationReleaseStore(new JdbcTemplate(outbox.dataSource()), properties.getStorage().getJdbc().getSchema());
+        return new AutomationBootstrapBehavior(bindings, releaseStore);
+    }
+
+    @Bean("processStorageGuard")
+    @Order(Ordered.LOWEST_PRECEDENCE)
+    EngineConfigurationConfigurer<SpringProcessEngineConfiguration> processStorageGuardWithAutomation(
+            OutboxInfrastructure outbox, TransactionalOutboxProperties properties, Environment environment,
+            ObjectProvider<FlowableCaseService> services,
+            ObjectProvider<top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry> registries,
+            @Qualifier("automationBootstrapBehavior") ObjectProvider<AutomationBootstrapBehavior> bootstrap) {
+        var pinnedStorage = processStorageGuard(outbox, properties, environment, services, registries);
+        return config -> {
+            pinnedStorage.configure(config);
+            AutomationBootstrapBehavior.register(config, bootstrap::getObject);
         };
     }
 

@@ -28,15 +28,19 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationErrorDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationReleaseDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DraftPublicationVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DraftValidationResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.PublishProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.ValidateProcessDraftQuery;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftService;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionManifest;
+import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionMode;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionResource;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.RequiresPermissions;
@@ -51,12 +55,20 @@ import java.io.IOException;
 import java.time.Instant;
 
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_MODEL_VALIDATE_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_INSTANCE_GET_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_INSTANCE_START_API;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_RELEASE_GET_API;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_RELEASE_PUBLISH_API;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.RELEASE_PUBLISH;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.RELEASE_PUBLISH_SCOPE;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.RELEASE_READ;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.RELEASE_READ_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.READ;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.READ_SCOPE;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.START;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.START_SCOPE;
 
 @Slf4j
 @Validated
@@ -68,11 +80,43 @@ public class ProcessAutomationController {
     public static final String VALIDATE_PATH = "/api/tianji/v2/process-model-validations";
     public static final String RELEASES_PATH = "/api/tianji/v2/process-releases";
     public static final String RELEASE_PATH = RELEASES_PATH + "/{releaseVersion}";
+    public static final String INSTANCES_PATH = "/api/tianji/v2/process-instances";
+    public static final String INSTANCE_PATH = INSTANCES_PATH + "/{instanceId}";
     private static final String PAGE = "tianji.process.permissions";
+    private static final String INSTANCE_ID = "[^\\p{Cc}]{1,255}";
 
     @Qualifier("tianjiProcessAccess") private final TianjiProcessAccess access;
     @Qualifier("processDraftService") private final ProcessDraftService drafts;
     @Qualifier("permissionServicePolicyGuard") private final PermissionServicePolicyGuard servicePolicies;
+    @Qualifier("processExecutionService") private final ProcessExecutionService processes;
+
+    @PermissionResource(key = AUTOMATION_INSTANCE_START_API, type = ResourceType.API, labelPage = PAGE,
+            labelKey = "api.automation.instance.start",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = START_SCOPE)
+    @RequiresPermissions(codes = START)
+    @PostMapping(path = INSTANCES_PATH, consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<AutomationInstanceDTO> startAutomationProcess(
+            @Valid @RequestBody AutomationStartCommand command, HttpServletRequest request) {
+        var actor = access.require(AUTOMATION_INSTANCE_START_API);
+        requireNoParameters(request);
+        return noStore(processes.startAutomation(actor, command));
+    }
+
+    @PermissionResource(key = AUTOMATION_INSTANCE_GET_API, type = ResourceType.API, labelPage = PAGE,
+            labelKey = "api.automation.instance.get",
+            allowedPrincipals = {PermissionManifest.PrincipalType.USER, PermissionManifest.PrincipalType.SERVICE},
+            oauthScopes = {READ_SCOPE, OBSERVE_SCOPE})
+    @RequiresPermissions(mode = PermissionMode.ANY, codes = {READ, OBSERVE})
+    @GetMapping(INSTANCE_PATH)
+    public ResponseEntity<AutomationInstanceDTO> getAutomationInstance(
+            @PathVariable("instanceId") @Pattern(regexp = INSTANCE_ID) String instanceId, HttpServletRequest request) {
+        requireNoParameters(request);
+        requireNoBody(request);
+        if (instanceId.isBlank() || !instanceId.matches(INSTANCE_ID)) throw invalidRequest();
+        var observation = access.observeAutomationInstance();
+        return noStore(processes.observeAutomation(observation.actor(), instanceId, observation.permit()));
+    }
 
     @PermissionResource(key = AUTOMATION_MODEL_VALIDATE_API, type = ResourceType.API, labelPage = PAGE,
             labelKey = "api.automation.model.validate",
@@ -153,12 +197,16 @@ public class ProcessAutomationController {
             HttpServletRequest request) {
         var reader = access.require(AUTOMATION_RELEASE_GET_API);
         requireNoParameters(request);
+        requireNoBody(request);
+        return noStore(drafts.getAutomationRelease(reader, releaseVersion));
+    }
+
+    private static void requireNoBody(HttpServletRequest request) {
         try {
             if (request.getContentLengthLong() > 0 || request.getInputStream().read() != -1) throw invalidRequest();
         } catch (IOException unreadable) {
             throw invalidRequest();
         }
-        return noStore(drafts.getAutomationRelease(reader, releaseVersion));
     }
 
     @ExceptionHandler({MethodArgumentNotValidException.class, ConstraintViolationException.class})

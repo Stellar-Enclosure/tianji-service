@@ -81,7 +81,7 @@ public final class ProcessApiErrors {
     ResponseEntity<OrchestrationErrorDTO> invalid() { return error(HttpStatus.BAD_REQUEST, "TIANJI_INVALID_COMMAND"); }
 
     /** Media selection can fail before MVC has selected a controller for package-scoped advice. */
-    public static HandlerExceptionResolver activationMediaErrors(RequestMatcher route) {
+    public static HandlerExceptionResolver closedJsonMediaErrors(RequestMatcher route) {
         return new AbstractHandlerExceptionResolver() {
             @Override
             protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,
@@ -126,8 +126,10 @@ public final class ProcessApiErrors {
     @ExceptionHandler(RuntimeException.class)
     ResponseEntity<OrchestrationErrorDTO> unexpected(RuntimeException failure, HttpServletRequest request) {
         if (request.getAttribute(HandlerMapping.BEST_MATCHING_HANDLER_ATTRIBUTE) instanceof HandlerMethod handler) {
-            if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())) {
-                log.error("Process activation API request failed: type={}", failure.getClass().getName());
+            if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())
+                    || ProcessAutomationController.class.isAssignableFrom(handler.getBeanType())
+                    && "startAutomationProcess".equals(handler.getMethod().getName())) {
+                log.error("Process admission API request failed: type={}", failure.getClass().getName());
                 return error(HttpStatus.SERVICE_UNAVAILABLE, "TIANJI_DEPENDENCY_UNAVAILABLE");
             }
             if (CaseController.class.isAssignableFrom(handler.getBeanType())) {

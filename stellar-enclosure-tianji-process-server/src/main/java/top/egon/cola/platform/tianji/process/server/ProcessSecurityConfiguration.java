@@ -48,12 +48,16 @@ import top.egon.cola.platform.tianji.process.server.api.ProcessApiErrors;
 import top.egon.cola.platform.tianji.process.server.api.ProcessAutomationController;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.AutomationActivationStore;
+import top.egon.cola.platform.tianji.process.server.release.AutomationAdmissionAuthority;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
+import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseTrustVerifier;
 import top.egon.cola.platform.tianji.process.server.api.ProcessStartReceiptController;
 import top.egon.cola.platform.tianji.process.server.decision.ProcessDecisionService;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceConverter;
 import top.egon.cola.platform.tianji.process.server.execution.GovernedStartPilotProperties;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.GovernedStartAuthority;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNativeAccess;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
@@ -134,11 +138,15 @@ public class ProcessSecurityConfiguration {
     private static final List<RequestMatcher> ACTIVATION_ROUTES = List.of(
             MATCHER.matcher(HttpMethod.POST, ProcessActivationController.PATH),
             MATCHER.matcher(HttpMethod.GET, ProcessActivationController.PATH));
+    private static final List<RequestMatcher> AUTOMATION_INSTANCE_ROUTES = List.of(
+            MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.INSTANCES_PATH),
+            MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.INSTANCE_PATH));
 
     @Bean("processActivationMediaErrors")
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     HandlerExceptionResolver processActivationMediaErrors() {
-        return ProcessApiErrors.activationMediaErrors(request -> ACTIVATION_ROUTES.stream().anyMatch(route -> route.matches(request)));
+        return ProcessApiErrors.closedJsonMediaErrors(request -> ACTIVATION_ROUTES.stream().anyMatch(route -> route.matches(request))
+                || AUTOMATION_INSTANCE_ROUTES.stream().anyMatch(route -> route.matches(request)));
     }
 
     @Bean
@@ -182,7 +190,8 @@ public class ProcessSecurityConfiguration {
                             .requestMatchers(HttpMethod.GET, ProcessStartReceiptController.PATH).authenticated()
                             .requestMatchers(HttpMethod.HEAD, ProcessStartReceiptController.PATH).authenticated();
                     if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
-                            .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
+                            .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
+                            .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
                     if (tasksEnabled) authorize.requestMatchers("/api/tianji/v1/human-tasks", "/api/tianji/v1/human-tasks/**").authenticated();
@@ -238,6 +247,7 @@ public class ProcessSecurityConfiguration {
             }
             selected.addAll(DRAFT_ROUTES);
             selected.addAll(ACTIVATION_ROUTES);
+            selected.addAll(AUTOMATION_INSTANCE_ROUTES);
             routes = List.copyOf(selected);
         }
 
@@ -294,7 +304,8 @@ public class ProcessSecurityConfiguration {
                         ProcessDraftController.CREATE_PATH, ProcessDraftController.DRAFT_PATH, ProcessDraftController.LIST_PATH,
                         ProcessDraftController.DISCARD_PATH, ProcessAutomationController.VALIDATE_PATH,
                         ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH,
-                        ProcessActivationController.PATH), true);
+                        ProcessActivationController.PATH, ProcessAutomationController.INSTANCES_PATH,
+                        ProcessAutomationController.INSTANCE_PATH), true);
     }
 
     @Bean
@@ -428,12 +439,27 @@ public class ProcessSecurityConfiguration {
                 bridgeEnabled, maintenanceReady, humanPublicationEnabled);
     }
 
-    @Bean
+    @Bean("processExecutionService")
     @ConditionalOnMissingBean(ProcessExecutionService.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    ProcessExecutionService processExecutionServiceWithAutomation(ProcessEngine process, DmnEngine dmn,
+            ProcessModelValidator validator, GovernedStartPilotProperties pilots, ObjectProvider<GovernedStartAuthority> authorities,
+            @Qualifier("automationActivationStore") AutomationActivationStore activations,
+            @Qualifier("automationReleaseStore") AutomationReleaseStore releases,
+            @Qualifier("processInstanceBindingStore") ProcessInstanceBindingStore bindings,
+            @Qualifier("automationInstanceConverter") AutomationInstanceConverter converter,
+            ProcessApiSchemaVerifier verifier, Environment environment,
+            @Qualifier("automationAdmissionAuthority") ObjectProvider<AutomationAdmissionAuthority> admissionAuthority,
+            @Qualifier("automationReleaseTrustAuthority") ObjectProvider<AutomationReleaseTrustVerifier.TrustAuthority> trustAuthority) {
+        var automation = new ProcessExecutionService.AutomationDependenciesVO(activations, releases, bindings, converter,
+                verifier, environment, admissionAuthority, trustAuthority);
+        return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator, pilots,
+                pilots.pilots().isEmpty() ? null : requiredPilotAuthority(authorities), automation);
+    }
+
     ProcessExecutionService processExecutionService(ProcessEngine process, DmnEngine dmn,
-                                                     ProcessModelValidator validator, GovernedStartPilotProperties pilots,
-                                                     ObjectProvider<GovernedStartAuthority> authorities) {
+            ProcessModelValidator validator, GovernedStartPilotProperties pilots,
+            ObjectProvider<GovernedStartAuthority> authorities) {
         if (pilots.pilots().isEmpty()) {
             return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator);
         }

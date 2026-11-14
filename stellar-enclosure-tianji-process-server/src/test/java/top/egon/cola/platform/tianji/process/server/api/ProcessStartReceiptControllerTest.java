@@ -1,12 +1,15 @@
 package top.egon.cola.platform.tianji.process.server.api;
 
+import jakarta.servlet.http.HttpServletRequest;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
+import org.springframework.http.MediaType;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessStartReceiptQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
@@ -18,6 +21,7 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.R
 import org.springframework.util.MultiValueMap;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -92,8 +96,37 @@ class ProcessStartReceiptControllerTest {
     }
 
     @Test
+    void v2ReadsTheIndependentRawDigestOnTheSameV1WireAndRejectsGetBody() throws Exception {
+        var start = new AutomationStartCommand("review", "invoice-1", "intent-raw", "corr-1",
+                Map.of("amount", "1.00"), Map.of());
+        String raw = start.requestSha256();
+        String changed = start.setVariables(Map.of("amount", "1.0")).requestSha256();
+        var exact = new GetProcessStartReceiptQuery("intent-raw", raw);
+        var wrong = new GetProcessStartReceiptQuery("intent-raw", changed);
+        when(access.require(RESOURCE)).thenReturn(OWNER);
+        var request = get(PATH).param("commandId", "intent-raw").param("requestSha256", raw);
+        mvc.perform(request.contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("TIANJI_INVALID_COMMAND"));
+        verifyNoInteractions(processes);
+
+        when(processes.getStartReceipt(OWNER, exact)).thenReturn(new ProcessStartReceiptDTO(
+                "instance-v2", ProcessStartReceiptDTO.StatusEnum.APPLIED, RECORDED));
+        when(processes.getStartReceipt(OWNER, wrong)).thenThrow(new ProcessResourceNotFoundException());
+        mvc.perform(get(PATH).param("commandId", "intent-raw").param("requestSha256", raw))
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store"))
+                .andExpect(content().json("""
+                        {"instanceId":"instance-v2","status":"APPLIED","recordedAt":"2026-11-05T10:20:30.123456Z"}
+                        """, org.springframework.test.json.JsonCompareMode.STRICT));
+        mvc.perform(get(PATH).param("commandId", "intent-raw").param("requestSha256", changed))
+                .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+        verify(processes).getStartReceipt(OWNER, exact);
+        verify(processes).getStartReceipt(OWNER, wrong);
+        verifyNoMoreInteractions(processes);
+    }
+
+    @Test
     void declares_only_existing_read_authority_and_needs_both_flags() throws Exception {
-        var method = ProcessStartReceiptController.class.getMethod("receipt", MultiValueMap.class);
+        var method = ProcessStartReceiptController.class.getMethod("receipt", MultiValueMap.class, HttpServletRequest.class);
         var permission = method.getAnnotation(PermissionResource.class);
         assertEquals(RESOURCE, permission.key());
         assertArrayEquals(new String[]{TianjiProcessPermissions.READ_SCOPE}, permission.oauthScopes());
@@ -102,7 +135,8 @@ class ProcessStartReceiptControllerTest {
         assertArrayEquals(new String[]{TianjiProcessPermissions.READ}, method.getAnnotation(RequiresPermissions.class).codes());
 
         var runner = new WebApplicationContextRunner().withUserConfiguration(ProcessStartReceiptController.class)
-                .withBean(ProcessExecutionService.class, () -> processes).withBean(TianjiProcessAccess.class, () -> access);
+                .withBean("processExecutionService", ProcessExecutionService.class, () -> processes)
+                .withBean("tianjiProcessAccess", TianjiProcessAccess.class, () -> access);
         String base = "stellar.tianji.process.api.";
         runner.run(context -> assertEquals(0, context.getBeansOfType(ProcessStartReceiptController.class).size()));
         runner.withPropertyValues(base + "enabled=true")

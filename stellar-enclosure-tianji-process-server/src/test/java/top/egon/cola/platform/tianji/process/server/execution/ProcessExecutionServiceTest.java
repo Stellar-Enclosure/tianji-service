@@ -9,6 +9,8 @@ import org.flowable.engine.RuntimeService;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
+import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.ProcessModelValidator;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.ValueType;
 
@@ -72,6 +74,33 @@ class ProcessExecutionServiceTest {
                 Map.of("count", 1, "title", "bad" + (char) 0xd800, "enabled", true)));
         assertThrows(IllegalStateException.class, () -> ProcessValues.outputs(Map.of("n", ValueType.INTEGER), Map.of("n", 2.5)));
         assertEquals(2L, ProcessValues.outputs(Map.of("n", ValueType.INTEGER), Map.of("n", 2.0)).get("n"));
+    }
+
+    @Test
+    void rejects_reserved_event_start_before_any_native_or_database_work() {
+        var engine = mock(SpringProcessEngineConfiguration.class);
+        var dmn = mock(SpringDmnEngineConfiguration.class);
+        var source = mock(DataSource.class);
+        var manager = new DataSourceTransactionManager(source);
+        when(engine.getDataSource()).thenReturn(source);
+        when(engine.getTransactionManager()).thenReturn(manager);
+        when(engine.getRepositoryService()).thenReturn(mock(RepositoryService.class));
+        when(engine.getRuntimeService()).thenReturn(mock(RuntimeService.class));
+        when(engine.getHistoryService()).thenReturn(mock(HistoryService.class));
+        when(engine.getDatabaseSchema()).thenReturn("tianji_process");
+        when(engine.getBeans()).thenReturn(Map.of());
+        when(engine.isDbHistoryUsed()).thenReturn(true);
+        when(engine.getHistoryLevel()).thenReturn(HistoryLevel.AUDIT);
+        when(dmn.getDataSource()).thenReturn(source);
+        when(dmn.getTransactionManager()).thenReturn(manager);
+        when(dmn.getDmnRepositoryService()).thenReturn(mock(DmnRepositoryService.class));
+        when(dmn.getDatabaseSchema()).thenReturn("tianji_process");
+        when(dmn.getBeans()).thenReturn(Map.of());
+        var service = new ProcessExecutionService(engine, dmn, new ProcessModelValidator());
+        var actor = ProcessActor.verified(42, ProcessActor.SubjectType.USER, "owner", "https://registry.test/issuer");
+        var command = new AutomationStartCommand("invoice", "invoice-1", "evt-v2-private", "trace", Map.of(), Map.of());
+        assertThrows(IllegalArgumentException.class, () -> service.startAutomation(actor, command));
+        verifyNoInteractions(source, engine.getRuntimeService());
     }
 
     @Test
