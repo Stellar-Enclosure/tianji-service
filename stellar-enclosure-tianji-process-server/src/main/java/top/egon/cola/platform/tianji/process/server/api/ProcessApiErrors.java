@@ -181,6 +181,7 @@ public final class ProcessApiErrors {
                 return error(HttpStatus.TOO_MANY_REQUESTS, "TIANJI_CAPACITY_EXCEEDED");
             }
             if (ProcessActivationController.class.isAssignableFrom(handler.getBeanType())
+                    || ProcessEventController.class.isAssignableFrom(handler.getBeanType())
                     || ProcessAutomationController.class.isAssignableFrom(handler.getBeanType())
                     && "startAutomationProcess".equals(handler.getMethod().getName())) {
                 log.error("Process admission API request failed: type={}", failure.getClass().getName());

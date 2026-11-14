@@ -28,6 +28,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.NodeRetry
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.CompleteEngineHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessEventCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.ActivationCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.CreateProcessDraftCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.draft.DiscardProcessDraftCommand;
@@ -48,6 +49,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.Set;
 import java.util.Map;
+import java.util.regex.Pattern;
 
 /** Applies the same bound to fixed-length and streamed JSON command bodies. */
 @ControllerAdvice(basePackageClasses = ProcessController.class)
@@ -63,6 +65,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
     private static final int MAX_ACTIVATION_COMMAND_BYTES = 4 * 1024;
     private static final int MAX_AUTOMATION_START_BYTES = 384 * 1024;
     private static final int MAX_ENGINE_TASK_COMPLETION_BYTES = 68 * 1024;
+    private static final int MAX_EVENT_BYTES = 68 * 1024;
     private static final int MAX_AUTOMATION_WORKER_ACQUIRE_BYTES = 4 * 1024;
     private static final int MAX_AUTOMATION_WORKER_REPORT_BYTES = 68 * 1024;
     private static final Set<String> WORKER_ACQUIRE_FIELDS = Set.of("capabilityKey", "capabilityVersion");
@@ -72,6 +75,11 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             "leaseToken", "commandId", "kind", "errorCode", "businessReceiptId");
     private static final Set<String> ENGINE_TASK_COMPLETION_FIELDS = Set.of("commandId", "expectedVersion", "result");
     private static final Set<String> ACTIVATION_FIELDS = Set.of("releaseVersion", "expectedActivationRevision", "commandId");
+    private static final Set<String> EVENT_STRING_FIELDS = Set.of("eventId", "definitionKey", "routeKey", "type", "occurredAt", "correlationKey");
+    private static final Set<String> EVENT_FIELDS = Set.of("eventId", "definitionKey", "routeKey", "type", "occurredAt", "correlationKey",
+            "routeVersion", "waitToken", "payload");
+    private static final Pattern EVENT_INSTANT = Pattern.compile(
+            "[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](?:[.][0-9]{1,6})?Z");
     private static final JsonMapper STRICT_WORKER_JSON = JsonMapper.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
     private static final JsonMapper STRICT_AGENT_RESULT_JSON = JsonMapper.builder(JsonFactory.builder()
@@ -103,14 +111,15 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
                 || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
                 || type == RecoverProcessWorkerCommand.class || draftCommand(type) || type == ActivationCommand.class
                 || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class
-                || type == NodeRetryCommand.class || automationWorkerCommand(type);
+                || type == NodeRetryCommand.class || type == ProcessEventCommand.class || automationWorkerCommand(type);
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
         if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class
-                || type == CompleteEngineHumanTaskCommand.class || type == NodeRetryCommand.class || automationWorkerCommand(type)) {
+                || type == CompleteEngineHumanTaskCommand.class || type == NodeRetryCommand.class
+                || type == ProcessEventCommand.class || automationWorkerCommand(type)) {
             var contentType = input.getHeaders().getContentType();
             if (contentType != null && contentType.getCharset() != null
                     && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
@@ -121,6 +130,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
                 : draftCommand(type) ? MAX_DRAFT_COMMAND_BYTES
                 : type == AutomationStartCommand.class ? MAX_AUTOMATION_START_BYTES
                 : type == CompleteEngineHumanTaskCommand.class ? MAX_ENGINE_TASK_COMPLETION_BYTES
+                : type == ProcessEventCommand.class ? MAX_EVENT_BYTES
                 : type == NodeRetryCommand.class ? MAX_NODE_RETRY_BYTES
                 : type == AutomationWorkerAcquireCommand.class ? MAX_AUTOMATION_WORKER_ACQUIRE_BYTES
                 : automationWorkerCommand(type) ? MAX_AUTOMATION_WORKER_REPORT_BYTES
@@ -144,10 +154,28 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (type == AutomationStartCommand.class) validateAutomationStartBody(body);
         if (type == CompleteEngineHumanTaskCommand.class) validateEngineTaskCompletionBody(body);
         if (type == NodeRetryCommand.class) validateNodeRetryBody(body);
+        if (type == ProcessEventCommand.class) validateEventBody(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
         };
+    }
+
+    private static void validateEventBody(byte[] body) {
+        try {
+            String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var root = STRICT_AUTOMATION_START_JSON.readTree(json);
+            if (root == null || !root.isObject() || !EVENT_FIELDS.equals(Set.copyOf(root.propertyNames()))
+                    || EVENT_STRING_FIELDS.stream().anyMatch(field -> !root.path(field).isString())
+                    || !EVENT_INSTANT.matcher(root.path("occurredAt").asString()).matches()
+                    || !root.path("routeVersion").isIntegralNumber() || !root.path("routeVersion").canConvertToLong()
+                    || !root.path("payload").isObject()
+                    || !root.path("waitToken").isNull() && !root.path("waitToken").isString()) {
+                throw invalidPublicationBody();
+            }
+        } catch (CharacterCodingException | RuntimeException malformed) {
+            throw invalidPublicationBody();
+        }
     }
 
     private static void validateNodeRetryBody(byte[] body) {

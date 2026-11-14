@@ -5,6 +5,7 @@ import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
@@ -14,6 +15,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.DependsOn;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
@@ -33,6 +35,8 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import org.springframework.web.filter.RequestContextFilter;
 import org.springframework.web.servlet.HandlerExceptionResolver;
 import org.springframework.web.util.ContentCachingResponseWrapper;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -76,6 +80,9 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessControlNati
 import top.egon.cola.platform.tianji.process.server.execution.ProcessControlService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCancellationReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore;
+import top.egon.cola.platform.tianji.process.server.api.ProcessEventController;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventApplicationService;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventInboxStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryReceiptStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessWorkerRecoveryService;
 import top.egon.cola.platform.tianji.process.server.execution.CaseStartProvenanceStore;
@@ -167,6 +174,8 @@ public class ProcessSecurityConfiguration {
             MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.INSTANCE_PATH));
     private static final RequestMatcher AUTOMATION_NODE_ROUTE = MATCHER.matcher(HttpMethod.GET, ProcessNodeExecutionController.PATH);
     private static final RequestMatcher AUTOMATION_NODE_RETRY_ROUTE = MATCHER.matcher(HttpMethod.POST, ProcessNodeExecutionController.RETRY_PATH);
+    private static final RequestMatcher EVENT_INGEST_ROUTE = MATCHER.matcher(HttpMethod.POST, ProcessEventController.EVENTS_PATH);
+    private static final RequestMatcher EVENT_RECEIPT_ROUTE = MATCHER.matcher(HttpMethod.GET, ProcessEventController.RECEIPT_PATH);
     private static final List<RequestMatcher> AUTOMATION_ACTION_ROUTES = List.of(
             MATCHER.matcher(HttpMethod.GET, EngineTaskController.TASK_PATH),
             MATCHER.matcher(HttpMethod.POST, EngineTaskController.COMPLETION_PATH));
@@ -227,6 +236,12 @@ public class ProcessSecurityConfiguration {
         return ProcessApiErrors.strictCommandMediaErrors(AUTOMATION_NODE_RETRY_ROUTE);
     }
 
+    @Bean("processEventMediaErrors")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
+    HandlerExceptionResolver processEventMediaErrors() {
+        return ProcessApiErrors.closedJsonMediaErrors(EVENT_INGEST_ROUTE, EVENT_RECEIPT_ROUTE);
+    }
+
     @Bean("processActivationMediaErrors")
     @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
     HandlerExceptionResolver processActivationMediaErrors() {
@@ -244,6 +259,7 @@ public class ProcessSecurityConfiguration {
         boolean startReceiptReadEnabled = environment.getProperty(
                 "stellar.tianji.process.api.start-receipt-read-enabled", Boolean.class, false);
         boolean workerEnabled = environment.getProperty("stellar.tianji.process.worker.enabled", Boolean.class, false);
+        boolean eventsEnabled = environment.getProperty("stellar.tianji.process.events.enabled", Boolean.class, false);
         boolean workerRecoveryEnabled = environment.getProperty("stellar.tianji.process.worker-recovery.enabled", Boolean.class, false);
         boolean inboxEnabled = environment.getProperty("stellar.tianji.process.agent-results.enabled", Boolean.class, false);
         boolean ownerOutcomesEnabled = environment.getProperty("stellar.tianji.process.agent-results.owner-outcomes-enabled", Boolean.class, false);
@@ -255,6 +271,7 @@ public class ProcessSecurityConfiguration {
         boolean cancellationEnabled = environment.getProperty("stellar.tianji.process.cancellation.enabled", Boolean.class, false);
         if (cancellationEnabled && !enabled) throw new IllegalStateException("Process cancellation requires the Process API security boundary");
         if (workerEnabled && !enabled) throw new IllegalStateException("Worker API requires the Process API security boundary");
+        if (eventsEnabled && !enabled) throw new IllegalStateException("Process events require the Process API security boundary");
         if (inboxEnabled && !enabled) throw new IllegalStateException("Agent result Inbox requires the Process API security boundary");
         if (ownerOutcomesEnabled && !inboxEnabled) throw new IllegalStateException("Process Agent outcomes require the durable Agent result Inbox");
         if (tasksEnabled && !enabled) throw new IllegalStateException("Human task API requires the Process API security boundary");
@@ -279,6 +296,7 @@ public class ProcessSecurityConfiguration {
                             .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(AUTOMATION_NODE_ROUTE, AUTOMATION_NODE_RETRY_ROUTE).authenticated();
+                    if (eventsEnabled) authorize.requestMatchers(EVENT_INGEST_ROUTE, EVENT_RECEIPT_ROUTE).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated()
                             .requestMatchers(AUTOMATION_WORKER_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
@@ -314,7 +332,7 @@ public class ProcessSecurityConfiguration {
             http.addFilterAfter(new VerifiedProcessIssuerFilter(), IdpBearerAuthenticationFilter.class);
             http.addFilterAfter(authorization, VerifiedProcessIssuerFilter.class);
             http.addFilterBefore(new ClosedProcessSecurityErrors(startReceiptReadEnabled, ownerOutcomesEnabled,
-                    workerEnabled && workerRecoveryEnabled, workerEnabled), RequestContextFilter.class);
+                    workerEnabled && workerRecoveryEnabled, workerEnabled, eventsEnabled), RequestContextFilter.class);
         }
         return http.build();
     }
@@ -331,6 +349,11 @@ public class ProcessSecurityConfiguration {
 
         ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled,
                                     boolean workerEnabled) {
+            this(startReceiptReadEnabled, ownerOutcomesEnabled, workerRecoveryEnabled, workerEnabled, false);
+        }
+
+        ClosedProcessSecurityErrors(boolean startReceiptReadEnabled, boolean ownerOutcomesEnabled, boolean workerRecoveryEnabled,
+                                    boolean workerEnabled, boolean eventsEnabled) {
             var selected = new ArrayList<RequestMatcher>();
             addRead(selected, CORRELATION);
             if (startReceiptReadEnabled) addRead(selected, ProcessStartReceiptController.PATH);
@@ -346,6 +369,10 @@ public class ProcessSecurityConfiguration {
             selected.add(AUTOMATION_NODE_RETRY_ROUTE);
             selected.addAll(AUTOMATION_ACTION_ROUTES);
             if (workerEnabled) selected.addAll(AUTOMATION_WORKER_ROUTES);
+            if (eventsEnabled) {
+                selected.add(EVENT_INGEST_ROUTE);
+                selected.add(EVENT_RECEIPT_ROUTE);
+            }
             routes = List.copyOf(selected);
         }
 
@@ -439,6 +466,47 @@ public class ProcessSecurityConfiguration {
     }
 
     static final class EventStorageReadiness { }
+
+    @Slf4j
+    @Configuration(proxyBeanMethods = false)
+    @EnableScheduling
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
+    static class EventReconciliationConfiguration {
+        @Bean("processEventReconciliation")
+        EventReconciliation processEventReconciliation(
+                @Qualifier("processEventApplicationService") ProcessEventApplicationService service) {
+            return new EventReconciliation(service);
+        }
+
+        record EventReconciliation(ProcessEventApplicationService service) {
+            @Scheduled(fixedDelayString = "${stellar.tianji.process.events.poll-interval:1s}")
+            public void reconcile() {
+                try {
+                    service.advancePending(32);
+                } catch (RuntimeException failure) {
+                    log.warn("Process event reconciliation failed: type={}", failure.getClass().getName());
+                }
+            }
+        }
+    }
+
+    @Bean("processEventApplicationService")
+    @DependsOn("processEventStorageReadiness")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "events.enabled"}, havingValue = "true")
+    ProcessEventApplicationService processEventApplicationService(ProcessEngine engine,
+            @Qualifier("processExecutionService") ProcessExecutionService execution, Environment environment,
+            ObjectProvider<ProcessEventApplicationService.EventSourceAuthorizer> sourceAuthorizers) {
+        var configuration = processConfiguration(engine);
+        var source = caseDataSource(configuration);
+        var jdbc = new JdbcTemplate(source);
+        jdbc.setQueryTimeout(5);
+        var transaction = new TransactionTemplate((DataSourceTransactionManager) configuration.getTransactionManager());
+        transaction.setTimeout(10);
+        var inbox = new ProcessEventInboxStore(jdbc, configuration.getDatabaseSchema());
+        var authorizer = sourceAuthorizers.getIfAvailable();
+        if (authorizer == null) throw new IllegalStateException("Process events require a trusted event source authorizer");
+        return new ProcessEventApplicationService(inbox, execution, transaction, environment, authorizer);
+    }
 
     @Bean("processApiSchemaVerifier")
     @ConditionalOnMissingBean(ProcessApiSchemaVerifier.class)

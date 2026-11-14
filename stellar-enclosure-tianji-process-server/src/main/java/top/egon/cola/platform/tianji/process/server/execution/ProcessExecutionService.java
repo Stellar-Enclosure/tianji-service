@@ -5,6 +5,8 @@ import lombok.extern.slf4j.Slf4j;
 import jakarta.validation.constraints.NotNull;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.EventRouteVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessEventCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand.AgentTaskOverrideVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationInstanceDTO.StateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
@@ -31,6 +33,9 @@ import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseTru
 import top.egon.cola.platform.tianji.process.server.release.PlatformReleaseTenantFence;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
+import top.egon.cola.platform.tianji.process.server.event.EventInboxBO;
+import top.egon.cola.platform.tianji.process.server.event.EventInboxBO.EventAdmissionVO;
+import top.egon.cola.platform.tianji.process.server.event.ProcessEventInboxStore;
 import tools.jackson.databind.json.JsonMapper;
 import tools.jackson.core.type.TypeReference;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseTrustVerifier.TrustAuthority;
@@ -98,6 +103,7 @@ public final class ProcessExecutionService {
     private final TransactionTemplate governedWrite;
     private final AutomationDependenciesVO automation;
     private final JdbcTemplate automationJdbc;
+    private final String schema;
 
     public ProcessExecutionService(SpringProcessEngineConfiguration engine, SpringDmnEngineConfiguration dmn,
                                    ProcessModelValidator validator) {
@@ -133,7 +139,8 @@ public final class ProcessExecutionService {
             throw new IllegalArgumentException("Process execution requires synchronous instance history and a shared JDBC transaction manager");
         }
         this.automationJdbc = new JdbcTemplate(manager.getDataSource());
-        this.receipts = new ProcessCommandReceiptStore(automationJdbc, engine.getDatabaseSchema());
+        this.schema = engine.getDatabaseSchema();
+        this.receipts = new ProcessCommandReceiptStore(automationJdbc, schema);
         this.write = new TransactionTemplate(manager);
         this.read = new TransactionTemplate(manager);
         this.read.setReadOnly(true);
@@ -236,6 +243,7 @@ public final class ProcessExecutionService {
     private static final int MAX_ROOT_INPUT_BYTES = 64 * 1024;
     private static final JsonMapper NATIVE_JSON = JsonMapper.builder().build();
     private static final TypeReference<Map<String, Object>> JSON_OBJECT = new TypeReference<>() { };
+    private static final String EVENT_START_PREFIX = "evt-v2-";
 
     public AutomationInstanceDTO startAutomation(@NotNull ProcessActor actor, @NotNull @Valid AutomationStartCommand command) {
         if (command == null || !command.isPublicStartValid()) throw invalid();
@@ -276,6 +284,11 @@ public final class ProcessExecutionService {
         automation.bindings().requireConfigurationFits(configuration);
         String configurationSha = ProcessInstanceBindingStore.configurationSha256(configuration);
         var query = admissionQuery(Purpose.START, actor, release, pinned.activation().getRevision(), intent.getCommandId(), raw, configurationSha);
+        var evidence = observeTrustedStart(query, release);
+        return new PreparedStartVO(pinned, normalized, configuration, configurationSha, evidence.proof(), evidence.trust());
+    }
+
+    private TrustedStartVO observeTrustedStart(AutomationAdmissionQuery query, ImmutableReleaseVO release) {
         String querySha = query.sha256();
         var proof = observeAdmission(query, querySha);
         try {
@@ -284,13 +297,236 @@ public final class ProcessExecutionService {
             var material = trust.observe(query, release);
             if (!querySha.equals(query.sha256())) throw automationUnavailable();
             AutomationReleaseTrustVerifier.verify(release, query, proof, material);
-            return new PreparedStartVO(pinned, normalized, configuration, configurationSha, proof, material);
+            return new TrustedStartVO(proof, material);
         } catch (AccessDeniedException denied) {
             throw denied;
         } catch (RuntimeException failure) {
             throw automationUnavailable();
         }
     }
+
+    public PreparedEventAdmissionVO prepareEventAdmission(ProcessActor producer, ProcessEventCommand submitted,
+                                                           String commandId, String fingerprint) {
+        requireAutomationActor(producer);
+        requireNewAutomationStart();
+        if (producer.subjectType() != ProcessActor.SubjectType.SERVICE || submitted == null || !submitted.isEventEnvelopeValid()
+                || !eventStartCommandId(producer, submitted.getEventId()).equals(commandId)
+                || !ProcessInstanceBindingStore.sha256(fingerprint)) throw invalid();
+        var command = new ProcessEventCommand(submitted.getEventId(), submitted.getDefinitionKey(), submitted.getRouteKey(),
+                submitted.getRouteVersion(), submitted.getType(), submitted.getOccurredAt(), submitted.getCorrelationKey(),
+                submitted.getWaitToken(), decodeCanonical(submitted.getPayload(), MAX_ROOT_INPUT_BYTES));
+        var pinned = Objects.requireNonNull(read.execute(status -> {
+            var activation = automation.activations().current(producer.tenantId(), command.getDefinitionKey())
+                    .orElseThrow(() -> new AutomationOperationException(AutomationOperationException.Code.TIANJI_PROCESS_NOT_ACTIVATED));
+            var release = automation.releases().find(producer.tenantId(), activation.getReleaseVersion())
+                    .orElseThrow(ProcessExecutionService::automationUnavailable);
+            requireActivation(activation, release);
+            return new PinnedReleaseVO(activation, release);
+        }));
+        var release = pinned.release();
+        var route = eventStartRoute(release, command.getRouteKey(), command.getRouteVersion());
+        command.validateForRoute(route);
+        String routeSha = eventRouteSha(release, route);
+        var normalized = map(release.source().inputSchema().normalizeValue(EventInboxBO.mapStartInput(route, command.getPayload())));
+        var configuration = effectiveManifest(release, Map.of());
+        automation.bindings().requireConfigurationFits(configuration);
+        String configurationSha = ProcessInstanceBindingStore.configurationSha256(configuration);
+        var query = eventAdmissionQuery(Purpose.EVENT_ADMIT, producer, release, pinned.activation().getRevision(),
+                commandId, fingerprint, configurationSha, command.getEventId(), routeSha, null);
+        var evidence = observeTrustedStart(query, release);
+        return new PreparedEventAdmissionVO(producer, command, commandId, fingerprint, pinned.activation(), release, route, routeSha,
+                normalized, configuration, configurationSha, evidence.proof(), evidence.trust());
+    }
+
+    public EventInboxBO validateEventAdmission(PreparedEventAdmissionVO prepared, String receiptId, Instant now) {
+        if (!TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(automationJdbc.getDataSource())) throw automationUnavailable();
+        requireNewAutomationStart();
+        var command = prepared.command();
+        var producer = prepared.producer();
+        var pinned = automation.activations().current(producer.tenantId(), command.getDefinitionKey())
+                .orElseThrow(ProcessExecutionService::activationConflict);
+        if (!pinned.equals(prepared.activation())) throw activationConflict();
+        var release = automation.releases().find(producer.tenantId(), pinned.getReleaseVersion())
+                .orElseThrow(ProcessExecutionService::automationUnavailable);
+        requireActivation(pinned, release);
+        var route = eventStartRoute(release, command.getRouteKey(), command.getRouteVersion());
+        if (!route.equals(prepared.route()) || !eventRouteSha(release, route).equals(prepared.routeSha())) throw activationConflict();
+        var query = eventAdmissionQuery(Purpose.EVENT_ADMIT, producer, release, pinned.getRevision(), prepared.commandId(),
+                prepared.fingerprint(), prepared.configurationSha(), command.getEventId(), prepared.routeSha(), null);
+        prepared.proof().requireCurrent(query.sha256(), now);
+        AutomationReleaseTrustVerifier.requireWindow(prepared.proof(), prepared.trust(), now);
+        Instant expires = now.plus(route.ttl()).truncatedTo(ChronoUnit.MICROS);
+        Instant day = now.plus(Duration.ofDays(1));
+        Instant cutoff = expires.isBefore(day) ? expires : day;
+        if (!cutoff.isAfter(now)) throw invalid();
+        var admission = new EventAdmissionVO(receiptId, command.getDefinitionKey(), pinned.getRevision(), release.releaseVersion(),
+                prepared.routeSha(), prepared.fingerprint(), Map.of("variables", prepared.normalized(), "agentTaskOverrides", Map.of()),
+                prepared.configuration(), prepared.configurationSha(), prepared.proof().authorizationSha256(), now, cutoff);
+        return new EventInboxBO().setTenantId(producer.tenantId()).setProducerIssuer(producer.issuerFingerprint())
+                .setProducerSubject(producer.subjectId()).setEventId(command.getEventId()).setReceiptId(receiptId)
+                .setFingerprint(prepared.fingerprint()).setRouteKey(route.routeKey()).setRouteVersion(route.version())
+                .setRouteSha256(prepared.routeSha()).setReleaseKey(release.releaseVersion()).setMode("START").setCommandId(prepared.commandId())
+                .setPayload(command.getPayload()).setCorrelationKey(command.getCorrelationKey()).setState("RECEIVED")
+                .setOccurredAt(command.getOccurredAt()).setReceivedAt(now).setExpiresAt(expires).setNextRetryAt(now)
+                .setDefinitionKey(command.getDefinitionKey()).setActivationRevision(pinned.getRevision())
+                .setAdmittedAt(now).setAdmissionNotAfter(cutoff).setAdmission(admission);
+    }
+
+    public static String eventStartCommandId(ProcessActor producer, String eventId) {
+        return EVENT_START_PREFIX + ProcessTypedJson.sha256("AUTOMATION_EVENT_START_COMMAND_V2", ProcessTypedJson.canonicalBytes(
+                List.of(producer.tenantId(), producer.issuerFingerprint(), producer.subjectId(), eventId)));
+    }
+
+    private static EventRouteVO eventStartRoute(ImmutableReleaseVO release, String routeKey, long routeVersion) {
+        return release.source().eventRoutes().stream()
+                .filter(route -> route.routeKey().equals(routeKey) && route.version() == routeVersion && "START".equals(route.mode()))
+                .findFirst().orElseThrow(() -> new AutomationOperationException(
+                        AutomationOperationException.Code.TIANJI_EVENT_ROUTE_VERSION_CONFLICT));
+    }
+
+    private static String eventRouteSha(ImmutableReleaseVO release, EventRouteVO route) {
+        Object digest = map(release.dependencies().get("eventRoutes")).get(route.routeKey() + "/" + route.version());
+        if (!(digest instanceof String value) || !ProcessInstanceBindingStore.sha256(value)) throw automationUnavailable();
+        return value;
+    }
+
+    private static AutomationAdmissionQuery eventAdmissionQuery(Purpose purpose, ProcessActor producer, ImmutableReleaseVO release,
+            long revision, String commandId, String fingerprint, String configurationSha, String eventId, String routeSha, String receiptId) {
+        return admissionQuery(purpose, producer, release, revision, commandId, fingerprint, configurationSha)
+                .setEventIdentity(new AutomationAdmissionQuery.EventIdentityVO(producer.issuerFingerprint(), producer.subjectId(), eventId, fingerprint))
+                .setRouteSha256(routeSha).setAdmissionReceiptId(receiptId);
+    }
+
+    public record PreparedEventAdmissionVO(ProcessActor producer, ProcessEventCommand command, String commandId, String fingerprint,
+            AutomationActivationBO activation, ImmutableReleaseVO release, EventRouteVO route, String routeSha,
+            Map<String, Object> normalized, Map<String, Object> configuration, String configurationSha,
+            AutomationAdmissionProofVO proof, TrustObservationVO trust) { }
+
+    private record TrustedStartVO(AutomationAdmissionProofVO proof, TrustObservationVO trust) { }
+
+    public EventStartOutcomeVO startAdmittedEvent(ProcessEventInboxStore store, long tenantId, String receiptId) {
+        if (automation == null || TransactionSynchronizationManager.isActualTransactionActive()
+                || TransactionSynchronizationManager.isSynchronizationActive()) throw automationUnavailable();
+        var snapshot = store.find(tenantId, receiptId).orElseThrow(ProcessResourceNotFoundException::new);
+        requireEventStartSource(snapshot);
+        TrustedStartVO evidence = null;
+        boolean revoked = false;
+        if ("RECEIVED".equals(snapshot.getState()) && snapshot.getAttempts() < ProcessEventInboxStore.MAX_RETRIES
+                && store.now().isBefore(snapshot.getAdmissionNotAfter())
+                && receipts.findOwnedStart(snapshot.producer(), snapshot.getCommandId()).isEmpty()) {
+            var release = eventStartRelease(snapshot);
+            try {
+                requireNewAutomationStart();
+                evidence = observeTrustedStart(eventStartQuery(snapshot, release), release);
+            } catch (AccessDeniedException denied) {
+                revoked = true;
+            } catch (RuntimeException failedPreparation) {
+                if (receipts.findOwnedStart(snapshot.producer(), snapshot.getCommandId()).isEmpty()) throw failedPreparation;
+            }
+        }
+        var prepared = evidence;
+        boolean denied = revoked;
+        return Objects.requireNonNull(write.execute(status ->
+                applyEventStart(store, tenantId, receiptId, snapshot, prepared, denied)));
+    }
+
+    private EventStartOutcomeVO applyEventStart(ProcessEventInboxStore store, long tenantId, String receiptId,
+            EventInboxBO observed, TrustedStartVO evidence, boolean denied) {
+        store.acquireTenantShared(tenantId);
+        var row = store.lock(tenantId, receiptId);
+        requireEventStartSource(row);
+        if (!observed.getAdmission().equals(row.getAdmission()) || !observed.producer().equals(row.producer())
+                || !observed.getCommandId().equals(row.getCommandId())) throw automationUnavailable();
+        var actor = row.producer();
+        var prior = receipts.lockIfPresent(actor, ProcessCommandReceiptStore.Kind.START, row.getCommandId()).orElse(null);
+        if (prior != null) {
+            var binding = automation.bindings().findByCommand(actor, row.getCommandId())
+                    .orElseThrow(ProcessExecutionService::automationUnavailable);
+            var release = verifyBoundRelease(binding, prior);
+            if (!row.getReceiptId().equals(binding.getSourceEventReceiptId())
+                    || !row.getFingerprint().equals(binding.getStartRequestSha256())
+                    || !eventStartQuery(row, release).sha256().equals(binding.getProof().querySha256())
+                    || !"RECEIVED".equals(row.getState()) && (!"APPLIED".equals(row.getState())
+                        || !prior.resourceId().equals(row.getInstanceId()))) throw automationUnavailable();
+            requireResolvedInput(binding, row.getCorrelationKey(), eventCorrelation(row.getCorrelationKey()), eventStartInput(row, release));
+            verifyNativeReceiptResource(binding, nativeDefinition(release));
+            return new EventStartOutcomeVO("APPLIED", "APPLIED", prior.resourceId());
+        }
+        if ("APPLIED".equals(row.getState())) throw automationUnavailable();
+        if (!"RECEIVED".equals(row.getState())) return eventOutcome(row);
+        Instant now = store.now();
+        if (!now.isBefore(row.getAdmissionNotAfter())) return eventOutcome(store.decide(row, "REJECTED", "EXPIRED", null));
+        if (denied) return eventOutcome(store.decide(row, "REJECTED", "ROUTE_REVOKED", null));
+        if (row.getAttempts() >= ProcessEventInboxStore.MAX_RETRIES) {
+            return eventOutcome(store.decide(row, "DEAD", "RETRY_EXHAUSTED", null));
+        }
+        if (evidence == null) throw automationUnavailable();
+        var release = eventStartRelease(row);
+        var query = eventStartQuery(row, release);
+        evidence.proof().requireCurrent(query.sha256(), now);
+        AutomationReleaseTrustVerifier.requireWindow(evidence.proof(), evidence.trust(), now);
+        var admission = row.getAdmission();
+        var input = eventStartInput(row, release);
+        var binding = new AutomationInstanceBindingBO().setTenantId(tenantId).setOwner(actor)
+                .setReleaseKey(row.getReleaseKey()).setDefinitionKey(row.getDefinitionKey()).setActivationRevision(row.getActivationRevision())
+                .setEffectiveManifest(admission.effectiveConfiguration()).setConfigurationSha256(admission.configurationSha256())
+                .setSourceCommandId(row.getCommandId()).setStartRequestSha256(row.getFingerprint())
+                .setAdmissionKind(AutomationInstanceBindingBO.AdmissionKind.EVENT).setSourceEventReceiptId(receiptId)
+                .setAdmittedAt(row.getAdmittedAt()).setProof(evidence.proof());
+        String nativeId = nativeDefinition(release);
+        var receipt = createBoundAutomationInstance(binding, nativeId, row.getCorrelationKey(), eventCorrelation(row.getCorrelationKey()), input);
+        if (receipt == null) throw automationUnavailable();
+        Instant finalCheck = store.now();
+        if (!finalCheck.isBefore(row.getAdmissionNotAfter())) throw automationUnavailable();
+        evidence.proof().requireCurrent(query.sha256(), finalCheck);
+        AutomationReleaseTrustVerifier.requireWindow(evidence.proof(), evidence.trust(), finalCheck);
+        return new EventStartOutcomeVO("APPLIED", "APPLIED", receipt.resourceId());
+    }
+
+    private ImmutableReleaseVO eventStartRelease(EventInboxBO row) {
+        var release = automation.releases().find(row.getTenantId(), row.getReleaseKey())
+                .orElseThrow(ProcessExecutionService::automationUnavailable);
+        if (!row.getDefinitionKey().equals(release.rootDefinitionKey())
+                || !row.getRouteSha256().equals(eventRouteSha(release, eventStartRoute(release, row.getRouteKey(), row.getRouteVersion())))) {
+            throw automationUnavailable();
+        }
+        return release;
+    }
+
+    private static void requireEventStartSource(EventInboxBO row) {
+        if (!"START".equals(row.getMode()) || row.getAdmission() == null
+                || !eventStartCommandId(row.producer(), row.getEventId()).equals(row.getCommandId())) throw automationUnavailable();
+    }
+
+    private static AutomationAdmissionQuery eventStartQuery(EventInboxBO row, ImmutableReleaseVO release) {
+        return eventAdmissionQuery(Purpose.EVENT_START, row.producer(), release, row.getActivationRevision(), row.getCommandId(),
+                row.getFingerprint(), row.getAdmission().configurationSha256(), row.getEventId(), row.getRouteSha256(), row.getReceiptId());
+    }
+
+    private Object eventStartInput(EventInboxBO row, ImmutableReleaseVO release) {
+        var admission = row.getAdmission();
+        var route = eventStartRoute(release, row.getRouteKey(), row.getRouteVersion());
+        var input = release.source().inputSchema().normalizeValue(EventInboxBO.mapStartInput(route, row.getPayload()));
+        if (!input.equals(release.source().inputSchema().normalizeValue(admission.mappedStartInput().get("variables")))
+                || !Map.of().equals(admission.mappedStartInput().get("agentTaskOverrides"))
+                || !ProcessInstanceBindingStore.configurationSha256(effectiveManifest(release, Map.of())).equals(admission.configurationSha256())
+                || !ProcessInstanceBindingStore.configurationSha256(admission.effectiveConfiguration()).equals(admission.configurationSha256())) {
+            throw automationUnavailable();
+        }
+        return input;
+    }
+
+    private static EventStartOutcomeVO eventOutcome(EventInboxBO row) {
+        return new EventStartOutcomeVO(row.getState(), row.getDecisionCode(), row.getInstanceId());
+    }
+
+    private static String eventCorrelation(String key) {
+        if (key.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")) return key;
+        return "event-correlation-" + ProcessTypedJson.sha256("AUTOMATION_EVENT_CORRELATION_V2", ProcessTypedJson.canonicalBytes(key));
+    }
+
+    public record EventStartOutcomeVO(String state, String decisionCode, String instanceId) { }
 
     private AutomationInstanceDTO writeAutomation(ProcessActor actor, AutomationStartCommand intent, String raw, PreparedStartVO prepared) {
         PlatformReleaseTenantFence.acquireShared(automationJdbc, actor.tenantId());
@@ -307,35 +543,44 @@ public final class ProcessExecutionService {
         var query = admissionQuery(Purpose.START, actor, release, activation.getRevision(), intent.getCommandId(), raw, prepared.configurationSha());
         prepared.proof().requireCurrent(query.sha256(), admitted);
         AutomationReleaseTrustVerifier.requireWindow(prepared.proof(), prepared.trust(), admitted);
-        String resolved = resolvedHash(raw, release.tenantId(), release.rootDefinitionKey(), release.releaseVersion(), activation.getRevision(),
-                prepared.configurationSha(), intent.getBusinessKey(), intent.getCorrelationId(), prepared.normalized());
-        if (!receipts.insert(actor, ProcessCommandReceiptStore.Kind.START, intent.getCommandId(), resolved,
-                release.releaseVersion(), intent.getCorrelationId())) return null;
-
-        String instanceRef = engine.getIdGenerator().getNextId();
-        var runtime = engine.getRuntimeService();
-        ProcessInstance instance = runtime.createProcessInstanceBuilder()
-                .predefineProcessInstanceId(instanceRef).processDefinitionId(nativeId).tenantId(Long.toString(actor.tenantId()))
-                .businessKey(intent.getBusinessKey()).variables(Map.of(ProcessReleaseService.AUTOMATION_BINDING_REF, instanceRef)).start();
-        if (instance == null || !instanceRef.equals(instance.getId()) || !nativeId.equals(instance.getProcessDefinitionId())
-                || !Long.toString(actor.tenantId()).equals(instance.getTenantId())) throw automationUnavailable();
-        receipts.apply(actor, ProcessCommandReceiptStore.Kind.START, intent.getCommandId(), instanceRef, null);
-        var receipt = receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, intent.getCommandId());
         var binding = new AutomationInstanceBindingBO().setTenantId(actor.tenantId()).setOwner(actor)
-                .setInstanceId(instanceRef).setReleaseKey(release.releaseVersion()).setDefinitionKey(release.rootDefinitionKey())
+                .setReleaseKey(release.releaseVersion()).setDefinitionKey(release.rootDefinitionKey())
                 .setActivationRevision(activation.getRevision()).setEffectiveManifest(prepared.configuration())
                 .setConfigurationSha256(prepared.configurationSha()).setSourceCommandId(intent.getCommandId()).setStartRequestSha256(raw)
-                .setResolvedStartSha256(resolved).setAdmissionKind(AutomationInstanceBindingBO.AdmissionKind.DIRECT)
-                .setSubmittedAt(receipt.createdAt()).setAdmittedAt(admitted).setProof(prepared.proof());
-        automation.bindings().insert(binding);
-        runtime.setVariableLocal(instanceRef, AutomationBootstrapBehavior.ROOT_INPUTS,
-                engine.getVariableJsonMapper().readTree(ProcessTypedJson.canonicalBytes(prepared.normalized(), MAX_ROOT_INPUT_BYTES)));
-        requireBoundReceipt(binding, receipt);
+                .setAdmissionKind(AutomationInstanceBindingBO.AdmissionKind.DIRECT).setAdmittedAt(admitted).setProof(prepared.proof());
+        var receipt = createBoundAutomationInstance(binding, nativeId, intent.getBusinessKey(), intent.getCorrelationId(), prepared.normalized());
+        if (receipt == null) return null;
         var projection = project(binding, receipt, release, nativeId, new AutomationObservationPermitVO(true, false, false, false, false), actor);
         Instant finalCheck = automation.bindings().now();
         prepared.proof().requireCurrent(query.sha256(), finalCheck);
         AutomationReleaseTrustVerifier.requireWindow(prepared.proof(), prepared.trust(), finalCheck);
         return projection;
+    }
+
+    private Receipt createBoundAutomationInstance(AutomationInstanceBindingBO binding, String nativeId,
+                                                   String business, String correlation, Object normalized) {
+        var actor = binding.getOwner();
+        var command = binding.getSourceCommandId();
+        String resolved = resolvedHash(binding.getStartRequestSha256(), binding.getTenantId(), binding.getDefinitionKey(),
+                binding.getReleaseKey(), binding.getActivationRevision(), binding.getConfigurationSha256(), business, correlation, normalized);
+        if (!receipts.insert(actor, ProcessCommandReceiptStore.Kind.START, command, resolved, binding.getReleaseKey(), correlation)) {
+            return null;
+        }
+        String instanceRef = engine.getIdGenerator().getNextId();
+        var runtime = engine.getRuntimeService();
+        ProcessInstance instance = runtime.createProcessInstanceBuilder()
+                .predefineProcessInstanceId(instanceRef).processDefinitionId(nativeId).tenantId(Long.toString(actor.tenantId()))
+                .businessKey(business).variables(Map.of(ProcessReleaseService.AUTOMATION_BINDING_REF, instanceRef)).start();
+        if (instance == null || !instanceRef.equals(instance.getId()) || !nativeId.equals(instance.getProcessDefinitionId())
+                || !Long.toString(actor.tenantId()).equals(instance.getTenantId())) throw automationUnavailable();
+        receipts.apply(actor, ProcessCommandReceiptStore.Kind.START, command, instanceRef, null);
+        var receipt = receipts.lock(actor, ProcessCommandReceiptStore.Kind.START, command);
+        binding.setInstanceId(instanceRef).setResolvedStartSha256(resolved).setSubmittedAt(receipt.createdAt());
+        automation.bindings().insert(binding);
+        runtime.setVariableLocal(instanceRef, AutomationBootstrapBehavior.ROOT_INPUTS,
+                engine.getVariableJsonMapper().readTree(ProcessTypedJson.canonicalBytes(normalized, MAX_ROOT_INPUT_BYTES)));
+        requireBoundReceipt(binding, receipt);
+        return receipt;
     }
 
     private AutomationInstanceDTO replayAutomation(ProcessActor actor, AutomationStartCommand intent, String raw) {
@@ -457,7 +702,23 @@ public final class ProcessExecutionService {
                     binding.getSourceCommandId(), binding.getStartRequestSha256(), binding.getConfigurationSha256());
             binding.getProof().requireCurrent(query.sha256(), binding.getAdmittedAt());
         } else {
-            throw automationUnavailable(); // The EVENT reader is introduced with the durable event source.
+            var inbox = new ProcessEventInboxStore(automationJdbc, schema);
+            var event = inbox.find(binding.getTenantId(), binding.getSourceEventReceiptId())
+                    .orElseThrow(ProcessExecutionService::automationUnavailable);
+            requireEventStartSource(event);
+            if (!event.producer().equals(binding.getOwner()) || !event.getCommandId().equals(binding.getSourceCommandId())
+                    || !event.getFingerprint().equals(binding.getStartRequestSha256())
+                    || !event.getReleaseKey().equals(binding.getReleaseKey()) || !event.getDefinitionKey().equals(binding.getDefinitionKey())
+                    || event.getActivationRevision() != binding.getActivationRevision()
+                    || !event.getAdmission().configurationSha256().equals(binding.getConfigurationSha256())
+                    || !eventCorrelation(event.getCorrelationKey()).equals(receipt.correlationId())
+                    || !binding.getAdmittedAt().equals(event.getAdmittedAt())
+                    || !binding.getSubmittedAt().isBefore(event.getAdmissionNotAfter())
+                    || !("RECEIVED".equals(event.getState()) || "APPLIED".equals(event.getState())
+                        && binding.getInstanceId().equals(event.getInstanceId()))) throw automationUnavailable();
+            var input = eventStartInput(event, eventStartRelease(event));
+            requireResolvedInput(binding, event.getCorrelationKey(), receipt.correlationId(), input);
+            binding.getProof().requireCurrent(eventStartQuery(event, release).sha256(), binding.getSubmittedAt());
         }
         return release;
     }
@@ -584,7 +845,9 @@ public final class ProcessExecutionService {
                 }
             }
         }
-        if (!validId(business, 255)) throw automationUnavailable();
+        if (binding.getAdmissionKind() == AutomationInstanceBindingBO.AdmissionKind.EVENT
+                ? business == null || business.isBlank() || business.length() > 255 || business.chars().anyMatch(Character::isISOControl)
+                : !validId(business, 255)) throw automationUnavailable();
         var actions = current != null && permit.cancel() && binding.getOwner().equals(actor) ? List.of("CANCEL") : List.<String>of();
         String version = ProcessTypedJson.sha256("AUTOMATION_INSTANCE_OBSERVATION_V2", ProcessTypedJson.canonicalBytes(
                 List.of(binding.getResolvedStartSha256(), state.name(), finished == null ? "" : finished.toString())));
