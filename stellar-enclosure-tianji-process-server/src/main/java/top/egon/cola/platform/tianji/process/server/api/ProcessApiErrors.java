@@ -92,6 +92,10 @@ public final class ProcessApiErrors {
     }
 
     public static HandlerExceptionResolver automationWorkerMediaErrors(RequestMatcher route) {
+        return strictCommandMediaErrors(route);
+    }
+
+    public static HandlerExceptionResolver strictCommandMediaErrors(RequestMatcher route) {
         return new AbstractHandlerExceptionResolver() {
             @Override
             protected ModelAndView doResolveException(HttpServletRequest request, HttpServletResponse response,

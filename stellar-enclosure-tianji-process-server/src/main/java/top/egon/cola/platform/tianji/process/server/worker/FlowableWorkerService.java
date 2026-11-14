@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.process.server.worker;
 
 import jakarta.validation.Valid;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
@@ -25,7 +26,9 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.NodePolicyVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireDTO;
@@ -34,11 +37,13 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.Au
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerTaskDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
+import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.WorkerLeaseLostException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.TaskOrigin;
@@ -62,6 +67,7 @@ import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessMode
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerBusinessError;
 import top.egon.cola.platform.tianji.process.server.release.ValidatedProcessModel.WorkerEffect;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore.RecoveryLeaseEvidence;
+import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry.FrozenWorkerContractVO;
 import top.egon.cola.platform.tianji.process.server.release.VerifiedProcessModels;
 
 import javax.sql.DataSource;
@@ -292,6 +298,50 @@ public final class FlowableWorkerService {
         return acquire(actor, command, false);
     }
 
+    public RecoveryScopeVO recoveryScope(ProcessActor actor, String instanceId, ProcessNodeExecutionBO prior,
+                                         @Nullable String businessReceiptRef) {
+        if (automation == null || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source)) throw automationUnavailable();
+        var root = automation.bindings().find(actor.tenantId(), instanceId).orElseThrow(FlowableWorkerService::unavailable);
+        if (!root.getOwner().equals(actor)) throw unavailable();
+        if (prior.getTenantId() != root.getTenantId() || !instanceId.equals(prior.getInstanceId())
+                || prior.getState() != StateEnum.WAIT_RECOVERY || prior.isExcluded()
+                || prior.getCapabilityKey() == null || prior.getCapabilityVersion() == null) throw recoveryBlocked();
+        automationStart(root);
+        var release = automation.releases().find(root.getTenantId(), root.getReleaseKey()).orElseThrow(FlowableWorkerService::automationUnavailable);
+        if (!root.getDefinitionKey().equals(release.rootDefinitionKey())) throw automationUnavailable();
+        var verified = releases.verifiedAutomation(release);
+        var slot = verified.controlBindings().occurrenceSlots().get(prior.getNodeId());
+        if (slot == null) throw recoveryBlocked();
+        var nodeBinding = release.source().nodeBindings().stream().filter(item -> item.nodeId().equals(prior.getNodeId())).findFirst()
+                .orElseThrow(FlowableWorkerService::automationUnavailable);
+        var frozen = registry.findFrozenContract(root.getTenantId(), prior.getCapabilityKey(), prior.getCapabilityVersion(),
+                frozenWorkerSha256(release, prior)).orElseThrow(FlowableWorkerService::recoveryBlocked);
+        var canonical = workerInput(root, prior, nodeBinding, frozen.capability());
+        var wait = process.getManagementService().executeCommand(context -> automation.lifecycle().observeWorkerRecoveryWait(prior));
+        if (!verified.root().engineDefinitionId().equals(wait.definitionId()) || !slot.activityId().equals(wait.activityId())) {
+            throw recoveryBlocked();
+        }
+        var query = WorkerEffectRecoveryQuery.builder().actor(actor).sourceId(frozen.sourceId()).instanceId(instanceId)
+                .nodeExecutionRef(prior.getNodeExecutionRef()).effectKey(prior.getEffectKey()).capabilityKey(prior.getCapabilityKey())
+                .handlerVersion(frozen.handlerVersion()).nodeRevision(prior.getRevision()).capabilityVersion(prior.getCapabilityVersion())
+                .attempt(prior.getAttempt()).effectFingerprint(workerFingerprint(frozen.capability(), frozen.handlerVersion(), frozen.targetId(),
+                        canonical)).outputSchemaSha256(prior.getOutputSchemaSha256()).nodeDeadlineAt(prior.getNodeDeadlineAt())
+                .targetId(frozen.targetId()).businessReceiptRef(businessReceiptRef).build();
+        query.sha256();
+        return new RecoveryScopeVO(query, nodeBinding.outputSchema(), frozen.capability().effectMode(), nodeBinding.policy(), root.getReleaseKey());
+    }
+
+    public String scheduleRecovery(ProcessNodeExecutionBO prior, @Nullable WorkerEffectRecoveryVO proof, String commandId, String reqSha) {
+        if (automation == null || !TransactionSynchronizationManager.hasResource(source)) throw automationUnavailable();
+        AutomationInstanceGuardCommandInterceptor.requireHeld(prior.getTenantId(), prior.getInstanceId());
+        return Objects.requireNonNull(process.getManagementService().executeCommand(
+                context -> automation.lifecycle().reenterWorkerRecovery(prior, proof, commandId, reqSha)));
+    }
+
+    public record RecoveryScopeVO(WorkerEffectRecoveryQuery query, ProcessSchemaVO outputSchema, WorkerEffectSafetyEnum effectMode,
+                                  NodePolicyVO policy, String releaseKey) { }
+
     public AutomationWorkerAcquireDTO acquireAutomation(ProcessActor actor, @Valid AutomationWorkerAcquireCommand command) {
         if (command == null || !AutomationNodeBindingVO.isCapabilityKey(command.getCapabilityKey())
                 || command.getCapabilityVersion() < 1 || command.getCapabilityVersion() > ProcessTypedJson.V2_MAX_WIRE_INTEGER) {
@@ -312,11 +362,17 @@ public final class FlowableWorkerService {
             var scope = automationScope(root, node, registration, nativeJob.definitionId(), nativeJob.elementId());
             if (node.getState() != StateEnum.WAITING || node.isExcluded()) return emptyAutomation();
             Instant now = automation.nodes().now();
+            if (!now.isBefore(node.getAttemptDeadlineAt()) || !now.isBefore(node.getNodeDeadlineAt())) return emptyAutomation();
             Instant expiresAt = earlier(now.plus(registration.leaseDuration()), node.getAttemptDeadlineAt());
             expiresAt = earlier(expiresAt, node.getNodeDeadlineAt());
             var proof = node.getWorkerEffectRecovery();
             if (proof != null) {
-                if (proof.observedAt().isAfter(now)) return emptyAutomation();
+                String reason = invalidRecoveryProof(node, registration.effectMode(), now);
+                if (reason != null) {
+                    process.getManagementService().executeCommand(context ->
+                            automation.lifecycle().parkInvalidWorkerRecovery(node, nativeJob.id(), reason));
+                    return emptyAutomation();
+                }
                 expiresAt = earlier(expiresAt, proof.validUntil());
             }
             expiresAt = expiresAt.truncatedTo(ChronoUnit.MILLIS);
@@ -400,6 +456,8 @@ public final class FlowableWorkerService {
             Instant now = automation.nodes().now();
             if (!now.isBefore(scope.node().getAttemptDeadlineAt()) || !now.isBefore(scope.node().getNodeDeadlineAt())
                     || !leases.isLive(actor, lease.jobId(), tokenHash)) throw lost();
+            if (command.completion() && scope.node().getWorkerEffectRecovery() != null
+                    && invalidRecoveryProof(scope.node(), scope.registration().effectMode(), now) != null) throw lost();
             if (!commands.insert(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId(), discovered.digest(),
                     root.getReleaseKey(), scope.correlationId())) {
                 var concurrent = commands.lock(actor, ProcessCommandReceiptStore.Kind.WORKER_REPORT_V2, command.commandId());
@@ -451,13 +509,7 @@ public final class FlowableWorkerService {
 
     private WorkerAttemptScopeVO automationScope(AutomationInstanceBindingBO root, ProcessNodeExecutionBO node,
             WorkerTopicRegistry.AutomationRegistrationVO registration, String engineDefinitionId, String nativeElementId) {
-        if (node.getTenantId() != registration.tenantId() || node.getTenantId() != root.getTenantId()
-                || !root.getInstanceId().equals(node.getInstanceId())
-                || !root.getConfigurationSha256().equals(node.getConfigurationSha256())
-                || !registration.capabilityKey().equals(node.getCapabilityKey())
-                || !Objects.equals(registration.capabilityVersion(), node.getCapabilityVersion())
-                || !registration.inputSchemaSha256().equals(node.getInputSchemaSha256())
-                || !registration.outputSchemaSha256().equals(node.getOutputSchemaSha256())) throw conflict();
+        if (node.getTenantId() != registration.tenantId()) throw conflict();
         var release = automation.releases().find(root.getTenantId(), root.getReleaseKey()).orElseThrow(FlowableWorkerService::automationUnavailable);
         if (!root.getDefinitionKey().equals(release.rootDefinitionKey())) throw automationUnavailable();
         var verified = releases.verifiedAutomation(release);
@@ -467,24 +519,66 @@ public final class FlowableWorkerService {
         }
         var binding = release.source().nodeBindings().stream().filter(item -> item.nodeId().equals(node.getNodeId())).findFirst()
                 .orElseThrow(FlowableWorkerService::automationUnavailable);
-        if (!registration.capability().equals(binding.service())
-                || !(release.dependencies().get("workerCapabilities") instanceof Map<?, ?> workers)
-                || !(workers.get(node.getNodeId()) instanceof Map<?, ?> worker)
-                || !registration.contractSha256().equals(worker.get("contractSha256"))) throw unavailable();
+        if (!registration.contractSha256().equals(frozenWorkerSha256(release, node))) throw unavailable();
         Map<String, Object> input = typedObject(binding.inputSchema().normalizeValue(node.getInput()));
-        byte[] canonical = ProcessTypedJson.canonicalBytes(input, 64 * 1024);
-        if (!Arrays.equals(canonical, ProcessTypedJson.canonicalBytes(node.getInput(), 64 * 1024))
-                || !ProcessTypedJson.sha256("AUTOMATION_NODE_INPUT_V2", utf8(node.getInputSchemaSha256()), canonical)
-                    .equals(node.getInputSha256())) throw automationUnavailable();
-        String fingerprint = ProcessTypedJson.sha256("AUTOMATION_WORKER_EFFECT_V2", utf8(registration.capabilityKey()),
-                utf8(Long.toString(registration.capabilityVersion())), utf8(registration.inputSchemaSha256()),
-                utf8(registration.outputSchemaSha256()), utf8(registration.effectMode().name()), utf8(registration.handlerVersion()),
-                ProcessTypedJson.canonicalBytes(registration.targetId()), canonical);
+        byte[] canonical = workerInput(root, node, binding, registration.capability());
+        String fingerprint = workerFingerprint(registration.capability(), registration.handlerVersion(), registration.targetId(), canonical);
+        var start = automationStart(root);
+        return new WorkerAttemptScopeVO(node, registration, binding, verified.root(), nativeElementId,
+                start.correlationId(), input, rawSha256(canonical), fingerprint);
+    }
+
+    private ProcessCommandReceiptStore.Receipt automationStart(AutomationInstanceBindingBO root) {
         var start = commands.startByInstance(root.getOwner(), root.getInstanceId());
         if (!root.getReleaseKey().equals(start.releaseKey()) || !root.getResolvedStartSha256().equals(start.requestHash())
                 || !root.getSubmittedAt().equals(start.createdAt()) || !root.getInstanceId().equals(start.resourceId())) throw automationUnavailable();
-        return new WorkerAttemptScopeVO(node, registration, binding, verified.root(), nativeElementId,
-                start.correlationId(), input, rawSha256(canonical), fingerprint);
+        return start;
+    }
+
+    private static String frozenWorkerSha256(AutomationReleaseStore.ImmutableReleaseVO release, ProcessNodeExecutionBO node) {
+        if (!(release.dependencies().get("workerCapabilities") instanceof Map<?, ?> workers)
+                || !(workers.get(node.getNodeId()) instanceof Map<?, ?> worker)
+                || !(worker.get("contractSha256") instanceof String sha) || !sha.matches("[0-9a-f]{64}")) throw automationUnavailable();
+        return sha;
+    }
+
+    private static byte[] workerInput(AutomationInstanceBindingBO root, ProcessNodeExecutionBO node, AutomationNodeBindingVO binding,
+                                      AutomationNodeBindingVO.CapabilityRefVO capability) {
+        if (node.getTenantId() != root.getTenantId() || !root.getInstanceId().equals(node.getInstanceId())
+                || !root.getConfigurationSha256().equals(node.getConfigurationSha256())
+                || !capability.capabilityKey().equals(node.getCapabilityKey()) || !Objects.equals(capability.version(), node.getCapabilityVersion())
+                || !capability.inputSchemaSha256().equals(node.getInputSchemaSha256())
+                || !capability.outputSchemaSha256().equals(node.getOutputSchemaSha256())
+                || !capability.equals(binding.service())) throw conflict();
+        var canonical = ProcessTypedJson.canonicalBytes(binding.inputSchema().normalizeValue(node.getInput()), 64 * 1024);
+        if (!Arrays.equals(canonical, ProcessTypedJson.canonicalBytes(node.getInput(), 64 * 1024))
+                || !ProcessTypedJson.sha256("AUTOMATION_NODE_INPUT_V2", utf8(node.getInputSchemaSha256()), canonical)
+                    .equals(node.getInputSha256())) throw automationUnavailable();
+        return canonical;
+    }
+
+    private static String workerFingerprint(AutomationNodeBindingVO.CapabilityRefVO capability, String handlerVersion,
+                                            String targetId, byte[] canonical) {
+        return ProcessTypedJson.sha256("AUTOMATION_WORKER_EFFECT_V2", utf8(capability.capabilityKey()),
+                utf8(Long.toString(capability.version())), utf8(capability.inputSchemaSha256()), utf8(capability.outputSchemaSha256()),
+                utf8(capability.effectMode().name()), utf8(handlerVersion), ProcessTypedJson.canonicalBytes(targetId), canonical);
+    }
+
+    @Nullable
+    private static String invalidRecoveryProof(ProcessNodeExecutionBO node, WorkerEffectSafetyEnum effectMode, Instant now) {
+        var proof = node.getWorkerEffectRecovery();
+        if (proof == null) return null;
+        if (proof.observedAt().isAfter(now) || proof.validUntil().isAfter(node.getNodeDeadlineAt()) || node.getAttempt() < 2
+                || node.getRetryCommandId() == null || node.getRetryRequestSha256() == null
+                || effectMode == WorkerEffectSafetyEnum.READ_ONLY
+                || proof.mode() == WorkerEffectRecoveryVO.Mode.RETRY_NOT_APPLIED && effectMode != WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT) {
+            return ProcessNodeLifecycleListener.WORKER_RECOVERY_PROOF_MISMATCH;
+        }
+        return now.isBefore(proof.validUntil()) ? null : ProcessNodeLifecycleListener.WORKER_RECOVERY_PROOF_EXPIRED;
+    }
+
+    private static AutomationOperationException recoveryBlocked() {
+        return new AutomationOperationException(AutomationOperationException.Code.TIANJI_NODE_RETRY_BLOCKED);
     }
 
     private AutomationWorkerTaskDTO automationTask(WorkerAttemptScopeVO scope, WorkerLeaseStore.Lease lease, String token) {

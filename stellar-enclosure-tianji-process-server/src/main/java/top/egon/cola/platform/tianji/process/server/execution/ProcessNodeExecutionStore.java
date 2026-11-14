@@ -15,11 +15,13 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTy
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerBusinessResultDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
+import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 
 import java.nio.charset.StandardCharsets;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -30,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 @Slf4j
 @Validated
@@ -37,6 +40,8 @@ public class ProcessNodeExecutionStore {
     static final int MAX_DATA = 64 * 1024;
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private static final TypeReference<Map<String, Object>> OBJECT = new TypeReference<>() { };
+    private static final Set<String> RECOVERY_FIELDS = Set.of("mode", "observedGeneration", "observedAt", "validUntil",
+            "authorityRef", "evidenceSha256", "businessReceiptId", "resultSha256");
     private static final String COLUMNS = """
             tenant_id,instance_id,occurrence_id,attempt,node_execution_ref,node_id,kind,parent_scope_id,attempt_scope_id,
             branch_index,iteration_index,excluded,native_job_id,native_subscription_id,capability_key,capability_version,effect_key,
@@ -78,7 +83,7 @@ public class ProcessNodeExecutionStore {
                 row.getOutputSchemaSha256(), row.getConfigurationSha256(), row.getState().name(), row.getRevision(), null, null,
                 row.getAgentRunId(), row.getSideEffectOutcome().name(), row.getErrorCode(), utc(row.getStartedAt()), utc(row.getNodeDeadlineAt()),
                 utc(row.getAttemptDeadlineAt()), utc(row.getAcceptedAt()), utc(row.getFinishedAt()), row.getRetryCommandId(),
-                row.getRetryRequestSha256(), row.getWorkerEffectRecovery() == null ? null : JSON.writeValueAsString(row.getWorkerEffectRecovery()));
+                row.getRetryRequestSha256(), recoveryJson(row.getWorkerEffectRecovery()));
         if (inserted != 1) throw unavailable();
     }
 
@@ -86,6 +91,49 @@ public class ProcessNodeExecutionStore {
         requireTransaction();
         return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED + " AND node_execution_ref=?",
                 this::row, tenantId, instanceId, nodeExecutionRef));
+    }
+
+    public Optional<ProcessNodeExecutionBO> findRetry(long tenantId, String instanceId, String commandId) {
+        requireTransaction();
+        return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED + " AND retry_command_id=? LIMIT 2",
+                this::row, tenantId, instanceId, commandId));
+    }
+
+    void insertRecoveredAttempt(ProcessNodeExecutionBO prior, ProcessNodeExecutionBO next) {
+        requireWrite(prior.getTenantId(), prior.getInstanceId());
+        var latest = findByOccurrence(prior.getTenantId(), prior.getInstanceId(), prior.getOccurrenceId())
+                .orElseThrow(ProcessNodeExecutionStore::unavailable);
+        var timestamp = now();
+        var proof = next.getWorkerEffectRecovery();
+        if (!prior.equals(latest) || prior.getState() != StateEnum.WAIT_RECOVERY || prior.getNativeSubscriptionId() == null
+                || prior.getNativeJobId() == null || prior.isExcluded() || prior.getCapabilityKey() == null
+                || !timestamp.isBefore(prior.getNodeDeadlineAt())
+                || (prior.getSideEffectOutcome() == SideEffectOutcomeEnum.UNKNOWN) != (proof != null)
+                || proof != null && (timestamp.isBefore(proof.observedAt()) || !timestamp.isBefore(proof.validUntil())
+                        || proof.validUntil().isAfter(prior.getNodeDeadlineAt()))) {
+            throw new AutomationOperationException(AutomationOperationException.Code.TIANJI_NODE_RETRY_BLOCKED);
+        }
+        if (next.getAttempt() != prior.getAttempt() + 1 || next.getTenantId() != prior.getTenantId()
+                || !prior.getInstanceId().equals(next.getInstanceId()) || !prior.getOccurrenceId().equals(next.getOccurrenceId())
+                || !prior.getParentScopeId().equals(next.getParentScopeId()) || !prior.getNodeId().equals(next.getNodeId())
+                || prior.getKind() != next.getKind() || !prior.getCapabilityKey().equals(next.getCapabilityKey())
+                || !Objects.equals(prior.getCapabilityVersion(), next.getCapabilityVersion())
+                || !prior.getEffectKey().equals(next.getEffectKey()) || !prior.getInputSha256().equals(next.getInputSha256())
+                || !prior.getInputSchemaSha256().equals(next.getInputSchemaSha256())
+                || !prior.getOutputSchemaSha256().equals(next.getOutputSchemaSha256())
+                || !prior.getConfigurationSha256().equals(next.getConfigurationSha256())
+                || !prior.getNodeDeadlineAt().equals(next.getNodeDeadlineAt())
+                || next.getState() != StateEnum.WAITING || next.getSideEffectOutcome() != SideEffectOutcomeEnum.NONE
+                || next.getNativeJobId() != null || next.getNativeSubscriptionId() != null || next.getRetryCommandId() == null
+                || !next.getRetryCommandId().matches("[A-Za-z][A-Za-z0-9_.:-]{0,127}")
+                || !ProcessInstanceBindingStore.sha256(next.getRetryRequestSha256())) throw unavailable();
+        int changed = jdbc.update("UPDATE " + table + " SET state='FAILED',revision=revision+1,finished_at=?"
+                        + SCOPED + WORKER + " AND occurrence_id=? AND attempt=? AND node_execution_ref=? AND attempt_scope_id=?"
+                        + " AND native_job_id=? AND native_subscription_id=? AND revision=? AND state='WAIT_RECOVERY'",
+                utc(timestamp), prior.getTenantId(), prior.getInstanceId(), prior.getOccurrenceId(), prior.getAttempt(),
+                prior.getNodeExecutionRef(), prior.getAttemptScopeId(), prior.getNativeJobId(), prior.getNativeSubscriptionId(), prior.getRevision());
+        if (changed != 1) throw new AutomationOperationException(AutomationOperationException.Code.TIANJI_NODE_RETRY_BLOCKED);
+        insertOccurrence(next);
     }
 
     public Optional<ProcessNodeExecutionBO> findCurrentHuman(long tenantId, String instanceId, String nativeExecutionId, String logicalNodeId) {
@@ -156,6 +204,15 @@ public class ProcessNodeExecutionStore {
                         + " WHERE id_=? AND tenant_id_=? AND process_instance_id_=? FOR UPDATE", String.class,
                 row.getNativeJobId(), Long.toString(row.getTenantId()), row.getInstanceId());
         if (found.size() != 1) throw unavailable();
+    }
+
+    void releaseWorkerScopeLock(ProcessNodeExecutionBO row, String definitionId, String owner, Instant expiresAt) {
+        requireWrite(row.getTenantId(), row.getInstanceId());
+        jdbc.update("UPDATE " + executions + " SET lock_owner_=NULL,lock_time_=NULL"
+                        + " WHERE id_=? AND proc_inst_id_=? AND parent_id_ IS NULL AND tenant_id_=? AND proc_def_id_=?"
+                        + " AND lock_owner_=? AND lock_time_=?",
+                row.getInstanceId(), row.getInstanceId(), Long.toString(row.getTenantId()), definitionId, owner,
+                Timestamp.from(expiresAt));
     }
 
     public String acceptWorkerResult(ProcessNodeExecutionBO row, String nativeJobId,
@@ -312,7 +369,7 @@ public class ProcessNodeExecutionStore {
                     .setAttemptDeadlineAt(instant(row,"attempt_deadline_at")).setAcceptedAt(instant(row,"accepted_at")).setFinishedAt(instant(row,"finished_at"))
                     .setRetryCommandId(row.getString("retry_command_id")).setRetryRequestSha256(row.getString("retry_request_sha256"));
             String recovery = row.getString("worker_effect_recovery");
-            if (recovery != null) item.setWorkerEffectRecovery(JSON.readValue(recovery, WorkerEffectRecoveryVO.class));
+            if (recovery != null) item.setWorkerEffectRecovery(recovery(recovery));
             if (!digest("AUTOMATION_NODE_INPUT_V2", item.getInputSchemaSha256(), item.getInput()).equals(item.getInputSha256())
                     || (item.getOutput() == null) != (item.getOutputSha256() == null)
                     || item.getOutput() != null && !digest("AUTOMATION_NODE_OUTPUT_V2", item.getOutputSchemaSha256(),
@@ -323,6 +380,29 @@ public class ProcessNodeExecutionStore {
         } catch (RuntimeException corrupt) {
             throw unavailable();
         }
+    }
+
+    private static String recoveryJson(WorkerEffectRecoveryVO proof) {
+        if (proof == null) return null;
+        var value = new LinkedHashMap<String, Object>();
+        value.put("mode", proof.mode().name());
+        value.put("observedGeneration", proof.observedGeneration());
+        value.put("observedAt", proof.observedAt().toString());
+        value.put("validUntil", proof.validUntil().toString());
+        value.put("authorityRef", proof.authorityRef());
+        value.put("evidenceSha256", proof.evidenceSha256());
+        value.put("businessReceiptId", proof.businessReceiptId());
+        value.put("resultSha256", proof.resultSha256());
+        return json(value, 4096);
+    }
+
+    private static WorkerEffectRecoveryVO recovery(String json) {
+        Map<String, Object> value = JSON.readValue(json, OBJECT);
+        if (!RECOVERY_FIELDS.equals(value.keySet()) || !(value.get("observedGeneration") instanceof Number generation)) throw unavailable();
+        return new WorkerEffectRecoveryVO(WorkerEffectRecoveryVO.Mode.valueOf((String) value.get("mode")),
+                generation.longValue(), Instant.parse((String) value.get("observedAt")), Instant.parse((String) value.get("validUntil")),
+                (String) value.get("authorityRef"), (String) value.get("evidenceSha256"),
+                (String) value.get("businessReceiptId"), (String) value.get("resultSha256"));
     }
 
     static String digest(String domain, String schema, Map<String, Object> value) {

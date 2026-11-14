@@ -32,6 +32,7 @@ import org.flowable.eventsubscription.service.impl.persistence.entity.EventSubsc
 import org.flowable.job.service.JobHandler;
 import org.flowable.job.service.JobProcessor;
 import org.flowable.job.service.JobProcessorContext;
+import org.flowable.job.service.impl.persistence.entity.AbstractRuntimeJobEntity;
 import org.flowable.job.service.impl.persistence.entity.ExternalWorkerJobEntity;
 import org.flowable.job.service.impl.persistence.entity.ExternalWorkerJobEntityManager;
 import org.flowable.job.service.impl.persistence.entity.JobEntity;
@@ -49,6 +50,8 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNo
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.WorkerEffectRecoveryVO;
+import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.release.AutomationModelCompiler.OccurrenceSlotVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.ImmutableReleaseVO;
@@ -93,6 +96,8 @@ public class ProcessNodeLifecycleListener {
     private static final String ATTEMPT_TIMEOUT = "ATTEMPT_TIMEOUT";
     private static final String NODE_TIMEOUT = "NODE_TIMEOUT";
     private static final String RETRY_JOB = "tianji-automation-worker-retry";
+    public static final String WORKER_RECOVERY_PROOF_EXPIRED = "WORKER_RECOVERY_PROOF_EXPIRED";
+    public static final String WORKER_RECOVERY_PROOF_MISMATCH = "WORKER_RECOVERY_PROOF_MISMATCH";
 
     @Qualifier("processInstanceBindingStore") private final ProcessInstanceBindingStore bindings;
     @Qualifier("processNodeExecutionStore") private final ProcessNodeExecutionStore nodes;
@@ -197,6 +202,155 @@ public class ProcessNodeLifecycleListener {
                 || !row.getConfigurationSha256().equals(execution.getVariableLocal(CONFIGURATION_SHA))) throw unavailable();
     }
 
+    public WorkerRecoveryWaitVO observeWorkerRecoveryWait(ProcessNodeExecutionBO row) {
+        var wait = requireWorkerRecoveryWait(row, false);
+        var execution = wait.attempt().execution();
+        return new WorkerRecoveryWaitVO(wait.subscription().getId(), execution.getId(), execution.getProcessDefinitionId(),
+                execution.getCurrentActivityId(), wait.attempt().occurrence().getId());
+    }
+
+    public String reenterWorkerRecovery(ProcessNodeExecutionBO prior, WorkerEffectRecoveryVO proof, String commandId, String requestSha) {
+        var recovered = requireWorkerRecoveryWait(prior, true);
+        var attempt = recovered.attempt();
+        Instant now = nodes.now();
+        if (!now.isBefore(prior.getNodeDeadlineAt()) || prior.getAttempt() >= attempt.binding().policy().retry().maxAttempts()
+                || (prior.getSideEffectOutcome() == SideEffectOutcomeEnum.UNKNOWN) != (proof != null)
+                || proof != null && (now.isBefore(proof.observedAt()) || !now.isBefore(proof.validUntil())
+                        || proof.validUntil().isAfter(prior.getNodeDeadlineAt()) || !allowedWorkerRecovery(attempt.binding(), proof))) {
+            throw recoveryBlocked();
+        }
+        var occurrence = attempt.occurrence();
+        var nextScope = replaceWorkerAttempt(attempt);
+        nextScope.setScope(true);
+        int nextNumber = prior.getAttempt() + 1;
+        Instant attemptDeadline = now.plus(attempt.binding().policy().attemptTimeout());
+        if (attemptDeadline.isAfter(prior.getNodeDeadlineAt())) attemptDeadline = prior.getNodeDeadlineAt();
+        String nextRef = executionRef(prior.getTenantId(), prior.getInstanceId(), prior.getOccurrenceId(), nextNumber);
+        var next = new ProcessNodeExecutionBO()
+                .setTenantId(prior.getTenantId()).setInstanceId(prior.getInstanceId()).setOccurrenceId(prior.getOccurrenceId())
+                .setAttempt(nextNumber).setNodeExecutionRef(nextRef).setNodeId(prior.getNodeId()).setKind(prior.getKind())
+                .setParentScopeId(occurrence.getParentId()).setAttemptScopeId(nextScope.getId())
+                .setBranchIndex(prior.getBranchIndex()).setIterationIndex(prior.getIterationIndex())
+                .setCapabilityKey(prior.getCapabilityKey()).setCapabilityVersion(prior.getCapabilityVersion()).setEffectKey(prior.getEffectKey())
+                .setInput(prior.getInput()).setInputSha256(prior.getInputSha256()).setInputSchemaSha256(prior.getInputSchemaSha256())
+                .setOutputSchemaSha256(prior.getOutputSchemaSha256()).setConfigurationSha256(prior.getConfigurationSha256())
+                .setState(StateEnum.WAITING).setRevision(1).setSideEffectOutcome(SideEffectOutcomeEnum.NONE)
+                .setStartedAt(now).setNodeDeadlineAt(prior.getNodeDeadlineAt()).setAttemptDeadlineAt(attemptDeadline)
+                .setRetryCommandId(commandId).setRetryRequestSha256(requestSha).setWorkerEffectRecovery(proof);
+        nodes.insertRecoveredAttempt(prior, next);
+        // The normal agenda replaces a subprocess's incoming execution with a new scope ID.
+        // The recovered row already names this exact scope, so enter it directly.
+        CommandContextUtil.getAgenda().planContinueProcessSynchronousOperation(nextScope);
+        return nextRef;
+    }
+
+    public boolean parkInvalidWorkerRecovery(ProcessNodeExecutionBO row, String nativeJobId, String reason) {
+        var job = requireWorkerJob(row, nativeJobId);
+        var execution = CommandContextUtil.getExecutionEntityManager().findById(job.getExecutionId());
+        var attempt = exactWorkerAttempt(context(execution), execution, job);
+        var proof = row.getWorkerEffectRecovery();
+        var now = nodes.now();
+        if (!row.equals(attempt.row()) || row.getState() != StateEnum.WAITING || proof == null
+                || !now.isBefore(row.getNodeDeadlineAt())) return false;
+        boolean invalid = switch (reason) {
+            case WORKER_RECOVERY_PROOF_EXPIRED -> !now.isBefore(proof.validUntil());
+            case WORKER_RECOVERY_PROOF_MISMATCH -> now.isBefore(proof.observedAt()) || !allowedWorkerRecovery(attempt.binding(), proof)
+                    || proof.validUntil().isAfter(row.getNodeDeadlineAt()) || row.getAttempt() < 2
+                    || row.getRetryCommandId() == null || !ProcessInstanceBindingStore.sha256(row.getRetryRequestSha256())
+                    || !matchesWorkerEnvelope(execution, row);
+            case null, default -> false;
+        };
+        if (!invalid) return false;
+        parkWorker(attempt, job, SideEffectOutcomeEnum.UNKNOWN, reason);
+        return true;
+    }
+
+    private static boolean allowedWorkerRecovery(AutomationNodeBindingVO binding, WorkerEffectRecoveryVO proof) {
+        var mode = binding.service().effectMode();
+        return mode != WorkerEffectSafetyEnum.READ_ONLY && (proof.mode() != WorkerEffectRecoveryVO.Mode.RETRY_NOT_APPLIED
+                || mode == WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT);
+    }
+
+    private VerifiedWorkerRecoveryWaitVO requireWorkerRecoveryWait(ProcessNodeExecutionBO row, boolean guarded) {
+        if (guarded) AutomationInstanceGuardCommandInterceptor.requireHeld(row.getTenantId(), row.getInstanceId());
+        if (row.getState() != StateEnum.WAIT_RECOVERY || row.isExcluded() || row.getNativeSubscriptionId() == null
+                || row.getNativeJobId() == null) throw recoveryBlocked();
+        var subscriptions = CommandContextUtil.getEventSubscriptionService();
+        var subscription = subscriptions.findById(row.getNativeSubscriptionId());
+        if (subscription == null || !"message".equals(subscription.getEventType())
+                || !(RECOVERY_MESSAGE + row.getNodeExecutionRef()).equals(subscription.getEventName())
+                || !row.getInstanceId().equals(subscription.getProcessInstanceId())
+                || !Long.toString(row.getTenantId()).equals(subscription.getTenantId())) throw recoveryBlocked();
+        var execution = CommandContextUtil.getExecutionEntityManager().findById(subscription.getExecutionId());
+        if (execution == null || !row.getInstanceId().equals(execution.getRootProcessInstanceId())
+                || !Long.toString(row.getTenantId()).equals(execution.getTenantId())
+                || !execution.getCurrentActivityId().equals(subscription.getActivityId())
+                || !execution.getProcessDefinitionId().equals(subscription.getProcessDefinitionId())) throw recoveryBlocked();
+        var context = context(execution, guarded);
+        var slot = context.verified().controlBindings().occurrenceSlots().get(row.getNodeId());
+        if (slot == null || !subscription.getActivityId().equals(slot.activityId())) throw recoveryBlocked();
+        var attemptScope = execution.getParent();
+        var occurrenceScope = attemptScope == null ? null : attemptScope.getParent();
+        if (attemptScope == null || occurrenceScope == null || !row.getAttemptScopeId().equals(attemptScope.getId())
+                || !slot.attemptOrBodyId().equals(attemptScope.getCurrentActivityId())
+                || !slot.scopeId().equals(occurrenceScope.getCurrentActivityId())
+                || !row.getParentScopeId().equals(occurrenceScope.getParentId())) throw recoveryBlocked();
+        var root = execution.getRootProcessInstance();
+        var related = execution.getEventSubscriptions();
+        if (root == null || !execution.isActive() || execution.isEnded() || execution.isSuspended()
+                || root.isEnded() || root.isSuspended() || !row.getInstanceId().equals(root.getId())
+                || related.size() != 1 || !subscription.getId().equals(related.getFirst().getId())
+                || !matchesWorkerEnvelope(execution, row)
+                || !row.getNodeDeadlineAt().equals(workerNodeDeadline(occurrenceScope))) throw recoveryBlocked();
+        var latest = nodes.findByOccurrence(row.getTenantId(), row.getInstanceId(), row.getOccurrenceId());
+        if (latest.filter(row::equals).isEmpty()) throw recoveryBlocked();
+        var attempt = exactWorkerAttempt(context, execution, null);
+        if (!row.equals(attempt.row())) throw recoveryBlocked();
+        var jobs = context.engine().getJobServiceConfiguration();
+        if (jobs.getExternalWorkerJobEntityManager().findById(row.getNativeJobId()) != null
+                || jobs.getJobService().findJobById(row.getNativeJobId()) != null
+                || jobs.getTimerJobService().findTimerJobById(row.getNativeJobId()) != null
+                || jobs.getSuspendedJobEntityManager().findById(row.getNativeJobId()) != null
+                || jobs.getDeadLetterJobEntityManager().findById(row.getNativeJobId()) != null) throw recoveryBlocked();
+        if (guarded) requireWorkerHardTimer(context, row, occurrenceScope);
+        return new VerifiedWorkerRecoveryWaitVO(attempt, subscription);
+    }
+
+    private static void requireWorkerHardTimer(LifecycleContextVO context, ProcessNodeExecutionBO row, ExecutionEntity occurrence) {
+        var policy = context.verified().controlBindings().policySlots().get(row.getNodeId());
+        if (policy == null || policy.nodeTimeoutBoundaryId() == null) throw recoveryBlocked();
+        String boundaryId = policy.nodeTimeoutBoundaryId();
+        var attached = occurrence.getExecutions().stream()
+                .filter(execution -> execution.getCurrentFlowElement() instanceof BoundaryEvent boundary
+                        && boundaryId.equals(boundary.getId()) && occurrence.getCurrentActivityId().equals(boundary.getAttachedToRefId())
+                        && occurrence.getId().equals(execution.getParentId()) && !execution.isEnded() && !execution.isSuspended())
+                .limit(2).toList();
+        if (attached.size() != 1) throw recoveryBlocked();
+        var boundary = attached.getFirst();
+        var jobs = context.engine().getJobServiceConfiguration();
+        List<AbstractRuntimeJobEntity> timers = new ArrayList<>(jobs.getTimerJobService().findTimerJobsByExecutionId(boundary.getId()));
+        timers.addAll(jobs.getJobService().findJobsByExecutionId(boundary.getId()));
+        long due = roundedTimerMillis(row.getNodeDeadlineAt());
+        if (timers.size() != 1 || !matchesHardTimer(timers.getFirst(), boundary, row, due)) throw recoveryBlocked();
+    }
+
+    private static boolean matchesHardTimer(AbstractRuntimeJobEntity timer, ExecutionEntity boundary,
+                                            ProcessNodeExecutionBO row, long dueMillis) {
+        String configuration = timer.getJobHandlerConfiguration();
+        return "trigger-timer".equals(timer.getJobHandlerType()) && configuration != null
+                && boundary.getId().equals(timer.getExecutionId()) && boundary.getCurrentActivityId().equals(timer.getElementId())
+                && boundary.getCurrentActivityId().equals(TimerEventHandler.getActivityIdFromConfiguration(configuration))
+                && boundary.getProcessDefinitionId().equals(timer.getProcessDefinitionId())
+                && row.getInstanceId().equals(timer.getProcessInstanceId()) && Long.toString(row.getTenantId()).equals(timer.getTenantId())
+                && timer.getDuedate() != null && timer.getDuedate().getTime() == dueMillis;
+    }
+
+    private static boolean matchesWorkerEnvelope(DelegateExecution execution, ProcessNodeExecutionBO row) {
+        return row.getNodeExecutionRef().equals(execution.getVariableLocal(NODE_REF))
+                && row.getInputSha256().equals(execution.getVariableLocal(INPUT_SHA))
+                && row.getConfigurationSha256().equals(execution.getVariableLocal(CONFIGURATION_SHA));
+    }
+
     private static ExternalWorkerJobEntity requireWorkerJob(ProcessNodeExecutionBO row, String nativeJobId) {
         if (nativeJobId == null || !nativeJobId.equals(row.getNativeJobId())) throw unavailable();
         AutomationInstanceGuardCommandInterceptor.requireHeld(row.getTenantId(), row.getInstanceId());
@@ -213,7 +367,7 @@ public class ProcessNodeLifecycleListener {
     private void parkWorker(WorkerAttemptVO attempt, ExternalWorkerJobEntity job, SideEffectOutcomeEnum outcome, String errorCode) {
         var execution = attempt.execution();
         if (!execution.getEventSubscriptions().isEmpty()) throw unavailable();
-        workerJobManager().delete(job, true);
+        retireExternalWorkerJob(attempt, job);
         String message = RECOVERY_MESSAGE + attempt.row().getNodeExecutionRef();
         var subscription = (EventSubscriptionEntity) CommandContextUtil.getEventSubscriptionService().createEventSubscriptionBuilder()
                 .eventType("message").eventName(message).executionId(execution.getId())
@@ -246,7 +400,7 @@ public class ProcessNodeLifecycleListener {
                                StateEnum closed, Instant now) {
         var row = attempt.row();
         var execution = attempt.execution();
-        workerJobManager().delete(original, true);
+        retireExternalWorkerJob(attempt, original);
         var timer = CommandContextUtil.getTimerJobService().createTimerJob();
         timer.setJobType("timer");
         timer.setJobHandlerType(RETRY_JOB);
@@ -263,6 +417,15 @@ public class ProcessNodeLifecycleListener {
         nodes.retireWorkerAttempt(row, closed, SideEffectOutcomeEnum.NONE, errorCode, null);
     }
 
+    private void retireExternalWorkerJob(WorkerAttemptVO attempt, ExternalWorkerJobEntity job) {
+        if (job.isExclusive() && job.getLockOwner() != null && job.getLockExpirationTime() != null) {
+            // Flowable's default unlock clears by root ID. Here only the retired job's lock may be removed.
+            nodes.releaseWorkerScopeLock(attempt.row(), job.getProcessDefinitionId(), job.getLockOwner(),
+                    job.getLockExpirationTime().toInstant());
+        }
+        workerJobManager().delete(job, true);
+    }
+
     private void runWorkerRetry(JobEntity timer, String nodeRef, DelegateExecution execution) {
         var context = context(execution);
         var attempt = exactWorkerAttempt(context, execution, null);
@@ -275,6 +438,12 @@ public class ProcessNodeLifecycleListener {
                 || row.getState() != StateEnum.FAILED && row.getState() != StateEnum.TIMED_OUT
                 || !canRunScheduledRetryFrom(row)) throw unavailable();
         if (!nodes.now().isBefore(row.getNodeDeadlineAt())) return;
+        var nextAttempt = replaceWorkerAttempt(attempt);
+        CommandContextUtil.getAgenda().planContinueProcessOperation(nextAttempt);
+    }
+
+    private static ExecutionEntity replaceWorkerAttempt(WorkerAttemptVO attempt) {
+        var row = attempt.row();
         var manager = CommandContextUtil.getExecutionEntityManager();
         var oldAttempt = attempt.execution().getParent();
         if (oldAttempt == null || !row.getAttemptScopeId().equals(oldAttempt.getId())
@@ -285,7 +454,7 @@ public class ProcessNodeLifecycleListener {
         manager.deleteExecutionAndRelatedData(oldAttempt, "Automation worker retry", false);
         var nextAttempt = manager.createChildExecution(attempt.occurrence());
         nextAttempt.setCurrentFlowElement(attemptModel);
-        CommandContextUtil.getAgenda().planContinueProcessOperation(nextAttempt);
+        return nextAttempt;
     }
 
     private static boolean canRunScheduledRetryFrom(ProcessNodeExecutionBO row) {
@@ -421,6 +590,8 @@ public class ProcessNodeLifecycleListener {
     private boolean effectUnknown(LifecycleContextVO context, WorkerAttemptVO attempt, ExternalWorkerJobEntity job) {
         if (attempt.binding().service().effectMode() == WorkerEffectSafetyEnum.READ_ONLY) return false;
         var row = attempt.row();
+        // An undispatched recovery attempt still carries the earlier attempt's unresolved effect.
+        if (row.getWorkerEffectRecovery() != null) return true;
         var history = nodes.workerHistory(row);
         if (history.isEmpty()) return job.getLockOwner() != null || job.getLockExpirationTime() != null;
         String expectedInput = WorkerLeaseStore.automationPhysicalInputSha256(job.getId(), row.getInstanceId(),
@@ -547,8 +718,7 @@ public class ProcessNodeLifecycleListener {
         if (previous != null && !nodeDeadline.equals(previous.getNodeDeadlineAt())) throw unavailable();
         var attemptDeadline = now.plus(binding.policy().attemptTimeout());
         if (attemptDeadline.isAfter(nodeDeadline)) attemptDeadline = nodeDeadline;
-        var executionRef = "node-" + hash("AUTOMATION_NODE_EXECUTION_V2",
-                List.of(root.getTenantId(), root.getInstanceId(), occurrenceId, attemptNumber));
+        var executionRef = executionRef(root.getTenantId(), root.getInstanceId(), occurrenceId, attemptNumber);
         var row = new ProcessNodeExecutionBO().setTenantId(root.getTenantId()).setInstanceId(root.getInstanceId())
                 .setOccurrenceId(occurrenceId).setAttempt(attemptNumber).setNodeExecutionRef(executionRef).setNodeId(nodeId)
                 .setKind(KindEnum.valueOf(binding.kind())).setParentScopeId(occurrence.getParentId()).setAttemptScopeId(attempt.getId())
@@ -682,13 +852,17 @@ public class ProcessNodeLifecycleListener {
     }
 
     private LifecycleContextVO context(DelegateExecution execution) {
+        return context(execution, true);
+    }
+
+    private LifecycleContextVO context(DelegateExecution execution, boolean guarded) {
         if (execution == null || !(CommandContextUtil.getProcessEngineConfiguration() instanceof SpringProcessEngineConfiguration process)
                 || !(CommandContextUtil.getDmnEngineConfiguration() instanceof SpringDmnEngineConfiguration dmn)
                 || execution.getRootProcessInstanceId() == null || execution.getTenantId() == null
                 || !execution.getTenantId().matches("[1-9][0-9]{0,18}")) throw unavailable();
         long tenant = Long.parseLong(execution.getTenantId());
         String root = execution.getRootProcessInstanceId();
-        AutomationInstanceGuardCommandInterceptor.requireHeld(tenant, root);
+        if (guarded) AutomationInstanceGuardCommandInterceptor.requireHeld(tenant, root);
         var binding = bindings.find(tenant, root).orElseThrow(ProcessNodeLifecycleListener::unavailable);
         var release = releases.find(tenant, binding.getReleaseKey()).orElseThrow(ProcessNodeLifecycleListener::unavailable);
         if (!binding.getDefinitionKey().equals(release.rootDefinitionKey())) throw unavailable();
@@ -739,6 +913,15 @@ public class ProcessNodeLifecycleListener {
         return deadline;
     }
 
+    private static Instant workerNodeDeadline(DelegateExecution occurrence) {
+        if (!(occurrence.getVariableLocal(OCCURRENCE_DEADLINE) instanceof String value)) throw unavailable();
+        return Instant.parse(value);
+    }
+
+    private static long roundedTimerMillis(Instant due) {
+        return due.toEpochMilli() + (due.getNano() % 1_000_000 == 0 ? 0 : 1);
+    }
+
     private Optional<Instant> workerBoundaryDeadline(DelegateExecution event, BoundaryEvent boundary) {
         var context = context(event);
         var verified = context.verified().controlBindings();
@@ -777,6 +960,10 @@ public class ProcessNodeLifecycleListener {
         return "occ-" + hash("AUTOMATION_NODE_OCCURRENCE_V2", List.of(root.getTenantId(), root.getInstanceId(), nodeId, nativeScopeId));
     }
 
+    private static String executionRef(long tenantId, String instanceId, String occurrenceId, int attempt) {
+        return "node-" + hash("AUTOMATION_NODE_EXECUTION_V2", List.of(tenantId, instanceId, occurrenceId, attempt));
+    }
+
     private static String hash(String domain, Object value) {
         return ProcessTypedJson.sha256(domain, ProcessTypedJson.canonicalBytes(value));
     }
@@ -791,6 +978,10 @@ public class ProcessNodeLifecycleListener {
         return new IllegalStateException("Automation node lifecycle evidence is unavailable or inconsistent");
     }
 
+    private static AutomationOperationException recoveryBlocked() {
+        return new AutomationOperationException(AutomationOperationException.Code.TIANJI_NODE_RETRY_BLOCKED);
+    }
+
     private record BoundaryCaptureVO(long tenantId, String instanceId, String nodeExecutionRef, String outcome,
                                      String nativeOccurrence, String exactOccurrenceId) { }
 
@@ -799,6 +990,11 @@ public class ProcessNodeLifecycleListener {
 
     private record WorkerAttemptVO(AutomationNodeBindingVO binding, ProcessNodeExecutionBO row, ExecutionEntity occurrence,
                                    ExecutionEntity execution, OccurrenceSlotVO slot) { }
+
+    public record WorkerRecoveryWaitVO(String subscriptionId, String executionId, String definitionId, String activityId,
+                                       String occurrenceExecutionId) { }
+
+    private record VerifiedWorkerRecoveryWaitVO(WorkerAttemptVO attempt, EventSubscriptionEntity subscription) { }
 
     private record WorkerCompletionJobVO(String id, String executionId, String tenantId, String instanceId, String definitionId,
                                          String activityId, String configuration) { }
@@ -969,9 +1165,7 @@ public class ProcessNodeLifecycleListener {
                     (ExecutionEntity) execution, "trigger-timer",
                     TimerEventHandler.createConfiguration(boundary.getId(), timerEventDefinition.getEndDate(), timerEventDefinition.getCalendarName()));
             if (timer == null) throw unavailable();
-            Instant due = deadline.orElseThrow();
-            long dueMillis = due.toEpochMilli() + (due.getNano() % 1_000_000 == 0 ? 0 : 1);
-            timer.setDuedate(new Date(dueMillis));
+            timer.setDuedate(new Date(roundedTimerMillis(deadline.orElseThrow())));
             CommandContextUtil.getTimerJobService().scheduleTimerJob(timer);
         }
 

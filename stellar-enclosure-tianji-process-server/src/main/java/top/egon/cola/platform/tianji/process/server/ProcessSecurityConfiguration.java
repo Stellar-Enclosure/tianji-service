@@ -19,6 +19,9 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.authentication.AuthenticationCredentialsNotFoundException;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
@@ -34,6 +37,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.flowable.cmmn.engine.CmmnEngine;
 import org.flowable.cmmn.spring.SpringCmmnEngineConfiguration;
@@ -115,7 +119,13 @@ import top.egon.cola.platform.tianji.process.server.bridge.AgentResultInboxPrope
 import top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistry;
 import top.egon.cola.platform.tianji.process.server.bridge.ProcessLinkedAgentOutcomeQuery;
 import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgePoller;
+import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient.AuthorizationDeniedException;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionContext;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionServicePolicyGuard;
+import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
@@ -124,11 +134,14 @@ import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
+
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_NODE_RETRY_API;
 
 /** The process API is opt-in and requires both identity and authorization filters. */
 @Configuration(proxyBeanMethods = false)
@@ -153,6 +166,7 @@ public class ProcessSecurityConfiguration {
             MATCHER.matcher(HttpMethod.POST, ProcessAutomationController.INSTANCES_PATH),
             MATCHER.matcher(HttpMethod.GET, ProcessAutomationController.INSTANCE_PATH));
     private static final RequestMatcher AUTOMATION_NODE_ROUTE = MATCHER.matcher(HttpMethod.GET, ProcessNodeExecutionController.PATH);
+    private static final RequestMatcher AUTOMATION_NODE_RETRY_ROUTE = MATCHER.matcher(HttpMethod.POST, ProcessNodeExecutionController.RETRY_PATH);
     private static final List<RequestMatcher> AUTOMATION_ACTION_ROUTES = List.of(
             MATCHER.matcher(HttpMethod.GET, EngineTaskController.TASK_PATH),
             MATCHER.matcher(HttpMethod.POST, EngineTaskController.COMPLETION_PATH));
@@ -161,11 +175,56 @@ public class ProcessSecurityConfiguration {
             MATCHER.matcher(HttpMethod.POST, WorkerController.COMPLETE_AUTOMATION_PATH),
             MATCHER.matcher(HttpMethod.POST, WorkerController.FAIL_AUTOMATION_PATH));
 
+    @Bean("processNodeRetryAuthorization")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    ProcessNodeExecutionController.NodeRetryAuthorization processNodeRetryAuthorization(
+            @Qualifier("tianjiProcessAccess") TianjiProcessAccess access,
+            @Qualifier("permissionServicePolicyGuard") ObjectProvider<PermissionServicePolicyGuard> servicePolicies) {
+        return actor -> {
+            if (TransactionSynchronizationManager.isActualTransactionActive()) {
+                throw new IllegalStateException("Node retry authorization must precede its write transaction");
+            }
+            if (!actor.equals(access.require(AUTOMATION_NODE_RETRY_API))) {
+                throw new AccessDeniedException("Node retry actor changed during authorization");
+            }
+            var auth = SecurityContextHolder.getContext().getAuthentication();
+            if (auth instanceof Rbac3AuthenticationToken user) {
+                var details = user.getPrincipal();
+                var snapshot = details.snapshot();
+                var view = snapshot.permissionSnapshot();
+                if (view == null) throw new IllegalStateException("Current node retry permission evidence is unavailable");
+                return earlier(details.identity().expiresAt(), earlier(snapshot.expiresAt(), view.snapshotExpiresAt()));
+            }
+            if (auth instanceof IdpAuthenticationToken token && token.getPrincipal() instanceof ServiceIdentityPrincipal service) {
+                var policies = servicePolicies.getIfAvailable();
+                if (policies == null) throw new IllegalStateException("Current node retry service permission is unavailable");
+                try {
+                    var snapshot = policies.require(service, AUTOMATION_NODE_RETRY_API);
+                    PermissionExecutionContext.verifyInput(AUTOMATION_NODE_RETRY_API, snapshot);
+                    return earlier(service.expiresAt(), snapshot.expiresAt());
+                } catch (AuthorizationDeniedException denied) {
+                    throw new AccessDeniedException("Current node retry permission is denied");
+                }
+            }
+            throw new AuthenticationCredentialsNotFoundException("Current node retry identity is required");
+        };
+    }
+
+    private static Instant earlier(Instant first, Instant second) {
+        return first.isBefore(second) ? first : second;
+    }
+
     @Bean("automationWorkerMediaErrors")
     @ConditionalOnProperty(prefix = "stellar.tianji.process", name = {"api.enabled", "worker.enabled"}, havingValue = "true")
     HandlerExceptionResolver automationWorkerMediaErrors() {
         return ProcessApiErrors.automationWorkerMediaErrors(request -> AUTOMATION_WORKER_ROUTES.stream()
                 .anyMatch(route -> route.matches(request)));
+    }
+
+    @Bean("processNodeRetryMediaErrors")
+    @ConditionalOnProperty(prefix = "stellar.tianji.process.api", name = "enabled", havingValue = "true")
+    HandlerExceptionResolver processNodeRetryMediaErrors() {
+        return ProcessApiErrors.strictCommandMediaErrors(AUTOMATION_NODE_RETRY_ROUTE);
     }
 
     @Bean("processActivationMediaErrors")
@@ -219,7 +278,7 @@ public class ProcessSecurityConfiguration {
                     if (enabled) authorize.requestMatchers(DRAFT_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(ACTIVATION_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
                             .requestMatchers(AUTOMATION_INSTANCE_ROUTES.toArray(RequestMatcher[]::new)).authenticated()
-                            .requestMatchers(AUTOMATION_NODE_ROUTE).authenticated();
+                            .requestMatchers(AUTOMATION_NODE_ROUTE, AUTOMATION_NODE_RETRY_ROUTE).authenticated();
                     if (workerEnabled) authorize.requestMatchers("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**").authenticated()
                             .requestMatchers(AUTOMATION_WORKER_ROUTES.toArray(RequestMatcher[]::new)).authenticated();
                     if (inboxEnabled) authorize.requestMatchers("/api/tianji/v1/agent-result-inbox").authenticated();
@@ -284,6 +343,7 @@ public class ProcessSecurityConfiguration {
             selected.addAll(ACTIVATION_ROUTES);
             selected.addAll(AUTOMATION_INSTANCE_ROUTES);
             selected.add(AUTOMATION_NODE_ROUTE);
+            selected.add(AUTOMATION_NODE_RETRY_ROUTE);
             selected.addAll(AUTOMATION_ACTION_ROUTES);
             if (workerEnabled) selected.addAll(AUTOMATION_WORKER_ROUTES);
             routes = List.copyOf(selected);
@@ -344,7 +404,7 @@ public class ProcessSecurityConfiguration {
                         ProcessDraftController.DISCARD_PATH, ProcessAutomationController.VALIDATE_PATH,
                         ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH,
                         ProcessActivationController.PATH, ProcessAutomationController.INSTANCES_PATH,
-                        ProcessAutomationController.INSTANCE_PATH, ProcessNodeExecutionController.PATH,
+                        ProcessAutomationController.INSTANCE_PATH, ProcessNodeExecutionController.PATH, ProcessNodeExecutionController.RETRY_PATH,
                         EngineTaskController.TASK_PATH, EngineTaskController.COMPLETION_PATH), true);
     }
 

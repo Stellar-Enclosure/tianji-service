@@ -59,6 +59,7 @@ egon:
               TIANJI_PROCESS_DATA_READ: ["tianji:process:data:read"]
               TIANJI_PROCESS_DIAGNOSTIC_READ: ["tianji:process:diagnostic:read"]
               TIANJI_PROCESS_CANCEL: ["tianji:process:cancel"]
+              TIANJI_PROCESS_NODE_RETRY: ["tianji:process:node:retry"]
               TIANJI_PROCESS_WORKER_RECOVER: ["tianji:process:worker-recover"]
               TIANJI_DECISION_EXECUTE: ["tianji:decision:execute"]
               TIANJI_WORKER_ACQUIRE: ["tianji:worker:acquire"]
@@ -89,6 +90,7 @@ stellar:
         automation-registrations: []
       worker-recovery:
         enabled: false
+        trusted-authorities: []
       cases:
         enabled: false
         new-starts-enabled: false

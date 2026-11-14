@@ -24,6 +24,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.FailWorkerTaskComman
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.RecoverProcessWorkerCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.NodeRetryCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.CompleteEngineHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
@@ -79,6 +80,9 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
+    private static final int MAX_NODE_RETRY_BYTES = 8192;
+    private static final Set<String> NODE_RETRY_FIELDS = Set.of("commandId", "nodeExecutionRef", "expectedVersion", "reason");
+    private static final String BUSINESS_RECEIPT_REF = "businessReceiptRef";
     private static final JsonMapper STRICT_FLAT_PROCESS_JSON = JsonMapper.builder(JsonFactory.builder()
                     .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(2).maxStringLength(4096)
                             .maxNameLength(64).maxNumberLength(20).maxTokenCount(32).build()).build())
@@ -98,14 +102,15 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         return type == PublishProcessReleaseCommand.class || type == StartProcessCommand.class || type == EvaluateDecisionCommand.class
                 || workerCommand(type) || type == AgentTerminalEvent.class || type == CancelProcessCommand.class
                 || type == RecoverProcessWorkerCommand.class || draftCommand(type) || type == ActivationCommand.class
-                || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class || automationWorkerCommand(type);
+                || type == AutomationStartCommand.class || type == CompleteEngineHumanTaskCommand.class
+                || type == NodeRetryCommand.class || automationWorkerCommand(type);
     }
 
     @Override
     public HttpInputMessage beforeBodyRead(HttpInputMessage input, MethodParameter parameter, Type type,
                                            Class<? extends HttpMessageConverter<?>> converter) throws IOException {
         if (draftCommand(type) || type == ActivationCommand.class || type == AutomationStartCommand.class
-                || type == CompleteEngineHumanTaskCommand.class || automationWorkerCommand(type)) {
+                || type == CompleteEngineHumanTaskCommand.class || type == NodeRetryCommand.class || automationWorkerCommand(type)) {
             var contentType = input.getHeaders().getContentType();
             if (contentType != null && contentType.getCharset() != null
                     && !StandardCharsets.UTF_8.equals(contentType.getCharset())) {
@@ -116,6 +121,7 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
                 : draftCommand(type) ? MAX_DRAFT_COMMAND_BYTES
                 : type == AutomationStartCommand.class ? MAX_AUTOMATION_START_BYTES
                 : type == CompleteEngineHumanTaskCommand.class ? MAX_ENGINE_TASK_COMPLETION_BYTES
+                : type == NodeRetryCommand.class ? MAX_NODE_RETRY_BYTES
                 : type == AutomationWorkerAcquireCommand.class ? MAX_AUTOMATION_WORKER_ACQUIRE_BYTES
                 : automationWorkerCommand(type) ? MAX_AUTOMATION_WORKER_REPORT_BYTES
                 : type == ActivationCommand.class ? MAX_ACTIVATION_COMMAND_BYTES
@@ -137,10 +143,35 @@ public final class ProcessRequestBodyAdvice extends RequestBodyAdviceAdapter {
         if (type == ActivationCommand.class) validateActivationBody(body);
         if (type == AutomationStartCommand.class) validateAutomationStartBody(body);
         if (type == CompleteEngineHumanTaskCommand.class) validateEngineTaskCompletionBody(body);
+        if (type == NodeRetryCommand.class) validateNodeRetryBody(body);
         return new HttpInputMessage() {
             @Override public InputStream getBody() { return new ByteArrayInputStream(body); }
             @Override public HttpHeaders getHeaders() { return input.getHeaders(); }
         };
+    }
+
+    private static void validateNodeRetryBody(byte[] body) {
+        try {
+            String json = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(body)).toString();
+            var root = STRICT_FLAT_PROCESS_JSON.readTree(json);
+            if (root == null || !root.isObject()
+                    || !root.propertyNames().stream().allMatch(name -> NODE_RETRY_FIELDS.contains(name) || BUSINESS_RECEIPT_REF.equals(name))
+                    || NODE_RETRY_FIELDS.stream().anyMatch(name -> !root.path(name).isString())) {
+                throw invalidPublicationBody();
+            }
+            var reason = root.get("reason").asString();
+            var receipt = root.get(BUSINESS_RECEIPT_REF);
+            if (!safeNodeRetryText(reason, 512)
+                    || receipt != null && !receipt.isNull() && (!receipt.isString() || !safeNodeRetryText(receipt.asString(), 255))) {
+                throw invalidPublicationBody();
+            }
+        } catch (CharacterCodingException | RuntimeException malformed) {
+            throw invalidPublicationBody();
+        }
+    }
+
+    private static boolean safeNodeRetryText(String value, int maxLength) {
+        return !value.isBlank() && value.length() <= maxLength && value.chars().noneMatch(Character::isISOControl);
     }
 
     private static boolean workerCommand(Type type) {

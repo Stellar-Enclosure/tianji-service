@@ -118,6 +118,17 @@ public final class WorkerTopicRegistry {
         return Map.copyOf(result);
     }
 
+    /** Resolves a sealed physical Worker contract without substituting any execution principal. */
+    public Optional<FrozenWorkerContractVO> findFrozenContract(long tenantId, String capabilityKey, long capabilityVersion, String expectedSha) {
+        var registration = automationTopics.get(new AutomationTopicKeyVO(tenantId, capabilityKey, capabilityVersion));
+        if (registration == null || !registration.contractSha256().equals(expectedSha)) return Optional.empty();
+        return Optional.of(new FrozenWorkerContractVO(registration.sourceId(), registration.capability(), registration.handlerVersion(),
+                registration.targetId(), expectedSha));
+    }
+
+    public record FrozenWorkerContractVO(String sourceId, CapabilityRefVO capability, String handlerVersion,
+                                         String targetId, String contractSha256) { }
+
     public boolean acceptsModel(long tenantId, WorkerTask worker) {
         if (tenantId <= 0 || worker == null) return false;
         Schema expected = schemas.get(new TopicKey(tenantId, worker.topic(), worker.schemaVersion()));

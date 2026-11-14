@@ -2,9 +2,11 @@ package top.egon.cola.platform.tianji.process.server.api;
 
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolationException;
+import jakarta.validation.Valid;
 import jakarta.validation.constraints.Pattern;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -13,6 +15,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.core.AuthenticationException;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.validation.annotation.Validated;
@@ -20,6 +23,8 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
@@ -28,6 +33,9 @@ import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationErrorDT
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationInstanceDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.NodeRetryCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.NodeRetryResultDTO;
+import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService.AutomationObservationPermitVO;
@@ -35,6 +43,7 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBin
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionBO;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionConverter;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeRetryService;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore.NodePageKeyVO;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.security.TianjiProcessAccess;
@@ -44,6 +53,8 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.PermissionMo
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.ResourceType;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.PermissionResource;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.RequiresPermissions;
+import top.egon.cola.platform.tianquan.jianshen.starter.client.Rbac3AuthorizationClient.AuthorizationUnavailableException;
+import top.egon.cola.platform.tianquan.jianshen.starter.permission.UserPermissionScopePolicy;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -56,6 +67,9 @@ import java.util.Objects;
 import java.util.Set;
 
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_NODE_EXECUTION_LIST_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.AUTOMATION_NODE_RETRY_API;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.NODE_RETRY;
+import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.NODE_RETRY_SCOPE;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.OBSERVE_SCOPE;
 import static top.egon.cola.platform.tianji.process.server.security.TianjiProcessPermissions.READ;
@@ -69,6 +83,7 @@ import static top.egon.cola.platform.tianji.process.server.security.TianjiProces
 @RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class ProcessNodeExecutionController {
     public static final String PATH = ProcessAutomationController.INSTANCE_PATH + "/node-executions";
+    public static final String RETRY_PATH = ProcessAutomationController.INSTANCE_PATH + "/node-retries";
     private static final String INSTANCE_ID = "[^\\p{Cc}]{1,255}";
     private static final String NODE_ID = "[A-Za-z][A-Za-z0-9_.:-]{0,254}";
     private static final String OCCURRENCE_ID = "[A-Za-z][A-Za-z0-9_.:-]{0,127}";
@@ -82,6 +97,41 @@ public class ProcessNodeExecutionController {
     @Qualifier("processNodeExecutionStore") private final ProcessNodeExecutionStore nodes;
     @Qualifier("processNodeExecutionConverter") private final ProcessNodeExecutionConverter converter;
     @Qualifier("processDraftTransactionTemplate") private final TransactionTemplate transaction;
+
+    @Qualifier("processNodeRetryService") private final ObjectProvider<ProcessNodeRetryService> retries;
+    @Qualifier("processNodeRetryAuthorization") private final ObjectProvider<NodeRetryAuthorization> retryAuthorization;
+
+    public ProcessNodeExecutionController(TianjiProcessAccess access, ProcessExecutionService instances,
+            ProcessInstanceBindingStore bindings, ProcessNodeExecutionStore nodes, ProcessNodeExecutionConverter converter,
+            TransactionTemplate transaction) {
+        this(access, instances, bindings, nodes, converter, transaction, null, null);
+    }
+
+    @PostMapping(path = RETRY_PATH, consumes = MediaType.APPLICATION_JSON_VALUE)
+    @PermissionResource(key = AUTOMATION_NODE_RETRY_API, type = ResourceType.API, labelPage = "tianji.process.permissions",
+            labelKey = "api.automation.node.retry", allowedPrincipals = {PrincipalType.USER, PrincipalType.SERVICE},
+            oauthScopes = NODE_RETRY_SCOPE)
+    @RequiresPermissions(mode = PermissionMode.ALL, codes = NODE_RETRY)
+    public ResponseEntity<NodeRetryResultDTO> retryProcessNode(
+            @PathVariable("instanceId") @Pattern(regexp = INSTANCE_ID) String instanceId,
+            @Valid @RequestBody NodeRetryCommand command, HttpServletRequest request) {
+        if (request.getQueryString() != null || !request.getParameterMap().isEmpty()) throw invalid();
+        var actor = access.require(AUTOMATION_NODE_RETRY_API);
+        var service = retries == null ? null : retries.getIfAvailable();
+        if (service == null) {
+            throw new AutomationOperationException(AutomationOperationException.Code.TIANJI_NODE_RETRY_BLOCKED);
+        }
+        return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(service.retry(actor, instanceId, command, () -> {
+            var authorization = retryAuthorization == null ? null : retryAuthorization.getIfAvailable();
+            if (authorization == null) throw new IllegalStateException("Node retry authorization is unavailable");
+            return authorization.refresh(actor);
+        }));
+    }
+
+    @FunctionalInterface
+    public interface NodeRetryAuthorization {
+        Instant refresh(ProcessActor actor);
+    }
 
     @GetMapping(PATH)
     @PermissionResource(key = AUTOMATION_NODE_EXECUTION_LIST_API, type = ResourceType.API, labelPage = "tianji.process.permissions",
@@ -98,17 +148,31 @@ public class ProcessNodeExecutionController {
         var permit = observation.permit();
         var metadata = instances.observeAutomation(observation.actor(), instanceId,
                 new AutomationObservationPermitVO(permit.ownerRead(), permit.observe(), false, false, false));
+        var retryService = retries == null ? null : retries.getIfAvailable();
+        Instant retryPermission = retryService == null || metadata == null || metadata.getState() != AutomationInstanceDTO.StateEnum.ACTIVE
+                ? null : observeRetryPermission(observation.actor());
         var read = new TransactionTemplate(transaction.getTransactionManager());
         read.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
         read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         read.setReadOnly(true);
         read.setTimeout(transaction.getTimeout());
-        var page = Objects.requireNonNull(read.execute(status -> page(observation, instanceId, query, metadata)));
+        var page = Objects.requireNonNull(read.execute(status -> page(observation, instanceId, query, metadata, retryService, retryPermission)));
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(page);
     }
 
+    private Instant observeRetryPermission(ProcessActor actor) {
+        if (retryAuthorization == null || !UserPermissionScopePolicy.currentScopes().contains(NODE_RETRY_SCOPE)) return null;
+        var authorization = retryAuthorization.getIfAvailable();
+        if (authorization == null) return null;
+        try {
+            return authorization.refresh(actor);
+        } catch (AccessDeniedException | AuthenticationException | AuthorizationUnavailableException unavailable) {
+            return null;
+        }
+    }
+
     private ProcessNodeExecutionPageDTO page(AutomationInstanceAccessVO observation, String instanceId, QueryVO query,
-                                             AutomationInstanceDTO metadata) {
+            AutomationInstanceDTO metadata, ProcessNodeRetryService retryService, Instant retryPermission) {
         var actor = observation.actor();
         var permit = observation.permit();
         var binding = bindings.find(actor.tenantId(), instanceId).orElseThrow(ProcessResourceNotFoundException::new);
@@ -131,8 +195,14 @@ public class ProcessNodeExecutionController {
         verifyRows(rows, actor.tenantId(), instanceId, binding.getConfigurationSha256(), query, highWater,
                 cursor == null ? null : cursor.key());
         boolean data = permit.dataRead() || permit.dataReadOwnerOnly() && owner;
-        var items = rows.stream().limit(query.limit())
-                .map(row -> converter.toTarget(row, data, permit.diagnosticRead())).toList();
+        boolean mayRetry = owner && retryPermission != null && observedAt.isBefore(retryPermission);
+        var items = rows.stream().limit(query.limit()).map(row -> {
+            var item = converter.toTarget(row, data, permit.diagnosticRead());
+            if (mayRetry && retryService.canOfferRetry(actor, binding, row, observedAt)) {
+                item.setAvailableActions(List.of("RETRY"));
+            }
+            return item;
+        }).toList();
         String next = rows.size() <= query.limit() ? null
                 : encodeCursor(scopeHash, new CursorVO(highWater, key(rows.get(query.limit() - 1))));
         return new ProcessNodeExecutionPageDTO(instanceId, binding.getReleaseKey(), observedAt, items, next);

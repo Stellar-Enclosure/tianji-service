@@ -22,6 +22,12 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         labelPage = "tianji.process.permissions", labelKey = "permission.process.read")
 @PermissionDefinition(code = TianjiProcessPermissions.CANCEL, meaning = "Cancel an owned process instance",
         labelPage = "tianji.process.permissions", labelKey = "permission.process.cancel")
+@PermissionDefinition(code = TianjiProcessPermissions.NODE_RETRY, meaning = "Request recovery for an eligible automation node",
+        labelPage = "tianji.process.permissions", labelKey = "permission.node.retry")
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "permission.node.retry", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Request recovery for an eligible automation node"))
+@PermissionMessage(pageCode = "tianji.process.permissions", key = "api.automation.node.retry", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Retry an eligible automation node"))
 @PermissionDefinition(code = TianjiProcessPermissions.WORKER_RECOVER, meaning = "Recover an eligible Process Worker failure",
         labelPage = "tianji.process.permissions", labelKey = "permission.process.workerRecover")
 @PermissionDefinition(code = TianjiProcessPermissions.DECISION_EXECUTE, meaning = "Execute a decision from a fixed release",
@@ -223,6 +229,7 @@ public final class TianjiProcessPermissions {
     public static final String AUTOMATION_ACTIVATION_LIST_API = "tianji.api.process.activation.list.v2";
     public static final String AUTOMATION_INSTANCE_START_API = "tianji.api.process.instance.start.v2";
     public static final String AUTOMATION_INSTANCE_GET_API = "tianji.api.process.instance.get.v2";
+    public static final String AUTOMATION_NODE_RETRY_API = "tianji.api.process.node.retry.v2";
     public static final String AUTOMATION_NODE_EXECUTION_LIST_API = "tianji.api.process.node.execution.list.v2";
     public static final String ENGINE_TASK_GET_API = "tianji.api.process.task.get.v2";
     public static final String ENGINE_TASK_COMPLETE_API = "tianji.api.process.task.complete.v2";
@@ -255,6 +262,8 @@ public final class TianjiProcessPermissions {
     public static final String RELEASE_ACTIVATE_SCOPE = "tianji:process:activate";
     public static final String START_SCOPE = top.egon.cola.platform.tianji.contract.orchestration.ProcessClient.START_SCOPE;
     public static final String READ_SCOPE = "tianji:process:read";
+    public static final String NODE_RETRY = "TIANJI_PROCESS_NODE_RETRY";
+    public static final String NODE_RETRY_SCOPE = "tianji:process:node:retry";
     public static final String OBSERVE_SCOPE = "tianji:process:observe";
     public static final String DATA_READ_SCOPE = "tianji:process:data:read";
     public static final String DIAGNOSTIC_READ_SCOPE = "tianji:process:diagnostic:read";
