@@ -312,6 +312,11 @@ public final class ProcessReleaseService {
 
     /** Verify an immutable descriptor against the exact original native deployment in the owning snapshot. */
     public void requireVerifiedAutomation(@NotNull @Valid ImmutableReleaseVO descriptor) {
+        verifiedAutomation(descriptor);
+    }
+
+    /** Returns the engine definitions verified against the immutable V2 release in the owning snapshot. */
+    public VerifiedProcessModels.VerifiedAutomationModelsVO verifiedAutomation(@NotNull @Valid ImmutableReleaseVO descriptor) {
         requireAutomationTransaction(false);
         try {
             var release = load(descriptor.tenantId(), descriptor.releaseVersion(), false, MAX_AUTOMATION_MODELS);
@@ -319,6 +324,7 @@ public final class ProcessReleaseService {
                     descriptor.compilerVersion(), descriptor.sourceSha256(), descriptor.compiledSha256(),
                     descriptor.dependencySha256(), descriptor.source(), descriptor.dependencies(), release);
             if (!AUTOMATION_ROOT_INPUT.equals(verified.root().inputs())) throw unavailable();
+            return verified;
         } catch (ProcessResourceNotFoundException inconsistent) {
             throw new IllegalStateException("Stored automation deployment evidence is unavailable");
         }
