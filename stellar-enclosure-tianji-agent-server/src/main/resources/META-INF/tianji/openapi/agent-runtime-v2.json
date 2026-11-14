@@ -1,0 +1,1879 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Agent Runtime v2",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/api/tianji/v2/agent-definitions": {
+      "post": {
+        "operationId": "publishAgentRuntimeTemplate",
+        "summary": "Publish one immutable Agent runtime template",
+        "description": "Requires a currently authorized service publisher. The tenant comes from the verified identity. An exact same-key replay of the effective normalized specification returns the original publication. A first publication validates current registered executor, instruction, model and tool dependencies. It does not update an active version.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:agent:template:publish"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_AGENT_TEMPLATE_PUBLISH"
+        ],
+        "x-resource-key": "tianji.api.agent.template.publish.v2",
+        "x-allowed-principals": [
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion of the verified tenant. Use exactly one decimal value. A duplicate or mismatch returns 409.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$(?![\\s\\S])"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Closed JSON. At most 2 MiB on the wire and 1 MiB in canonical specification form. Unknown fields, duplicate keys and trailing tokens are rejected.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentRuntimeTemplateCommand"
+              },
+              "examples": {
+                "singleExecutor": {
+                  "summary": "Publish without an Agentic plan",
+                  "value": {
+                    "templateKey": "extract",
+                    "templateVersion": 1,
+                    "runtimeProfile": "RUNTIME_V2",
+                    "executorRef": "registered-executor-1",
+                    "inputSchema": {
+                      "type": "object",
+                      "properties": {
+                        "text": {
+                          "type": "string",
+                          "maxLength": 4096
+                        }
+                      },
+                      "required": [
+                        "text"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "outputSchema": {
+                      "type": "object",
+                      "properties": {
+                        "category": {
+                          "type": "string",
+                          "enum": [
+                            "A",
+                            "B"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "category"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "parameterSchema": {
+                      "type": "object",
+                      "properties": {},
+                      "required": [],
+                      "additionalProperties": false
+                    },
+                    "configuration": {
+                      "instructionRef": {
+                        "key": "extract-prompt",
+                        "version": 1,
+                        "contentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      },
+                      "modelRef": "registered-model-1",
+                      "toolRefs": []
+                    },
+                    "limits": {
+                      "totalTimeout": "PT2M",
+                      "modelIdleTimeout": "PT20S",
+                      "toolTimeout": "PT10S",
+                      "maxModelCalls": 10,
+                      "maxToolCalls": 10,
+                      "maxParallelism": 2,
+                      "contextWindowTokens": 8192,
+                      "maxOutputTokensPerCall": 1024
+                    }
+                  }
+                },
+                "minimalReasoning": {
+                  "summary": "Publish with the default REASONING plan",
+                  "value": {
+                    "templateKey": "extract",
+                    "templateVersion": 1,
+                    "runtimeProfile": "RUNTIME_V2",
+                    "executorRef": "registered-executor-1",
+                    "inputSchema": {
+                      "type": "object",
+                      "properties": {
+                        "text": {
+                          "type": "string",
+                          "maxLength": 4096
+                        }
+                      },
+                      "required": [
+                        "text"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "outputSchema": {
+                      "type": "object",
+                      "properties": {
+                        "category": {
+                          "type": "string",
+                          "enum": [
+                            "A",
+                            "B"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "category"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "parameterSchema": {
+                      "type": "object",
+                      "properties": {},
+                      "required": [],
+                      "additionalProperties": false
+                    },
+                    "configuration": {
+                      "instructionRef": {
+                        "key": "extract-prompt",
+                        "version": 1,
+                        "contentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                      },
+                      "modelRef": "registered-model-1",
+                      "toolRefs": [],
+                      "agenticPlan": {
+                        "agents": [
+                          {
+                            "agentKey": "extract",
+                            "instructionRef": {
+                              "key": "extract-prompt",
+                              "version": 1,
+                              "contentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            },
+                            "modelRef": "registered-model-1",
+                            "toolRefs": []
+                          }
+                        ],
+                        "outputAgentKey": "extract"
+                      }
+                    },
+                    "limits": {
+                      "totalTimeout": "PT2M",
+                      "modelIdleTimeout": "PT20S",
+                      "toolTimeout": "PT10S",
+                      "maxModelCalls": 10,
+                      "maxToolCalls": 10,
+                      "maxParallelism": 2,
+                      "contextWindowTokens": 8192,
+                      "maxOutputTokensPerCall": 1024
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "First publication or same-content replay, with the original publication instant.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRuntimeTemplateDTO"
+                },
+                "example": {
+                  "templateKey": "extract",
+                  "templateVersion": 1,
+                  "contentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "runtimeProfile": "RUNTIME_V2",
+                  "publishedAt": "2026-11-11T11:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or oversized fields, invalid JSON shape, or invalid contract values.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_INVALID_COMMAND"
+                    }
+                  }
+                },
+                "examples": {
+                  "explicitNullPlan": {
+                    "summary": "A supplied null agenticPlan is invalid",
+                    "value": {
+                      "code": "TIANJI_INVALID_COMMAND",
+                      "message": "TIANJI_INVALID_COMMAND",
+                      "correlationId": null,
+                      "decisionId": null,
+                      "retryAfter": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "A verified SERVICE credential is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AgentSecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentErrorDTO"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_UNAUTHENTICATED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current resource or SERVICE scope authorization was denied.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AgentSecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentErrorDTO"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_PERMISSION_DENIED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The requested dependency or exact resource is unavailable to the authorized tenant.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_RESOURCE_NOT_FOUND"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The immutable key has different content, another profile occupies it, or the tenant assertion does not match.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "TIANJI_DEFINITION_VERSION_CONFLICT",
+                        "TIANJI_TENANT_CONTEXT_CHANGED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request exceeds the applicable input limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_REQUEST_TOO_LARGE"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported request media type, using the existing MVC response."
+          },
+          "429": {
+            "description": "Available execution or publication capacity was exceeded.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_CAPACITY_EXCEEDED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected internal failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_INTERNAL_ERROR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A required dependency or trusted store is unavailable.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_DEPENDENCY_UNAVAILABLE"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tianji/v2/agent-process-dispatches/submit": {
+      "post": {
+        "operationId": "submitAgentRuntimeNode",
+        "summary": "Submit a linked Agent runtime node",
+        "description": "Accepts only a trusted Process service with the current source, template and execution grant. The immutable original key and digests recover an accepted run. The acknowledgement records acceptance and does not establish a terminal result.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:agent:linked:submit"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_LINKED_AGENT_SUBMIT"
+        ],
+        "x-resource-key": "tianji.api.agent.linkedSubmit.v2",
+        "x-allowed-principals": [
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion of the verified tenant. Use exactly one decimal value. A duplicate or mismatch returns 409.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}$(?![\\s\\S])"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Closed JSON. Use the original stable key, frozen hashes and absolute attempt deadline.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkedAgentRuntimeCommand"
+              },
+              "examples": {
+                "exactLinkedAttempt": {
+                  "summary": "Submit the selected BPMN attempt",
+                  "value": {
+                    "idempotencyKey": "dispatch-101",
+                    "link": {
+                      "sourceId": "ps-main",
+                      "scopeType": "BPMN",
+                      "scopeInstanceId": "pi-101",
+                      "activityOccurrenceId": "job-101",
+                      "definitionContentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "dispatchNotAfter": "2026-11-11T11:00:30Z"
+                    },
+                    "nodeExecutionRef": "nx-101",
+                    "templateKey": "extract",
+                    "templateVersion": 1,
+                    "templateSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "configurationSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "inputSchemaSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "outputSchemaSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "input": {
+                      "text": "Sample"
+                    },
+                    "parameters": {},
+                    "limits": {
+                      "totalTimeout": "PT2M",
+                      "modelIdleTimeout": "PT20S",
+                      "toolTimeout": "PT10S",
+                      "maxModelCalls": 10,
+                      "maxToolCalls": 10,
+                      "maxParallelism": 2,
+                      "contextWindowTokens": 8192,
+                      "maxOutputTokensPerCall": 1024
+                    },
+                    "attemptDeadlineAt": "2026-11-11T11:02:00Z",
+                    "correlationId": "corr-101"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Durable acknowledgement of the exact linked submission.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkedAgentRuntimeDTO"
+                },
+                "example": {
+                  "runId": "run-101",
+                  "nodeExecutionRef": "nx-101",
+                  "state": "QUEUED",
+                  "revision": 1,
+                  "idempotencyKey": "dispatch-101"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed or oversized fields, invalid JSON shape, or invalid contract values.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_INVALID_COMMAND"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "A verified SERVICE credential is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AgentSecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentErrorDTO"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_UNAUTHENTICATED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current resource or SERVICE scope authorization was denied.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AgentSecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AgentErrorDTO"
+                    }
+                  ],
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_PERMISSION_DENIED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The requested dependency or exact resource is unavailable to the authorized tenant.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_RESOURCE_NOT_FOUND"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The original key or binding differs, the dispatch is expired or closed, or a tenant/revision check failed.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "enum": [
+                        "TIANJI_IDEMPOTENCY_CONFLICT",
+                        "TIANJI_REVISION_CONFLICT",
+                        "TIANJI_TENANT_CONTEXT_CHANGED",
+                        "TIANJI_DISPATCH_EXPIRED",
+                        "TIANJI_DISPATCH_CLOSED"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request exceeds the applicable input limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_REQUEST_TOO_LARGE"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported request media type, using the existing MVC response."
+          },
+          "429": {
+            "description": "Available execution or publication capacity was exceeded.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_CAPACITY_EXCEEDED"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Unexpected internal failure.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_INTERNAL_ERROR"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A required dependency or trusted store is unavailable.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentErrorDTO",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "const": "TIANJI_DEPENDENCY_UNAVAILABLE"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "description": "Only verified service identities may call these operations.",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:agent:template:publish": "Publish one immutable Agent runtime template",
+              "tianji:agent:linked:submit": "Submit a linked Agent runtime node"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Id": {
+        "type": "string",
+        "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$(?![\\s\\S])"
+      },
+      "OriginalCommandId": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$(?![\\s\\S])"
+      },
+      "Sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$(?![\\s\\S])"
+      },
+      "UtcInstant": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](?:\\.[0-9]{1,6})?Z$(?![\\s\\S])"
+      },
+      "RuntimeVersion": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 999999999999999,
+        "format": "int64",
+        "description": "Send a plain integer JSON token. Numeric strings, fractions and exponent notation are rejected by the service."
+      },
+      "Duration": {
+        "type": "string",
+        "format": "duration",
+        "minLength": 1,
+        "description": "A positive ISO 8601 duration. The service validates positivity and relationships between timeout values."
+      },
+      "TypedValue": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TypedObject"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TypedValue"
+            },
+            "maxItems": 256
+          },
+          {
+            "type": "integer",
+            "minimum": -999999999999999,
+            "maximum": 999999999999999
+          },
+          {
+            "type": [
+              "string",
+              "boolean",
+              "null"
+            ]
+          }
+        ],
+        "description": "Typed JSON rejects floating-point tokens, invalid Unicode and NUL. Values are bounded to depth 8."
+      },
+      "TypedObject": {
+        "type": "object",
+        "additionalProperties": {
+          "$ref": "#/components/schemas/TypedValue"
+        }
+      },
+      "ProcessSchemaVO": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ObjectProcessSchema"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "items",
+              "maxItems"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "array"
+              },
+              "items": {
+                "$ref": "#/components/schemas/ProcessSchemaVO"
+              },
+              "maxItems": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 256
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "string"
+              },
+              "enum": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string"
+                }
+              },
+              "maxLength": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2147483647
+              },
+              "pattern": {
+                "type": "string",
+                "maxLength": 128,
+                "pattern": "^[ -~]*$(?![\\s\\S])",
+                "description": "Portable search pattern. Allows ASCII literals and literal escapes, non-negated character classes and ranges, optional absolute anchors, and ?, {n}, or {m,n}. Maximum expanded width is 128. The service validates the complete grammar, ranges and width."
+              },
+              "format": {
+                "type": "string",
+                "pattern": "^(?:date|date-time|decimal:(?:[0-9]|1[0-8]))$(?![\\s\\S])",
+                "description": "A real ISO calendar date, UTC Z instant with 0–6 fractional digits, or exact fixed-scale decimal string. The service validates and normalizes values."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "integer"
+              },
+              "minimum": {
+                "type": "integer",
+                "minimum": -999999999999999,
+                "maximum": 999999999999999
+              },
+              "maximum": {
+                "type": "integer",
+                "minimum": -999999999999999,
+                "maximum": 999999999999999
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "const": "null"
+              }
+            }
+          }
+        ],
+        "description": "Closed typed schema, at most 32 KiB and depth 8. The service checks that required keys are declared and minimum is no greater than maximum."
+      },
+      "ObjectProcessSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "properties",
+          "required",
+          "additionalProperties"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "object"
+          },
+          "properties": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ProcessSchemaVO"
+            }
+          },
+          "required": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": {
+            "type": "boolean",
+            "const": false
+          }
+        }
+      },
+      "TechnicalLimitsVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "totalTimeout",
+          "modelIdleTimeout",
+          "toolTimeout",
+          "maxModelCalls",
+          "maxToolCalls",
+          "maxParallelism",
+          "contextWindowTokens",
+          "maxOutputTokensPerCall"
+        ],
+        "properties": {
+          "totalTimeout": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "modelIdleTimeout": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "toolTimeout": {
+            "$ref": "#/components/schemas/Duration"
+          },
+          "maxModelCalls": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "maxToolCalls": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "maxParallelism": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32
+          },
+          "contextWindowTokens": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1048576
+          },
+          "maxOutputTokensPerCall": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          }
+        },
+        "description": "Total timeout is bounded by the node limit. Idle and tool timeouts are bounded by total timeout. Output tokens per call cannot exceed the context window. These relationships are validated by the service."
+      },
+      "TemplateDependencyRefVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key",
+          "version",
+          "contentSha256"
+        ],
+        "properties": {
+          "key": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "version": {
+            "$ref": "#/components/schemas/RuntimeVersion"
+          },
+          "contentSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          }
+        }
+      },
+      "TemplateConfigurationVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "instructionRef",
+          "modelRef",
+          "toolRefs"
+        ],
+        "properties": {
+          "instructionRef": {
+            "$ref": "#/components/schemas/TemplateDependencyRefVO"
+          },
+          "modelRef": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "toolRefs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateDependencyRefVO"
+            },
+            "maxItems": 32
+          },
+          "agenticPlan": {
+            "$ref": "#/components/schemas/AgenticTemplatePlanVO"
+          }
+        },
+        "description": "Frozen host capability references. Omit agenticPlan for the single-executor route. Explicit null is rejected."
+      },
+      "AgenticTemplateLeafVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agentKey",
+          "instructionRef",
+          "modelRef",
+          "toolRefs"
+        ],
+        "properties": {
+          "agentKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          },
+          "instructionRef": {
+            "$ref": "#/components/schemas/TemplateDependencyRefVO"
+          },
+          "modelRef": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "toolRefs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TemplateDependencyRefVO"
+            },
+            "maxItems": 32
+          }
+        }
+      },
+      "AgenticTemplateLinkVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "target"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          },
+          "target": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          }
+        },
+        "description": "Source and target are different declared agentKey values. The service validates declarations and equality."
+      },
+      "AgenticTemplatePlanVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "agents"
+        ],
+        "properties": {
+          "strategy": {
+            "type": "string",
+            "enum": [
+              "REASONING",
+              "SEQUENTIAL",
+              "PARALLEL",
+              "BOUNDED_LOOP",
+              "HANDOFF"
+            ],
+            "default": "REASONING"
+          },
+          "agents": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgenticTemplateLeafVO"
+            },
+            "maxItems": 16,
+            "minItems": 1
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AgenticTemplateLinkVO"
+            },
+            "maxItems": 64,
+            "uniqueItems": true,
+            "default": []
+          },
+          "maxRounds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 32
+          },
+          "maxParallelism": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 32,
+            "default": 1
+          },
+          "outputAgentKey": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "merge": {
+            "type": "string",
+            "enum": [
+              "OUTPUT_AGENT",
+              "COLLECT_BY_AGENT"
+            ],
+            "default": "OUTPUT_AGENT"
+          },
+          "sharedFields": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 256,
+              "pattern": "^(?:input\\.|agents\\.[A-Za-z][A-Za-z0-9_-]{0,63}\\.output\\.)[A-Za-z_][A-Za-z0-9_]*(?:\\[(?:0|[1-9][0-9]{0,2})\\])*(?:\\.[A-Za-z_][A-Za-z0-9_]*(?:\\[(?:0|[1-9][0-9]{0,2})\\])*)*$(?![\\s\\S])"
+            },
+            "maxItems": 32,
+            "uniqueItems": true,
+            "default": []
+          },
+          "termination": {
+            "$ref": "#/components/schemas/AgenticTemplateTerminationVO",
+            "default": {
+              "mode": "ROOT_TERMINAL"
+            }
+          }
+        },
+        "description": "Defaults apply at publication. Effective maxRounds and outputAgentKey are null where the selected strategy or merge has no value. The service checks unique declared agent keys, declaration and equality of edge endpoints, declared output and shared agent references, and at most eight path segments.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AgenticPlanStrategyConstraints"
+          },
+          {
+            "$ref": "#/components/schemas/AgenticPlanMergeConstraints"
+          }
+        ]
+      },
+      "AgenticPlanStrategyConstraints": {
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "strategy": {
+                  "type": "string",
+                  "const": "REASONING"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "agents": {
+                  "minItems": 1,
+                  "maxItems": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": [
+                "strategy"
+              ],
+              "properties": {
+                "strategy": {
+                  "type": "string",
+                  "enum": [
+                    "BOUNDED_LOOP",
+                    "HANDOFF"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "maxRounds"
+              ],
+              "properties": {
+                "maxRounds": {
+                  "type": "integer"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "maxRounds": {
+                  "type": "null"
+                },
+                "termination": {
+                  "properties": {
+                    "mode": {
+                      "type": "string",
+                      "const": "ROOT_TERMINAL"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "not": {
+                "required": [
+                  "strategy"
+                ],
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "const": "HANDOFF"
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "links": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "not": {
+                "required": [
+                  "strategy"
+                ],
+                "properties": {
+                  "strategy": {
+                    "type": "string",
+                    "const": "PARALLEL"
+                  }
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "maxParallelism": {
+                  "const": 1
+                }
+              }
+            }
+          }
+        ]
+      },
+      "AgenticPlanMergeConstraints": {
+        "if": {
+          "required": [
+            "merge"
+          ],
+          "properties": {
+            "merge": {
+              "type": "string",
+              "const": "COLLECT_BY_AGENT"
+            }
+          }
+        },
+        "then": {
+          "required": [
+            "strategy"
+          ],
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "enum": [
+                "SEQUENTIAL",
+                "PARALLEL"
+              ]
+            },
+            "outputAgentKey": {
+              "type": "null"
+            }
+          }
+        },
+        "else": {
+          "required": [
+            "outputAgentKey"
+          ],
+          "properties": {
+            "outputAgentKey": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+            }
+          }
+        }
+      },
+      "AgenticTemplateTerminationVO": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "ROOT_TERMINAL"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode",
+              "condition"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "PREDICATE"
+              },
+              "condition": {
+                "$ref": "#/components/schemas/AgenticConditionVO"
+              }
+            }
+          }
+        ]
+      },
+      "AgenticConditionVO": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "args"
+            ],
+            "properties": {
+              "op": {
+                "type": "string",
+                "const": "NOT"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AgenticConditionVO"
+                },
+                "maxItems": 1,
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "args"
+            ],
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "EQ",
+                  "NE",
+                  "GT",
+                  "GE",
+                  "LT",
+                  "LE"
+                ]
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AgenticConditionVO"
+                },
+                "maxItems": 2,
+                "minItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "op",
+              "args"
+            ],
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "AND",
+                  "OR"
+                ]
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AgenticConditionVO"
+                },
+                "maxItems": 63,
+                "minItems": 2
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "maxLength": 256,
+                "pattern": "^(?:round|(?:input\\.|agents\\.[A-Za-z][A-Za-z0-9_-]{0,63}\\.output\\.)[A-Za-z_][A-Za-z0-9_]*(?:\\[(?:0|[1-9][0-9]{0,2})\\])*(?:\\.[A-Za-z_][A-Za-z0-9_]*(?:\\[(?:0|[1-9][0-9]{0,2})\\])*)*)$(?![\\s\\S])"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "literal"
+            ],
+            "properties": {
+              "literal": {
+                "$ref": "#/components/schemas/TypedValue"
+              }
+            }
+          }
+        ],
+        "description": "At most 64 nodes and depth 8. A literal may be null. A path must be round, template input, or fixed output of a declared leaf. A missing or unavailable path does not match as a null literal."
+      },
+      "AgentRuntimeTemplateCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "templateKey",
+          "templateVersion",
+          "runtimeProfile",
+          "executorRef",
+          "inputSchema",
+          "outputSchema",
+          "parameterSchema",
+          "configuration",
+          "limits"
+        ],
+        "properties": {
+          "templateKey": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "templateVersion": {
+            "$ref": "#/components/schemas/RuntimeVersion"
+          },
+          "runtimeProfile": {
+            "type": "string",
+            "const": "RUNTIME_V2"
+          },
+          "executorRef": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "inputSchema": {
+            "$ref": "#/components/schemas/ObjectProcessSchema"
+          },
+          "outputSchema": {
+            "$ref": "#/components/schemas/ObjectProcessSchema"
+          },
+          "parameterSchema": {
+            "$ref": "#/components/schemas/ObjectProcessSchema"
+          },
+          "configuration": {
+            "$ref": "#/components/schemas/TemplateConfigurationVO"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/TechnicalLimitsVO"
+          }
+        }
+      },
+      "AgentRuntimeTemplateDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "templateKey",
+          "templateVersion",
+          "contentSha256",
+          "runtimeProfile",
+          "publishedAt"
+        ],
+        "properties": {
+          "templateKey": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "templateVersion": {
+            "$ref": "#/components/schemas/RuntimeVersion"
+          },
+          "contentSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "runtimeProfile": {
+            "type": "string",
+            "const": "RUNTIME_V2"
+          },
+          "publishedAt": {
+            "$ref": "#/components/schemas/UtcInstant"
+          }
+        }
+      },
+      "AgentProcessLink": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceId",
+          "scopeType",
+          "scopeInstanceId",
+          "activityOccurrenceId",
+          "definitionContentSha256",
+          "dispatchNotAfter"
+        ],
+        "properties": {
+          "sourceId": {
+            "$ref": "#/components/schemas/OriginalCommandId"
+          },
+          "scopeType": {
+            "type": "string",
+            "const": "BPMN"
+          },
+          "scopeInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$(?![\\s\\S])"
+          },
+          "activityOccurrenceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$(?![\\s\\S])"
+          },
+          "definitionContentSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "dispatchNotAfter": {
+            "$ref": "#/components/schemas/UtcInstant"
+          }
+        },
+        "description": "Exact trusted process occurrence. The service checks source, linked ownership and dispatch deadline."
+      },
+      "LinkedAgentRuntimeCommand": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "idempotencyKey",
+          "link",
+          "nodeExecutionRef",
+          "templateKey",
+          "templateVersion",
+          "templateSha256",
+          "configurationSha256",
+          "inputSchemaSha256",
+          "outputSchemaSha256",
+          "input",
+          "parameters",
+          "limits",
+          "attemptDeadlineAt",
+          "correlationId"
+        ],
+        "properties": {
+          "idempotencyKey": {
+            "$ref": "#/components/schemas/OriginalCommandId"
+          },
+          "link": {
+            "$ref": "#/components/schemas/AgentProcessLink"
+          },
+          "nodeExecutionRef": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "templateKey": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "templateVersion": {
+            "$ref": "#/components/schemas/RuntimeVersion"
+          },
+          "templateSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "configurationSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "inputSchemaSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "outputSchemaSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "input": {
+            "$ref": "#/components/schemas/TypedObject",
+            "description": "Canonical typed object, at most 64 KiB, validated against the frozen input schema."
+          },
+          "parameters": {
+            "$ref": "#/components/schemas/TypedObject",
+            "description": "Canonical typed object, at most 64 KiB, validated against the frozen parameter schema."
+          },
+          "limits": {
+            "$ref": "#/components/schemas/TechnicalLimitsVO"
+          },
+          "attemptDeadlineAt": {
+            "$ref": "#/components/schemas/UtcInstant",
+            "description": "Absolute attempt deadline. It cannot exceed the node deadline or be extended by the receiver."
+          },
+          "correlationId": {
+            "$ref": "#/components/schemas/Id"
+          }
+        }
+      },
+      "LinkedAgentRuntimeDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "runId",
+          "nodeExecutionRef",
+          "state",
+          "revision",
+          "idempotencyKey"
+        ],
+        "properties": {
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[^\\x00-\\x1F\\x7F-\\x9F]+$(?![\\s\\S])"
+          },
+          "nodeExecutionRef": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "CREATED",
+              "QUEUED",
+              "RUNNING",
+              "WAITING",
+              "SUSPENDED",
+              "COMPLETED",
+              "FAILED",
+              "CANCELLED",
+              "TIMED_OUT"
+            ]
+          },
+          "revision": {
+            "$ref": "#/components/schemas/RuntimeVersion"
+          },
+          "idempotencyKey": {
+            "$ref": "#/components/schemas/OriginalCommandId"
+          }
+        }
+      },
+      "AgentSecurityError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^TIANJI_[A-Z_]+$(?![\\s\\S])"
+          }
+        }
+      },
+      "AgentErrorDTO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "message",
+          "correlationId",
+          "decisionId",
+          "retryAfter"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^TIANJI_[A-Z_]+$(?![\\s\\S])"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "correlationId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "decisionId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retryAfter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "duration",
+                "description": "Non-negative delay when available."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}

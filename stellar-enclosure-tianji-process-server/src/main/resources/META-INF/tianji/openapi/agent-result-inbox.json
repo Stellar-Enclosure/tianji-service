@@ -1,0 +1,970 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Tianji Private Agent Result Inbox",
+    "version": "2.0.0"
+  },
+  "paths": {
+    "/api/tianji/v1/agent-result-inbox": {
+      "post": {
+        "operationId": "receiveAgentTerminalEvent",
+        "summary": "Register one authorized Agent terminal delivery",
+        "description": "Private Process Server route for the fixed Agent Outbox producer. Current SERVICE permissions and the registered producer, tenant, source and dispatch owner determine admission. An exact replay returns the original event ID, fingerprint and receivedAt plus the current receipt state. The sender acknowledges delivery only when both returned identifiers match. Native application happens separately.",
+        "security": [
+          {
+            "oauth2": [
+              "tianji:process:agent-result:receive"
+            ]
+          }
+        ],
+        "x-required-permissions": [
+          "TIANJI_AGENT_RESULT_RECEIVE"
+        ],
+        "x-resource-key": "tianji.api.process.agent.result.receive",
+        "x-allowed-principals": [
+          "SERVICE"
+        ],
+        "parameters": [
+          {
+            "name": "X-Egon-Tianji-Tenant",
+            "in": "header",
+            "required": false,
+            "description": "Optional assertion equal to the verified tenant. The trusted identity selects the tenant.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[1-9][0-9]{0,18}(?![\\s\\S])",
+              "maxLength": 19
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "Closed JSON envelope selected by its exact schemaVersion token. V1 permits 64 KiB and v2 permits 16 KiB; unknown or mixed versions are rejected. Duplicate keys and trailing input are rejected by the receiver.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TerminalEnvelope"
+              },
+              "examples": {
+                "legacy": {
+                  "value": {
+                    "schemaVersion": 1,
+                    "producerId": "as-main",
+                    "tenantId": 11,
+                    "ownerIssuerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "ownerSubjectId": "ps-agent-worker",
+                    "idempotencyKey": "dispatch-101",
+                    "link": {
+                      "sourceId": "ps-main",
+                      "scopeType": "BPMN",
+                      "scopeInstanceId": "pi-101",
+                      "activityOccurrenceId": "job-101",
+                      "definitionContentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "dispatchNotAfter": "2026-11-11T11:00:30Z"
+                    },
+                    "definitionKey": "extract",
+                    "definitionVersion": 1,
+                    "runId": "run-101",
+                    "terminalRevision": 7,
+                    "finishedAt": "2026-11-11T11:00:20Z",
+                    "status": "COMPLETED",
+                    "sideEffectOutcome": "NONE",
+                    "eventId": "58caed7b9252c07d3d3aa52fe79a37fe996c42018d536601c131bc6af46d448e",
+                    "resultSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                  }
+                },
+                "inline": {
+                  "value": {
+                    "schemaVersion": 2,
+                    "producerId": "as-main",
+                    "tenantId": 11,
+                    "ownerIssuerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "ownerSubjectId": "ps-agent-worker",
+                    "idempotencyKey": "dispatch-101",
+                    "link": {
+                      "sourceId": "ps-main",
+                      "scopeType": "BPMN",
+                      "scopeInstanceId": "pi-101",
+                      "activityOccurrenceId": "job-101",
+                      "definitionContentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "dispatchNotAfter": "2026-11-11T11:00:30Z"
+                    },
+                    "definitionKey": "extract",
+                    "definitionVersion": 1,
+                    "runId": "run-101",
+                    "terminalRevision": 7,
+                    "nodeExecutionRef": "nx-101",
+                    "configurationSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "inputSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "outputSchemaSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "finishedAt": "2026-11-11T11:00:20Z",
+                    "status": "COMPLETED",
+                    "output": {
+                      "category": "A"
+                    },
+                    "artifactRef": null,
+                    "errorCode": null,
+                    "sideEffectOutcome": "NONE",
+                    "eventId": "cfc6656709e75a76ac881f3882568574e0b059d3de1f2d22aa9036681788a067",
+                    "resultSha256": "87fcfce7edfd5f8b5d55a9cf1c39760b8e2abcb910b9e986fdccc2277a0b9041"
+                  }
+                },
+                "reference": {
+                  "value": {
+                    "schemaVersion": 2,
+                    "producerId": "as-main",
+                    "tenantId": 11,
+                    "ownerIssuerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "ownerSubjectId": "ps-agent-worker",
+                    "idempotencyKey": "dispatch-101",
+                    "link": {
+                      "sourceId": "ps-main",
+                      "scopeType": "BPMN",
+                      "scopeInstanceId": "pi-101",
+                      "activityOccurrenceId": "job-101",
+                      "definitionContentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "dispatchNotAfter": "2026-11-11T11:00:30Z"
+                    },
+                    "definitionKey": "extract",
+                    "definitionVersion": 1,
+                    "runId": "run-101",
+                    "terminalRevision": 7,
+                    "nodeExecutionRef": "nx-101",
+                    "configurationSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "inputSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "outputSchemaSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "finishedAt": "2026-11-11T11:00:20Z",
+                    "status": "COMPLETED",
+                    "output": null,
+                    "artifactRef": {
+                      "resourceKey": "result-101",
+                      "contentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                      "mediaType": "application/json",
+                      "sizeBytes": 42
+                    },
+                    "errorCode": null,
+                    "sideEffectOutcome": "CONFIRMED",
+                    "eventId": "cfc6656709e75a76ac881f3882568574e0b059d3de1f2d22aa9036681788a067",
+                    "resultSha256": "50ca0167ece0f6c14157f6843e491ac8dc56a124852e35c6e567e0c6a9513bb8"
+                  }
+                },
+                "failure": {
+                  "value": {
+                    "schemaVersion": 2,
+                    "producerId": "as-main",
+                    "tenantId": 11,
+                    "ownerIssuerSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "ownerSubjectId": "ps-agent-worker",
+                    "idempotencyKey": "dispatch-101",
+                    "link": {
+                      "sourceId": "ps-main",
+                      "scopeType": "BPMN",
+                      "scopeInstanceId": "pi-101",
+                      "activityOccurrenceId": "job-101",
+                      "definitionContentSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "dispatchNotAfter": "2026-11-11T11:00:30Z"
+                    },
+                    "definitionKey": "extract",
+                    "definitionVersion": 1,
+                    "runId": "run-101",
+                    "terminalRevision": 7,
+                    "nodeExecutionRef": "nx-101",
+                    "configurationSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "inputSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "outputSchemaSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "finishedAt": "2026-11-11T11:00:20Z",
+                    "status": "FAILED",
+                    "output": null,
+                    "artifactRef": null,
+                    "errorCode": "INVALID_OUTPUT",
+                    "sideEffectOutcome": "UNKNOWN",
+                    "eventId": "cfc6656709e75a76ac881f3882568574e0b059d3de1f2d22aa9036681788a067",
+                    "resultSha256": "099ea0d6232dddd88858368dd4b6d439745ec26f53ee0b338192550f2d247074"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The committed Inbox receipt. RECEIVED confirms registration; APPLIED confirms native process advancement.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentResultReceipt"
+                },
+                "example": {
+                  "eventId": "cfc6656709e75a76ac881f3882568574e0b059d3de1f2d22aa9036681788a067",
+                  "eventFingerprint": "7af381b5c99b97357cafdcf88237fc4f92ecb78116b29778e69ce8d1016e2f71",
+                  "state": "RECEIVED",
+                  "receivedAt": "2026-11-11T11:00:21Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Unknown, duplicate, mixed-version or invalid members, unsafe references, or malformed JSON.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_INVALID_COMMAND"
+            ]
+          },
+          "401": {
+            "description": "Verified tenant SERVICE authentication is required.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/SecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_UNAUTHENTICATED"
+            ]
+          },
+          "403": {
+            "description": "Current route, receiver or disclosure permission denied. No Inbox record is written.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/SecurityError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_PERMISSION_DENIED"
+            ]
+          },
+          "404": {
+            "description": "No visible dispatch or exact producer, tenant, source and owner binding. A v2 sender may retry the same bytes within the original delivery window.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_RESOURCE_NOT_FOUND"
+            ]
+          },
+          "409": {
+            "description": "Changed fingerprint, runtime profile, dispatch or attempt for the stable identity, or changed tenant assertion. Stop automatic delivery on identity/content conflict.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_IDEMPOTENCY_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED"
+            ]
+          },
+          "413": {
+            "description": "The received envelope exceeds its version-specific body limit.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_REQUEST_TOO_LARGE"
+            ]
+          },
+          "415": {
+            "description": "The route accepts application/json. Unsupported media types use the existing MVC error mapping."
+          },
+          "429": {
+            "description": "Technical capacity limit. Bounded retry uses the same stored envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_CAPACITY_EXCEEDED"
+            ]
+          },
+          "500": {
+            "description": "Unexpected technical failure. Verify the original delivery evidence before advancing.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_INTERNAL_ERROR"
+            ]
+          },
+          "503": {
+            "description": "Required dependency unavailable. Preserve the original delivery envelope.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "x-error-codes": [
+              "TIANJI_DEPENDENCY_UNAVAILABLE"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "oauth2": {
+        "type": "oauth2",
+        "flows": {
+          "clientCredentials": {
+            "tokenUrl": "https://identity.example/token",
+            "scopes": {
+              "tianji:process:agent-result:receive": "Register an authorized Agent terminal event"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "TerminalEnvelope": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AgentTerminalEventV1"
+          },
+          {
+            "$ref": "#/components/schemas/AgentTerminalEventV2"
+          }
+        ]
+      },
+      "AgentTerminalEventV1": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "producerId",
+          "eventId",
+          "tenantId",
+          "ownerIssuerSha256",
+          "ownerSubjectId",
+          "idempotencyKey",
+          "link",
+          "definitionKey",
+          "definitionVersion",
+          "runId",
+          "terminalRevision",
+          "status",
+          "finishedAt",
+          "resultSha256",
+          "sideEffectOutcome"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "const": 1
+          },
+          "producerId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "eventId": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "tenantId": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "ownerIssuerSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "ownerSubjectId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "link": {
+            "$ref": "#/components/schemas/AgentProcessLink"
+          },
+          "definitionKey": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])"
+          },
+          "definitionVersion": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])"
+          },
+          "terminalRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "COMPLETED",
+              "FAILED",
+              "CANCELLED",
+              "TIMED_OUT"
+            ]
+          },
+          "finishedAt": {
+            "$ref": "#/components/schemas/UtcMicros"
+          },
+          "resultSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "errorCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}(?![\\s\\S])",
+            "maxLength": 64
+          },
+          "sideEffectOutcome": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}(?![\\s\\S])",
+            "maxLength": 64
+          }
+        },
+        "description": "Historical reference-only envelope. The original event ID, result digest and envelope fingerprint algorithms still apply.",
+        "x-max-request-bytes": 65536
+      },
+      "AgentTerminalEventV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "producerId",
+          "eventId",
+          "tenantId",
+          "ownerIssuerSha256",
+          "ownerSubjectId",
+          "idempotencyKey",
+          "link",
+          "definitionKey",
+          "definitionVersion",
+          "runId",
+          "terminalRevision",
+          "status",
+          "finishedAt",
+          "resultSha256",
+          "sideEffectOutcome",
+          "nodeExecutionRef",
+          "configurationSha256",
+          "inputSha256",
+          "outputSchemaSha256",
+          "output",
+          "artifactRef",
+          "errorCode"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "integer",
+            "const": 2
+          },
+          "producerId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "eventId": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "tenantId": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "ownerIssuerSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "ownerSubjectId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "link": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/AgentProcessLink"
+              },
+              {
+                "properties": {
+                  "scopeType": {
+                    "const": "BPMN"
+                  }
+                }
+              }
+            ]
+          },
+          "definitionKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "definitionVersion": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 999999999999999
+          },
+          "runId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])"
+          },
+          "terminalRevision": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 999999999999999
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "COMPLETED",
+              "FAILED",
+              "CANCELLED",
+              "TIMED_OUT"
+            ]
+          },
+          "finishedAt": {
+            "$ref": "#/components/schemas/UtcMicros"
+          },
+          "resultSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "errorCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}(?![\\s\\S])",
+            "maxLength": 64
+          },
+          "sideEffectOutcome": {
+            "type": "string",
+            "enum": [
+              "NONE",
+              "CONFIRMED",
+              "UNKNOWN"
+            ]
+          },
+          "nodeExecutionRef": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "configurationSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "inputSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "outputSchemaSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "output": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TypedJsonValue"
+            },
+            "x-max-canonical-bytes": 8192,
+            "description": "When present, the inline object must satisfy the frozen output schema. The receiver verifies canonical JSON, depth and the 8 KiB UTF-8 limit."
+          },
+          "artifactRef": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AgentResultArtifactRefVO"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "description": "Runtime v2 envelope. The receiver validates the exact registered dispatch, attempt and frozen input, configuration and schema references. It recomputes the versioned event ID, result digest and envelope fingerprint. Integer fields require integral JSON tokens.",
+        "x-max-request-bytes": 16384,
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "const": "COMPLETED"
+              },
+              "output": {
+                "type": "object"
+              },
+              "artifactRef": {
+                "type": "null"
+              },
+              "errorCode": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "COMPLETED"
+              },
+              "output": {
+                "type": "null"
+              },
+              "artifactRef": {
+                "$ref": "#/components/schemas/AgentResultArtifactRefVO"
+              },
+              "errorCode": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "FAILED",
+                  "CANCELLED",
+                  "TIMED_OUT"
+                ]
+              },
+              "output": {
+                "type": "null"
+              },
+              "artifactRef": {
+                "type": "null"
+              },
+              "errorCode": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_]{0,63}(?![\\s\\S])",
+                "maxLength": 64
+              }
+            }
+          }
+        ]
+      },
+      "AgentProcessLink": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sourceId",
+          "scopeType",
+          "scopeInstanceId",
+          "activityOccurrenceId",
+          "definitionContentSha256",
+          "dispatchNotAfter"
+        ],
+        "properties": {
+          "sourceId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "scopeType": {
+            "type": "string",
+            "enum": [
+              "BPMN",
+              "CMMN"
+            ]
+          },
+          "scopeInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])",
+            "description": "At most 512 bytes in UTF-8."
+          },
+          "activityOccurrenceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^(?! )[^\\u0000-\\u001f\\u007f]*[^ \\u0000-\\u001f\\u007f](?![\\s\\S])",
+            "description": "At most 512 bytes in UTF-8."
+          },
+          "definitionContentSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "dispatchNotAfter": {
+            "$ref": "#/components/schemas/UtcMicros"
+          }
+        }
+      },
+      "AgentResultArtifactRefVO": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "resourceKey",
+          "contentSha256",
+          "mediaType",
+          "sizeBytes"
+        ],
+        "properties": {
+          "resourceKey": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])",
+            "maxLength": 128
+          },
+          "contentSha256": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "mediaType": {
+            "type": "string",
+            "pattern": "^[a-z0-9.+-]{1,63}/[a-z0-9.+-]{1,63}(?![\\s\\S])",
+            "maxLength": 127
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 999999999999999
+          }
+        },
+        "description": "Opaque immutable result metadata for a frozen reference-mode output schema. The receiver verifies current permission and registered SPI-012 metadata. The event carries no location, access token or artifact body."
+      },
+      "AgentResultReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "eventId",
+          "eventFingerprint",
+          "state",
+          "receivedAt"
+        ],
+        "properties": {
+          "eventId": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "eventFingerprint": {
+            "$ref": "#/components/schemas/Sha256"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "RECEIVED",
+              "APPLIED",
+              "IGNORED_LATE",
+              "DEAD"
+            ]
+          },
+          "receivedAt": {
+            "$ref": "#/components/schemas/UtcMicros"
+          }
+        }
+      },
+      "Sha256": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}(?![\\s\\S])",
+        "maxLength": 64
+      },
+      "UtcMicros": {
+        "type": "string",
+        "pattern": "^(?:19[7-9][0-9]|[2-9][0-9]{3})-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9](?:\\.[0-9]{1,6})?Z(?![\\s\\S])",
+        "maxLength": 27,
+        "format": "date-time",
+        "description": "Valid UTC instant from 1970 through year 9999, with at most six fractional digits."
+      },
+      "TypedJsonValue": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/TypedJsonValue"
+            }
+          },
+          {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/TypedJsonValue"
+            }
+          },
+          {
+            "type": "integer",
+            "minimum": -999999999999999,
+            "maximum": 999999999999999
+          },
+          {
+            "type": [
+              "string",
+              "boolean",
+              "null"
+            ]
+          }
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "correlationId"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}(?![\\s\\S])",
+            "maxLength": 64
+          },
+          "correlationId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "SecurityError": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "enum": [
+              "TIANJI_UNAUTHENTICATED",
+              "TIANJI_PERMISSION_DENIED"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

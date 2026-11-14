@@ -10,7 +10,7 @@
       "get": {
         "operationId": "getOwnedProcessStartReceipt",
         "summary": "Read one exact owned applied Process START receipt",
-        "description": "Requires the existing Process API and an explicit default-off START receipt read opt-in. Requires the current exact START owner and an independently expected request digest. A positive result proves an applied Process START receipt. No match is inconclusive and never permits replay. Only the two query parameters shown are accepted.",
+        "description": "Requires the existing Process API and an explicit default-off START receipt read opt-in. Requires the current exact START owner and an independently computed expected request digest from the original intent. An exact APPLIED result proves the original START committed. For v2, the server verifies the immutable instance binding and matching original and resolved digests against the receipt. Only the two query parameters shown are accepted.",
         "security": [
           {
             "oauth2": [
@@ -42,7 +42,7 @@
             "name": "requestSha256",
             "in": "query",
             "required": true,
-            "description": "Lowercase SHA-256 from the exact original validated START command using OrchestrationRequestDigests.start. It does not confer authority.",
+            "description": "Expected lowercase SHA-256, computed independently from the original START intent. V1 retains OrchestrationRequestDigests.start. V2 uses AUTOMATION_START_REQUEST_V2 and the length-prefixed canonical encoding of definitionKey, businessKey, correlationId, variables and agentTaskOverrides before schema normalization. Preserve originally sent string literals and exact integers; omitted agentTaskOverrides alone becomes an empty object. Exclude commandId, the server-selected release and activation, and the resolved digest. This digest does not confer authority.",
             "schema": {
               "type": "string",
               "pattern": "^[0-9a-f]{64}$"
@@ -123,7 +123,7 @@
             }
           },
           "404": {
-            "description": "No exact owned applied START receipt observed. Missing, non-APPLIED, different digest and foreign owner are indistinguishable.",
+            "description": "No exact owned APPLIED START receipt was observed. Missing, non-APPLIED, different digest and foreign owner are indistinguishable. A 404 is inconclusive; recheck the same commandId and digest within a bounded read window. It does not authorize a new START or a changed key or input.",
             "headers": {
               "Cache-Control": {
                 "schema": {
@@ -159,7 +159,7 @@
             }
           },
           "503": {
-            "description": "Process store unavailable.",
+            "description": "The Process store is unavailable, or the preserved v2 binding, receipt, or digest evidence is inconsistent. Keep the result unknown and recheck the original receipt within the read window.",
             "headers": {
               "Cache-Control": {
                 "schema": {
