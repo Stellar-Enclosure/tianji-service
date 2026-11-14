@@ -10171,7 +10171,7 @@
             "$ref": "#/components/schemas/LogicalId"
           },
           "definitionKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/DefinitionKey"
           },
           "title": {
             "type": "string",
@@ -10394,7 +10394,7 @@
             "$ref": "#/components/schemas/LogicalId"
           },
           "definitionKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/DefinitionKey"
           },
           "title": {
             "type": "string",
@@ -10782,7 +10782,7 @@
         ],
         "properties": {
           "definitionKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/DefinitionKey"
           },
           "revision": {
             "$ref": "#/components/schemas/ExactPositiveInteger"
@@ -10887,7 +10887,7 @@
         ],
         "properties": {
           "definitionKey": {
-            "$ref": "#/components/schemas/LogicalId"
+            "$ref": "#/components/schemas/DefinitionKey"
           },
           "observedAt": {
             "$ref": "#/components/schemas/UtcInstant"

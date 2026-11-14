@@ -179,6 +179,18 @@ class AutomationOpenApiContractTest {
     }
 
     @Test
+    void draftAndActivationResponsesUseTheExactDefinitionKeyAlphabet() throws IOException {
+        JsonNode doc = mapper.readTree(artifact());
+        for (String name : List.of("DraftSummaryDTO", "ProcessDraftDTO", "AutomationActivationDTO", "ActivationPageDTO")) {
+            var definition = schema(doc, name).path("properties").path("definitionKey");
+            assertEquals("#/components/schemas/DefinitionKey", definition.path("$ref").asText(), name);
+            String pattern = resolve(doc, definition).path("pattern").asText();
+            assertTrue("_order-entry".matches(pattern), name);
+            assertFalse("order:entry".matches(pattern), name);
+        }
+    }
+
+    @Test
     void processServerAndClientPublishIdenticalBytes() throws IOException {
         Path repo = repository();
         byte[] clientSource = Files.readAllBytes(repo.resolve(CLIENT_MODULE).resolve(SOURCE_RESOURCES).resolve(AUTOMATION));
