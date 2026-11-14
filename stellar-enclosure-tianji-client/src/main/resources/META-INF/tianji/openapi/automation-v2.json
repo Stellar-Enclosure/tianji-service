@@ -249,6 +249,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_DRAFT_VERSION_CONFLICT"
             ]
@@ -526,6 +527,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_DRAFT_VERSION_CONFLICT",
               "TIANJI_DRAFT_STATE_CONFLICT",
@@ -859,6 +861,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -1202,6 +1205,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_PROCESS_NOT_ACTIVATED",
               "TIANJI_PROCESS_ACTIVATION_CONFLICT"
@@ -1525,6 +1529,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -1905,6 +1910,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -2224,6 +2230,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_EVENT_CONFLICT",
               "TIANJI_EVENT_ROUTE_CHANGED",
@@ -2532,6 +2539,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -2875,6 +2883,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -3191,6 +3200,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -3526,6 +3536,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_NODE_RETRY_BLOCKED"
             ]
@@ -3881,6 +3892,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -4202,6 +4214,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -4531,6 +4544,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -4879,6 +4893,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_DRAFT_SOURCE_UNAVAILABLE"
             ]
@@ -5195,6 +5210,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -5458,6 +5474,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_DRAFT_VERSION_CONFLICT",
               "TIANJI_DRAFT_STATE_CONFLICT"
@@ -5814,6 +5831,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },
@@ -6079,6 +6097,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_DRAFT_VERSION_CONFLICT",
               "TIANJI_DRAFT_STATE_CONFLICT"
@@ -6364,6 +6383,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT",
               "TIANJI_PROCESS_ACTIVATION_CONFLICT"
             ]
@@ -6691,6 +6711,7 @@
             },
             "x-error-codes": [
               "TIANJI_PROCESS_VERSION_CONFLICT",
+              "TIANJI_TENANT_CONTEXT_CHANGED",
               "TIANJI_IDEMPOTENCY_CONFLICT"
             ]
           },

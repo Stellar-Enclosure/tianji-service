@@ -89,6 +89,26 @@ class AutomationOpenApiContractTest {
     }
 
     @Test
+    void tenantAssertionsDocumentTheirStableConflictCode() throws IOException {
+        JsonNode doc = mapper.readTree(artifact());
+        for (OperationVO expected : OPERATIONS) {
+            JsonNode operation = operation(doc, expected.id());
+            boolean assertsTenant = false;
+            for (JsonNode parameter : operation.path("parameters")) {
+                JsonNode resolved = resolve(doc, parameter);
+                if ("X-Egon-Tianji-Tenant".equals(resolved.path("name").asText())) {
+                    assertEquals("header", resolved.path("in").asText(), expected.id());
+                    assertFalse(resolved.path("required").asBoolean(), expected.id());
+                    assertsTenant = true;
+                }
+            }
+            assertTrue(assertsTenant, expected.id());
+            JsonNode conflict = resolve(doc, operation.path("responses").path("409"));
+            assertTrue(values(conflict.path("x-error-codes")).contains("TIANJI_TENANT_CONTEXT_CHANGED"), expected.id());
+        }
+    }
+
+    @Test
     void distinguishesStartObservationActivationAndServiceAuthorization() throws IOException {
         JsonNode doc = mapper.readTree(artifact());
         assertEquals(Set.of(Set.of("tianji:process:start")), oauth(operation(doc, "startAutomationProcess")));

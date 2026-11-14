@@ -45,7 +45,8 @@ final class AutomationResponseCodec {
     private static final Set<String> DRAFT_FIELDS = Set.of("baseSourceManifestSha256", "content", "lastCommandId", "publication", "commandReceipt");
     private static final int MAX_RESPONSE_BYTES = 9 * 1024 * 1024;
     private static final Set<String> ERROR_FIELDS = Set.of("code", "correlationId");
-    private static final Set<String> GENERIC_CONFLICTS = Set.of("TIANJI_PROCESS_VERSION_CONFLICT", "TIANJI_IDEMPOTENCY_CONFLICT");
+    private static final Set<String> GENERIC_CONFLICTS = Set.of(
+            "TIANJI_PROCESS_VERSION_CONFLICT", "TIANJI_IDEMPOTENCY_CONFLICT", "TIANJI_TENANT_CONTEXT_CHANGED");
     private static final Map<Integer, String> ERRORS = Map.of(400, "TIANJI_INVALID_COMMAND", 401, "TIANJI_UNAUTHENTICATED",
             403, "TIANJI_PERMISSION_DENIED", 404, "TIANJI_RESOURCE_NOT_FOUND", 413, "TIANJI_REQUEST_TOO_LARGE",
             503, "TIANJI_DEPENDENCY_UNAVAILABLE");

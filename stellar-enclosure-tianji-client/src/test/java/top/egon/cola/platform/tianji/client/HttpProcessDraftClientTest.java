@@ -178,6 +178,21 @@ class HttpProcessDraftClientTest {
     }
 
     @Test
+    void preservesTheServerTenantConflictWithoutRetrying() {
+        fixture.handler = request -> new Reply(409, "application/json", """
+                {"code":"TIANJI_TENANT_CONTEXT_CHANGED","correlationId":null}
+                """);
+
+        ProcessClientException conflict = assertThrows(ProcessClientException.class, () -> client.get("pd-101", null));
+
+        assertEquals(409, conflict.httpStatus());
+        assertEquals("TIANJI_TENANT_CONTEXT_CHANGED", conflict.code());
+        assertNull(conflict.correlationId());
+        assertEquals("11", fixture.take().tenant());
+        assertNull(fixture.poll());
+    }
+
+    @Test
     void creation_lookup_bypasses_default_editing_and_forbids_mixed_filters() {
         fixture.handler = request -> Reply.json(page(summary(3, "DISCARDED"), "null"));
         assertEquals(DraftSummaryDTO.StateEnum.DISCARDED, client.list(null, null, null, null, "create-1").getItems().getFirst().getState());
