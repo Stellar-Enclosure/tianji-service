@@ -64,6 +64,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -738,9 +739,13 @@ final class AutomationIndependentServicesIT {
     }
 
     private static <T> T awaitAvailable(String description, Supplier<T> call) {
+        return awaitAvailable(description, call, ignored -> true);
+    }
+
+    private static <T> T awaitAvailable(String description, Supplier<T> call, Predicate<T> ready) {
         return fixture.await(description, () -> {
             try {
-                return Optional.of(call.get());
+                return Optional.of(call.get()).filter(ready);
             } catch (ProcessClientException failure) {
                 if (failure.httpStatus() != 503 || !"TIANJI_DEPENDENCY_UNAVAILABLE".equals(failure.code())) throw failure;
                 return Optional.empty();
@@ -780,10 +785,8 @@ final class AutomationIndependentServicesIT {
     }
 
     private static ProcessEventReceiptDTO awaitEvent(HttpProcessEventClient client, String receipt) {
-        var settled = fixture.await("terminal event receipt", () -> {
-            var observed = client.getReceipt(receipt);
-            return "RECEIVED".equals(observed.getState()) ? Optional.empty() : Optional.of(observed);
-        });
+        var settled = awaitAvailable("terminal event receipt", () -> client.getReceipt(receipt),
+                observed -> !"RECEIVED".equals(observed.getState()));
         assertEquals("APPLIED", settled.getState(), settled::getDecisionCode);
         return settled;
     }
