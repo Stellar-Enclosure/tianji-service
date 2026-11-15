@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.process.server;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.Filter;
 import jakarta.servlet.http.HttpServletResponse;
 import org.flowable.engine.ProcessEngine;
@@ -10,12 +11,17 @@ import org.springframework.jdbc.datasource.TransactionAwareDataSourceProxy;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.config.YamlMapFactoryBean;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
+import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
+import org.springframework.boot.jackson2.autoconfigure.Jackson2AutoConfiguration;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -28,6 +34,7 @@ import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxPropertie
 import top.egon.cola.platform.tianji.process.server.execution.ProcessMigrationPreflightService;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterAutoConfiguration;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 
 import javax.sql.DataSource;
@@ -42,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.eq;
@@ -55,6 +63,34 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.verify;
 
 class ProcessStorageConfigurationTest {
+    @Test
+    void identity_and_outbox_share_the_unique_jackson_2_mapper() {
+        var source = mock(DataSource.class);
+        var manager = new DataSourceTransactionManager(source);
+        var infrastructure = new OutboxInfrastructure(source, "source", manager, "manager");
+        var properties = new TransactionalOutboxProperties();
+        properties.getStorage().getJdbc().setSchema("tianji_process");
+
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(Jackson2AutoConfiguration.class))
+                .withUserConfiguration(ProcessStorageConfiguration.class, IdentityMapperConsumerConfiguration.class)
+                .withInitializer(context -> context.addBeanFactoryPostProcessor(
+                        IdpStarterAutoConfiguration.idpJacksonObjectMapperAlias()))
+                .withBean(OutboxInfrastructure.class, () -> infrastructure)
+                .withBean(TransactionalOutboxProperties.class, () -> properties)
+                .withPropertyValues("flowable.database-schema-update=false", "flowable.database-schema=tianji_process",
+                        "spring.sql.init.mode=never", "spring.flyway.enabled=false",
+                        "egon.cola.component.transactional-outbox.storage.type=JDBC",
+                        "egon.cola.component.transactional-outbox.storage.jdbc.schema=tianji_process")
+                .run(context -> {
+                    assertNull(context.getStartupFailure(), () -> String.valueOf(context.getStartupFailure()));
+                    var outbox = context.getBean("outboxObjectMapper", ObjectMapper.class);
+                    assertEquals(1, context.getBeanNamesForType(ObjectMapper.class).length);
+                    assertSame(outbox, context.getBeanProvider(ObjectMapper.class).getIfUnique());
+                    assertSame(outbox, context.getBean(IdentityMapperConsumer.class).mapper());
+                });
+    }
+
     @Test
     void automation_readiness_uses_the_existing_engine_source_and_rejects_unready_v14_when_enabled() {
         var engine = mock(ProcessEngine.class);
@@ -489,4 +525,14 @@ class ProcessStorageConfigurationTest {
                 .withProperty("egon.cola.component.transactional-outbox.storage.type", "JDBC")
                 .withProperty("egon.cola.component.transactional-outbox.storage.jdbc.schema", "tianji_process");
     }
+
+    @Configuration(proxyBeanMethods = false)
+    static class IdentityMapperConsumerConfiguration {
+        @Bean
+        IdentityMapperConsumer identityMapperConsumer(@Qualifier("jacksonObjectMapper") ObjectMapper mapper) {
+            return new IdentityMapperConsumer(mapper);
+        }
+    }
+
+    record IdentityMapperConsumer(ObjectMapper mapper) { }
 }

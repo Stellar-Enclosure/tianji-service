@@ -117,7 +117,7 @@ public class ProcessStorageConfiguration {
         };
     }
 
-    @Bean
+    @Bean({"outboxObjectMapper", "jacksonObjectMapper"})
     @ConditionalOnMissingBean(ObjectMapper.class)
     ObjectMapper outboxObjectMapper() {
         return new ObjectMapper().findAndRegisterModules();
