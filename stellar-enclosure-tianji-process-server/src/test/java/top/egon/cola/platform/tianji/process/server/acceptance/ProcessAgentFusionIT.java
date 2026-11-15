@@ -182,8 +182,66 @@ class ProcessAgentFusionIT {
                 assertEquals("retry", reopened.inputText(retryRoot, "review", "assessment", "category"));
                 assertEquals(4, agent.runCount());
                 verifyThreeSequentialAgents(reopened, agent);
+                verifyClosedDispatchDoesNotStarveAndSubmittedCanReplay(reopened, agent);
             }
         }
+    }
+
+    private static void verifyClosedDispatchDoesNotStarveAndSubmittedCanReplay(ProcessBoundary process,
+            AgentTaskSnapshotIT.AgentBoundary agent) throws InterruptedException {
+        var route = new AgentDispatchStore.TypedRoute(BRIDGE_ACTOR, SOURCE, Duration.ofSeconds(4), ROUTE.submissionTimeout());
+        var bridge = new AgentStartWorker(route, process.worker, process.dispatches, agent.client());
+        String closingRoot = startNativeAgentWait(process, "closing-head");
+        var initial = process.worker.acquireTypedAgentDispatch(route);
+        assertEquals(WorkerAcquireStatusEnum.ACQUIRED, initial.status());
+        assertEquals(closingRoot, initial.task().processInstanceId());
+        var closing = process.worker.prepareTypedAgentDispatch(route, initial.task(), process.dispatches).intent();
+        assertEquals(AgentDispatchStore.State.CLOSING, process.dispatches.refresh(closing.seed().key(), false).state());
+
+        String submittedRoot = startNativeAgentWait(process, "submitted-behind-head");
+        process.awaitNativeLeaseExpiry(closingRoot);
+        var acquired = process.worker.acquireTypedAgentDispatch(route);
+        assertEquals(WorkerAcquireStatusEnum.ACQUIRED, acquired.status());
+        assertEquals(submittedRoot, acquired.task().processInstanceId(), "a CLOSING native job must not be leased again");
+        assertEquals(1, process.count("tianji_worker_lease_receipt", "scope_id=?", closingRoot));
+        assertEquals(1, process.count("act_ru_external_job", "process_instance_id_=?", closingRoot));
+
+        var prepared = process.worker.prepareTypedAgentDispatch(route, acquired.task(), process.dispatches);
+        int beforeRuns = agent.runCount();
+        int beforeSubmissions = agent.submissions();
+        var run = agent.client().submitRuntime(prepared.command());
+        var submitted = process.dispatches.recordTyped(prepared.intent().seed().key(), run);
+        assertEquals(AgentDispatchStore.State.SUBMITTED, submitted.state());
+        assertEquals(AgentResultReceiptStateEnum.RECEIVED,
+                agent.executeAndDeliver(Map.of("assessment", Map.of("approved", true, "category", "resumed"))).state());
+
+        process.awaitNativeLeaseExpiry(submittedRoot);
+        assertEquals(AgentStartWorker.Outcome.ACKNOWLEDGED, bridge.runOnce());
+        assertEquals("ACKNOWLEDGED", process.dispatchState(submittedRoot));
+        assertEquals(run.getRunId(), process.observer.queryForObject(
+                "SELECT run_id FROM tianji_process.tianji_process_agent_dispatch WHERE scope_id=?", String.class, submittedRoot));
+        assertEquals(2, process.count("tianji_worker_lease_receipt", "scope_id=?", submittedRoot));
+        assertEquals(1, process.count("tianji_worker_lease_receipt", "scope_id=? AND state='COMPLETED'", submittedRoot));
+        assertEquals(beforeRuns + 1, agent.runCount());
+        assertEquals(beforeSubmissions + 1, agent.submissions());
+        process.runAsync(submittedRoot);
+        process.reconcileUntilApplied(agent.eventId());
+
+        bridge.reconcileOnce(32, Duration.ofSeconds(1));
+        assertEquals("CLOSED", process.dispatchState(closingRoot));
+        String nextRoot = startNativeAgentWait(process, "behind-closed-head");
+        var next = process.worker.acquireTypedAgentDispatch(route);
+        assertEquals(WorkerAcquireStatusEnum.ACQUIRED, next.status());
+        assertEquals(nextRoot, next.task().processInstanceId(), "a CLOSED native job must not be leased again");
+        assertEquals(1, process.count("tianji_worker_lease_receipt", "scope_id=?", closingRoot));
+        assertEquals(1, process.count("act_ru_external_job", "process_instance_id_=?", closingRoot));
+    }
+
+    private static String startNativeAgentWait(ProcessBoundary process, String key) {
+        String root = process.start(key, Map.of()).getInstanceId();
+        process.completeHuman(root, Map.of("amount", 17L));
+        assertEquals(1, process.count("act_ru_external_job", "process_instance_id_=?", root));
+        return root;
     }
 
     private static void verifyThreeSequentialAgents(ProcessBoundary process, AgentTaskSnapshotIT.AgentBoundary agent) throws Exception {

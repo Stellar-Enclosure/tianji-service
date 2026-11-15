@@ -107,6 +107,7 @@ public final class FlowableWorkerService {
     private static final Map<String, ProcessValueTypeEnum> AGENT_LEASE_INPUT = Map.of(
             "nodeExecutionRef", ProcessValueTypeEnum.STRING, "inputSha256", ProcessValueTypeEnum.STRING,
             "configurationSha256", ProcessValueTypeEnum.STRING);
+    private static final String AGENT_DISPATCH_LEASE_STATES = "('PENDING','SUBMITTED')";
     private static final JsonMapper REPORT_JSON = JsonMapper.builder().build();
     private static final TypeReference<Map<String, Object>> REPORT_OBJECT = new TypeReference<>() { };
     private final SpringProcessEngineConfiguration process;
@@ -885,8 +886,10 @@ public final class FlowableWorkerService {
             if (job == null || job.live() || !nativeTypedAgentTopic().equals(job.topic())
                     || !root.getInstanceId().equals(job.processInstanceId())) return empty();
             var node = automation.nodes().findAgentAttempt(actor.tenantId(), root.getInstanceId(), job.id()).orElse(null);
+            if (node == null || !currentAgentRoute(root, node, route)
+                    || !agentDispatchAllowsLease(route, root.getInstanceId(), job.id())) return empty();
             Instant now = automation.nodes().now();
-            if (node == null || !isAgentDispatchWaiting(node, now) || !currentAgentRoute(root, node, route)) return empty();
+            if (!isAgentDispatchWaiting(node, now)) return empty();
             var scope = typedAgentScope(root, node, job);
             var expiresAt = earlier(now.plus(route.leaseDuration()), earlier(node.getAttemptDeadlineAt(), node.getNodeDeadlineAt()))
                     .truncatedTo(ChronoUnit.MILLIS);
@@ -923,16 +926,37 @@ public final class FlowableWorkerService {
                     AND n.agent_run_id IS NULL AND n.native_subscription_id IS NULL
                     AND n.attempt_deadline_at>clock_timestamp() AND n.node_deadline_at>clock_timestamp()
                 JOIN %1$s.tianji_process_instance_binding b ON b.tenant_id=n.tenant_id AND b.instance_id=n.instance_id
+                LEFT JOIN %1$s.tianji_process_agent_dispatch d ON d.tenant_id=n.tenant_id AND d.occurrence_id=j.id_
                 WHERE j.tenant_id_=? AND j.handler_cfg_=? AND j.retries_>0
                     AND (j.lock_exp_time_ IS NULL OR j.lock_exp_time_<=clock_timestamp())
                     AND (j.duedate_ IS NULL OR j.duedate_<=clock_timestamp())
                     AND b.configuration -> n.node_id ->> 'sourceId' = ?
                     AND b.configuration -> n.node_id ->> 'issuer' = ?
                     AND b.configuration -> n.node_id ->> 'subject' = ?
+                    AND (d.occurrence_id IS NULL OR (d.state IN %2$s AND d.scope_type='BPMN' AND d.scope_id=n.instance_id
+                        AND d.source_id=b.configuration -> n.node_id ->> 'sourceId'
+                        AND d.subject_issuer=b.configuration -> n.node_id ->> 'issuer'
+                        AND d.subject_id=b.configuration -> n.node_id ->> 'subject'
+                        AND d.topic=? AND d.schema_version=?))
                 ORDER BY j.create_time_, j.id_ COLLATE "C" LIMIT 1
-                """.formatted(schema), (rs, index) -> new WorkerCandidateVO(rs.getString(1), rs.getString(2)), actor.tenantId(),
-                Long.toString(actor.tenantId()), nativeTypedAgentTopic(), route.sourceId(), actor.issuerFingerprint(), actor.subjectId());
+                """.formatted(schema, AGENT_DISPATCH_LEASE_STATES), (rs, index) -> new WorkerCandidateVO(rs.getString(1), rs.getString(2)),
+                actor.tenantId(), Long.toString(actor.tenantId()), nativeTypedAgentTopic(), route.sourceId(), actor.issuerFingerprint(),
+                actor.subjectId(), AgentDispatchStore.TYPED_TOPIC, AgentDispatchStore.TYPED_VERSION);
         return rows.stream().findFirst();
+    }
+
+    private boolean agentDispatchAllowsLease(AgentDispatchStore.TypedRoute route, String instanceId, String jobId) {
+        var actor = route.actor();
+        AutomationInstanceGuardCommandInterceptor.requireHeld(actor.tenantId(), instanceId);
+        // Close reconciliation can update the dispatch independently of the root and native job locks.
+        var allowed = jdbc.query("""
+                SELECT state IN %2$s AND scope_type='BPMN' AND scope_id=? AND source_id=?
+                    AND subject_issuer=? AND subject_id=? AND topic=? AND schema_version=?
+                FROM %1$s.tianji_process_agent_dispatch WHERE tenant_id=? AND occurrence_id=? FOR UPDATE
+                """.formatted(schema, AGENT_DISPATCH_LEASE_STATES), (rs, row) -> rs.getBoolean(1), instanceId, route.sourceId(),
+                actor.issuerFingerprint(), actor.subjectId(), AgentDispatchStore.TYPED_TOPIC, AgentDispatchStore.TYPED_VERSION,
+                actor.tenantId(), jobId);
+        return allowed.isEmpty() || allowed.size() == 1 && allowed.getFirst();
     }
 
     public AgentStartWorker.TypedDispatch prepareTypedAgentDispatch(AgentDispatchStore.TypedRoute route,
