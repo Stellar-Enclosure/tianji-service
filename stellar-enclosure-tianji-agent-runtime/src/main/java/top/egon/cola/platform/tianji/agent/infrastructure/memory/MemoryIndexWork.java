@@ -9,6 +9,8 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.component.agentflow.api.memory.MemoryScopeVO;
+import top.egon.cola.component.agentflow.memory.jdbc.JdbcMemoryStore.HostFenceVO;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -16,12 +18,14 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryStateEnum;
 
 import javax.sql.DataSource;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.concurrent.TimeUnit;
 
 /** Applies one existing Outbox intention. Embedding is outside transactions; vector SQL and the current-fact fence commit together. */
 @Slf4j
@@ -32,6 +36,7 @@ public final class MemoryIndexWork {
     private final Consumer<MemoryIndexPublication.Event> buildAuthority;
     private final Clock clock;
     private final MemoryJsonCodec codec = new MemoryJsonCodec();
+    private final Map<String, ScopeWork> running = new java.util.HashMap<>();
 
     /** The authority is a current, local platform/realm/egress check, not an end-user impersonation or an I/O callback. */
     public MemoryIndexWork(DataSource source, PostgresMemoryService memory, PgVectorMemoryIndex index, Consumer<MemoryIndexPublication.Event> buildAuthority, Clock clock) {
@@ -43,15 +48,104 @@ public final class MemoryIndexWork {
     public void apply(MemoryIndexPublication.Event event, Instant deadline) {
         Objects.requireNonNull(event, "event"); Objects.requireNonNull(deadline, "deadline");
         index.bounded(deadline, () -> {
-            if (event.action() == MemoryIndexPublication.Action.BUILD) build(event, deadline);
-            else cleanup(event, deadline);
-            return Boolean.TRUE;
+            if (memory.hostAdapter() == null) {
+                applyAdmitted(event, deadline, null);
+                return Boolean.TRUE;
+            }
+            var scope = LegacyMemoryStoreAdapter.scopeOf(event.tenantId(), event.ownerIssuer(), event.owner(), event.scopeId());
+            Long frozenEpoch = enter(scope.hash());
+            try {
+                applyAdmitted(event, deadline, frozenEpoch);
+                return Boolean.TRUE;
+            } finally {
+                leave(scope.hash());
+            }
         });
     }
 
-    private void build(MemoryIndexPublication.Event event, Instant deadline) {
-        var before = transaction(event, false, deadline, null, (repository, now) -> {
-            if (repository.component() || repository.frozen()) throw unavailable();
+    private void applyAdmitted(MemoryIndexPublication.Event event, Instant deadline, Long frozenEpoch) {
+        if (event.action() == MemoryIndexPublication.Action.BUILD) build(event, deadline, frozenEpoch);
+        else cleanup(event, deadline, frozenEpoch);
+    }
+
+    private Long enter(String hash) {
+        synchronized (running) {
+            var slot = running.computeIfAbsent(hash, ignored -> new ScopeWork());
+            if (slot.stopped) throw unavailable();
+            slot.active++;
+            return slot.frozenEpoch;
+        }
+    }
+
+    private void leave(String hash) {
+        synchronized (running) {
+            var slot = running.get(hash);
+            slot.active--;
+            if (slot.active == 0 && slot.frozenEpoch == null) running.remove(hash);
+            running.notifyAll();
+        }
+    }
+
+    void openFrozenDrain(MemoryScopeVO scope, long epoch) {
+        synchronized (running) {
+            var slot = running.computeIfAbsent(scope.hash(), ignored -> new ScopeWork());
+            if (slot.frozenEpoch != null) throw unavailable();
+            slot.frozenEpoch = epoch;
+        }
+    }
+
+    void stopAndAwaitFrozenDrain(MemoryScopeVO scope, long epoch, Instant deadline) {
+        synchronized (running) {
+            var slot = running.get(scope.hash());
+            if (slot == null || !Objects.equals(slot.frozenEpoch, epoch)) throw unavailable();
+            slot.stopped = true;
+            while (slot.active != 0) {
+                var remaining = Duration.between(clock.instant(), deadline);
+                if (remaining.isNegative() || remaining.isZero() || Thread.currentThread().isInterrupted()) throw unavailable();
+                long wait = remaining.compareTo(Duration.ofMillis(250)) < 0 ? remaining.toNanos() : TimeUnit.MILLISECONDS.toNanos(250);
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(running, wait);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw unavailable();
+                }
+            }
+        }
+    }
+
+    void requireStopped(MemoryScopeVO scope, long epoch) {
+        synchronized (running) {
+            var slot = running.get(scope.hash());
+            if (slot == null || !slot.stopped || slot.active != 0 || !Objects.equals(slot.frozenEpoch, epoch)) throw unavailable();
+        }
+    }
+
+    void closeFrozenDrain(MemoryScopeVO scope, long epoch) {
+        synchronized (running) {
+            var slot = running.get(scope.hash());
+            if (slot == null || !Objects.equals(slot.frozenEpoch, epoch)) return;
+            slot.frozenEpoch = null;
+            slot.stopped = false;
+            if (slot.active == 0) running.remove(scope.hash());
+            running.notifyAll();
+        }
+    }
+
+    MemoryIndexPublication.Binding indexBinding() { return index.binding(); }
+
+    boolean usesDataSource(DataSource candidate) {
+        return source == candidate && index.usesDataSource(candidate) && memory.hostAdapter() != null;
+    }
+
+    private static final class ScopeWork {
+        private long active;
+        private Long frozenEpoch;
+        private boolean stopped;
+    }
+
+    private void build(MemoryIndexPublication.Event event, Instant deadline, Long frozenEpoch) {
+        var before = transaction(event, false, deadline, null, frozenEpoch, (repository, now) -> {
+            if (repository.component() || repository.frozen() && frozenEpoch == null) throw unavailable();
             var snapshot = snapshot(repository, event, now);
             if (!current(snapshot, event)) return new BuildTicketVO(snapshot, repository.authorityEpoch(), false);
             eligible(event, snapshot.current());
@@ -62,7 +156,7 @@ public final class MemoryIndexWork {
             return new BuildTicketVO(snapshot, repository.authorityEpoch(), physical.isEmpty());
         });
         if (!current(before.snapshot(), event)) {
-            cleanupBuild(event, deadline, before.epoch());
+            cleanupBuild(event, deadline, before.epoch(), frozenEpoch);
             return;
         }
         EmbeddingResponse computed = null;
@@ -75,7 +169,7 @@ public final class MemoryIndexWork {
         // A timed-out caller may have interrupted the completed model call. Only bounded local SQL follows from here.
         boolean interrupted = Thread.interrupted();
         try {
-            transaction(event, true, deadline, before.epoch(), (repository, now) -> {
+            transaction(event, true, deadline, before.epoch(), frozenEpoch, (repository, now) -> {
                 if (repository.component()) throw unavailable();
                 var current = snapshot(repository, event, now);
                 if (!current(current, event)) { deleteBuild(repository, current.manifest()); return Boolean.TRUE; }
@@ -109,8 +203,8 @@ public final class MemoryIndexWork {
         return manifest;
     }
 
-    private void cleanupBuild(MemoryIndexPublication.Event event, Instant deadline, long epoch) {
-        transaction(event, true, deadline, epoch, (repository, now) -> {
+    private void cleanupBuild(MemoryIndexPublication.Event event, Instant deadline, long epoch, Long frozenEpoch) {
+        transaction(event, true, deadline, epoch, frozenEpoch, (repository, now) -> {
             if (repository.component()) throw unavailable();
             var snapshot = snapshot(repository, event, now);
             if (current(snapshot, event)) throw unavailable(); deleteBuild(repository, snapshot.manifest()); return Boolean.TRUE;
@@ -122,11 +216,11 @@ public final class MemoryIndexWork {
         index.deletePhysical(manifest.vectorTable(), manifest.documentId(), ownership(repository, manifest)); repository.deleted(manifest);
     }
 
-    private void cleanup(MemoryIndexPublication.Event event, Instant deadline) {
+    private void cleanup(MemoryIndexPublication.Event event, Instant deadline, Long frozenEpoch) {
         Long epoch = null;
         for (int chunk = 0; chunk < 128; chunk++) {
             if (!clock.instant().isBefore(deadline) || Thread.currentThread().isInterrupted()) throw continuation();
-            var work = transaction(event, true, deadline, epoch, (repository, now) -> {
+            var work = transaction(event, true, deadline, epoch, frozenEpoch, (repository, now) -> {
                 reference(repository, event);
                 var current = repository.current(event.memoryId(), true).orElseThrow(MemoryIndexWork::unavailable).entry();
                 if (event.action() == MemoryIndexPublication.Action.DELETE_MEMORY) {
@@ -180,7 +274,7 @@ public final class MemoryIndexWork {
         if (norm == 0) throw unavailable();
     }
     private <T> T transaction(MemoryIndexPublication.Event event, boolean lock, Instant deadline, Long expectedEpoch,
-                              BiFunction<JdbcMemoryRepository, Instant, T> action) {
+                              Long frozenEpoch, BiFunction<JdbcMemoryRepository, Instant, T> action) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Memory index work requires its own short transaction");
         var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(2);
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(3);
@@ -197,6 +291,19 @@ public final class MemoryIndexWork {
                     return result;
                 };
                 if (adapter == null) return apply.apply(repository);
+                if (frozenEpoch != null) {
+                    if (expectedEpoch != null && !expectedEpoch.equals(frozenEpoch)) throw unavailable();
+                    var scope = LegacyMemoryStoreAdapter.scopeOf(event.tenantId(), event.ownerIssuer(), event.owner(), event.scopeId());
+                    String rowLock = lock ? " FOR UPDATE" : " FOR SHARE";
+                    var fences = jdbc.query("""
+                            SELECT high_water_revision FROM %s.scope
+                            WHERE scope_hash=? AND canonical_scope=?::jsonb AND storage_ref='LEGACY'
+                              AND state='FROZEN' AND authority_epoch=?
+                            """.formatted(adapter.schema()) + rowLock, (rs, row) -> rs.getLong("high_water_revision"),
+                            scope.hash(), LegacyMemoryStoreAdapter.json(scope.canonicalScope()), frozenEpoch);
+                    if (fences.size() != 1) throw unavailable();
+                    return apply.apply(repository.fenced(adapter.schema(), scope.hash(), new HostFenceVO("LEGACY", frozenEpoch, fences.getFirst(), true)));
+                }
                 return adapter.inScope(repository, deadline, lock, false, expectedEpoch,
                         () -> memory.usesHostAuthority(adapter) && index.binding().equals(memory.indexBinding()), apply);
             });
@@ -204,6 +311,69 @@ public final class MemoryIndexWork {
         } catch (AgentLedgerException rejected) { throw rejected; }
         catch (DataAccessException | TransactionException failed) { log.debug("Memory index transaction unavailable"); throw unavailable(); }
     }
+    void retireFrozen(JdbcMemoryRepository repository, Map<String, MemoryIndexPublication.Binding> bindings,
+                      java.util.function.Predicate<MemoryIndexPublication.Event> completeOutbox, Instant deadline) {
+        if (!repository.frozen() || repository.component()
+                || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
+        var after = JdbcMemoryRepository.ManifestKeyVO.FIRST;
+        for (;;) {
+            var rows = repository.migrationManifests(after);
+            if (rows.isEmpty()) break;
+            for (var row : rows) {
+                if (!repository.databaseNow().isBefore(deadline)) throw unavailable();
+                var binding = bindings.get(row.modelRef());
+                if (binding == null || !binding.vectorTable().equals(row.vectorTable()) || binding.dimensions() != row.dimensions()) throw unavailable();
+                var historic = repository.migrationRevision(row.memoryId(), row.revision()).orElseThrow(MemoryIndexWork::unavailable);
+                if (!row.contentSha256().equals(historic.entry().contentSha256())
+                        || !row.modelRef().equals(historic.indexModelRef())) throw unavailable();
+                var event = new MemoryIndexPublication.Event(MemoryIndexPublication.Action.BUILD, repository.tenantId(), repository.issuer(),
+                        repository.owner(), repository.scopeId(), row.memoryId(), row.revision(), row.contentSha256(), row.modelRef(),
+                        row.documentId(), historic.entry().updatedAt());
+                boolean recorded = completeOutbox.test(event);
+                var physical = index.physical(row.vectorTable(), row.documentId());
+                if (!recorded && (
+                        "PENDING".equals(row.state()) && !outboxDeadIsHarmless(repository, event)
+                        || "ACTIVE".equals(row.state()) && physical.isEmpty())) throw unavailable();
+                if (physical.isPresent()) {
+                    var evidence = physical.orElseThrow();
+                    var expected = PgVectorMemoryIndex.metadata(repository.tenantId(), repository.issuer(), historic, binding);
+                    if (!expected.equals(evidence.metadata()) || evidence.vector().length != row.dimensions()
+                            || !codec.content(codec.readContent(evidence.content(), row.contentSha256())).equals(evidence.content())) throw unavailable();
+                    double norm = 0;
+                    for (float value : evidence.vector()) {
+                        if (!Float.isFinite(value)) throw unavailable();
+                        norm += (double) value * value;
+                    }
+                    if (norm == 0) throw unavailable();
+                }
+                index.deletePhysical(row.vectorTable(), row.documentId(), ownership(repository, row));
+            }
+            var last = rows.getLast();
+            after = new JdbcMemoryRepository.ManifestKeyVO(last.memoryId(), last.revision(), last.modelRef());
+            for (var row : rows) repository.deleted(row);
+        }
+        repository.requireRetiredManifests();
+        index.requireEmptyFrozenScope(repository, bindings.values());
+    }
+
+    void requireOutboxReference(JdbcMemoryRepository repository, MemoryIndexPublication.Event event) {
+        reference(repository, event);
+    }
+
+    boolean outboxDeadIsHarmless(JdbcMemoryRepository repository, MemoryIndexPublication.Event event) {
+        requireOutboxReference(repository, event);
+        var head = repository.current(event.memoryId(), false).orElseThrow(MemoryIndexWork::unavailable).entry();
+        return switch (event.action()) {
+            case BUILD -> head.revision() > event.revision() || head.state() == MemoryStateEnum.FORGOTTEN
+                    || head.state() == MemoryStateEnum.EXPIRED || !head.expiresAt().isAfter(repository.databaseNow());
+            case DELETE_REVISION -> head.revision() > event.revision()
+                    || head.state() == MemoryStateEnum.FORGOTTEN || head.state() == MemoryStateEnum.EXPIRED;
+            case DELETE_MEMORY -> head.revision() >= event.revision()
+                    && (head.state() == MemoryStateEnum.FORGOTTEN || head.state() == MemoryStateEnum.EXPIRED);
+        };
+    }
+
     private record BuildTicketVO(Snapshot snapshot, long epoch, boolean needsEmbedding) { }
     private record CleanupResultVO(boolean more, long epoch) { }
     private record Snapshot(JdbcMemoryRepository.StoredMemory current, JdbcMemoryRepository.Manifest manifest, Instant now) { }

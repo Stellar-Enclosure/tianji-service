@@ -414,6 +414,9 @@ class MemoryPostgresTest {
                 return new ContextWindow(request.model().orElseThrow(), snapshot.definition().dependencies().modelRouteRef(),
                         snapshot.definition().dependencies().policyVersionRef(), 2000, 10);
             }
+            @Override public String modelAdapterFingerprint(AgentExecutionSnapshot snapshot, LlmRequest request) {
+                return MemoryJsonCodec.sha256("s04-model-adapter-fixture-v1");
+            }
             @Override public AgentBudgetSettlement actualUsage(AgentExecutionSnapshot snapshot, LlmResponse response) {
                 return new AgentBudgetSettlement(10L, 5L, new BigDecimal("0.05"));
             }

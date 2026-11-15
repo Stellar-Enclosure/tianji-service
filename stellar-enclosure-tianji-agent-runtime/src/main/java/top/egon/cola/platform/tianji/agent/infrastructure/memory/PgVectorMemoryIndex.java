@@ -151,6 +151,39 @@ public final class PgVectorMemoryIndex implements AutoCloseable {
         }
         jdbc.update(sql, arguments.toArray()); if (physical(table, documentId).isPresent()) throw unavailable();
     }
+    void requireEmptyFrozenScope(JdbcMemoryRepository repository, java.util.Collection<MemoryIndexPublication.Binding> bindings) {
+        requireJdbcReady();
+        if (!repository.frozen() || repository.component() || !TransactionSynchronizationManager.isActualTransactionActive()
+                || !TransactionSynchronizationManager.hasResource(source)) throw unavailable();
+        var jdbc = new JdbcTemplate(source);
+        jdbc.setQueryTimeout(3);
+        var registered = new java.util.HashSet<>(List.of("agent_memory_vector_v1", binding.vectorTable()));
+        for (var candidate : bindings) registered.add(candidate.vectorTable());
+        var actual = jdbc.query("""
+                SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                WHERE n.nspname='tianji_agent' AND c.relkind IN ('r','p') AND c.relname ~ '^agent_memory_vector(_[a-z0-9]+)?$'
+                """, (rs, row) -> rs.getString(1));
+        if (!registered.equals(Set.copyOf(actual))) throw unavailable();
+        String exact = LegacyMemoryStoreAdapter.json(Map.of("tenantId", Long.toString(repository.tenantId()), "issuerFingerprint", repository.issuer(),
+                "ownerType", repository.owner().type().name(), "ownerId", repository.owner().id(), "scopeId", repository.scopeId()));
+        for (String table : registered) {
+            table(table);
+            if (!Boolean.TRUE.equals(jdbc.queryForObject("""
+                    SELECT has_table_privilege(current_user,?,'SELECT') AND has_table_privilege(current_user,?,'DELETE')
+                        AND NOT has_any_column_privilege(current_user,?,'INSERT,UPDATE')
+                        AND NOT has_table_privilege(current_user,?,'TRUNCATE,TRIGGER')
+                    """, Boolean.class, "tianji_agent." + table, "tianji_agent." + table, "tianji_agent." + table, "tianji_agent." + table))) throw unavailable();
+            if (!Boolean.FALSE.equals(jdbc.queryForObject("""
+                    SELECT EXISTS (SELECT 1 FROM tianji_agent."%s" physical WHERE metadata @> ?::jsonb
+                        UNION ALL
+                        SELECT 1 FROM tianji_agent.agent_memory_index_manifest manifest
+                        JOIN tianji_agent."%s" physical ON physical.id=manifest.document_id
+                        WHERE manifest.tenant_id=? AND manifest.owner_issuer=? AND manifest.owner_type=? AND manifest.owner_id=? AND manifest.scope_id=?)
+                    """.formatted(table, table), Boolean.class, exact, repository.tenantId(), repository.issuer(), repository.owner().type().name(),
+                    repository.owner().id(), repository.scopeId()))) throw unavailable();
+        }
+    }
+
     private static void table(String name) { if (name == null || name.length() > 56 || !name.matches("agent_memory_vector(?:_[a-z0-9]+)?")) throw unavailable(); }
 
     /** Index delivery wraps pre-read, model/write and post-fence cleanup in one task, so timeout cannot skip late-write cleanup. */

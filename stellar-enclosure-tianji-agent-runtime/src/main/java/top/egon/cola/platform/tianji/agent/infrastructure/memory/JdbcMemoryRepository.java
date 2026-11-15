@@ -115,6 +115,7 @@ final class JdbcMemoryRepository {
     }
 
     long authorityEpoch() { return fence == null ? 0 : fence.authorityEpoch(); }
+    long scopeWatermark() { return fence == null ? 0 : fence.highWaterRevision(); }
     boolean component() { return fence != null && "COMPONENT".equals(fence.storageRef()); }
     boolean frozen() { return fence != null && fence.frozen(); }
 
@@ -461,6 +462,19 @@ final class JdbcMemoryRepository {
     private void insertComponentRevision(StoredMemory stored) {
         var entry = stored.entry();
         long sequence = advanceRevision(entry.updatedAt());
+        String json = hostMetadata(stored);
+        requireOne(jdbc.update("""
+                INSERT INTO %s.revision(scope_hash,fact_id,revision,scope_revision,content_profile,content,provenance,state,
+                    confirmed,effective_at,expires_at,redacted_at,host_metadata,native_metadata,content_sha256,created_at)
+                VALUES (?,?,?,?,'HOST_V1',?::jsonb,NULL,?,?,?,?,?,?::jsonb,NULL,?,?)
+                """.formatted(hostSchema), hostScopeHash, entry.memoryId(), entry.revision(), sequence,
+                entry.content() == null ? null : codec.content(entry.content()), entry.state().name(), entry.confirmed(),
+                timestamp(entry.effectiveAt()), timestamp(entry.expiresAt()), timestamp(stored.retiredAt()), json,
+                entry.contentSha256(), timestamp(entry.updatedAt())));
+    }
+
+    private String hostMetadata(StoredMemory stored) {
+        var entry = stored.entry();
         Map<String, Object> metadata = new LinkedHashMap<>();
         metadata.put("schemaVersion", 1);
         metadata.put("source", entry.source() == null ? null : JSON.valueToTree(entry.source()));
@@ -475,14 +489,7 @@ final class JdbcMemoryRepository {
         String json = LegacyMemoryStoreAdapter.json(metadata);
         if (json.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 16 * 1024) throw unavailable();
         if (entry.source() != null) codec.source(entry.source());
-        requireOne(jdbc.update("""
-                INSERT INTO %s.revision(scope_hash,fact_id,revision,scope_revision,content_profile,content,provenance,state,
-                    confirmed,effective_at,expires_at,redacted_at,host_metadata,native_metadata,content_sha256,created_at)
-                VALUES (?,?,?,?,'HOST_V1',?::jsonb,NULL,?,?,?,?,?,?::jsonb,NULL,?,?)
-                """.formatted(hostSchema), hostScopeHash, entry.memoryId(), entry.revision(), sequence,
-                entry.content() == null ? null : codec.content(entry.content()), entry.state().name(), entry.confirmed(),
-                timestamp(entry.effectiveAt()), timestamp(entry.expiresAt()), timestamp(stored.retiredAt()), json,
-                entry.contentSha256(), timestamp(entry.updatedAt())));
+        return json;
     }
 
     private void verifyHostMetadata(ResultSet rs) throws SQLException {
@@ -641,6 +648,220 @@ final class JdbcMemoryRepository {
     private static void requireOne(int count) {
         if (count != 1) throw unavailable();
     }
+
+    private static final String HISTORICAL = """
+            SELECT r.*,e.kind,e.created_at AS fact_created_at
+            FROM tianji_agent.agent_memory_revision r JOIN tianji_agent.agent_memory_entry e
+              USING (tenant_id,owner_issuer,owner_type,owner_id,scope_id,memory_id)
+            WHERE r.tenant_id=? AND r.owner_issuer=? AND r.owner_type=? AND r.owner_id=? AND r.scope_id=?
+            """;
+    private static final int MIGRATION_PAGE = 100;
+
+    List<StoredMemory> migrationRevisions(VersionKeyVO after) {
+        requireFrozen();
+        return jdbc.query(HISTORICAL + " AND (r.memory_id,r.revision)>(?,?) ORDER BY r.memory_id,r.revision LIMIT " + MIGRATION_PAGE,
+                (rs, row) -> historicalRevision(rs), key(after.memoryId(), after.revision()));
+    }
+
+    Optional<StoredMemory> migrationRevision(String id, long revision) {
+        requireFrozen();
+        return single(jdbc.query(HISTORICAL + " AND r.memory_id=? AND r.revision=?", (rs, row) -> historicalRevision(rs), key(id, revision)));
+    }
+
+    private StoredMemory historicalRevision(ResultSet rs) throws SQLException {
+        try {
+            var state = MemoryStateEnum.valueOf(rs.getString("state"));
+            var hash = rs.getString("content_sha256");
+            var evidence = rs.getString("source_evidence_sha256");
+            var body = rs.getString("content_json");
+            var source = rs.getString("source_json");
+            var redacted = time(rs, "redacted_at");
+            if ((state == MemoryStateEnum.FORGOTTEN || state == MemoryStateEnum.EXPIRED) != (redacted != null)) throw unavailable();
+            var entry = new MemoryEntryDTO(owner, scopeId, rs.getString("memory_id"), MemoryKindEnum.valueOf(rs.getString("kind")),
+                    rs.getLong("revision"), rs.getObject("supersedes_revision", Long.class), state,
+                    body == null ? null : codec.readContent(body, hash), hash, source == null ? null : codec.readSource(source, evidence),
+                    rs.getBigDecimal("confidence"), rs.getBoolean("confirmed"), MemorySensitivityEnum.valueOf(rs.getString("sensitivity")),
+                    rs.getString("retention_policy_ref"), time(rs, "effective_at"), time(rs, "expires_at"),
+                    time(rs, "fact_created_at"), time(rs, "written_at"));
+            return new StoredMemory(entry, rs.getString("index_model_ref"), evidence, rs.getString("source_actor_sha256"),
+                    rs.getString("reason_code"), redacted);
+        } catch (IllegalArgumentException malformed) {
+            throw unavailable();
+        }
+    }
+
+    List<StoredMemory> migrationHeads(String after) {
+        requireFrozen();
+        return jdbc.query(CURRENT + " AND e.memory_id>? ORDER BY e.memory_id LIMIT " + MIGRATION_PAGE, (rs, row) -> legacyStored(rs), key(after));
+    }
+
+    List<MigrationReceiptVO> migrationReceipts(ReceiptKeyVO after) {
+        requireFrozen();
+        return jdbc.query("""
+                SELECT actor_type,actor_id,operation,command_id,request_sha256,result_memory_id,result_revision,
+                    result_outcome,result_state,authority_epoch,created_at
+                FROM tianji_agent.agent_memory_command_receipt WHERE
+                """ + OWNED + " AND (actor_type,actor_id,operation,command_id)>(?,?,?,?)"
+                + " ORDER BY actor_type,actor_id,operation,command_id LIMIT " + MIGRATION_PAGE, (rs, row) -> {
+                    var key = new ReceiptKeyVO(rs.getString("actor_type"), rs.getString("actor_id"), rs.getString("operation"), rs.getString("command_id"));
+                    try {
+                        var actor = new TrustedAgentActor(tenantId, TrustedAgentActor.SubjectType.valueOf(key.actorType()), key.actorId(), issuer);
+                        if (!actor.subjectId().equals(key.actorId())) throw unavailable();
+                        var result = new MemoryMutationResultDTO(key.commandId(), owner, scopeId, rs.getString("result_memory_id"),
+                                rs.getLong("result_revision"), MemoryMutationOutcomeEnum.valueOf(rs.getString("result_outcome")),
+                                MemoryStateEnum.valueOf(rs.getString("result_state")), time(rs, "created_at"));
+                        Long epoch = rs.getObject("authority_epoch", Long.class);
+                        String request = rs.getString("request_sha256");
+                        if (request == null || !request.matches("[a-f0-9]{64}") || epoch != null && (epoch < 1 || epoch >= authorityEpoch())) throw unavailable();
+                        return new MigrationReceiptVO(key, LegacyMemoryStoreAdapter.namespaceOf(actor, key.operation()), request, result, epoch);
+                    } catch (IllegalArgumentException malformed) { throw unavailable(); }
+                }, key(after.actorType(), after.actorId(), after.operation(), after.commandId()));
+    }
+
+    MigrationBoundsVO migrationBounds() {
+        requireFrozen();
+        var revisions = jdbc.query("SELECT memory_id,revision FROM tianji_agent.agent_memory_revision WHERE " + OWNED
+                        + " ORDER BY memory_id DESC,revision DESC LIMIT 1",
+                (rs, row) -> new VersionKeyVO(rs.getString("memory_id"), rs.getLong("revision")), key());
+        var heads = jdbc.query("SELECT memory_id FROM tianji_agent.agent_memory_entry WHERE " + OWNED + " ORDER BY memory_id DESC LIMIT 1",
+                (rs, row) -> rs.getString(1), key());
+        var receipts = jdbc.query("SELECT actor_type,actor_id,operation,command_id FROM tianji_agent.agent_memory_command_receipt WHERE " + OWNED
+                        + " ORDER BY actor_type DESC,actor_id DESC,operation DESC,command_id DESC LIMIT 1",
+                (rs, row) -> new ReceiptKeyVO(rs.getString(1), rs.getString(2), rs.getString(3), rs.getString(4)), key());
+        return new MigrationBoundsVO(legacyRevisionCount(), countLegacy("agent_memory_entry"), countLegacy("agent_memory_command_receipt"),
+                single(revisions).orElse(VersionKeyVO.FIRST), single(heads).orElse(""), single(receipts).orElse(ReceiptKeyVO.FIRST));
+    }
+
+    private long countLegacy(String table) {
+        var count = jdbc.queryForObject("SELECT count(*) FROM tianji_agent." + table + " WHERE " + OWNED, Long.class, key());
+        if (count == null) throw unavailable();
+        return count;
+    }
+
+    void requireShadowCounts(MigrationBoundsVO source) {
+        requireFrozen();
+        for (var table : Map.of("revision", source.revisions(), "fact", source.heads(), "receipt", source.receipts()).entrySet()) {
+            var count = jdbc.queryForObject("SELECT count(*) FROM " + hostSchema + "." + table.getKey() + " WHERE scope_hash=?",
+                    Long.class, hostScopeHash);
+            if (!table.getValue().equals(count)) throw unavailable();
+        }
+    }
+
+    void clearFrozenShadow() {
+        requireFrozen();
+        for (String table : List.of("receipt", "fact", "revision")) {
+            jdbc.update("DELETE FROM " + hostSchema + "." + table + " WHERE scope_hash=?", hostScopeHash);
+        }
+    }
+
+    String copyRevision(StoredMemory source, long sequence, boolean copy) {
+        requireFrozen();
+        var e = source.entry();
+        String content = e.content() == null ? null : codec.content(e.content());
+        String metadata = hostMetadata(source);
+        Object[] columns = {hostScopeHash, e.memoryId(), e.revision(), sequence, content, e.state().name(), e.confirmed(),
+                timestamp(e.effectiveAt()), timestamp(e.expiresAt()), timestamp(source.retiredAt()), metadata,
+                e.contentSha256(), timestamp(e.updatedAt())};
+        if (copy) jdbc.update("""
+                INSERT INTO %s.revision(scope_hash,fact_id,revision,scope_revision,content_profile,content,provenance,state,
+                    confirmed,effective_at,expires_at,redacted_at,host_metadata,native_metadata,content_sha256,created_at)
+                VALUES (?,?,?,?,'HOST_V1',?::jsonb,NULL,?,?,?,?,?,?::jsonb,NULL,?,?) ON CONFLICT DO NOTHING
+                """.formatted(hostSchema), columns);
+        requirePresent("""
+                SELECT EXISTS (SELECT 1 FROM %s.revision
+                WHERE scope_hash=? AND fact_id=? AND revision=? AND scope_revision=? AND content_profile='HOST_V1'
+                    AND content IS NOT DISTINCT FROM ?::jsonb AND provenance IS NULL AND state=? AND confirmed=?
+                    AND effective_at=? AND expires_at=? AND redacted_at IS NOT DISTINCT FROM ?::timestamptz
+                    AND host_metadata=?::jsonb AND native_metadata IS NULL AND content_sha256=? AND created_at=?)
+                """.formatted(hostSchema), columns);
+        return fingerprint("revision", columns);
+    }
+
+    String copyHead(StoredMemory source, boolean copy) {
+        requireFrozen();
+        var fact = source.entry();
+        Object[] columns = {hostScopeHash, fact.memoryId(), fact.kind().name(), timestamp(fact.createdAt()), fact.revision(), timestamp(fact.updatedAt())};
+        if (copy) jdbc.update("""
+                INSERT INTO %s.fact(scope_hash,fact_id,fact_type,created_at,current_revision,updated_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING
+                """.formatted(hostSchema), columns);
+        requirePresent("""
+                SELECT EXISTS (SELECT 1 FROM %s.fact
+                WHERE scope_hash=? AND fact_id=? AND fact_type=? AND created_at=? AND current_revision=? AND updated_at=?)
+                """.formatted(hostSchema), columns);
+        var complete = prefix(columns, new Object[]{fact.state().name(), fact.contentSha256(), fact.confirmed(),
+                fact.sensitivity().name(), fact.retentionPolicyRef(), source.indexModelRef(), timestamp(fact.effectiveAt()),
+                timestamp(fact.expiresAt()), timestamp(source.retiredAt())});
+        return fingerprint("head", complete);
+    }
+
+    String copyReceipt(MigrationReceiptVO source, boolean copy) {
+        requireFrozen();
+        var result = source.result();
+        Object[] columns = {hostScopeHash, source.namespace(), result.commandId(), source.request(), source.key().operation(),
+                result.outcome().name(), result.stateAtMutation().name(), result.memoryId(), result.revision(),
+                source.epoch(), timestamp(result.occurredAt())};
+        if (copy) jdbc.update("""
+                INSERT INTO %s.receipt(scope_hash,command_namespace,command_id,request_sha256,operation,result_outcome,
+                    result_state,fact_id,result_revision,authority_epoch,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING
+                """.formatted(hostSchema), columns);
+        requirePresent("""
+                SELECT EXISTS (SELECT 1 FROM %s.receipt
+                WHERE scope_hash=? AND command_namespace=? AND command_id=? AND request_sha256=? AND operation=?
+                    AND result_outcome=? AND result_state=? AND fact_id=? AND result_revision=?
+                    AND authority_epoch IS NOT DISTINCT FROM ?::bigint AND created_at=?)
+                """.formatted(hostSchema), columns);
+        return fingerprint("receipt", columns);
+    }
+
+    private static String fingerprint(String kind, Object[] columns) {
+        var canonical = Arrays.stream(columns).map(value -> value instanceof Timestamp stamp ? stamp.toInstant().toString() : value).toList();
+        return MemoryJsonCodec.sha256("TIANJI_MEMORY_MIGRATION_V1:" + kind + ':' + LegacyMemoryStoreAdapter.json(canonical));
+    }
+
+    private void requirePresent(String sql, Object... args) {
+        if (!Boolean.TRUE.equals(jdbc.queryForObject(sql, Boolean.class, args))) throw unavailable();
+    }
+
+    List<Manifest> migrationManifests(ManifestKeyVO after) {
+        requireFrozen();
+        return jdbc.query("SELECT * FROM tianji_agent.agent_memory_index_manifest WHERE " + OWNED
+                + " AND (memory_id,content_revision,model_ref)>(?,?,?) ORDER BY memory_id,content_revision,model_ref LIMIT " + MIGRATION_PAGE,
+                (rs, row) -> manifest(rs), key(after.memoryId(), after.revision(), after.modelRef()));
+    }
+
+    void requireRetiredManifests() {
+        requireFrozen();
+        requirePresent("SELECT NOT EXISTS (SELECT 1 FROM tianji_agent.agent_memory_index_manifest WHERE " + OWNED
+                + " AND (index_state<>'DELETED' OR deleted_at IS NULL))", key());
+    }
+
+    void requireSafePreferenceState() {
+        requireFrozen();
+        if (!owner.type().equals(top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum.USER)) return;
+        requirePresent("""
+                SELECT NOT EXISTS (SELECT 1 FROM tianji_agent.agent_memory_preference_intent
+                WHERE tenant_id=? AND actor_issuer=? AND actor_type='USER' AND actor_id=? AND scope_id=?
+                    AND (state IN ('RESERVED','READY','CLAIMED') OR total_count IS NOT NULL AND next_index<total_count))
+                """, tenantId, issuer, owner.id(), scopeId);
+    }
+
+    private void requireFrozen() {
+        if (fence == null || !fence.frozen() || component()) throw unavailable();
+    }
+
+    record VersionKeyVO(String memoryId, long revision) {
+        static final VersionKeyVO FIRST = new VersionKeyVO("", 0);
+    }
+    record ReceiptKeyVO(String actorType, String actorId, String operation, String commandId) {
+        static final ReceiptKeyVO FIRST = new ReceiptKeyVO("", "", "", "");
+    }
+    record ManifestKeyVO(String memoryId, long revision, String modelRef) {
+        static final ManifestKeyVO FIRST = new ManifestKeyVO("", 0, "");
+    }
+    record MigrationBoundsVO(long revisions, long heads, long receipts, VersionKeyVO lastVersion, String lastHead, ReceiptKeyVO lastReceipt) { }
+    record MigrationReceiptVO(ReceiptKeyVO key, String namespace, String request, MemoryMutationResultDTO result, Long epoch) { }
 
     private Manifest manifest(ResultSet rs) throws SQLException {
         try {

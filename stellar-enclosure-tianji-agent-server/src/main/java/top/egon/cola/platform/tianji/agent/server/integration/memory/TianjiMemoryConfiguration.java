@@ -21,10 +21,12 @@ import top.egon.cola.component.outbox.api.TransactionalOutbox;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
 import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
 import top.egon.cola.component.outbox.delivery.DeliveryHandlerRegistry;
+import top.egon.cola.component.outbox.serialization.OutboxMessageFingerprint;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.memory.MemoryIndexWork;
+import top.egon.cola.platform.tianji.agent.infrastructure.memory.MemoryScopeMigrationService;
 import top.egon.cola.platform.tianji.agent.infrastructure.memory.LegacyMemoryStoreAdapter;
 import top.egon.cola.platform.tianji.agent.infrastructure.memory.LegacyMemoryFactConverter;
 import top.egon.cola.platform.tianji.agent.infrastructure.memory.LegacyMemoryFactConverterImpl;
@@ -38,6 +40,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRe
 
 import javax.sql.DataSource;
 import java.time.Clock;
+import java.util.Map;
 
 /** Opt-in assembly around the current source authority and existing JDBC Outbox, with no schema or provider auto-creation. */
 @Configuration(proxyBeanMethods = false)
@@ -146,6 +149,28 @@ public class TianjiMemoryConfiguration {
             properties.origins().forEach(origin -> requireOrigin(origin.tenantId(), origin.issuerFingerprint(), properties, issuers));
             memory.verifyStorage(properties.baseVectorDimensions(), properties.expectedVectorVersion());
         };
+    }
+
+    @Bean(name = {"memoryScopeMigrationService", "tianjiMemoryScopeMigrationService"})
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.memory.migration", name = "enabled", havingValue = "true")
+    MemoryScopeMigrationService memoryScopeMigrationService(DataSource source,
+            @Qualifier("jdbcMemoryStore") MemoryStore configured, @Qualifier("memoryIndexWork") MemoryIndexWork indexes,
+            @Qualifier("tianjiMemoryMigrationAuthority") MemoryScopeMigrationService.MigrationAuthority authority,
+            OutboxInfrastructure infrastructure, TransactionalOutboxProperties outbox, Environment environment) {
+        String schema = environment.getRequiredProperty("egon.cola.component.agent-flow.memory.schema");
+        String role = environment.getRequiredProperty("stellar.tianji.agent.memory.migration.role");
+        if (!(configured instanceof JdbcMemoryStore store) || !store.usesStorage(source, schema)
+                || infrastructure.dataSource() != source || outbox.getStorage().getType() != TransactionalOutboxProperties.Storage.StorageType.JDBC
+                || !outbox.getStorage().isValidateSchema() || !"tianji_agent".equals(outbox.getStorage().getJdbc().getSchema())) throw invalid();
+        var protocol = new MemoryScopeMigrationService.OutboxProtocol() {
+            @Override public MemoryIndexPublication.Event decode(String payload) { return MemoryIndexEventJson.decode(payload); }
+            @Override public String messageId(MemoryIndexPublication.Event event) { return OutboxMemoryIndexPublication.transportMessageId(event); }
+            @Override public String fingerprint(String payload, Map<String, String> headers) {
+                return OutboxMessageFingerprint.sha256(OutboxMemoryIndexPublication.CHANNEL, OutboxMemoryIndexPublication.DESTINATION,
+                        payload, "application/json", "1", headers);
+            }
+        };
+        return new MemoryScopeMigrationService(source, schema, store, indexes, role, authority, protocol, Clock.systemUTC());
     }
 
     static void requireOrigin(long tenantId, String fingerprint, TianjiMemoryProperties properties, TrustedIssuerRegistry issuers) {
