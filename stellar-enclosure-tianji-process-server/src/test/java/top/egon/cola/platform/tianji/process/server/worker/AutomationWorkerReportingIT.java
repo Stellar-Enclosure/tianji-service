@@ -5,10 +5,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import top.egon.cola.platform.tianji.contract.orchestration.AcquireWorkerTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerAcquireCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerCompletionCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerFailureCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.AutomationWorkerReportDTO.OutcomeEnum;
 import top.egon.cola.platform.tianji.process.server.AutomationControlFlowIT.Harness;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
@@ -21,6 +25,11 @@ import java.time.OffsetDateTime;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
@@ -90,16 +99,24 @@ class AutomationWorkerReportingIT {
         assertEquals(Long.toString(registration.capabilityVersion()), lease.get("schema_version"));
 
         var request = complete(task, "typed-report", "receipt-report", Map.of("approved", true));
-        var report = fixture.worker.completeAutomation(registration.actor(), request);
+        var report = completeUnderRootContention(root, registration.actor(), request);
         assertEquals(OutcomeEnum.COMPLETED, report.getOutcome());
         assertEquals("RESULT_ACCEPTED", fixture.nodeState(root, "work"));
         assertEquals("true", fixture.nodeValue(root, "work", "approved", true));
         assertNotNull(fixture.process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root).singleResult());
+        assertEquals(1, fixture.count(NODE, "WHERE tenant_id=? AND instance_id=?", registration.tenantId(), root));
+        assertEquals(1, fixture.count(LEASE, "WHERE tenant_id=? AND scope_id=?", registration.tenantId(), root));
         var originalLease = fixture.owner.queryForMap("SELECT * FROM " + LEASE + " WHERE token_sha256=?", task.leaseTokenSha256());
         assertEquals("COMPLETED", originalLease.get("state"));
         assertEquals(report.getDecidedAt(), fixture.owner.queryForObject(
                 "SELECT decided_at FROM " + LEASE + " WHERE token_sha256=?", OffsetDateTime.class, task.leaseTokenSha256()).toInstant());
-        assertEquals(1, fixture.count(COMMAND, "WHERE subject_type='SERVICE' AND command_id=?", request.getCommandId()));
+        assertEquals(1, fixture.count(COMMAND, """
+                WHERE tenant_id=? AND subject_type='SERVICE' AND command_type='WORKER_REPORT_V2' AND state='APPLIED'
+                  AND command_id=? AND resource_id=?
+                """, registration.tenantId(), request.getCommandId(), task.getNodeExecutionRef()));
+        var management = fixture.process.getManagementService();
+        assertEquals(0, management.createExternalWorkerJobQuery().processInstanceId(root).count());
+        assertEquals(1, management.createJobQuery().processInstanceId(root).count());
         var wrongOutput = complete(task, request.getCommandId(), "receipt-report", Map.of("approved", false));
         var wrongToken = complete(task, request.getCommandId(), "receipt-report", Map.of("approved", true));
         byte[] token = new byte[32];
@@ -123,6 +140,70 @@ class AutomationWorkerReportingIT {
         assertEquals(originalLease, fixture.owner.queryForMap("SELECT * FROM " + LEASE + " WHERE token_sha256=?", task.leaseTokenSha256()));
         assertEquals(1, fixture.count(COMMAND, "WHERE subject_type='SERVICE' AND command_id=?", request.getCommandId()));
         assertEquals(0, fixture.process.getManagementService().createJobQuery().processInstanceId(root).count());
+    }
+
+    private static AutomationWorkerReportDTO completeUnderRootContention(String root, ProcessActor actor,
+            AutomationWorkerCompletionCommand request) throws Exception {
+        var manager = (DataSourceTransactionManager) fixture.process.getTransactionManager();
+        var probe = new JdbcTemplate(Objects.requireNonNull(manager.getDataSource()));
+        probe.setQueryTimeout(2);
+        var ready = new CountDownLatch(2);
+        var start = new CountDownLatch(1);
+        Callable<AutomationWorkerReportDTO> complete = () -> {
+            ready.countDown();
+            assertTrue(start.await(3, TimeUnit.SECONDS));
+            return fixture.worker.completeAutomation(actor, request);
+        };
+        try (var holder = Objects.requireNonNull(fixture.owner.getDataSource()).getConnection()) {
+            holder.setAutoCommit(false);
+            int holderPid;
+            try (var lock = holder.prepareStatement("""
+                    SELECT pg_backend_pid() FROM tianji_process.tianji_process_instance_binding
+                    WHERE tenant_id=? AND instance_id=? FOR UPDATE
+                    """)) {
+                lock.setLong(1, actor.tenantId());
+                lock.setString(2, root);
+                try (var binding = lock.executeQuery()) {
+                    assertTrue(binding.next());
+                    holderPid = binding.getInt(1);
+                    assertFalse(binding.next());
+                }
+            }
+            try (var callers = Executors.newVirtualThreadPerTaskExecutor()) {
+                var left = callers.submit(complete);
+                var right = callers.submit(complete);
+                try {
+                    assertTrue(ready.await(2, TimeUnit.SECONDS));
+                    start.countDown();
+                    // The second backend can wait behind the first, so follow the blocker chain to the held root.
+                    await().pollInterval(Duration.ofMillis(25)).atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                            assertEquals(2L, probe.queryForObject("""
+                                    WITH RECURSIVE blocked(pid) AS (
+                                        SELECT CAST(? AS integer)
+                                        UNION
+                                        SELECT waiter.pid
+                                        FROM pg_catalog.pg_stat_activity waiter
+                                        JOIN blocked blocker ON blocker.pid=ANY(pg_catalog.pg_blocking_pids(waiter.pid))
+                                        WHERE waiter.datname=current_database() AND waiter.usename=current_user
+                                          AND waiter.wait_event_type='Lock'
+                                          AND waiter.query LIKE '%tianji_process_instance_binding%'
+                                          AND waiter.query LIKE '%FOR UPDATE'
+                                    )
+                                    SELECT count(*) FROM blocked WHERE pid<>?
+                                    """, Long.class, holderPid, holderPid)));
+                    assertFalse(left.isDone());
+                    assertFalse(right.isDone());
+                } finally {
+                    start.countDown();
+                    holder.rollback();
+                }
+                var first = left.get(8, TimeUnit.SECONDS);
+                var replay = right.get(8, TimeUnit.SECONDS);
+                assertEquals(first, replay);
+                assertEquals(first.getDecidedAt(), replay.getDecidedAt());
+                return first;
+            }
+        }
     }
 
     @Test
@@ -212,6 +293,41 @@ class AutomationWorkerReportingIT {
         fixture.cancel(root);
         assertNativeClean(root);
         assertEquals(report, fixture.worker.failAutomation(fixture.external.actor(), request));
+    }
+
+    @Test
+    void unknown_report_keeps_the_full_error_code_and_the_fixed_v4_projection() {
+        String root = fixture.start("externalRetry", "unknown-long-error", 32);
+        var registration = fixture.external;
+        var task = fixture.acquire(registration);
+        assertEquals(nativeId(root), task.getTaskId());
+
+        String prefix = "E" + "A".repeat(126);
+        String errorCode = prefix + "Z";
+        var request = new AutomationWorkerFailureCommand(task.getTaskId(), task.getActivityOccurrenceId(), task.getNodeExecutionRef(),
+                task.getLeaseToken(), "unknown-long-error", AutomationWorkerFailureCommand.KindEnum.UNKNOWN, errorCode, null);
+        var report = fixture.worker.failAutomation(registration.actor(), request);
+        assertEquals(OutcomeEnum.UNKNOWN, report.getOutcome());
+        assertEquals("WAIT_RECOVERY", fixture.nodeState(root, "work"));
+
+        String nodeSql = "SELECT error_code,side_effect_outcome FROM " + NODE
+                + " WHERE tenant_id=? AND instance_id=? AND node_execution_ref=?";
+        String leaseSql = "SELECT state,failure_kind,failure_code FROM " + LEASE + " WHERE tenant_id=? AND scope_id=? AND token_sha256=?";
+        var node = Map.of("error_code", errorCode, "side_effect_outcome", "UNKNOWN");
+        var lease = Map.of("state", "NEEDS_MANUAL", "failure_kind", "UNKNOWN", "failure_code", "V2_EFFECT_UNKNOWN");
+        assertEquals(node, fixture.owner.queryForMap(nodeSql, registration.tenantId(), root, task.getNodeExecutionRef()));
+        assertEquals(lease, fixture.owner.queryForMap(leaseSql, registration.tenantId(), root, task.leaseTokenSha256()));
+        assertEquals(report, fixture.worker.failAutomation(registration.actor(), request));
+        var differentLastCharacter = new AutomationWorkerFailureCommand(task.getTaskId(), task.getActivityOccurrenceId(),
+                task.getNodeExecutionRef(), task.getLeaseToken(), request.getCommandId(),
+                AutomationWorkerFailureCommand.KindEnum.UNKNOWN, prefix + "Y", null);
+        assertThrows(ProcessConflictException.class, () -> fixture.worker.failAutomation(registration.actor(), differentLastCharacter));
+        assertEquals(node, fixture.owner.queryForMap(nodeSql, registration.tenantId(), root, task.getNodeExecutionRef()));
+        assertEquals(lease, fixture.owner.queryForMap(leaseSql, registration.tenantId(), root, task.leaseTokenSha256()));
+        assertEquals(1, fixture.count(COMMAND, "WHERE tenant_id=? AND command_type='WORKER_REPORT_V2' AND command_id=? AND resource_id=?",
+                registration.tenantId(), request.getCommandId(), task.getNodeExecutionRef()));
+        fixture.cancel(root);
+        assertNativeClean(root);
     }
 
     @Test
