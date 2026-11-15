@@ -29,9 +29,17 @@ import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
 import top.egon.cola.platform.tianji.contract.orchestration.VerifiedApprovalDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.RuntimeProfileEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Objects;
 import java.lang.reflect.Modifier;
@@ -64,6 +72,8 @@ class ToolActionIntentStoreTest {
     private static final Instant NOW = Instant.parse("2026-10-31T10:00:00Z");
     private static final String RUN = "10000000-0000-0000-0000-000000000001", HASH = "a".repeat(64);
     private static final TrustedAgentActor ACTOR = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/20");
+    private static final TrustedAgentActor RUNTIME_OWNER = TrustedAgentActor.verified(
+            20, TrustedAgentActor.SubjectType.SERVICE, "process-source", "https://idp.example/20");
     private static final ToolDescriptor TOOL = new ToolDescriptor("process.start", 1, "start_process", "Fixed operation",
             new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount")), new ToolSchema(Map.of(), Set.of()),
             new ToolPolicy(ToolPolicy.Risk.IDEMPOTENT_WRITE, "process.start.invoice", "tianji.api.process.instance.start", HASH, null));
@@ -179,7 +189,9 @@ class ToolActionIntentStoreTest {
             fixture.sourceActive.set(false);
             assertThrows(AgentLedgerException.class, () -> store.current(run(RUN), lease(RUN), ACTION, TOOL));
             assertEquals(0, fixture.inserts.get());
-            verify(fixture.jdbc.get()).query(contains("cancel_requested_at IS NULL FOR SHARE"), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(),
+            verify(fixture.jdbc.get()).query(argThat(sql -> sql != null && sql.replaceAll("\\s+", " ")
+                            .contains("cancel_requested_at IS NULL FOR SHARE")),
+                    org.mockito.ArgumentMatchers.<RowMapper<Object>>any(),
                     eq(20L), eq("USER"), eq(ACTOR.issuerFingerprint()), eq("alice"), eq(RUN), eq("worker"), eq(1L));
         }
     }
@@ -226,23 +238,28 @@ class ToolActionIntentStoreTest {
     }
 
     @Test void v17_history_reads_one_exact_runtime_receipt_and_preserves_legacy_boundaries() throws Exception {
-        try (var fixture = new Fixture(RESULT_TOOL)) {
+        try (var fixture = new Fixture(RESULT_TOOL, RUNTIME_OWNER)) {
             var stored = fixture.seed("APPLIED");
+            var codec = new ToolExecutionJsonCodec();
             var runtime = ToolExecutionJsonCodec.ActionProfile.RUNTIME_V2;
+            var origin = fixture.seedRuntimeSource(RUN, "origin");
+            var dispatch = fixture.seedRuntimeSource(DISPATCH_RUN, "dispatch");
             stored.put("stored_action_profile", "\"RUNTIME_V2\"");
             stored.put("stored_dispatch_call_id", "\"" + DISPATCH_INVOCATION + "\"");
             stored.remove("dispatch_invocation_id");
-            stored.put("origin_runtime_snapshot_sha256", HASH);
-            stored.put("dispatch_runtime_snapshot_sha256", HASH);
+            stored.put("origin_snapshot_sha256", origin.get("snapshot_sha256"));
+            stored.put("origin_runtime_snapshot_sha256", origin.get("snapshot_sha256"));
+            stored.put("dispatch_runtime_snapshot_sha256", dispatch.get("snapshot_sha256"));
             stored.put("runtime_dispatch_matches", true);
             stored.put("runtime_call_state", "SUCCEEDED");
             stored.put("runtime_input_sha256", fixture.tool.parametersSha256(fixture.action.arguments()));
-            stored.put("runtime_result_sha256", HASH);
             stored.put("dispatch_identity_matches", false);
             stored.put("dispatch_fact_matches", false);
             var outcome = new ToolExecutionOutcome(ToolExecutionOutcome.Status.SUCCEEDED,
                     Map.of("instanceId", "private-instance"), "business-receipt-1", null, null);
-            stored.put("result", new ToolExecutionJsonCodec().outcome(runtime, fixture.tool, outcome));
+            stored.put("result", codec.outcome(runtime, fixture.tool, outcome));
+            stored.put("runtime_result_sha256", codec.runtimeWriteResultSha256(
+                    fixture.action.intentId(), fixture.action.requestSha256(), fixture.tool, outcome));
             var authority = mock(ToolExecutionAuthorization.class);
             var store = fixture.store(authority);
             assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool));
@@ -255,6 +272,8 @@ class ToolActionIntentStoreTest {
             assertEquals(DISPATCH_INVOCATION, row.dispatch().callId());
             assertNull(row.dispatch().invocationId());
             assertEquals(1L, fixture.queries.stream().filter(sql -> sql.contains("agent_runtime_call_receipt")).count());
+            assertEquals(List.of(RUN, DISPATCH_RUN), fixture.runtimeSourceReads);
+            assertNotEquals(origin.get("snapshot_sha256"), dispatch.get("snapshot_sha256"));
             for (var drift : Map.of(
                     "stored_action_profile", "\"UNKNOWN\"",
                     "stored_dispatch_call_id", "null",
@@ -264,11 +283,36 @@ class ToolActionIntentStoreTest {
                     "runtime_dispatch_matches", false,
                     "runtime_input_sha256", "0".repeat(64),
                     "runtime_call_state", "FAILED",
-                    "runtime_result_sha256", "malformed").entrySet()) {
+                    "runtime_result_sha256", "0".repeat(64)).entrySet()) {
                 Object previous = stored.put(drift.getKey(), drift.getValue());
-                assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool), drift.getKey());
+                assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                        assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool), drift.getKey()).code());
                 if (previous == null) stored.remove(drift.getKey()); else stored.put(drift.getKey(), previous);
             }
+            for (var evidence : List.of(origin, dispatch)) {
+                var otherRun = evidence == origin ? dispatch : origin;
+                for (var drift : Map.of(
+                        "execution_snapshot", otherRun.get("execution_snapshot"),
+                        "request_hash", "0".repeat(64),
+                        "snapshot_sha256", "0".repeat(64),
+                        "content_sha256", "0".repeat(64),
+                        "template_sha256", "0".repeat(64),
+                        "configuration_sha256", "0".repeat(64),
+                        "node_execution_ref", "unrelated-node",
+                        "attempt_deadline_at", NOW.plusSeconds(1),
+                        "safety_policy", "{}",
+                        "specification", "{}").entrySet()) {
+                    Object previous = evidence.put(drift.getKey(), drift.getValue());
+                    assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                            assertThrows(AgentLedgerException.class, () -> store.historical(fixture.action, fixture.tool), drift.getKey()).code());
+                    evidence.put(drift.getKey(), previous);
+                }
+            }
+            var replay = store.historical(fixture.action, fixture.tool).orElseThrow();
+            assertEquals(row.action().requestSha256(), replay.action().requestSha256());
+            assertEquals(row.dispatch(), replay.dispatch());
+            assertEquals(row.outcome(), replay.outcome());
+            verify(fixture.ledger, never()).executionMaterial(any(), any());
             verifyNoInteractions(authority);
             verify(fixture.jdbc.get(), never()).update(anyString(), any(Object[].class));
         }
@@ -522,6 +566,7 @@ class ToolActionIntentStoreTest {
     }
 
     private static final class Fixture implements AutoCloseable {
+        final TrustedAgentActor owner;
         final ToolDescriptor tool;
         final ToolActionRequest action;
         final DataSource source = mock(DataSource.class);
@@ -532,6 +577,8 @@ class ToolActionIntentStoreTest {
         final AtomicReference<Instant> sourceDeadline = new AtomicReference<>(NOW.plusSeconds(600));
         final AtomicReference<String> sourceSnapshot = new AtomicReference<>(HASH);
         final Map<String, TrustedAgentActor> sourceOwners = new HashMap<>();
+        final Map<String, Map<String, Object>> runtimeSources = new HashMap<>();
+        final List<String> runtimeSourceReads = new ArrayList<>();
         final AtomicReference<JdbcTemplate> jdbc = new AtomicReference<>();
         final AtomicReference<Map<String, Object>> row = new AtomicReference<>();
         final AtomicReference<Runnable> advisoryWait = new AtomicReference<>(() -> { }), rowLockWait = new AtomicReference<>(() -> { }), afterJoined = new AtomicReference<>(() -> { });
@@ -544,10 +591,12 @@ class ToolActionIntentStoreTest {
                 new AtomicReference<>(ToolExecutionStorageVerifier.SchemaProfile.LEGACY);
 
         Fixture() throws Exception { this(TOOL); }
-        Fixture(ToolDescriptor selected) throws Exception {
-            tool = selected; action = new ToolActionRequest(ACTOR, tool, "invoice-1", "v1", Map.of("amount", 20L));
+        Fixture(ToolDescriptor selected) throws Exception { this(selected, ACTOR); }
+        Fixture(ToolDescriptor selected, TrustedAgentActor owner) throws Exception {
+            this.owner = owner;
+            tool = selected; action = new ToolActionRequest(owner, tool, "invoice-1", "v1", Map.of("amount", 20L));
             when(source.getConnection()).thenReturn(connection); when(connection.getAutoCommit()).thenReturn(true); when(ledger.usesDataSource(source)).thenReturn(true);
-            when(ledger.executionMaterial(eq(ACTOR), any())).thenAnswer(call -> {
+            when(ledger.executionMaterial(eq(owner), any())).thenAnswer(call -> {
                 GetAgentRunQuery query = call.getArgument(1); return material(query == null ? run.get().runId() : query.runId());
             });
             templates = mockConstruction(JdbcTemplate.class, (template, context) -> {
@@ -565,6 +614,18 @@ class ToolActionIntentStoreTest {
                         var current = matching(call);
                         if (current == null) return List.of();
                         var mapped = mapper.mapRow(result(new HashMap<>(current)), 0); afterJoined.get().run(); return List.of(mapped);
+                    }
+                    if (sql.contains("JOIN tianji_agent.agent_runtime_binding b USING (tenant_id,run_id)")) {
+                        var values = (Object[]) call.getRawArguments()[2];
+                        assertEquals(5, values.length);
+                        assertEquals(owner.tenantId(), values[0]);
+                        assertEquals(owner.subjectType().name(), values[1]);
+                        assertEquals(owner.issuerFingerprint(), values[2]);
+                        assertEquals(owner.subjectId(), values[3]);
+                        String runId = (String) values[4];
+                        runtimeSourceReads.add(runId);
+                        var evidence = runtimeSources.get(runId);
+                        return evidence == null ? List.of() : List.of(mapper.mapRow(result(evidence), 0));
                     }
                     throw new AssertionError("Unexpected controlled tool intent query");
                 }).when(template).query(anyString(), org.mockito.ArgumentMatchers.<RowMapper<Object>>any(), any(Object[].class));
@@ -588,8 +649,49 @@ class ToolActionIntentStoreTest {
             return values.length == 5 && Objects.equals(stored.get("tenant_id"), values[0]) && Objects.equals(stored.get("owner_type"), values[1])
                     && Objects.equals(stored.get("owner_issuer"), values[2]) && Objects.equals(stored.get("owner_id"), values[3]) && Objects.equals(stored.get("intent_id"), values[4]) ? stored : null;
         }
+        private Map<String, Object> seedRuntimeSource(String runId, String occurrence) {
+            var codec = new AgentJsonCodec();
+            var schema = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
+                    "required", List.of(), "additionalProperties", false));
+            var limits = new TechnicalLimitsVO(Duration.ofMinutes(3), Duration.ofSeconds(10),
+                    Duration.ofSeconds(10), 2, 4, 1, 4096, 1024);
+            var configuration = new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
+                    new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("instructions", 1, HASH), "registered-model",
+                    List.of(new AgentRuntimeTemplateCommand.TemplateDependencyRefVO(tool.key(), tool.version(),
+                            tool.reference().contentSha256())), null);
+            var template = new AgentRuntimeTemplateCommand("runtime-tools", 1, RuntimeProfileEnum.RUNTIME_V2,
+                    "runtime-executor", schema, schema, schema, configuration, limits);
+            String templateSha = template.contentSha256();
+            String schemaSha = codec.runtimeSchemaHash(schema);
+            Instant createdAt = NOW.minusSeconds(60);
+            Instant deadline = NOW.plusSeconds(90);
+            var link = new AgentProcessLink("process-source", WorkerScopeTypeEnum.BPMN, "instance",
+                    occurrence, templateSha, deadline.minusSeconds(30));
+            var command = new LinkedAgentRuntimeCommand("submit-" + occurrence, link, "node-" + occurrence, template.getTemplateKey(),
+                    template.getTemplateVersion(), templateSha, HASH, schemaSha, schemaSha, Map.of(), Map.of(), limits, deadline, "correlation");
+            var snapshot = codec.runtimeSnapshot(owner.identityFingerprint(), runId, command, template);
+            var evidence = new HashMap<String, Object>();
+            evidence.put("definition_key", template.getTemplateKey());
+            evidence.put("definition_version", template.getTemplateVersion());
+            evidence.put("request_hash", codec.runtimeRequestHash(command));
+            evidence.put("correlation_id", command.getCorrelationId());
+            evidence.put("created_at", createdAt);
+            evidence.put("deadline_at", deadline);
+            evidence.put("execution_snapshot", codec.writeRuntimeSnapshot(snapshot));
+            evidence.put("snapshot_sha256", snapshot.snapshotSha256());
+            evidence.put("template_sha256", templateSha);
+            evidence.put("configuration_sha256", command.getConfigurationSha256());
+            evidence.put("node_execution_ref", command.getNodeExecutionRef());
+            evidence.put("attempt_deadline_at", deadline);
+            evidence.put("safety_policy", codec.write(limits.toWire(), AgentJsonCodec.MAX_SNAPSHOT_BYTES));
+            evidence.put("content_sha256", templateSha);
+            evidence.put("specification", new String(template.canonicalBytes(), StandardCharsets.UTF_8));
+            runtimeSources.put(runId, evidence);
+            return evidence;
+        }
+
         private AgentLedgerService.ExecutionMaterial material(String id) {
-            var actor = sourceOwners.getOrDefault(id, ACTOR); var refs = sourceAllowed.get() ? List.of(tool.reference()) : List.<DefinitionResourceRef>of();
+            var actor = sourceOwners.getOrDefault(id, owner); var refs = sourceAllowed.get() ? List.of(tool.reference()) : List.<DefinitionResourceRef>of();
             var versions = sourceAllowed.get() ? Set.of(tool.versionKey()) : Set.<String>of();
             var policy = new ExecutionPolicyDTO(Duration.ofMinutes(10), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, 2, 1000, 100,
                     BigDecimal.ONE, "USD", 1, versions, "retry-1", tool.policy().approvalPolicyRef());
@@ -604,11 +706,11 @@ class ToolActionIntentStoreTest {
         Map<String, Object> seed(String state) { return seed(state, Set.of("DISPATCHING", "APPLIED", "UNKNOWN").contains(state), tool.policy().risk() == ToolPolicy.Risk.APPROVAL_REQUIRED && !state.equals("AWAITING_APPROVAL")); }
         Map<String, Object> seed(String state, boolean dispatched, boolean approved) {
             var codec = new ToolExecutionJsonCodec(); var stored = new HashMap<String, Object>();
-            stored.put("tenant_id", ACTOR.tenantId()); stored.put("intent_id", UUID.fromString(action.intentId()));
-            stored.put("owner_type", ACTOR.subjectType().name()); stored.put("owner_issuer", ACTOR.issuerFingerprint()); stored.put("owner_id", ACTOR.subjectId());
+            stored.put("tenant_id", owner.tenantId()); stored.put("intent_id", UUID.fromString(action.intentId()));
+            stored.put("owner_type", owner.subjectType().name()); stored.put("owner_issuer", owner.issuerFingerprint()); stored.put("owner_id", owner.subjectId());
             stored.put("action_key", action.actionKey()); stored.put("business_key", action.businessKey()); stored.put("business_version", action.businessVersion());
             stored.put("tool_key", tool.key()); stored.put("tool_version", tool.version()); stored.put("tool_sha256", tool.reference().contentSha256()); stored.put("binding_sha256", tool.policy().bindingSha256());
-            stored.put("request_sha256", action.requestSha256()); stored.put("logical_identity_sha256", OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_ACTION_LOGICAL_IDENTITY_V1", ACTOR.identityFingerprint(), action.actionKey(), action.businessKey(), action.businessVersion()), Map.of()));
+            stored.put("request_sha256", action.requestSha256()); stored.put("logical_identity_sha256", OrchestrationRequestDigests.hash(List.of("TIANJI_TOOL_ACTION_LOGICAL_IDENTITY_V1", owner.identityFingerprint(), action.actionKey(), action.businessKey(), action.businessVersion()), Map.of()));
             stored.put("descriptor", codec.descriptor(tool)); stored.put("arguments", codec.arguments(tool, action.arguments()));
             stored.put("origin_run_id", RUN); stored.put("origin_snapshot_sha256", HASH); stored.put("risk", tool.policy().risk().name()); stored.put("approval_policy_ref", tool.policy().approvalPolicyRef());
             stored.put("state", state); stored.put("revision", 7L); stored.put("created_at", NOW.minusSeconds(60)); stored.put("updated_at", NOW);
