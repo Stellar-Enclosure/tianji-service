@@ -293,7 +293,12 @@ public class AgentRuntimeExecutionService {
             Decision end = authorize(material, AgentRunAuthorization.Boundary.MODEL);
             if (end != Decision.ALLOW) return ledger.suspendForAuthorization(actor, claim.lease(), end);
         }
-        return ledger.finish(actor, claim.lease(), current.revision(), terminalResult(current, result));
+        var terminal = terminalResult(current, result);
+        if (terminal.status() == AgentRunStatusEnum.COMPLETED
+                && AgentLedgerService.runtimeArtifactOutput(material.template().getOutputSchema())) {
+            return ledger.finishRuntimeArtifact(actor, claim.lease(), current.revision(), terminal);
+        }
+        return ledger.finish(actor, claim.lease(), current.revision(), terminal);
     }
 
     private void checkLease(TrustedAgentActor actor, ClaimedAgentRun claim,
@@ -375,7 +380,11 @@ public class AgentRuntimeExecutionService {
             case COMPLETED, CANCELLED -> null;
             case TIMED_OUT -> ("MODEL_IDLE_TIMEOUT".equals(result.errorCode()) ? AgentErrorCodeEnum.TIANJI_MODEL_IDLE_TIMEOUT
                     : AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT).name();
-            default -> AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
+            default -> {
+                String code = result.errorCode();
+                yield "INVALID_OUTPUT".equals(code) || "AGENTIC_LIMIT_EXCEEDED".equals(code)
+                        ? code : AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
+            }
         };
         return new top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult(current.runId(), status,
                 status == AgentRunStatusEnum.COMPLETED ? result.output() : Map.of(), null, null, null, error,

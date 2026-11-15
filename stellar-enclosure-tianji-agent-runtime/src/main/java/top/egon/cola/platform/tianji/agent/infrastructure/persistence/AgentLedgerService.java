@@ -50,6 +50,14 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentResultArtifactRefVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2.SideEffectOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO.DecisionEnum;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactQuery;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentJsonCodec.RuntimeTerminalResultVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TemplateDependencyRefVO;
@@ -61,6 +69,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -72,6 +81,7 @@ import java.util.UUID;
 import java.util.Base64;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.nio.charset.StandardCharsets;
@@ -170,8 +180,18 @@ public final class AgentLedgerService {
         return terminalPublisher != null && terminalPublisher == publisher;
     }
 
-    /** Reads an immutable linked terminal reference on the owning primary before delivery opens a network call. */
+    /** Reads the immutable legacy reference on the owning primary before delivery opens a network call. */
     public Optional<AgentTerminalEvent> terminalReference(TrustedAgentActor actor, GetAgentRunQuery query, Duration budget) {
+        return readTerminal(actor, query, budget, stored -> terminalReference(actor, stored));
+    }
+
+    /** Reads only the exact committed V2 fact, never the public result projection. */
+    public Optional<AgentTerminalEventV2> terminalReferenceV2(TrustedAgentActor actor, GetAgentRunQuery query, Duration budget) {
+        return readTerminal(actor, query, budget, stored -> terminalReferenceV2(actor, stored));
+    }
+
+    private <T> Optional<T> readTerminal(TrustedAgentActor actor, GetAgentRunQuery query, Duration budget,
+                                           Function<JdbcAgentLedgerRepository.StoredRun, Optional<T>> projection) {
         if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
                 || query == null || budget == null || budget.compareTo(Duration.ofSeconds(1)) < 0 || budget.compareTo(Duration.ofSeconds(30)) > 0) {
             throw new IllegalArgumentException("Linked terminal reference requires a verified owner and bounded read");
@@ -182,7 +202,7 @@ public final class AgentLedgerService {
         read.setReadOnly(false);
         read.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         read.setTimeout(Math.toIntExact(budget.toSeconds()));
-        return read.execute(status -> terminalReference(actor, requireRun(actor, query)));
+        return read.execute(status -> projection.apply(requireRun(actor, query)));
     }
 
     /** Observes the exact owner's recorded recovery evidence on the bound Agent primary. */
@@ -1026,8 +1046,17 @@ public final class AgentLedgerService {
     }
 
     public Optional<AgentExecutionResult> getResult(TrustedAgentActor actor, GetAgentRunQuery query) {
-        String result = requireRun(actor, query).resultJson();
-        return result == null ? Optional.empty() : Optional.of(json.readResult(result));
+        return transaction.execute(status -> {
+            var stored = requireRun(actor, query);
+            if (stored.resultJson() == null) return Optional.empty();
+            if (runtimeProfile(stored) == RunProfileEnum.LEGACY_V1) return Optional.of(json.readResult(stored.resultJson()));
+            var verified = verifyRuntime(actor, stored);
+            var result = readRuntimeTerminal(stored, verified);
+            // The old public DTO has a string artifact slot and cannot expose the V2 reference faithfully.
+            return Optional.of(new AgentExecutionResult(stored.run().runId(), result.status(),
+                    result.output() == null ? Map.of() : result.output(), null, null, null, result.errorCode(),
+                    result.sideEffectOutcome().wire()));
+        });
     }
 
     public AgentExecutionSnapshot snapshot(TrustedAgentActor actor, GetAgentRunQuery query) {
@@ -1057,6 +1086,7 @@ public final class AgentLedgerService {
         var existing = repository.byIdempotencyKey(actor, input.getIdempotencyKey());
         if (existing.isPresent()) return replayRuntimeStart(actor, existing.get(), requestSha256);
 
+        if (terminalPublisher != null && terminalPublisher.runtimeDestination(actor, input.getLink().sourceId()) == null) throw runtimeUnavailable();
         requireDispatchTime(input.getLink());
         var template = runtimeTemplate(actor, input.getTemplateKey(), input.getTemplateVersion());
         validateRuntimePins(input, template);
@@ -1507,30 +1537,192 @@ public final class AgentLedgerService {
         });
     }
 
+    private static final ProcessSchemaVO RUNTIME_ARTIFACT_SCHEMA = ProcessSchemaVO.fromWire(Map.of(
+            "type", "object", "additionalProperties", false,
+            "properties", Map.of(
+                    "resourceKey", Map.of("type", "string", "maxLength", 128, "pattern", "^[A-Za-z][A-Za-z0-9_.:-]{0,127}$"),
+                    "contentSha256", Map.of("type", "string", "maxLength", 64, "pattern", "^[0-9a-f]{64}$"),
+                    "mediaType", Map.of("type", "string", "maxLength", 127, "pattern", "^[a-z0-9.+-]{1,63}/[a-z0-9.+-]{1,63}$"),
+                    "sizeBytes", Map.of("type", "integer", "minimum", 0, "maximum", ProcessTypedJson.V2_MAX_WIRE_INTEGER)),
+            "required", List.of("resourceKey", "contentSha256", "mediaType", "sizeBytes")));
+    private static final Duration ARTIFACT_PROOF_BUDGET = Duration.ofSeconds(3);
+    private static final int ARTIFACT_PROOF_ATTEMPTS = 2;
+    private static final String INVALID_RUNTIME_OUTPUT = "INVALID_OUTPUT";
+    private static final AgentResultArtifactEvidenceVO ARTIFACT_UNAVAILABLE =
+            new AgentResultArtifactEvidenceVO(DecisionEnum.UNAVAILABLE, null, null, null, null);
+
+    public static boolean runtimeArtifactOutput(ProcessSchemaVO schema) {
+        return "object".equals(schema.type()) && Boolean.FALSE.equals(schema.additionalProperties())
+                && RUNTIME_ARTIFACT_SCHEMA.properties().equals(schema.properties())
+                && Set.copyOf(RUNTIME_ARTIFACT_SCHEMA.required()).equals(Set.copyOf(schema.required()));
+    }
+
     /** Commits a terminal result only for the current, unexpired lease. */
-    public AgentRunDTO finish(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision,
-                              AgentExecutionResult result) {
-        Objects.requireNonNull(actor, "actor");
-        Objects.requireNonNull(lease, "lease");
-        Objects.requireNonNull(result, "result");
-        if (expectedRevision < 0 || !lease.runId().equals(result.runId())
-                || !(result.status() == AgentRunStatusEnum.COMPLETED || result.status() == AgentRunStatusEnum.FAILED
-                || result.status() == AgentRunStatusEnum.CANCELLED || result.status() == AgentRunStatusEnum.TIMED_OUT)) {
-            throw invalid("invalid leased Agent result");
+    public AgentRunDTO finish(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision, AgentExecutionResult result) {
+        return finish(actor, lease, expectedRevision, result, null);
+    }
+
+    /** Resolves the original candidate once or twice under one bounded, transaction-free PREPARE window. */
+    public AgentRunDTO finishRuntimeArtifact(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision,
+                                            AgentExecutionResult result) {
+        validateFinish(actor, lease, expectedRevision, result);
+        if (result.status() != AgentRunStatusEnum.COMPLETED || TransactionSynchronizationManager.isActualTransactionActive()) {
+            throw runtimeUnavailable();
         }
-        String resultJson = json.write(result, AgentJsonCodec.MAX_RESULT_BYTES);
+        var query = new GetAgentRunQuery(lease.runId());
+        var observation = transaction.execute(status -> {
+            var stored = requireLockedRun(actor, query);
+            var verified = verifyRuntime(actor, stored);
+            var schema = verified.snapshot().template().getOutputSchema();
+            if (!runtimeArtifactOutput(schema)) throw runtimeUnavailable();
+            var current = now();
+            if (stored.run().revision() != expectedRevision) throw revisionConflict();
+            requireCurrentArtifactLease(stored, lease, current);
+            AgentResultArtifactRefVO reference;
+            try {
+                reference = json.readRuntimeArtifact(normalizeRuntimeOutput(schema, result.output()));
+            } catch (IllegalArgumentException | IllegalStateException invalidOutput) {
+                return new ArtifactObservationVO(null, INVALID_RUNTIME_OUTPUT);
+            }
+            if (terminalPublisher == null) return new ArtifactObservationVO(null, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name());
+            var command = verifyTerminalFence(actor, stored, verified);
+            String source = command.getLink().sourceId();
+            String destination = terminalPublisher.runtimeDestination(actor, source);
+            if (destination == null) throw runtimeUnavailable();
+            Instant deadline = earlier(stored.leaseExpiresAt(), earlier(stored.run().deadlineAt(), current.plus(ARTIFACT_PROOF_BUDGET)));
+            return new ArtifactObservationVO(new AgentResultArtifactQuery(AgentResultArtifactQuery.PurposeEnum.PREPARE_TERMINAL,
+                    actor, source, terminalProducerId, destination, stored.run().runId(), command.getNodeExecutionRef(),
+                    command.getOutputSchemaSha256(), reference, deadline), null);
+        });
+        if (observation.errorCode() != null) return finish(actor, lease, expectedRevision, failureFor(result, observation.errorCode()), null);
+
+        var request = observation.query();
+        var proof = ARTIFACT_UNAVAILABLE;
+        for (int attempt = 0; attempt < ARTIFACT_PROOF_ATTEMPTS && now().isBefore(request.getDeadlineAt()); attempt++) {
+            try {
+                proof = terminalPublisher.verifyArtifact(copyArtifactQuery(request));
+                if (proof == null) proof = ARTIFACT_UNAVAILABLE;
+            } catch (RuntimeException unavailable) {
+                proof = ARTIFACT_UNAVAILABLE;
+            }
+            if (proof.decision() == DecisionEnum.DENY || proof.permits(request, now())) break;
+        }
+        if (proof.decision() == DecisionEnum.DENY) {
+            return finish(actor, lease, expectedRevision, failureFor(result, AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED.name()), null);
+        }
+        return finish(actor, lease, expectedRevision, result, new PreparedArtifactVO(request, proof));
+    }
+
+    private AgentRunDTO finish(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision,
+                               AgentExecutionResult result, PreparedArtifactVO artifact) {
+        validateFinish(actor, lease, expectedRevision, result);
         return transaction.execute(status -> {
-            GetAgentRunQuery query = new GetAgentRunQuery(lease.runId());
-            JdbcAgentLedgerRepository.StoredRun previous = requireLockedRun(actor, query);
+            var previous = requireLockedRun(actor, new GetAgentRunQuery(lease.runId()));
             var profile = verifyRunProfile(actor, previous);
-            JdbcAgentLedgerRepository.StoredRun updated = repository.finishLeased(actor, lease, expectedRevision,
-                    result.status(), resultJson, result.errorCode()).orElseThrow(() -> new AgentLedgerException(
-                            AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent run lease or revision is no longer valid"));
+            RuntimeTerminalResultVO runtime = profile.profile() == RunProfileEnum.RUNTIME_V2
+                    ? runtimeTerminalForFinish(actor, previous, profile, lease, result, artifact) : null;
+            String resultJson = runtime == null ? json.write(result, AgentJsonCodec.MAX_RESULT_BYTES) : json.writeRuntimeResult(runtime);
+            AgentRunStatusEnum terminal = runtime == null ? result.status() : runtime.status();
+            String errorCode = runtime == null ? result.errorCode() : runtime.errorCode();
+            var updated = repository.finishLeased(actor, lease, expectedRevision, terminal, resultJson, errorCode)
+                    .orElseThrow(() -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED,
+                            "Agent run lease or revision is no longer valid"));
             closeOutstanding(actor, previous, profile);
-            appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING, result.status(), null);
+            appendStatusEvent(actor, previous, updated, AgentRunStatusEnum.RUNNING, terminal, null);
             return updated.run();
         });
     }
+
+    private static void validateFinish(TrustedAgentActor actor, AgentRunLease lease, long expectedRevision, AgentExecutionResult result) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(lease, "lease");
+        Objects.requireNonNull(result, "result");
+        if (expectedRevision < 0 || !lease.runId().equals(result.runId()) || !AgentRunTransitions.terminal(result.status())) {
+            throw invalid("invalid leased Agent result");
+        }
+    }
+
+    private RuntimeTerminalResultVO runtimeTerminalForFinish(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored,
+            VerifiedRunProfileVO verified, AgentRunLease lease, AgentExecutionResult result, PreparedArtifactVO artifact) {
+        if (result.status() != AgentRunStatusEnum.COMPLETED) return runtimeNonSuccess(result);
+        var schema = verified.snapshot().template().getOutputSchema();
+        SideEffectOutcomeEnum effect = runtimeEffect(result);
+        Map<String, Object> output;
+        try {
+            if (result.artifactRef() != null) throw invalid("invalid runtime artifact");
+            output = normalizeRuntimeOutput(schema, result.output());
+            if (!runtimeArtifactOutput(schema)) {
+                return new RuntimeTerminalResultVO(result.status(), output, null, null, effect);
+            }
+        } catch (IllegalArgumentException invalidOutput) {
+            return runtimeNonSuccess(failureFor(result, INVALID_RUNTIME_OUTPUT));
+        }
+        if (artifact == null) throw runtimeUnavailable();
+        var current = now();
+        requireCurrentArtifactLease(stored, lease, current);
+        var command = verifyTerminalFence(actor, stored, verified);
+        var request = artifact.query();
+        var reference = json.readRuntimeArtifact(output);
+        Instant leaseAndAttempt = earlier(stored.leaseExpiresAt(), stored.run().deadlineAt());
+        if (request.getPurpose() != AgentResultArtifactQuery.PurposeEnum.PREPARE_TERMINAL
+                || !actor.equals(request.getOwner()) || !command.getLink().sourceId().equals(request.getSourceId())
+                || !terminalProducerId.equals(request.getProducerId())
+                || !Objects.equals(terminalPublisher.runtimeDestination(actor, request.getSourceId()), request.getDestinationId())
+                || !stored.run().runId().equals(request.getRunId()) || !command.getNodeExecutionRef().equals(request.getNodeExecutionRef())
+                || !command.getOutputSchemaSha256().equals(request.getOutputSchemaSha256()) || !reference.equals(request.getArtifactRef())
+                || request.getDeadlineAt().isAfter(leaseAndAttempt) || !artifact.evidence().permits(request, now())) {
+            return runtimeNonSuccess(failureFor(result, AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name()));
+        }
+        return new RuntimeTerminalResultVO(result.status(), null, reference, null, effect);
+    }
+
+    private static AgentExecutionResult failureFor(AgentExecutionResult attempted, String code) {
+        return new AgentExecutionResult(attempted.runId(), AgentRunStatusEnum.FAILED, Map.of(), null, null, null,
+                code, attempted.sideEffectOutcome());
+    }
+
+    private static RuntimeTerminalResultVO runtimeNonSuccess(AgentExecutionResult result) {
+        String error = Objects.requireNonNullElseGet(result.errorCode(), () -> switch (result.status()) {
+            case CANCELLED -> "CANCELLED";
+            case TIMED_OUT -> AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name();
+            default -> AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name();
+        });
+        return new RuntimeTerminalResultVO(result.status(), null, null, error, runtimeEffect(result));
+    }
+
+    private static SideEffectOutcomeEnum runtimeEffect(AgentExecutionResult result) {
+        return result.sideEffectOutcome() == null ? SideEffectOutcomeEnum.UNKNOWN : SideEffectOutcomeEnum.valueOf(result.sideEffectOutcome());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> normalizeRuntimeOutput(ProcessSchemaVO schema, Map<String, Object> output) {
+        // The published runtime schema is a closed object and this typed result still needs its 8 KiB canonical bound.
+        if (!(schema.normalizeValue(output) instanceof Map<?, ?> normalized)) throw new IllegalArgumentException("Invalid Agent output");
+        ProcessTypedJson.canonicalBytes(normalized, 8 * 1024);
+        return (Map<String, Object>) normalized;
+    }
+
+    private static Instant earlier(Instant left, Instant right) {
+        return left.isBefore(right) ? left : right;
+    }
+
+    private static void requireCurrentArtifactLease(JdbcAgentLedgerRepository.StoredRun stored, AgentRunLease lease, Instant now) {
+        if (stored.run().status() != AgentRunStatusEnum.RUNNING || stored.run().cancelRequested()
+                || stored.leaseEpoch() != lease.epoch() || !lease.owner().equals(stored.leaseOwner())
+                || stored.leaseExpiresAt() == null || !stored.leaseExpiresAt().isAfter(now)
+                || !stored.run().deadlineAt().isAfter(now)) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent Runtime artifact lease is no longer valid");
+        }
+    }
+
+    private static AgentResultArtifactQuery copyArtifactQuery(AgentResultArtifactQuery query) {
+        return new AgentResultArtifactQuery(query.getPurpose(), query.getOwner(), query.getSourceId(), query.getProducerId(),
+                query.getDestinationId(), query.getRunId(), query.getNodeExecutionRef(), query.getOutputSchemaSha256(),
+                query.getArtifactRef(), query.getDeadlineAt());
+    }
+
+    private record ArtifactObservationVO(AgentResultArtifactQuery query, String errorCode) { }
+    private record PreparedArtifactVO(AgentResultArtifactQuery query, AgentResultArtifactEvidenceVO evidence) { }
 
     /** Database time, rather than a worker's clock, decides when a deadline has expired. */
     public AgentRunDTO expireDeadline(TrustedAgentActor actor, GetAgentRunQuery query, long expectedRevision) {
@@ -1543,7 +1735,7 @@ public final class AgentLedgerService {
                     Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(),
                     previous.run().attempt() == 0 ? "NONE" : "UNKNOWN");
             JdbcAgentLedgerRepository.StoredRun updated = repository.expireDeadline(actor, query.runId(),
-                    expectedRevision, json.write(result, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(
+                    expectedRevision, writeTerminalFailure(profile, result)).orElseThrow(
                     () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                             "Agent run deadline or revision has changed"));
             closeOutstanding(actor, previous, profile);
@@ -1566,7 +1758,7 @@ public final class AgentLedgerService {
             AgentExecutionResult result = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.TIMED_OUT,
                     Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(), sideEffectOutcome);
             JdbcAgentLedgerRepository.StoredRun updated = repository.expireDeadline(actor, lease,
-                    expectedRevision, json.write(result, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(
+                    expectedRevision, writeTerminalFailure(profile, result)).orElseThrow(
                     () -> new AgentLedgerException(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT,
                             "Agent run deadline or execution generation has changed"));
             closeOutstanding(actor, previous, profile);
@@ -1727,7 +1919,7 @@ public final class AgentLedgerService {
                         Map.of(), null, null, null, AgentErrorCodeEnum.TIANJI_RUN_TIMED_OUT.name(),
                         previous.run().attempt() == 0 ? "NONE" : "UNKNOWN");
                 JdbcAgentLedgerRepository.StoredRun updated = repository.expireDeadline(actor, query.runId(),
-                        previous.run().revision(), json.write(expired, AgentJsonCodec.MAX_RESULT_BYTES))
+                        previous.run().revision(), writeTerminalFailure(profile, expired))
                         .orElseThrow(AgentLedgerService::revisionConflict);
                 closeOutstanding(actor, previous, profile);
                 appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.TIMED_OUT, null);
@@ -1752,7 +1944,7 @@ public final class AgentLedgerService {
                     AgentExecutionResult cancelled = new AgentExecutionResult(query.runId(), AgentRunStatusEnum.CANCELLED,
                             Map.of(), null, null, null, null, previous.run().attempt() == 0 ? "NONE" : "UNKNOWN");
                     updated = repository.cancelNotRunning(actor, query.runId(), command.expectedRevision(),
-                            json.write(cancelled, AgentJsonCodec.MAX_RESULT_BYTES)).orElseThrow(AgentLedgerService::revisionConflict);
+                            writeTerminalFailure(profile, cancelled)).orElseThrow(AgentLedgerService::revisionConflict);
                     closeOutstanding(actor, previous, profile);
                     appendStatusEvent(actor, previous, updated, previous.run().status(), AgentRunStatusEnum.CANCELLED, null);
                 }
@@ -1762,6 +1954,11 @@ public final class AgentLedgerService {
             repository.completeCancelReceipt(actor, command.commandId(), json.write(result, AgentJsonCodec.MAX_EVENT_BYTES));
             return result;
         });
+    }
+
+    private String writeTerminalFailure(VerifiedRunProfileVO profile, AgentExecutionResult failure) {
+        return profile.profile() == RunProfileEnum.RUNTIME_V2 ? json.writeRuntimeResult(runtimeNonSuccess(failure))
+                : json.write(failure, AgentJsonCodec.MAX_RESULT_BYTES);
     }
 
     /** Unfenced lifecycle changes are retired; use claim, finish, cancellation or reconciliation. */
@@ -1786,7 +1983,13 @@ public final class AgentLedgerService {
                 updated.run().runId(), updated.run().lastEventSequence(), "RUN_STATUS_CHANGED", null, null,
                 null, now(), previous.correlationId(), "1", payload);
         repository.insertEvent(actor.tenantId(), event);
-        if (terminalPublisher != null && AgentRunTransitions.terminal(to)) terminalReference(actor, updated).ifPresent(terminalPublisher::publish);
+        if (terminalPublisher != null && AgentRunTransitions.terminal(to)) {
+            if (runtimeProfile(updated) == RunProfileEnum.RUNTIME_V2) {
+                terminalPublisher.publish(terminalReferenceV2(actor, updated).orElseThrow(AgentLedgerService::runtimeUnavailable));
+            } else {
+                terminalReference(actor, updated).ifPresent(terminalPublisher::publish);
+            }
+        }
         return event.occurredAt();
     }
 
@@ -1814,6 +2017,57 @@ public final class AgentLedgerService {
                 actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), query.idempotencyKey(), query.link(), run.definitionKey(), run.definitionVersion(),
                 run.runId(), run.revision(), run.status(), run.finishedAt(), json.resultHash(stored.resultJson()), result.errorCode(),
                 result.sideEffectOutcome() == null ? "UNKNOWN" : result.sideEffectOutcome()));
+    }
+
+    private Optional<AgentTerminalEventV2> terminalReferenceV2(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {
+        var run = stored.run();
+        if (terminalProducerId == null || !AgentRunTransitions.terminal(run.status())
+                || runtimeProfile(stored) != RunProfileEnum.RUNTIME_V2) return Optional.empty();
+        if (run.finishedAt() == null || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE
+                || !TransactionSynchronizationManager.isActualTransactionActive() || !TransactionSynchronizationManager.hasResource(dataSource)) {
+            throw runtimeUnavailable();
+        }
+        var verified = verifyRuntime(actor, stored);
+        var command = verifyTerminalFence(actor, stored, verified);
+        if (terminalPublisher.runtimeDestination(actor, command.getLink().sourceId()) == null) throw runtimeUnavailable();
+        var result = readRuntimeTerminal(stored, verified);
+        var expectedInput = verified.snapshot().template().getInputSchema().normalizeValue(command.getInput());
+        String inputSha256 = ProcessTypedJson.sha256("AUTOMATION_NODE_INPUT_V2",
+                command.getInputSchemaSha256().getBytes(StandardCharsets.UTF_8), ProcessTypedJson.canonicalBytes(expectedInput));
+        return Optional.of(new AgentTerminalEventV2(2, terminalProducerId,
+                AgentTerminalEventV2.eventIdFor(terminalProducerId, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(),
+                        run.runId(), run.revision()), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(),
+                command.getIdempotencyKey(), command.getLink(), run.definitionKey(), run.definitionVersion(), run.runId(), run.revision(),
+                command.getNodeExecutionRef(), command.getConfigurationSha256(), inputSha256, command.getOutputSchemaSha256(),
+                result.status(), run.finishedAt(), result.resultSha256(), result.output(), result.artifactRef(), result.errorCode(),
+                result.sideEffectOutcome()));
+    }
+
+    private LinkedAgentRuntimeCommand verifyTerminalFence(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored,
+                                                          VerifiedRunProfileVO verified) {
+        var command = verified.snapshot().command();
+        if (!repository.hasRuntimeTerminalFence(actor, stored.run().runId(), command.getIdempotencyKey(),
+                json.processLinkHash(command.getLink()), stored.requestHash())) throw runtimeUnavailable();
+        return command;
+    }
+
+    private RuntimeTerminalResultVO readRuntimeTerminal(JdbcAgentLedgerRepository.StoredRun stored, VerifiedRunProfileVO verified) {
+        try {
+            var result = json.readRuntimeResult(stored.resultJson());
+            var run = stored.run();
+            if (run.status() != result.status() || run.finishedAt() == null) throw runtimeUnavailable();
+            if (result.status() == AgentRunStatusEnum.COMPLETED) {
+                var schema = verified.snapshot().template().getOutputSchema();
+                boolean artifact = runtimeArtifactOutput(schema);
+                if (artifact != (result.artifactRef() != null)) throw runtimeUnavailable();
+                var wire = artifact ? result.artifactRef().toWire() : result.output();
+                var normalized = normalizeRuntimeOutput(schema, wire);
+                if (!Arrays.equals(ProcessTypedJson.canonicalBytes(wire), ProcessTypedJson.canonicalBytes(normalized))) throw runtimeUnavailable();
+            }
+            return result;
+        } catch (IllegalStateException | IllegalArgumentException invalid) {
+            throw runtimeUnavailable();
+        }
     }
 
     private static long leaseMillis(Duration duration) {

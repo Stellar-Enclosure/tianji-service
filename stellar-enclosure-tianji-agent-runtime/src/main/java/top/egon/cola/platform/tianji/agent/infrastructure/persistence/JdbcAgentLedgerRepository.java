@@ -167,6 +167,14 @@ final class JdbcAgentLedgerRepository {
         return keys.stream().findFirst();
     }
 
+    boolean hasRuntimeTerminalFence(TrustedAgentActor actor, String runId, String key, String linkSha256, String requestSha256) {
+        return Boolean.TRUE.equals(jdbc.queryForObject("""
+                SELECT EXISTS(SELECT 1 FROM tianji_agent.agent_process_dispatch
+                    WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND run_id=?
+                      AND idempotency_key=? AND link_sha256=? AND request_sha256=?)
+                """, Boolean.class, actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), runId, key, linkSha256, requestSha256));
+    }
+
     boolean ownedRunExists(TrustedAgentActor actor, String runId) {
         return Boolean.TRUE.equals(jdbc.queryForObject("""
                 SELECT EXISTS(SELECT 1 FROM tianji_agent.agent_run

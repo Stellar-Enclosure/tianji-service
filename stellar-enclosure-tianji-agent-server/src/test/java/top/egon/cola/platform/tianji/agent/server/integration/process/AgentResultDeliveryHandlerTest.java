@@ -35,6 +35,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptSt
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -246,6 +247,33 @@ class AgentResultDeliveryHandlerTest {
         assertEquals(DeliveryResult.Kind.SUCCESS, cross.deliver(linked).kind());
         verify(client).receive(event);
         verify(client, never()).receive(any(), anyString());
+    }
+
+    @Test
+    void v2_inline_retries_the_original_bytes_and_requires_the_matching_ledger_and_inbox_receipts() {
+        var runtime = OutboxAgentTerminalEventPublisherTest.eventV2(owner.issuerFingerprint(), null);
+        byte[] bytes = runtime.canonicalBytes();
+        var context = new DeliveryContext(runtime.eventId(), handler.channel(), "process-one",
+                new String(bytes, StandardCharsets.UTF_8), "application/json", "2",
+                Map.of("tianji-event-fingerprint", runtime.fingerprint()), null, 1, 5, NOW.plusSeconds(30));
+        when(ledger.terminalReferenceV2(owner, new GetAgentRunQuery(runtime.runId()), Duration.ofSeconds(5)))
+                .thenReturn(Optional.of(runtime));
+        var invocations = new ArrayList<byte[]>();
+        when(client.receiveV2(eq(runtime), any(byte[].class), isNull())).thenAnswer(call -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            invocations.add(call.getArgument(1));
+            return switch (invocations.size()) {
+                case 1 -> throw new ProcessClientException(503, "TIANJI_DEPENDENCY_UNAVAILABLE", null, null);
+                case 2 -> new AgentResultReceipt(runtime.eventId(), "b".repeat(64), AgentResultReceiptStateEnum.RECEIVED, NOW);
+                default -> new AgentResultReceipt(runtime.eventId(), runtime.fingerprint(), AgentResultReceiptStateEnum.RECEIVED, NOW);
+            };
+        });
+        assertEquals(DeliveryResult.Kind.RETRYABLE_FAILURE, handler.deliver(context).kind());
+        assertEquals(DeliveryResult.Kind.PERMANENT_FAILURE, handler.deliver(context).kind());
+        assertEquals(DeliveryResult.Kind.SUCCESS, handler.deliver(context).kind());
+        assertEquals(3, invocations.size());
+        invocations.forEach(attempt -> assertArrayEquals(bytes, attempt));
+        verify(client, never()).receive(any());
     }
 
     private static final class LocalSpans implements SpanProcessor {

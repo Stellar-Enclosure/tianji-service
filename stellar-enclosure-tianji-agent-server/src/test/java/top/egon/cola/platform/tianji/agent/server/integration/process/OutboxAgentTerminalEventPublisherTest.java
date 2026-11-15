@@ -12,9 +12,13 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentResultArtifactRefVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2.SideEffectOutcomeEnum;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Map;
@@ -97,6 +101,9 @@ class OutboxAgentTerminalEventPublisherTest {
                 assertTrue(context.getBeansOfType(OutboxAgentTerminalEventPublisher.class).isEmpty()));
         new ApplicationContextRunner().withUserConfiguration(TianjiAgentTerminalOutboxConfiguration.class)
                 .withPropertyValues("stellar.tianji.agent.terminal-events.enabled=true").run(context -> assertNotNull(context.getStartupFailure()));
+        new ApplicationContextRunner().withUserConfiguration(TianjiAgentTerminalOutboxConfiguration.class)
+                .withPropertyValues("stellar.tianji.agent.runtime-v2.enabled=true").run(context ->
+                        assertTrue(context.getStartupFailure().getMessage().contains("Agent Runtime v2 admission")));
         assertThrows(IllegalArgumentException.class, () -> new OutboxAgentTerminalEventPublisher(mock(DataSource.class), infrastructure(),
                 outbox, "agent-east", Map.of("process-east", "process-destination")));
         assertThrows(IllegalArgumentException.class, () -> new OutboxAgentTerminalEventPublisher(source, infrastructure(), outbox,
@@ -140,6 +147,40 @@ class OutboxAgentTerminalEventPublisherTest {
         assertEquals(original.headers(), observed.headers());
         verify(observation, times(1)).enqueueCarrier();
         verify(connection, times(2)).commit();
+    }
+
+    @Test
+    void both_v2_success_shapes_enqueue_the_exact_canonical_bytes_under_the_original_route() throws Exception {
+        var connection = connection();
+        var publisher = publisher();
+        var artifact = new AgentResultArtifactRefVO("artifact-one", "d".repeat(64), "application/json", 42);
+        for (var event : java.util.List.of(eventV2("b".repeat(64), null), eventV2("b".repeat(64), artifact))) {
+            assertThrows(RuntimeException.class, () -> publisher.publish(event));
+            doAnswer(call -> {
+                OutboxMessage message = call.getArgument(0);
+                assertEquals(event.eventId(), message.messageId());
+                assertEquals(event.eventId(), message.idempotencyKey());
+                assertEquals("process-destination", message.destination());
+                assertEquals("2", message.schemaVersion());
+                assertEquals("application/json", message.contentType());
+                assertEquals(Map.of("tianji-event-fingerprint", event.fingerprint()), message.headers());
+                assertArrayEquals(event.canonicalBytes(), assertInstanceOf(String.class, message.payload()).getBytes(StandardCharsets.UTF_8));
+                return new OutboxReceipt(event.eventId(), event.eventId(), true);
+            }).when(outbox).enqueue(any());
+            new TransactionTemplate(manager).executeWithoutResult(status -> publisher.publish(event));
+        }
+        verify(connection, times(2)).commit();
+    }
+
+    static AgentTerminalEventV2 eventV2(String issuer, AgentResultArtifactRefVO artifact) {
+        var legacy = event("agent-east");
+        Map<String, Object> output = artifact == null ? Map.of("count", 1, "text", "结果") : null;
+        var result = AgentTerminalEventV2.resultSha256(legacy.status(), output, artifact, null, SideEffectOutcomeEnum.NONE);
+        return new AgentTerminalEventV2(2, legacy.producerId(), AgentTerminalEventV2.eventIdFor(legacy.producerId(), 20, issuer,
+                "process-worker", legacy.runId(), legacy.terminalRevision()), 20, issuer, "process-worker",
+                legacy.idempotencyKey(), legacy.link(), legacy.definitionKey(), legacy.definitionVersion(), legacy.runId(),
+                legacy.terminalRevision(), "node-one", "e".repeat(64), "f".repeat(64), "c".repeat(64), legacy.status(),
+                legacy.finishedAt(), result, output, artifact, null, SideEffectOutcomeEnum.NONE);
     }
 
     private Connection connection() throws Exception {

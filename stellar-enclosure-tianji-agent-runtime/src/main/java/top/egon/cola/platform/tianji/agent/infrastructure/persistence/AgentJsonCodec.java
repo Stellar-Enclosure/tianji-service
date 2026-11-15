@@ -12,13 +12,17 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.agent.CancelAgentRunResult;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentResultArtifactRefVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2.SideEffectOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
@@ -65,6 +69,59 @@ final class AgentJsonCodec {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .disable(SerializationFeature.WRITE_DURATIONS_AS_TIMESTAMPS)
             .build();
+
+    private static final Set<String> RUNTIME_RESULT_FIELDS = Set.of("status", "output", "artifactRef", "errorCode",
+            "sideEffectOutcome", "resultSha256");
+    private static final Set<String> ARTIFACT_FIELDS = Set.of("resourceKey", "contentSha256", "mediaType", "sizeBytes");
+
+    String writeRuntimeResult(RuntimeTerminalResultVO result) {
+        var fields = new LinkedHashMap<String, Object>();
+        fields.put("status", result.status().name());
+        fields.put("output", result.output());
+        fields.put("artifactRef", result.artifactRef() == null ? null : result.artifactRef().toWire());
+        fields.put("errorCode", result.errorCode());
+        fields.put("sideEffectOutcome", result.sideEffectOutcome().wire());
+        fields.put("resultSha256", result.resultSha256());
+        return new String(ProcessTypedJson.canonicalBytes(fields, 16 * 1024), StandardCharsets.UTF_8);
+    }
+
+    RuntimeTerminalResultVO readRuntimeResult(String payload) {
+        // PostgreSQL jsonb preserves the closed value, not its original key order or whitespace.
+        if (payload == null || payload.length() > 128 * 1024) throw invalidRuntimeData();
+        try {
+            Map<String, Object> fields = strictRuntime.readValue(payload, JSON_OBJECT);
+            if (fields == null || !RUNTIME_RESULT_FIELDS.equals(fields.keySet())
+                    || !(fields.get("status") instanceof String status)
+                    || !(fields.get("sideEffectOutcome") instanceof String effect)
+                    || !(fields.get("resultSha256") instanceof String sha)
+                    || fields.get("errorCode") != null && !(fields.get("errorCode") instanceof String)) throw invalidRuntimeData();
+            var output = fields.get("output") == null ? null : exactObject(fields.get("output"));
+            var artifact = fields.get("artifactRef") == null ? null : readRuntimeArtifact(exactObject(fields.get("artifactRef")));
+            var result = new RuntimeTerminalResultVO(AgentRunStatusEnum.valueOf(status), output, artifact,
+                    (String) fields.get("errorCode"), SideEffectOutcomeEnum.valueOf(effect));
+            if (!sha.equals(result.resultSha256())) throw invalidRuntimeData();
+            return result;
+        } catch (JsonProcessingException | IllegalArgumentException malformed) {
+            throw invalidRuntimeData();
+        }
+    }
+
+    AgentResultArtifactRefVO readRuntimeArtifact(Map<String, Object> fields) {
+        if (!ARTIFACT_FIELDS.equals(fields.keySet())) throw invalidRuntimeData();
+        return strictRuntime.convertValue(fields, AgentResultArtifactRefVO.class);
+    }
+
+    record RuntimeTerminalResultVO(AgentRunStatusEnum status, Map<String, Object> output, AgentResultArtifactRefVO artifactRef,
+                                   String errorCode, SideEffectOutcomeEnum sideEffectOutcome) {
+        RuntimeTerminalResultVO {
+            if (output != null) output = exactObject(output);
+            AgentTerminalEventV2.resultSha256(status, output, artifactRef, errorCode, sideEffectOutcome);
+        }
+
+        String resultSha256() {
+            return AgentTerminalEventV2.resultSha256(status, output, artifactRef, errorCode, sideEffectOutcome);
+        }
+    }
 
     String runtimeRequestHash(LinkedAgentRuntimeCommand command) {
         return ProcessTypedJson.sha256("tianji-linked-agent-runtime-request-v2",

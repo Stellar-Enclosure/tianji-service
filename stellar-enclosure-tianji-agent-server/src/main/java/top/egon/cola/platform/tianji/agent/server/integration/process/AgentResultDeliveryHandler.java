@@ -11,16 +11,24 @@ import tools.jackson.databind.json.JsonMapper;
 import top.egon.cola.component.outbox.delivery.DeliveryContext;
 import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO.DecisionEnum;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactQuery;
+import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactVerifier;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.client.HttpAgentResultClient;
 import top.egon.cola.platform.tianji.client.ProcessClientException;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +36,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.function.Supplier;
+import java.util.function.BooleanSupplier;
 
 /** Delivers a ledger-confirmed reference; lazy ledger resolution breaks the publisher/Outbox/handler construction cycle. */
 public final class AgentResultDeliveryHandler implements DeliveryHandler {
@@ -36,12 +45,23 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
             .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS).disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).build();
+    private static final JsonMapper RUNTIME_JSON = JsonMapper.builder(JsonFactory.builder()
+                    .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(40)
+                            .maxStringLength(16_384).maxNameLength(16_384).maxNumberLength(20).maxTokenCount(32_768).build()).build())
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
+                    DeserializationFeature.FAIL_ON_NULL_FOR_PRIMITIVES)
+            .enable(EnumFeature.FAIL_ON_NUMBERS_FOR_ENUMS)
+            .disable(MapperFeature.ALLOW_COERCION_OF_SCALARS).disable(DeserializationFeature.ACCEPT_FLOAT_AS_INT).build();
     private final Supplier<AgentLedgerService> ledgers;
     private final Map<Key, Route> routes;
     private final Set<String> destinations;
     private final Clock clock;
     private final AgentResultSpanObservation observation;
     private final boolean crossProcessSpanLinksEnabled;
+    private final AgentResultArtifactVerifier artifacts;
+    private static final AgentResultArtifactEvidenceVO ARTIFACT_UNAVAILABLE =
+            new AgentResultArtifactEvidenceVO(DecisionEnum.UNAVAILABLE, null, null, null, null);
 
     public AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock) {
         this(ledgers, routes, clock, AgentResultSpanObservation.disabled());
@@ -54,6 +74,13 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
 
     AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock,
                                AgentResultSpanObservation observation, boolean crossProcessSpanLinksEnabled) {
+        this(ledgers, routes, clock, observation, crossProcessSpanLinksEnabled, null);
+    }
+
+    AgentResultDeliveryHandler(Supplier<AgentLedgerService> ledgers, List<Route> routes, Clock clock,
+                               AgentResultSpanObservation observation, boolean crossProcessSpanLinksEnabled,
+                               AgentResultArtifactVerifier artifacts) {
+        this.artifacts = artifacts;
         this.observation = Objects.requireNonNull(observation, "observation");
         this.crossProcessSpanLinksEnabled = crossProcessSpanLinksEnabled;
         this.ledgers = Objects.requireNonNull(ledgers, "ledgers");
@@ -78,41 +105,54 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
         if (routes.keySet().stream().noneMatch(key -> key.sourceId().equals(sourceId) && key.destination().equals(destination))) throw invalid();
     }
 
+    boolean hasRuntimeRoute(OutboxAgentTerminalEventPublisher.RuntimeRouteVO route) {
+        var owner = route.owner();
+        return routes.containsKey(new Key(route.destination(), owner.tenantId(), route.sourceId(),
+                owner.issuerFingerprint(), owner.subjectId()));
+    }
+
     @Override public DeliveryResult deliver(DeliveryContext context) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) return retry("TIANJI_RESULT_DELIVERY_TRANSACTION");
-        AgentTerminalEvent event;
+        DeliveryEventVO event;
         Route route;
         try {
-            if (context == null || !channel().equals(context.channel()) || !"1".equals(context.schemaVersion())
-                    || !"application/json".equalsIgnoreCase(context.contentType()) || context.payload() == null
-                    || context.payload().getBytes(StandardCharsets.UTF_8).length > 16_384) throw invalid();
-            event = JSON.readValue(context.payload(), AgentTerminalEvent.class);
-            if (event == null || !event.eventId().equals(context.messageId())
-                    || !context.headers().equals(Map.of("tianji-event-fingerprint", event.fingerprint()))) throw invalid();
-            route = routes.get(new Key(context.destination(), event.tenantId(), event.link().sourceId(), event.ownerIssuerSha256(), event.ownerSubjectId()));
+            event = decode(context);
+            route = routes.get(new Key(context.destination(), event.tenantId(), event.sourceId(), event.ownerIssuer(), event.ownerSubject()));
             if (route == null) throw invalid();
         } catch (RuntimeException invalid) { return permanent("TIANJI_RESULT_ENVELOPE_INVALID"); }
-        if (context.deadline() == null) return permanent("TIANJI_RESULT_ENVELOPE_INVALID");
-        Duration remaining = Duration.between(clock.instant(), context.deadline());
-        Duration readBudget = remaining.minus(route.client().timeout()).minusMillis(100);
+        Duration readBudget = Duration.between(clock.instant(), context.deadline()).minus(route.client().timeout()).minusMillis(100);
         if (readBudget.compareTo(Duration.ofSeconds(1)) < 0) return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
         readBudget = readBudget.compareTo(Duration.ofSeconds(5)) > 0 ? Duration.ofSeconds(5) : readBudget;
         try {
-            var reference = Objects.requireNonNull(ledgers.get(), "ledger").terminalReference(route.owner(), new GetAgentRunQuery(event.runId()), readBudget);
-            if (reference.isEmpty() || !reference.get().equals(event)) return permanent("TIANJI_RESULT_REFERENCE_INVALID");
+            var ledger = Objects.requireNonNull(ledgers.get(), "ledger");
+            var query = new GetAgentRunQuery(event.runId());
+            boolean exact = event.runtime() == null
+                    ? ledger.terminalReference(route.owner(), query, readBudget).filter(event.legacy()::equals).isPresent()
+                    : ledger.terminalReferenceV2(route.owner(), query, readBudget).filter(event.runtime()::equals).isPresent();
+            if (!exact) return permanent("TIANJI_RESULT_REFERENCE_INVALID");
         } catch (RuntimeException unavailable) { return retry("TIANJI_RESULT_METADATA_UNAVAILABLE"); }
         if (TransactionSynchronizationManager.isActualTransactionActive()) return retry("TIANJI_RESULT_DELIVERY_TRANSACTION");
-        if (Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
-            return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
-        }
+        if (!hasDeliveryTime(route, context)) return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
+
         try (var delivery = observation.delivery(context.traceId())) {
             String traceLink = crossProcessSpanLinksEnabled ? delivery.wireCarrier() : null;
-            if (observation.isEnabled()
-                    && Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) < 0) {
+            ArtifactDeliveryProofVO proof = null;
+            if (event.runtime() != null) {
+                if (!route.currentTransport().getAsBoolean()) return permanent("TIANJI_RESULT_DELIVERY_REJECTED");
+                if (event.runtime().artifactRef() != null) {
+                    proof = verifyArtifact(route, event.runtime(), context);
+                    if (proof.evidence().decision() == DecisionEnum.DENY) return permanent("TIANJI_RESULT_ARTIFACT_DENIED");
+                    if (!proof.permits(clock.instant())) return retry("TIANJI_RESULT_ARTIFACT_UNAVAILABLE");
+                    if (!route.currentTransport().getAsBoolean()) return permanent("TIANJI_RESULT_DELIVERY_REJECTED");
+                }
+            }
+            if ((observation.isEnabled() || event.runtime() != null) && !hasDeliveryTime(route, context)) {
                 return retry("TIANJI_RESULT_DELIVERY_DEADLINE");
             }
-            var receipt = traceLink == null ? route.client().receive(event) : route.client().receive(event, traceLink);
-            if (receipt == null || !event.eventId().equals(receipt.eventId()) || !event.fingerprint().equals(receipt.eventFingerprint())) {
+            if (proof != null && !proof.permits(clock.instant())) return retry("TIANJI_RESULT_ARTIFACT_UNAVAILABLE");
+            var receipt = event.runtime() != null ? route.client().receiveV2(event.runtime(), event.original(), traceLink)
+                    : traceLink == null ? route.client().receive(event.legacy()) : route.client().receive(event.legacy(), traceLink);
+            if (receipt == null || !event.id().equals(receipt.eventId()) || !event.fingerprint().equals(receipt.eventFingerprint())) {
                 return permanent("TIANJI_RESULT_RECEIPT_INVALID");
             }
             // Every receipt state confirms durable reception; the Process Inbox owns application and recovery.
@@ -126,17 +166,74 @@ public final class AgentResultDeliveryHandler implements DeliveryHandler {
         } catch (RuntimeException unavailable) { return retry("TIANJI_RESULT_DELIVERY_UNAVAILABLE"); }
     }
 
+    private boolean hasDeliveryTime(Route route, DeliveryContext context) {
+        return Duration.between(clock.instant(), context.deadline()).compareTo(route.client().timeout().plusMillis(100)) >= 0;
+    }
+
+    private ArtifactDeliveryProofVO verifyArtifact(Route route, AgentTerminalEventV2 event, DeliveryContext context) {
+        if (artifacts == null) return new ArtifactDeliveryProofVO(null, ARTIFACT_UNAVAILABLE);
+        var now = clock.instant();
+        var limit = context.deadline().minus(route.client().timeout()).minusMillis(100);
+        var budget = now.plusSeconds(3);
+        var deadline = (budget.isBefore(limit) ? budget : limit).truncatedTo(ChronoUnit.MICROS);
+        if (!now.isBefore(deadline)) return new ArtifactDeliveryProofVO(null, ARTIFACT_UNAVAILABLE);
+        var query = new AgentResultArtifactQuery(AgentResultArtifactQuery.PurposeEnum.DELIVER_TERMINAL, route.owner(), event.link().sourceId(),
+                event.producerId(), route.destination(), event.runId(), event.nodeExecutionRef(), event.outputSchemaSha256(), event.artifactRef(), deadline);
+        // The registered verifier is guarded and cannot perform I/O under the preceding ledger snapshot.
+        var evidence = artifacts.verify(new AgentResultArtifactQuery(query.getPurpose(), query.getOwner(), query.getSourceId(),
+                query.getProducerId(), query.getDestinationId(), query.getRunId(), query.getNodeExecutionRef(),
+                query.getOutputSchemaSha256(), query.getArtifactRef(), query.getDeadlineAt()));
+        return new ArtifactDeliveryProofVO(query, Objects.requireNonNullElse(evidence, ARTIFACT_UNAVAILABLE));
+    }
+
+    private record ArtifactDeliveryProofVO(AgentResultArtifactQuery query, AgentResultArtifactEvidenceVO evidence) {
+        boolean permits(Instant now) { return evidence.permits(query, now); }
+    }
+
+    private DeliveryEventVO decode(DeliveryContext context) {
+        if (context == null || !channel().equals(context.channel()) || !"application/json".equalsIgnoreCase(context.contentType())
+                || context.payload() == null || context.deadline() == null) throw invalid();
+        byte[] original = context.payload().getBytes(StandardCharsets.UTF_8);
+        if (original.length == 0 || original.length > 16_384) throw invalid();
+        var decoded = switch (context.schemaVersion()) {
+            case "1" -> new DeliveryEventVO(JSON.readValue(context.payload(), AgentTerminalEvent.class), null, original);
+            case "2" -> {
+                var event = RUNTIME_JSON.readValue(context.payload(), AgentTerminalEventV2.class);
+                if (event == null || !Arrays.equals(event.canonicalBytes(), original)) throw invalid();
+                yield new DeliveryEventVO(null, event, original);
+            }
+            default -> throw invalid();
+        };
+        if (!decoded.id().equals(context.messageId())
+                || !Map.of("tianji-event-fingerprint", decoded.fingerprint()).equals(context.headers())) throw invalid();
+        return decoded;
+    }
+
+    private record DeliveryEventVO(AgentTerminalEvent legacy, AgentTerminalEventV2 runtime, byte[] original) {
+        String id() { return runtime == null ? legacy.eventId() : runtime.eventId(); }
+        String fingerprint() { return runtime == null ? legacy.fingerprint() : runtime.fingerprint(); }
+        long tenantId() { return runtime == null ? legacy.tenantId() : runtime.tenantId(); }
+        String sourceId() { return runtime == null ? legacy.link().sourceId() : runtime.link().sourceId(); }
+        String ownerIssuer() { return runtime == null ? legacy.ownerIssuerSha256() : runtime.ownerIssuerSha256(); }
+        String ownerSubject() { return runtime == null ? legacy.ownerSubjectId() : runtime.ownerSubjectId(); }
+        String runId() { return runtime == null ? legacy.runId() : runtime.runId(); }
+    }
+
     private static DeliveryResult retry(String code) { return DeliveryResult.retryableFailure(code, code); }
     private static DeliveryResult permanent(String code) { return DeliveryResult.permanentFailure(code, code); }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Agent result delivery route is invalid"); }
     private record Key(String destination, long tenantId, String sourceId, String ownerIssuer, String ownerSubject) { }
 
-    public record Route(String destination, String sourceId, TrustedAgentActor owner, HttpAgentResultClient client) {
+    public record Route(String destination, String sourceId, TrustedAgentActor owner, HttpAgentResultClient client,
+                        BooleanSupplier currentTransport) {
+        public Route(String destination, String sourceId, TrustedAgentActor owner, HttpAgentResultClient client) {
+            this(destination, sourceId, owner, client, () -> true);
+        }
         public Route {
             if (destination == null || !destination.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}") || sourceId == null
                     || !sourceId.matches("[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}") || owner == null
                     || owner.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(owner.issuerFingerprint())
-                    || client == null || client.timeout() == null || client.timeout().compareTo(Duration.ofMillis(100)) < 0
+                    || client == null || currentTransport == null || client.timeout() == null || client.timeout().compareTo(Duration.ofMillis(100)) < 0
                     || client.timeout().compareTo(Duration.ofSeconds(60)) > 0) throw invalid();
         }
     }
