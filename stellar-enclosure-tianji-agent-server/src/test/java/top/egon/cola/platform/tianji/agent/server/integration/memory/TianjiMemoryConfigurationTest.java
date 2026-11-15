@@ -1,11 +1,13 @@
 package top.egon.cola.platform.tianji.agent.server.integration.memory;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.validation.Validation;
 import jakarta.validation.Validator;
 import org.junit.jupiter.api.Test;
 import org.springframework.aop.framework.ProxyFactory;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.embedding.EmbeddingOptions;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
@@ -65,9 +67,14 @@ class TianjiMemoryConfigurationTest {
         try (var storage = mockConstruction(MemoryStorageVerifier.class);
              var validator = Validation.buildDefaultValidatorFactory()) {
             exactStore(configured(issuers), validator.getValidator())
+                    .withUserConfiguration(IdentityMapperConfiguration.class)
                     .withBean("tianjiMemoryAuthorization", MemoryAuthorization.class, () -> authority).run(context -> {
                 assertNull(context.getStartupFailure()); assertEquals(1, storage.constructed().size());
                 assertNotNull(context.getBean(PostgresMemoryService.class)); assertNotNull(context.getBean(MemoryIndexDeliveryHandler.class));
+                var fallback = context.getBean("tianjiMemoryOutboxMapper", ObjectMapper.class);
+                assertSame(fallback, context.getBean(IdentityMapperConsumer.class).mapper());
+                assertSame(fallback, context.getBeanProvider(ObjectMapper.class).getIfUnique());
+                assertEquals(1, context.getBeansOfType(ObjectMapper.class).size());
                 var converter = assertInstanceOf(LegacyMemoryFactConverterImpl.class, context.getBean("legacyMemoryFactConverter"));
                 assertEquals("legacyMemoryFactConverter", converter.getClass().getAnnotation(Component.class).value());
                 assertNotSame(context.getBean("jdbcMemoryStore"), context.getBean("tianjiHostMemoryStore"));
@@ -191,5 +198,15 @@ class TianjiMemoryConfigurationTest {
         var registry = mock(TrustedIssuerRegistry.class); when(registry.findByIssuer(ISSUER.toASCIIString())).thenReturn(Optional.of(new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER,
                 URI.create("https://idp.example/jwks"), "tenant:20", TrustedIssuerRegistry.RealmType.TENANT, "20", TrustedIssuerRegistry.Status.ACTIVE, 1))); return registry;
     }
+
+    private record IdentityMapperConsumer(ObjectMapper mapper) {}
+
+    static class IdentityMapperConfiguration {
+        @Bean
+        IdentityMapperConsumer identityMapperConsumer(@Qualifier("jacksonObjectMapper") ObjectMapper mapper) {
+            return new IdentityMapperConsumer(mapper);
+        }
+    }
+
     static class Registry { @Bean DeliveryHandlerRegistry handlers(MemoryIndexDeliveryHandler handler) { return new DeliveryHandlerRegistry(List.of(handler)); } }
 }

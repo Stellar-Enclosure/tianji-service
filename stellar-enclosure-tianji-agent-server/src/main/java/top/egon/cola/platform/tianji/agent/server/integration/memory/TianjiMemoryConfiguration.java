@@ -64,7 +64,7 @@ public class TianjiMemoryConfiguration {
         };
     }
 
-    @Bean
+    @Bean({"tianjiMemoryOutboxMapper", "jacksonObjectMapper"})
     @ConditionalOnMissingBean(ObjectMapper.class)
     ObjectMapper tianjiMemoryOutboxMapper() { return new ObjectMapper().findAndRegisterModules(); }
 
