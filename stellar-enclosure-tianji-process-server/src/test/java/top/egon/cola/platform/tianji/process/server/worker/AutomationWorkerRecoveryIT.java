@@ -32,6 +32,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.Wo
 import top.egon.cola.platform.tianji.process.server.AutomationControlFlowIT.Harness;
 import top.egon.cola.platform.tianji.process.server.api.WorkerController;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
+import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBindingStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionConverter;
@@ -62,6 +63,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -283,6 +285,96 @@ class AutomationWorkerRecoveryIT {
         }
     }
 
+    @Test
+    void cancellation_while_a_valid_worker_proof_is_pending_invalidates_the_observed_attempt() throws Exception {
+        String root = fixture.start(DEFINITION, "cancel-while-observing", 40);
+        var original = acquire(root);
+        var hardDeadline = deadline(root, 1);
+        try (var external = new TargetEndpoint(original.getEffectKey(), Set.of(1L), false)) {
+            assertUnknown(() -> worker(external.localUri(), external::resolve, original));
+            assertEquals(List.of("STARTED", "1"), effect(original));
+            assertEquals(List.of(1L), generations(original));
+            assertEquals(0, applied(original));
+            var failure = new AutomationWorkerFailureCommand(original.getTaskId(), original.getActivityOccurrenceId(),
+                    original.getNodeExecutionRef(), original.getLeaseToken(), "cancel-race-unknown",
+                    AutomationWorkerFailureCommand.KindEnum.UNKNOWN, "RESPONSE_LOST", null);
+            var originalReport = fixture.worker.failAutomation(fixture.external.actor(), failure);
+            assertEquals(AutomationWorkerReportDTO.OutcomeEnum.UNKNOWN, originalReport.getOutcome());
+            assertEquals("WAIT_RECOVERY", fixture.nodeState(root, "work"));
+            assertEquals(1, fixture.count(SCHEMA + ".act_ru_event_subscr", "WHERE proc_inst_id_=? AND event_type_='message'", root));
+
+            var request = retryRequest(root, original, "cancel-race-retry");
+            String nodeRevision = "SELECT revision FROM " + NODE + " WHERE tenant_id=? AND instance_id=? AND node_execution_ref=?";
+            long beforeRevision = fixture.owner.queryForObject(nodeRevision, Long.class,
+                    OWNER.tenantId(), root, original.getNodeExecutionRef());
+            String leaseSql = "SELECT * FROM " + LEASE + " WHERE tenant_id=? AND scope_id=? AND token_sha256=?";
+            var originalLease = fixture.owner.queryForMap(leaseSql, OWNER.tenantId(), root, original.leaseTokenSha256());
+            int observations = authorityCalls.get();
+            var observed = new CountDownLatch(1);
+            var releaseProof = new CountDownLatch(1);
+            var previousAuthority = authority.getAndSet(query -> {
+                assertRootAvailableToObserver(query);
+                assertWorkerEffectAvailableToObserver(query);
+                var proof = observedProof(query, original, 1);
+                assertEquals(WorkerEffectRecoveryProofVO.Status.NOT_APPLIED_FINAL, proof.status());
+                observed.countDown();
+                try {
+                    assertTrue(releaseProof.await(7, TimeUnit.SECONDS), "Cancellation must finish before returning the proof");
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError("Recovery proof observation was interrupted", interrupted);
+                }
+                assertTrue(processNow().isBefore(proof.validUntil()));
+                return proof;
+            });
+            try (var callers = Executors.newVirtualThreadPerTaskExecutor()) {
+                var pending = callers.submit(() -> ask(root, request));
+                try {
+                    assertTrue(observed.await(3, TimeUnit.SECONDS), "The authority must first observe the original attempt");
+                    callers.submit(() -> fixture.cancel(root)).get(4, TimeUnit.SECONDS);
+                    assertFalse(pending.isDone());
+                    assertEquals("CANCELLED", fixture.nodeState(root, "work"));
+                    assertEquals(beforeRevision + 1, fixture.owner.queryForObject(nodeRevision, Long.class,
+                            OWNER.tenantId(), root, original.getNodeExecutionRef()));
+                } finally {
+                    releaseProof.countDown();
+                }
+                var staleAttempt = assertThrows(ExecutionException.class, () -> pending.get(5, TimeUnit.SECONDS));
+                assertInstanceOf(ProcessVersionConflictException.class, staleAttempt.getCause());
+            } finally {
+                authority.set(previousAuthority);
+            }
+
+            assertEquals(observations + 1, authorityCalls.get());
+            assertEquals(1, fixture.count(NODE, "WHERE tenant_id=? AND instance_id=?", OWNER.tenantId(), root));
+            assertEquals(1, fixture.count(NODE, """
+                    WHERE tenant_id=? AND instance_id=? AND node_execution_ref=? AND attempt=1 AND state='CANCELLED'
+                      AND revision=? AND finished_at IS NOT NULL AND retry_command_id IS NULL
+                      AND retry_request_sha256 IS NULL AND worker_effect_recovery IS NULL
+                    """, OWNER.tenantId(), root, original.getNodeExecutionRef(), beforeRevision + 1));
+            assertEquals(hardDeadline, deadline(root, 1));
+            assertEquals(0, fixture.count(COMMAND, "WHERE tenant_id=? AND command_id=?", OWNER.tenantId(), request.getCommandId()));
+            assertEquals(1, fixture.count(SCHEMA + ".tianji_process_cancel_receipt", """
+                    WHERE tenant_id=? AND process_instance_id=? AND command_id=? AND accepted
+                    """, OWNER.tenantId(), root, "cancel-" + root));
+            assertEquals(1, fixture.count(LEASE, "WHERE tenant_id=? AND scope_id=?", OWNER.tenantId(), root));
+            assertEquals(originalLease, fixture.owner.queryForMap(leaseSql, OWNER.tenantId(), root, original.leaseTokenSha256()));
+            assertEquals(originalReport, fixture.worker.failAutomation(fixture.external.actor(), failure));
+
+            var management = fixture.process.getManagementService();
+            assertEquals(0, management.createExternalWorkerJobQuery().processInstanceId(root).count());
+            assertEquals(0, management.createTimerJobQuery().processInstanceId(root).count());
+            assertEquals(0, management.createJobQuery().processInstanceId(root).count());
+            assertEquals(0, fixture.count(SCHEMA + ".act_ru_event_subscr", "WHERE proc_inst_id_=?", root));
+            assertNull(fixture.process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root).singleResult());
+            assertNotNull(fixture.process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(root)
+                    .singleResult().getDeleteReason());
+            assertEquals(List.of("STARTED", "1"), effect(original));
+            assertEquals(List.of(1L), generations(original));
+            assertEquals(0, applied(original));
+        }
+    }
+
     private static void assertRootAvailableToObserver(WorkerEffectRecoveryQuery query) {
         var observer = fixture.owner.getDataSource();
         assertNotNull(observer);
@@ -293,6 +385,19 @@ class AutomationWorkerRecoveryIT {
                     SELECT instance_id FROM tianji_process.tianji_process_instance_binding
                     WHERE tenant_id=? AND instance_id=? FOR UPDATE NOWAIT
                     """, String.class, query.getActor().tenantId(), query.getInstanceId()));
+            status.setRollbackOnly();
+        });
+    }
+
+    private static void assertWorkerEffectAvailableToObserver(WorkerEffectRecoveryQuery query) {
+        var source = business.owner().getDataSource();
+        assertNotNull(source);
+        var transaction = new TransactionTemplate(new DataSourceTransactionManager(source));
+        transaction.setTimeout(2);
+        transaction.executeWithoutResult(status -> {
+            assertEquals(1L, business.owner().queryForObject("SELECT dispatch_generation FROM " + EFFECT
+                            + " WHERE tenant_id=? AND source_id=? AND effect_key=? FOR UPDATE NOWAIT",
+                    Long.class, query.getActor().tenantId(), query.getSourceId(), query.getEffectKey()));
             status.setRollbackOnly();
         });
     }
