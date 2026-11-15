@@ -1,7 +1,6 @@
 package top.egon.cola.platform.tianji.process.server.bridge;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.scheduling.TaskScheduler;
 
@@ -17,8 +16,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Separates new submission from maintenance, while persistent intents and Inbox rows retain cross-node authority. */
+@Slf4j
 public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoCloseable {
-    private static final Logger log = LoggerFactory.getLogger(ProcessAgentBridgePoller.class);
     private final List<AgentStartWorker> workers;
     private final List<AgentResultProducerRegistry.Registration> producers;
     private final AgentResultCorrelationService results;
@@ -32,6 +31,7 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
     private final Duration shutdownTimeout;
     private final int batchSize;
     private final boolean initialDispatch;
+    private final Runnable requireNativeReady;
     private final Object monitor = new Object();
     private final Set<Job> active = new HashSet<>();
     private boolean running;
@@ -49,6 +49,14 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
                                     AgentResultCorrelationService results, TaskScheduler dispatchScheduler, TaskScheduler maintenanceScheduler,
                                     Executor dispatchExecutor, Executor maintenanceExecutor, int maxDispatch, int maxMaintenance, int batchSize,
                                     Duration interval, Duration shutdownTimeout, boolean dispatchEnabled) {
+        this(workers, producers, results, dispatchScheduler, maintenanceScheduler, dispatchExecutor, maintenanceExecutor,
+                maxDispatch, maxMaintenance, batchSize, interval, shutdownTimeout, dispatchEnabled, () -> {});
+    }
+
+    ProcessAgentBridgePoller(List<AgentStartWorker> workers, List<AgentResultProducerRegistry.Registration> producers,
+                            AgentResultCorrelationService results, TaskScheduler dispatchScheduler, TaskScheduler maintenanceScheduler,
+                            Executor dispatchExecutor, Executor maintenanceExecutor, int maxDispatch, int maxMaintenance, int batchSize,
+                            Duration interval, Duration shutdownTimeout, boolean dispatchEnabled, Runnable requireNativeReady) {
         if (workers == null || workers.isEmpty() || workers.size() > 1000 || producers == null || producers.isEmpty() || producers.size() > 1000
                 || workers.stream().anyMatch(Objects::isNull) || producers.stream().anyMatch(Objects::isNull)
                 || maxDispatch < 1 || maxDispatch > 32 || maxMaintenance < 1 || maxMaintenance > 32 || batchSize < 1 || batchSize > 32
@@ -60,6 +68,7 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
         this.maintenanceScheduler = Objects.requireNonNull(maintenanceScheduler, "maintenanceScheduler");
         this.dispatchExecutor = Objects.requireNonNull(dispatchExecutor, "dispatchExecutor");
         this.maintenanceExecutor = Objects.requireNonNull(maintenanceExecutor, "maintenanceExecutor");
+        this.requireNativeReady = Objects.requireNonNull(requireNativeReady, "requireNativeReady");
         if (dispatchScheduler == maintenanceScheduler || dispatchExecutor == maintenanceExecutor) throw invalid();
         this.dispatchSlots = new Semaphore(maxDispatch); this.maintenanceSlots = new Semaphore(maxMaintenance);
         this.interval = interval; this.shutdownTimeout = shutdownTimeout; this.batchSize = batchSize; this.initialDispatch = dispatchEnabled;
@@ -70,6 +79,7 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
             if (running) return;
             if (closed) throw new IllegalStateException("Process Agent bridge is closed");
             if (!active.isEmpty() || dispatchTick || maintenanceTick) throw new IllegalStateException("Process Agent bridge has unfinished prior operations");
+            requireNativeReady.run();
             running = true; dispatching = initialDispatch; long current = ++generation;
             try {
                 maintenanceFuture = Objects.requireNonNull(maintenanceScheduler.scheduleWithFixedDelay(() -> maintain(current), interval));
@@ -189,6 +199,7 @@ public final class ProcessAgentBridgePoller implements SmartLifecycle, AutoClose
         catch (RuntimeException failure) { log.warn("Process Agent bridge unschedule failed: type={}", failure.getClass().getName()); }
     }
     @Override public boolean isRunning() { synchronized (monitor) { return running; } }
+    // Flowable starts its native executor in an earlier SmartLifecycle phase.
     @Override public int getPhase() { return Integer.MAX_VALUE - 100; }
     @Override public void close() { stop(); }
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("Process Agent bridge polling settings are invalid"); }

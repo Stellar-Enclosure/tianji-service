@@ -43,6 +43,30 @@ class ProcessAgentBridgePollerTest {
     }
 
     @Test
+    void failed_start_readiness_does_not_schedule_and_can_be_retried() {
+        var requireReady = mock(Runnable.class);
+        var unavailable = new IllegalStateException("controlled native executor not ready");
+        doThrow(unavailable).doNothing().when(requireReady).run();
+        try (var poller = new ProcessAgentBridgePoller(List.of(first), List.of(producer), results, dispatchScheduler, maintenanceScheduler,
+                newWork::add, upkeep::add, 1, 1, 4, Duration.ofSeconds(1), Duration.ZERO, true, requireReady)) {
+            assertSame(unavailable, assertThrows(IllegalStateException.class, poller::start));
+            assertFalse(poller.isRunning());
+            assertFalse(poller.isDispatching());
+            verifyNoInteractions(dispatchScheduler, maintenanceScheduler);
+
+            poller.start();
+            poller.start();
+            assertTrue(poller.isRunning());
+            assertTrue(poller.isDispatching());
+            var order = inOrder(requireReady, maintenanceScheduler, dispatchScheduler);
+            order.verify(requireReady, times(2)).run();
+            order.verify(maintenanceScheduler).scheduleWithFixedDelay(any(Runnable.class), eq(Duration.ofSeconds(1)));
+            order.verify(dispatchScheduler).scheduleWithFixedDelay(any(Runnable.class), eq(Duration.ofSeconds(1)));
+            order.verifyNoMoreInteractions();
+        }
+    }
+
+    @Test
     void saturated_dispatch_keeps_the_next_cursor_and_never_duplicates_in_flight_workers() {
         try (var poller = poller()) {
             poller.start(); dispatch.get().run(); dispatch.get().run();

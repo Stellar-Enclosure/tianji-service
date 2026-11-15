@@ -108,7 +108,7 @@ public class ProcessAgentBridgeConfiguration {
         return new AgentResultCorrelationService(process, workers, inbox, properties.inboxRetryDelay(), properties.inboxMaxFailures(), typed);
     }
 
-    @Bean(destroyMethod = "close")
+    @Bean(name = "tianjiProcessAgentBridgeResources", destroyMethod = "close")
     BridgeResources tianjiProcessAgentBridgeResources(ProcessEngine engine, FlowableWorkerService workers, AgentDispatchStore dispatches,
             WorkerTopicRegistry topics, AgentResultProducerRegistry producers, AgentResultInboxProperties inbox,
             ProcessAgentBridgeProperties properties, RuntimeProperties runtime,
@@ -116,7 +116,7 @@ public class ProcessAgentBridgeConfiguration {
             @Qualifier("automationInstanceGuardCommandInterceptor") ObjectProvider<AutomationInstanceGuardCommandInterceptor> guards,
             IdpStarterProperties starter, TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth) {
         var process = configuration(engine);
-        WorkerNativeAvailability.require(process);
+        WorkerNativeAvailability.requireConfigured(process);
         FlowableAgentWaitInspector.requireHistory(process);
         if (!(process.getTransactionManager() instanceof DataSourceTransactionManager manager) || manager.getDataSource() == null) throw invalid();
         workers.requireStorage(process, manager, topics);
@@ -160,15 +160,17 @@ public class ProcessAgentBridgeConfiguration {
                 new RuntimeProperties(List.of()), ignored -> null, null, starter, issuers, oauth);
     }
 
-    @Bean(destroyMethod = "close")
-    ProcessAgentBridgePoller tianjiProcessAgentBridgePoller(BridgeResources resources, AgentResultProducerRegistry producers,
+    @Bean(name = "tianjiProcessAgentBridgePoller", destroyMethod = "close")
+    ProcessAgentBridgePoller tianjiProcessAgentBridgePoller(ProcessEngine engine, BridgeResources resources, AgentResultProducerRegistry producers,
             AgentResultInboxProperties inbox, AgentResultCorrelationService results, ProcessAgentBridgeProperties properties) {
+        var process = configuration(engine);
         var registrations = inbox.registrations();
         registrations.forEach(producers::require);
         return new ProcessAgentBridgePoller(resources.workers, registrations, results,
                 new ConcurrentTaskScheduler(resources.dispatchScheduler), new ConcurrentTaskScheduler(resources.maintenanceScheduler),
                 resources.dispatchExecutor, resources.maintenanceExecutor, properties.dispatchConcurrency(), properties.maintenanceConcurrency(),
-                properties.inboxBatchSize(), properties.pollInterval(), properties.shutdownTimeout(), properties.dispatchEnabled());
+                properties.inboxBatchSize(), properties.pollInterval(), properties.shutdownTimeout(), properties.dispatchEnabled(),
+                () -> WorkerNativeAvailability.require(process));
     }
 
     static void validateBindings(ProcessAgentBridgeProperties properties, WorkerTopicRegistry topics, AgentResultProducerRegistry producers,

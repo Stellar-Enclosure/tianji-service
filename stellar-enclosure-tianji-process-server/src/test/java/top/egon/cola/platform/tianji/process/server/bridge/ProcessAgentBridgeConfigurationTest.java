@@ -132,38 +132,18 @@ class ProcessAgentBridgeConfigurationTest {
     }
 
     @Test
-    void spring_assembles_and_disposes_the_bridge_without_a_cycle_or_starting_pollers() {
+    void spring_assembles_and_disposes_the_bridge_before_native_execution_is_active() {
         var engine = initializedEngine();
+        var process = (SpringProcessEngineConfiguration) engine.getProcessEngineConfiguration();
+        var nativeExecutor = process.getAsyncExecutor();
+        when(nativeExecutor.isActive()).thenReturn(false);
         var workers = mock(FlowableWorkerService.class);
         var dispatches = mock(AgentDispatchStore.class);
         var reception = mock(AgentResultInbox.class);
         var oauth = mock(IdpServiceOAuth2Client.class);
         when(oauth.authorizationKey(any())).thenAnswer(call -> ServiceAuthorizationKey.from(call.getArgument(0), ISSUER.toString(), "process-worker", 1));
         try (var clients = mockConstruction(HttpLinkedAgentClient.class)) {
-            new ApplicationContextRunner().withUserConfiguration(ProcessAgentBridgeConfiguration.class)
-                    .withBean("lifecycleProcessor", LifecycleProcessor.class, () -> mock(LifecycleProcessor.class))
-                    .withBean(ProcessEngine.class, () -> engine).withBean(FlowableWorkerService.class, () -> workers)
-                    .withBean(AgentDispatchStore.class, () -> dispatches).withBean(AgentResultInbox.class, () -> reception)
-                    .withBean(WorkerTopicRegistry.class, () -> topics(Duration.ofSeconds(15)))
-                    .withBean(AgentResultProducerRegistry.class, () -> producers).withBean(AgentResultInboxProperties.class, () -> inbox)
-                    .withBean(IdpStarterProperties.class, () -> starter).withBean(TrustedIssuerRegistry.class, () -> issuers)
-                    .withBean(IdpServiceOAuth2Client.class, () -> oauth)
-                    .withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.worker.enabled=true",
-                            "stellar.tianji.process.agent-results.enabled=true", "stellar.tianji.process.agent-bridge.enabled=true",
-                            "stellar.tianji.process.agent-bridge.dispatch-enabled=false",
-                            "stellar.tianji.process.agent-bridge.bindings[0].tenant-id=20",
-                            "stellar.tianji.process.agent-bridge.bindings[0].issuer=" + ISSUER,
-                            "stellar.tianji.process.agent-bridge.bindings[0].subject-id=process-worker",
-                            "stellar.tianji.process.agent-bridge.bindings[0].source-id=process-east",
-                            "stellar.tianji.process.agent-bridge.bindings[0].topic=agent-start",
-                            "stellar.tianji.process.agent-bridge.bindings[0].schema-version=1",
-                            "stellar.tianji.process.agent-bridge.bindings[0].definition-key=assistant",
-                            "stellar.tianji.process.agent-bridge.bindings[0].definition-version=1",
-                            "stellar.tianji.process.agent-bridge.bindings[0].definition-content-sha256=" + "a".repeat(64),
-                            "stellar.tianji.process.agent-bridge.bindings[0].instruction=Review the provided inputs",
-                            "stellar.tianji.process.agent-bridge.bindings[0].base-uri=https://agent.example/",
-                            "stellar.tianji.process.agent-bridge.bindings[0].resource-uri=" + RESOURCE,
-                            "stellar.tianji.process.agent-bridge.bindings[0].registration-id=agent-client")
+            bridgeContext(engine, workers, dispatches, reception, oauth)
                     .run(context -> {
                         assertNull(context.getStartupFailure());
                         assertFalse(context.getBean(ProcessAgentBridgePoller.class).isRunning());
@@ -171,12 +151,94 @@ class ProcessAgentBridgeConfigurationTest {
                         assertFalse(context.getBean(ProcessAgentBridgeProperties.class).dispatchEnabled());
                         verify(reception).requireBindings(dispatches, producers);
                         verify(oauth, never()).authorizeBounded(any(), anyString(), any());
-                        var process = (SpringProcessEngineConfiguration) engine.getProcessEngineConfiguration();
+                        verify(nativeExecutor, never()).isActive();
                         verifyNoInteractions(((DataSourceTransactionManager) process.getTransactionManager()).getDataSource());
                     });
             assertEquals(1, clients.constructed().size());
             verify(clients.constructed().getFirst()).close();
         }
+    }
+
+    @Test
+    void bridge_requires_the_native_executor_at_start_even_when_dispatch_is_disabled() {
+        var engine = initializedEngine();
+        var process = (SpringProcessEngineConfiguration) engine.getProcessEngineConfiguration();
+        var nativeExecutor = process.getAsyncExecutor();
+        var oauth = mock(IdpServiceOAuth2Client.class);
+        when(oauth.authorizationKey(any())).thenAnswer(call -> ServiceAuthorizationKey.from(call.getArgument(0), ISSUER.toString(), "process-worker", 1));
+        try (var clients = mockConstruction(HttpLinkedAgentClient.class)) {
+            bridgeContext(engine, mock(FlowableWorkerService.class), mock(AgentDispatchStore.class), mock(AgentResultInbox.class), oauth)
+                    .run(context -> {
+                        assertNull(context.getStartupFailure());
+                        var poller = context.getBean(ProcessAgentBridgePoller.class);
+                        assertTrue(poller.getPhase() > new SpringProcessEngineConfiguration().getPhase());
+                        when(nativeExecutor.isActive()).thenReturn(false);
+
+                        var failure = assertThrows(IllegalStateException.class, poller::start);
+                        assertEquals("Worker acquisition requires the native job executor and expired-lock reset", failure.getMessage());
+                        assertFalse(poller.isRunning());
+                        assertFalse(poller.isDispatching());
+
+                        when(nativeExecutor.isActive()).thenReturn(true);
+                        poller.start();
+                        assertTrue(poller.isRunning());
+                        assertFalse(poller.isDispatching());
+                    });
+            assertEquals(1, clients.constructed().size());
+        }
+    }
+
+    @Test
+    void bridge_resources_reject_disabled_native_acquisition_and_expired_lock_reset() {
+        var engine = initializedEngine();
+        var process = (SpringProcessEngineConfiguration) engine.getProcessEngineConfiguration();
+        var nativeJobs = process.getAsyncExecutorConfiguration();
+        var workers = mock(FlowableWorkerService.class);
+        var dispatches = mock(AgentDispatchStore.class);
+        var oauth = mock(IdpServiceOAuth2Client.class);
+        Runnable assembly = () -> configuration.tianjiProcessAgentBridgeResources(engine, workers, dispatches, topics(Duration.ofSeconds(15)),
+                producers, inbox, properties(), starter, issuers, oauth);
+
+        when(process.isAsyncExecutorActivate()).thenReturn(false);
+        assertEquals("Worker acquisition requires the native job executor and expired-lock reset",
+                assertThrows(IllegalStateException.class, assembly::run).getMessage());
+        when(process.isAsyncExecutorActivate()).thenReturn(true);
+        when(nativeJobs.isAsyncJobAcquisitionEnabled()).thenReturn(false);
+        assertEquals("Worker acquisition requires the native job executor and expired-lock reset",
+                assertThrows(IllegalStateException.class, assembly::run).getMessage());
+        when(nativeJobs.isAsyncJobAcquisitionEnabled()).thenReturn(true);
+        when(nativeJobs.isResetExpiredJobEnabled()).thenReturn(false);
+        assertEquals("Worker acquisition requires the native job executor and expired-lock reset",
+                assertThrows(IllegalStateException.class, assembly::run).getMessage());
+        verifyNoInteractions(workers, dispatches, oauth);
+    }
+
+    private ApplicationContextRunner bridgeContext(ProcessEngine engine, FlowableWorkerService workers, AgentDispatchStore dispatches,
+            AgentResultInbox reception, IdpServiceOAuth2Client oauth) {
+        return new ApplicationContextRunner().withUserConfiguration(ProcessAgentBridgeConfiguration.class)
+                .withBean("lifecycleProcessor", LifecycleProcessor.class, () -> mock(LifecycleProcessor.class))
+                .withBean(ProcessEngine.class, () -> engine).withBean(FlowableWorkerService.class, () -> workers)
+                .withBean(AgentDispatchStore.class, () -> dispatches).withBean(AgentResultInbox.class, () -> reception)
+                .withBean(WorkerTopicRegistry.class, () -> topics(Duration.ofSeconds(15)))
+                .withBean(AgentResultProducerRegistry.class, () -> producers).withBean(AgentResultInboxProperties.class, () -> inbox)
+                .withBean(IdpStarterProperties.class, () -> starter).withBean(TrustedIssuerRegistry.class, () -> issuers)
+                .withBean(IdpServiceOAuth2Client.class, () -> oauth)
+                .withPropertyValues("stellar.tianji.process.api.enabled=true", "stellar.tianji.process.worker.enabled=true",
+                        "stellar.tianji.process.agent-results.enabled=true", "stellar.tianji.process.agent-bridge.enabled=true",
+                        "stellar.tianji.process.agent-bridge.dispatch-enabled=false",
+                        "stellar.tianji.process.agent-bridge.bindings[0].tenant-id=20",
+                        "stellar.tianji.process.agent-bridge.bindings[0].issuer=" + ISSUER,
+                        "stellar.tianji.process.agent-bridge.bindings[0].subject-id=process-worker",
+                        "stellar.tianji.process.agent-bridge.bindings[0].source-id=process-east",
+                        "stellar.tianji.process.agent-bridge.bindings[0].topic=agent-start",
+                        "stellar.tianji.process.agent-bridge.bindings[0].schema-version=1",
+                        "stellar.tianji.process.agent-bridge.bindings[0].definition-key=assistant",
+                        "stellar.tianji.process.agent-bridge.bindings[0].definition-version=1",
+                        "stellar.tianji.process.agent-bridge.bindings[0].definition-content-sha256=" + "a".repeat(64),
+                        "stellar.tianji.process.agent-bridge.bindings[0].instruction=Review the provided inputs",
+                        "stellar.tianji.process.agent-bridge.bindings[0].base-uri=https://agent.example/",
+                        "stellar.tianji.process.agent-bridge.bindings[0].resource-uri=" + RESOURCE,
+                        "stellar.tianji.process.agent-bridge.bindings[0].registration-id=agent-client");
     }
 
     private static ProcessEngine initializedEngine() {
