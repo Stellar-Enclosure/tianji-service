@@ -13,6 +13,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.web.server.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
@@ -137,6 +138,7 @@ public final class AutomationProcessAcceptanceMain {
             environment.getPropertySources().remove(StandardEnvironment.SYSTEM_PROPERTIES_PROPERTY_SOURCE_NAME);
             var application = new SpringApplicationBuilder(FixtureConfiguration.class, TianjiProcessServerApplication.class)
                     .environment(environment).web(WebApplicationType.SERVLET)
+                    .profiles("tianji-automation-acceptance-fixture")
                     .initializers(context -> context.getBeanFactory().registerSingleton("automationProcessFixtureSettings", fixture));
             try {
                 var context = application.run("--spring.config.location=classpath:/application.yml," + config.toUri(),
@@ -165,6 +167,7 @@ public final class AutomationProcessAcceptanceMain {
     }
 
     @TestConfiguration(proxyBeanMethods = false)
+    @Profile("tianji-automation-acceptance-fixture")
     static class FixtureConfiguration {
         @Bean("automationReleaseDependencies")
         FixtureDependencies automationReleaseDependencies(@Qualifier("automationProcessFixtureSettings") FixtureSettings settings,

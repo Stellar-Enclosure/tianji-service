@@ -19,6 +19,7 @@ import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.web.server.servlet.context.ServletWebServerApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Profile;
 import org.springframework.context.support.GenericApplicationContext;
 import org.springframework.core.env.MapPropertySource;
 import org.springframework.core.env.StandardEnvironment;
@@ -128,6 +129,7 @@ public final class AutomationAgentAcceptanceMain {
             var context = new SpringApplicationBuilder(TianjiAgentServerApplication.class, FixtureConfiguration.class)
                     .web(WebApplicationType.SERVLET)
                     .environment(environment)
+                    .profiles("tianji-automation-acceptance-fixture")
                     .initializers(application -> {
                         var registry = (GenericApplicationContext) application;
                         registry.registerBean("automationFixtureAgentSettings", AgentSettingsVO.class, () -> settings);
@@ -151,6 +153,7 @@ public final class AutomationAgentAcceptanceMain {
     }
 
     @TestConfiguration(proxyBeanMethods = false)
+    @Profile("tianji-automation-acceptance-fixture")
     static class FixtureConfiguration {
         @Bean("automationFixtureChatModel")
         ChatModel automationFixtureChatModel(@Qualifier("automationFixtureAgentSettings") AgentSettingsVO settings) {
