@@ -425,7 +425,8 @@ public class ProcessSecurityConfiguration {
     IdpEndpointAuthenticationPolicy processEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
                 List.of("/api/tianji/v1/worker-tasks", "/api/tianji/v1/worker-tasks/**", "/api/tianji/v1/agent-result-inbox", ApprovalClient.PATH,
-                        WorkerController.ACQUIRE_AUTOMATION_PATH, WorkerController.COMPLETE_AUTOMATION_PATH, WorkerController.FAIL_AUTOMATION_PATH),
+                        WorkerController.ACQUIRE_AUTOMATION_PATH, WorkerController.COMPLETE_AUTOMATION_PATH, WorkerController.FAIL_AUTOMATION_PATH,
+                        ProcessEventController.EVENTS_PATH),
                 List.of("/api/tianji/v1/process-releases", "/api/tianji/v1/process-releases/**",
                         "/api/tianji/v1/process-instances", "/api/tianji/v1/process-instances/**",
                         "/api/tianji/v1" + ProcessController.CORRELATION_PATH, ProcessStartReceiptController.PATH,
@@ -435,7 +436,7 @@ public class ProcessSecurityConfiguration {
                         ProcessAutomationController.RELEASES_PATH, ProcessAutomationController.RELEASE_PATH,
                         ProcessActivationController.PATH, ProcessAutomationController.INSTANCES_PATH,
                         ProcessAutomationController.INSTANCE_PATH, ProcessNodeExecutionController.PATH, ProcessNodeExecutionController.RETRY_PATH,
-                        EngineTaskController.TASK_PATH, EngineTaskController.COMPLETION_PATH), true);
+                        EngineTaskController.TASK_PATH, EngineTaskController.COMPLETION_PATH, ProcessEventController.RECEIPT_PATH), true);
     }
 
     @Bean

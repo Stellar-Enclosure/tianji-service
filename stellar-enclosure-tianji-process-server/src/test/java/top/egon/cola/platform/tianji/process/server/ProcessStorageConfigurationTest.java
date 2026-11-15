@@ -36,6 +36,7 @@ import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExe
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterAutoConfiguration;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement;
 
 import javax.sql.DataSource;
 import java.nio.charset.StandardCharsets;
@@ -44,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -491,6 +493,22 @@ class ProcessStorageConfigurationTest {
             assertEquals(status, response.getStatus());
             assertEquals("{\"original\":true}", response.getContentAsString(StandardCharsets.UTF_8));
         }
+    }
+
+    @Test
+    void event_routes_select_the_contract_bearer_principals() {
+        var policy = new ProcessSecurityConfiguration().processEndpointAuthenticationPolicy();
+        assertAll(
+                () -> assertEquals(Requirement.SERVICE,
+                        policy.requirement(recoveryRequest("POST", "/api/tianji/v2/process-events")), "API-007"),
+                () -> assertEquals(Requirement.USER_OR_SERVICE,
+                        policy.requirement(recoveryRequest("GET", "/api/tianji/v2/process-event-receipts/er-1")), "API-008"),
+                () -> assertEquals(Requirement.USER,
+                        policy.requirement(recoveryRequest("GET", "/api/tianji/v2/process-event-receipts/er-1/extra"))),
+                () -> assertEquals(Requirement.USER_OR_SERVICE,
+                        policy.requirement(recoveryRequest("GET", "/api/tianji/v1/process-start-receipts"))),
+                () -> assertEquals(Requirement.SERVICE,
+                        policy.requirement(recoveryRequest("POST", "/api/tianji/v1/worker-tasks/acquire"))));
     }
 
     private static List<String> ownerReadPaths() {
