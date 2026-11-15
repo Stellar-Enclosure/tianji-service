@@ -1,13 +1,7 @@
 package top.egon.cola.platform.tianji.process.server.bridge;
 
-import org.flowable.bpmn.model.BaseElement;
-import org.flowable.bpmn.model.ServiceTask;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
 import org.flowable.engine.RepositoryService;
-import org.flowable.engine.delegate.DelegateExecution;
-import org.flowable.engine.impl.bpmn.behavior.AbstractBpmnActivityBehavior;
-import org.flowable.engine.impl.bpmn.parser.BpmnParse;
-import org.flowable.engine.parse.BpmnParseHandler;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.flowable.spring.boot.EngineConfigurationConfigurer;
 import org.flywaydb.core.Flyway;
@@ -32,21 +26,24 @@ import org.springframework.jdbc.datasource.DriverManagerDataSource;
 import org.springframework.mock.env.MockEnvironment;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
-import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceipt;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentResultReceiptStateEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessAgentOutcomesQuery;
-import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessAgentOutcomePageDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerAcquireStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerEffectSafetyEnum;
-import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcomeEnum;
-import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.RuntimeProfileEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TemplateConfigurationVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TemplateDependencyRefVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTerminalEventV2;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationModelSourceVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationStartCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.NodePolicyVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
@@ -64,7 +61,6 @@ import top.egon.cola.platform.tianji.process.server.execution.ProcessInstanceBin
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionBO;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionStore;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeLifecycleListener;
-import top.egon.cola.platform.tianji.process.server.execution.ProcessRequestDigest;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessExecutionService;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
 import top.egon.cola.platform.tianji.process.server.release.AutomationActivationConverter;
@@ -84,7 +80,6 @@ import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftBO
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftContentCodec;
 import top.egon.cola.platform.tianji.process.server.release.draft.ProcessDraftStore;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
-import top.egon.cola.platform.tianji.process.server.worker.WorkerLeaseStore;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 
 import java.nio.charset.StandardCharsets;
@@ -96,14 +91,11 @@ import java.security.Signature;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
-import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Collection;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -111,7 +103,6 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStoreTest.ACTOR;
-import static top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStoreTest.binding;
 import static top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStoreTest.seed;
 import static top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistryTest.PRODUCER;
 import static top.egon.cola.platform.tianji.process.server.bridge.AgentResultProducerRegistryTest.event;
@@ -331,8 +322,12 @@ class AgentResultInboxTest {
                     "--spring.datasource.username=" + role, "--flowable.database-schema-update=true",
                     "--egon.cola.component.transactional-outbox.enabled=false", "--spring.main.banner-mode=off");
         }
-        return new SpringApplicationBuilder(TianjiProcessServerApplication.class, FixtureDispatch.class).web(WebApplicationType.NONE).run(
-                "--spring.datasource.url=" + url, "--spring.datasource.username=" + role, "--spring.main.banner-mode=off");
+        return new SpringApplicationBuilder(TianjiProcessServerApplication.class, FixtureJobScheduling.class).web(WebApplicationType.NONE).run(
+                "--spring.datasource.url=" + url, "--spring.datasource.username=" + role, "--spring.main.banner-mode=off",
+                "--flowable.async-executor-activate=true",
+                "--flowable.process.async.executor.default-timer-job-acquire-wait-time=PT5M",
+                "--flowable.process.async.executor.default-async-job-acquire-wait-time=PT5M",
+                "--flowable.process.async.executor.reset-expired-jobs-interval=PT5M");
     }
 
     private record NativeDatabaseVO(JdbcTemplate owner, String url, String role) {
@@ -344,32 +339,12 @@ class AgentResultInboxTest {
     static class NativeInstaller { }
 
     @Configuration(proxyBeanMethods = false)
-    static class FixtureDispatch {
-        /** Stands in only for Step 37's outbound writer and ACK. Native waits and results use production behavior. */
-        private Consumer<DelegateExecution> dispatch;
-
+    static class FixtureJobScheduling {
         @Bean
         @Order(Ordered.HIGHEST_PRECEDENCE)
-        EngineConfigurationConfigurer<SpringProcessEngineConfiguration> compiledAgentDispatchFixture() {
-            return config -> {
-                var handlers = new ArrayList<BpmnParseHandler>();
-                if (config.getPostBpmnParseHandlers() != null) handlers.addAll(config.getPostBpmnParseHandlers());
-                handlers.add(new BpmnParseHandler() {
-                    @Override public Collection<Class<? extends BaseElement>> getHandledTypes() { return List.of(ServiceTask.class); }
-
-                    @Override public void parse(BpmnParse parse, BaseElement element) {
-                        if (element instanceof ServiceTask task && "${tianjiAutomationAgentDispatch}".equals(task.getImplementation())) {
-                            task.setBehavior(new AbstractBpmnActivityBehavior() {
-                                @Override public void execute(DelegateExecution current) {
-                                    dispatch.accept(current);
-                                    leave(current);
-                                }
-                            });
-                        }
-                    }
-                });
-                config.setPostBpmnParseHandlers(List.copyOf(handlers));
-            };
+        EngineConfigurationConfigurer<SpringProcessEngineConfiguration> fixtureJobScheduling() {
+            // Keep Flowable's live native Worker support while stepping this fixture's jobs explicitly.
+            return config -> config.setEnabledJobCategories(List.of("fixture-manual-jobs"));
         }
     }
 
@@ -377,6 +352,12 @@ class AgentResultInboxTest {
         private static final String DEFINITION = "typedAgentFlow";
         private static final String RELEASE = "native-agent-release";
         private static final String NODE = "review";
+        private static final String SOURCE = "process-east";
+        private static final AgentDispatchStore.TypedRoute ROUTE =
+                new AgentDispatchStore.TypedRoute(ACTOR, SOURCE, Duration.ofSeconds(10), Duration.ofSeconds(30));
+        private static final Map<String, Object> APPROVAL = Map.of("approved", Map.of("type", "boolean"));
+        private static final ProcessSchemaVO EMPTY = schema(Map.of(), List.of());
+        private static final ProcessSchemaVO REQUIRED_APPROVAL = schema(APPROVAL, List.of("approved"));
         private static final ProcessActor STARTER = ProcessActor.verified(ACTOR.tenantId(), ProcessActor.SubjectType.USER,
                 "fixture-start-owner", "https://idp.example/20");
         private static final String XML = """
@@ -395,7 +376,7 @@ class AgentResultInboxTest {
         private final TransactionTemplate transaction;
         private final ProcessNodeExecutionStore nodes;
         private final AgentDispatchStore dispatches;
-        private final WorkerLeaseStore leases;
+        private final FlowableWorkerService workers;
         private final AutomationReleaseStore releases;
         private final ProcessReleaseService releaseService;
         private final AutomationActivationService activation;
@@ -404,8 +385,13 @@ class AgentResultInboxTest {
         private final AgentResultInbox inbox;
         private final AgentResultCorrelationService correlation;
         private final ProcessLinkedAgentOutcomeQuery outcomes;
-        private AutomationReleaseStore.ImmutableReleaseVO release;
-        private VerifiedProcessModels.VerifiedAutomationModelsVO verified;
+        private final AgentRuntimeTemplateCommand runtimeTemplate = new AgentRuntimeTemplateCommand(
+                "research", 2, RuntimeProfileEnum.RUNTIME_V2, "fixture-executor", EMPTY, REQUIRED_APPROVAL, EMPTY,
+                new TemplateConfigurationVO(new TemplateDependencyRefVO("fixture-instruction", 1, "a".repeat(64)),
+                        "fixture-model", List.of(), null),
+                new TechnicalLimitsVO(Duration.ofSeconds(90), Duration.ofSeconds(20), Duration.ofSeconds(10), 2, 1, 1, 2048, 100));
+        private final AgentTaskBindingVO.TemplateRefVO template = new AgentTaskBindingVO.TemplateRefVO(
+                runtimeTemplate.getTemplateKey(), runtimeTemplate.getTemplateVersion(), runtimeTemplate.contentSha256());
 
         private NativeFixture(ConfigurableApplicationContext app, NativeDatabaseVO database) throws GeneralSecurityException {
             this.database = database;
@@ -423,15 +409,17 @@ class AgentResultInboxTest {
             var validator = new ProcessModelValidator();
             releaseService = new ProcessReleaseService(process, dmn, validator);
             dispatches = new AgentDispatchStore(source, manager, SCHEMA);
-            leases = new WorkerLeaseStore(source, manager, SCHEMA);
-            registration = new AgentResultProducerRegistry.Registration(PRODUCER, "agent-east", "process-east", ACTOR);
+            registration = new AgentResultProducerRegistry.Registration(PRODUCER, "agent-east", SOURCE, ACTOR);
             var producers = new AgentResultProducerRegistry(List.of(registration));
             inbox = new AgentResultInbox(source, manager, SCHEMA, dispatches, producers, Duration.ofHours(1));
             outcomes = new ProcessLinkedAgentOutcomeQuery(source, manager, SCHEMA, dispatches, inbox, producers, List.of(registration));
-            var workers = new FlowableWorkerService(process, dmn, validator, new WorkerTopicRegistry(List.of(),
+            var topics = new WorkerTopicRegistry(List.of(),
                     List.of(new WorkerTopicRegistry.AutomationRegistrationVO(ACTOR.tenantId(), "https://idp.example/20", "fixture-worker",
                             "fixture-worker-source", "unusedFixtureCapability", 1, "a".repeat(64), "b".repeat(64),
-                            WorkerEffectSafetyEnum.READ_ONLY, "fixture-handler", "fixture-target", 1, Duration.ofSeconds(30)))));
+                            WorkerEffectSafetyEnum.READ_ONLY, "fixture-handler", "fixture-target", 1, Duration.ofSeconds(30))));
+            workers = new FlowableWorkerService(process, dmn, validator, topics,
+                    new FlowableWorkerService.AutomationWorkerParticipants(bindings, releases, guard, nodes,
+                            app.getBean(ProcessNodeLifecycleListener.class)));
             var inspector = new FlowableAgentWaitInspector(process, releaseService, new VerifiedProcessModels(process, dmn, validator));
             correlation = new AgentResultCorrelationService(process, workers, inbox, Duration.ofMillis(200), 5,
                     new AgentResultCorrelationService.TypedParticipantsVO(guard, releases, releaseService, nodes, inspector));
@@ -440,37 +428,37 @@ class AgentResultInboxTest {
             var activationStore = new AutomationActivationStore(jdbc, SCHEMA);
             var authority = new TestAuthority(database, releases);
             var host = new StaticListableBeanFactory(Map.of("authorization", (AutomationAdmissionAuthority) authority::proof,
-                    "signatures", (AutomationReleaseTrustVerifier.TrustAuthority) authority::signed));
+                    "signatures", (AutomationReleaseTrustVerifier.TrustAuthority) authority::signed,
+                    "routes", (ProcessAgentBridgeConfiguration.TypedRouteProvider) tenant -> tenant == ACTOR.tenantId() ? ROUTE : null,
+                    "templates", (ProcessExecutionService.AgentTemplateAuthority) (actor, sourceId, reference, configuration) ->
+                            STARTER.equals(actor) && SOURCE.equals(sourceId) && template.equals(reference) && configuration == null
+                                    ? runtimeTemplate : null));
             var permissions = host.getBeanProvider(AutomationAdmissionAuthority.class);
             var signatures = host.getBeanProvider(AutomationReleaseTrustVerifier.TrustAuthority.class);
             var environment = new MockEnvironment().withProperty("stellar.tianji.process.automation.enabled", "true");
             activation = new AutomationActivationService(activationStore, releases, releaseService, Mappers.getMapper(AutomationActivationConverter.class),
                     verifier, transaction, environment, permissions, signatures);
             var dependencies = new ProcessExecutionService.AutomationDependenciesVO(activationStore, releases, bindings,
-                    Mappers.getMapper(AutomationInstanceConverter.class), verifier, environment, permissions, signatures);
+                    Mappers.getMapper(AutomationInstanceConverter.class), verifier, environment, permissions, signatures,
+                    host.getBeanProvider(ProcessExecutionService.AgentTemplateAuthority.class),
+                    host.getBeanProvider(ProcessAgentBridgeConfiguration.TypedRouteProvider.class));
             execution = new ProcessExecutionService(process, dmn, validator, new GovernedStartPilotProperties(List.of()), null, dependencies);
-            app.getBean(FixtureDispatch.class).dispatch = this::recordDispatch;
         }
 
         private void publish() {
-            var empty = schema(Map.of(), List.of());
-            var approval = Map.<String, Object>of("approved", Map.of("type", "boolean"));
-            var requiredApproval = schema(approval, List.of("approved"));
-            var optionalApproval = schema(approval, List.of());
-            var template = new AgentTaskBindingVO.TemplateRefVO(binding().definitionKey(), binding().definitionVersion(),
-                    binding().definitionContentSha256());
-            var agent = new AgentTaskBindingVO(template, List.of(template), empty, Map.of(), List.of(), null);
+            var optionalApproval = schema(APPROVAL, List.of());
+            var agent = new AgentTaskBindingVO(template, List.of(template), EMPTY, Map.of(), List.of(), null);
             var end = new NodePolicyVO.PolicyActionVO("END", null);
             var policy = new NodePolicyVO(Duration.ofMinutes(3), Duration.ofMinutes(2), Duration.ofSeconds(20), end, end, end,
                     new NodePolicyVO.RetryPolicyVO(1, Duration.ZERO, List.of()), "BEST_EFFORT_STOP", "WAIT_RECOVERY");
-            var node = new AutomationNodeBindingVO(NODE, "AGENT", empty, requiredApproval, List.of(),
+            var node = new AutomationNodeBindingVO(NODE, "AGENT", EMPTY, REQUIRED_APPROVAL, List.of(),
                     List.of(new AutomationNodeBindingVO.MappingVO("approved", "nodes.review.output.approved")), policy,
                     null, null, agent, null, null, null);
             var model = new AutomationModelSourceVO("AUTOMATION_V2",
-                    List.of(new AutomationModelSourceVO.ModelSourceVO("BPMN", DEFINITION, XML)), empty, optionalApproval, List.of(node), List.of());
-            String inputSchema = ProcessNodeLifecycleListener.schemaSha256(empty);
+                    List.of(new AutomationModelSourceVO.ModelSourceVO("BPMN", DEFINITION, XML)), EMPTY, optionalApproval, List.of(node), List.of());
+            String inputSchema = ProcessNodeLifecycleListener.schemaSha256(EMPTY);
             var registration = new AutomationModelValidator.TemplateRegistrationVO(template, inputSchema,
-                    ProcessNodeLifecycleListener.schemaSha256(requiredApproval), inputSchema);
+                    ProcessNodeLifecycleListener.schemaSha256(REQUIRED_APPROVAL), inputSchema);
             var dependencies = new AutomationModelValidator.DependencySnapshotVO(ACTOR.tenantId(), Map.of(),
                     Map.of(new AutomationModelValidator.VersionedRefVO(template.key(), template.version()), registration), Set.of(), Map.of(), Map.of());
             var compiled = new AutomationModelCompiler().compile(new AutomationModelValidator().validate(model, dependencies));
@@ -488,46 +476,8 @@ class AgentResultInboxTest {
                 releaseService.publishCompiled(STARTER, RELEASE, prepared);
                 releases.insert(draft, RELEASE, prepared, now);
                 releases.seal(draft, RELEASE, "publish-typed-agent", now);
-                release = releases.find(ACTOR.tenantId(), RELEASE).orElseThrow();
-                verified = releaseService.verifiedAutomation(release);
             });
             assertEquals(1, activation.activate(STARTER, DEFINITION, new ActivationCommand(RELEASE, 0L, "activate-typed-agent")).getRevision());
-        }
-
-        private void recordDispatch(DelegateExecution current) {
-            var instanceId = current.getProcessInstanceId();
-            AutomationInstanceGuardCommandInterceptor.requireHeld(ACTOR.tenantId(), instanceId);
-            assertEquals(verified.controlBindings().occurrenceSlots().get(NODE).activityId(), current.getCurrentActivityId());
-            var occurrence = current.getParent().getParent();
-            var occurrenceId = "occ-" + nodeHash("AUTOMATION_NODE_OCCURRENCE_V2", List.of(ACTOR.tenantId(), instanceId, NODE, occurrence.getId()));
-            var nodeRef = "node-" + nodeHash("AUTOMATION_NODE_EXECUTION_V2", List.of(ACTOR.tenantId(), instanceId, occurrenceId, 1));
-            var row = nodes.find(ACTOR.tenantId(), instanceId, nodeRef).orElseThrow();
-            String business = current.getProcessInstanceBusinessKey();
-            String suffix = business.substring("native-agent-".length());
-            var facts = Map.<String, Object>of("nodeExecutionRef", nodeRef, "configurationSha256", row.getConfigurationSha256(),
-                    "inputSha256", row.getInputSha256());
-            var leaseHash = nodeHash("TEST_NATIVE_AGENT_LEASE", List.of(instanceId, current.getId()));
-            var physicalInput = WorkerLeaseStore.automationPhysicalInputSha256(current.getId(), instanceId,
-                    verified.root().engineDefinitionId(), current.getCurrentActivityId(), binding().topic(),
-                    Long.parseLong(binding().schemaVersion()), nodeRef, row.getInputSha256(), row.getConfigurationSha256());
-            var seed = new AgentDispatchStore.Seed(binding(), instanceId, current.getId(), RELEASE, verified.root().engineDefinitionId(),
-                    verified.root().modelSha256(), current.getCurrentActivityId(), physicalInput, business,
-                    "native-agent-correlation-" + suffix, facts);
-            leases.claim(new WorkerLeaseStore.Claim(ACTOR, leaseHash, binding().topic(), binding().schemaVersion(),
-                    seed.occurrenceId(), seed.occurrenceId(), WorkerScopeTypeEnum.BPMN, instanceId, RELEASE, seed.processDefinitionId(),
-                    seed.elementId(), seed.idempotencyKey(), seed.processModelSha256(), physicalInput, "tianji-" + leaseHash,
-                    row.getAttemptDeadlineAt(), Duration.ofSeconds(60)));
-            var pending = dispatches.prepare(seed);
-            String runId = "native-agent-run-" + suffix;
-            var submitted = new AgentRunDTO(runId, binding().definitionKey(), binding().definitionVersion(), null,
-                    AgentRunStatusEnum.RUNNING, null, false, 1, 1, 0, pending.dispatchNotAfter(), pending.createdAt(), null);
-            dispatches.record(seed.key(), pending.query(), new LinkedAgentSubmissionDTO(false, submitted));
-            dispatches.markAcknowledged(seed.key(), runId);
-            String businessReceipt = "agent-" + runId;
-            leases.finish(ACTOR, seed.occurrenceId(), leaseHash, new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.COMPLETED,
-                    ProcessRequestDigest.hash(List.of("worker-complete-v1", seed.occurrenceId(), seed.occurrenceId(), businessReceipt),
-                            Map.of("runId", runId)), businessReceipt, null, null));
-            nodes.bindAgentDispatch(row, current.getId(), runId);
         }
 
         private NativeWaitingVO start(String suffix) {
@@ -535,10 +485,27 @@ class AgentResultInboxTest {
                     "start-native-agent-" + suffix, "native-agent-correlation-" + suffix, Map.of(), Map.of())).getInstanceId();
             var jobs = process.getManagementService();
             jobs.executeJob(jobs.createJobQuery().processInstanceId(root).singleResult().getId());
+            var acquired = workers.acquireTypedAgentDispatch(ROUTE);
+            assertEquals(WorkerAcquireStatusEnum.ACQUIRED, acquired.status());
+            var task = acquired.task();
+            assertEquals(root, task.processInstanceId());
+            var dispatch = workers.prepareTypedAgentDispatch(ROUTE, task, dispatches);
+            var command = dispatch.command();
+            assertEquals(template.contentSha256(), command.getTemplateSha256());
+            assertEquals(ProcessNodeLifecycleListener.schemaSha256(EMPTY), command.getInputSchemaSha256());
+            assertEquals(ProcessNodeLifecycleListener.schemaSha256(REQUIRED_APPROVAL), command.getOutputSchemaSha256());
+            var receipt = new LinkedAgentRuntimeDTO("native-agent-run-" + suffix, command.getNodeExecutionRef(), "RUNNING", 1,
+                    command.getIdempotencyKey());
+            var submitted = dispatches.recordTyped(dispatch.intent().seed().key(), receipt);
+            assertEquals(AgentDispatchStore.State.SUBMITTED, submitted.state());
+            workers.completeTypedAgentDispatch(ROUTE, task, dispatches, submitted.runId());
+            jobs.executeJob(jobs.createJobQuery().processInstanceId(root).singleResult().getId());
             return transaction.execute(status -> {
-                var row = nodes.open(ACTOR.tenantId(), root, 2).getFirst();
+                var row = nodes.find(ACTOR.tenantId(), root, command.getNodeExecutionRef()).orElseThrow();
+                assertEquals(task.taskId(), row.getNativeJobId());
                 assertNotNull(row.getNativeSubscriptionId());
-                var intent = dispatches.lockForResult(new AgentDispatchStore.Key(ACTOR, "process-east", root, row.getNativeJobId()));
+                var intent = dispatches.lockForResult(dispatch.intent().seed().key());
+                assertEquals(AgentDispatchStore.State.ACKNOWLEDGED, intent.state());
                 return new NativeWaitingVO(root, row, intent);
             });
         }
@@ -550,7 +517,7 @@ class AgentResultInboxTest {
             var id = AgentTerminalEventV2.eventIdFor("agent-east", ACTOR.tenantId(), ACTOR.issuerFingerprint(), ACTOR.subjectId(), intent.runId(), 3);
             var digest = AgentTerminalEventV2.resultSha256(status, output, null, code, outcome);
             return new AgentTerminalEventV2(2, "agent-east", id, ACTOR.tenantId(), ACTOR.issuerFingerprint(), ACTOR.subjectId(),
-                    intent.query().idempotencyKey(), intent.query().link(), binding().definitionKey(), binding().definitionVersion(),
+                    intent.query().idempotencyKey(), intent.query().link(), template.key(), template.version(),
                     intent.runId(), 3, row.getNodeExecutionRef(), row.getConfigurationSha256(), row.getInputSha256(), row.getOutputSchemaSha256(),
                     status, database.now(), digest, output, null, code, outcome);
         }
@@ -603,10 +570,6 @@ class AgentResultInboxTest {
                     SELECT attempt_count FROM tianji_process.tianji_process_agent_result_inbox
                     WHERE tenant_id=? AND event_id=? AND state='PENDING' AND decided_at IS NULL
                     """, Integer.class, ACTOR.tenantId(), terminal.eventId()));
-        }
-
-        private static String nodeHash(String domain, List<?> value) {
-            return ProcessTypedJson.sha256(domain, ProcessTypedJson.canonicalBytes(value));
         }
 
         private static ProcessSchemaVO schema(Map<String, Object> fields, List<String> required) {

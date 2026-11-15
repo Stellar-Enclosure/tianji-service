@@ -5,6 +5,9 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.*;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeDTO;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService;
 
@@ -169,6 +172,79 @@ class AgentStartWorkerTest {
         assertEquals(AgentStartWorker.Outcome.DEFERRED, worker.runOnce(() -> checks.getAndIncrement() == 0));
         verify(client, never()).submit(any());
         verify(workers, never()).completeAgentDispatch(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void typed_submit_recovers_the_original_run_after_a_lost_response_without_replacing_its_deadline() {
+        var route = new AgentDispatchStore.TypedRoute(ACTOR, "process-east", Duration.ofSeconds(30), Duration.ofMinutes(1));
+        var task = acquired();
+        var requested = typedCommand(route);
+        var original = requested.intent();
+        var command = requested.command();
+        var recorded = new AgentDispatchStore.Intent(original.seed(), original.createdAt(), original.dispatchNotAfter(),
+                AgentDispatchStore.State.SUBMITTED, "run-one", null);
+        var completed = new LinkedAgentSubmissionDTO(false, run(AgentRunStatusEnum.COMPLETED));
+        when(workers.acquireTypedAgentDispatch(route)).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task));
+        when(workers.prepareTypedAgentDispatch(route, task, store)).thenReturn(requested);
+        when(workers.isTypedAgentDispatchActive(any())).thenReturn(true);
+        when(store.refresh(original.seed().key(), true)).thenReturn(original, original, original, recorded);
+        when(client.resolve(original.query())).thenReturn(new LinkedAgentLookupResult(original.query(), false, null),
+                new LinkedAgentLookupResult(original.query(), true, completed));
+        when(client.submitRuntime(any())).thenAnswer(call -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            LinkedAgentRuntimeCommand sent = call.getArgument(0);
+            assertEquals(original.query().idempotencyKey(), sent.getIdempotencyKey());
+            assertEquals(original.query().link(), sent.getLink());
+            assertEquals(NOW.plusSeconds(75), sent.getAttemptDeadlineAt());
+            assertEquals(Map.of("case", Map.of("amount", 17)), sent.getInput());
+            assertEquals(Map.of("lane", "supervisor"), sent.getParameters());
+            throw new IllegalStateException("fixture dropped the committed Agent response");
+        });
+        when(store.record(original.seed().key(), original.query(), completed)).thenReturn(recorded);
+        var beforeRestart = new AgentStartWorker(route, workers, store, client);
+        assertThrows(IllegalStateException.class, beforeRestart::runOnce);
+        verify(workers, never()).completeTypedAgentDispatch(any(), any(), any(), anyString());
+
+        var afterRestart = new AgentStartWorker(route, workers, store, client);
+        assertEquals(AgentStartWorker.Outcome.ACKNOWLEDGED, afterRestart.runOnce());
+        verify(client, times(2)).resolve(original.query());
+        verify(client).submitRuntime(eq(command));
+        verify(client, never()).submit(any());
+        verify(workers).completeTypedAgentDispatch(route, task, store, "run-one");
+    }
+
+    @Test
+    void typed_queued_submit_rejects_a_response_for_another_sidecar() {
+        var route = new AgentDispatchStore.TypedRoute(ACTOR, "process-east", Duration.ofSeconds(30), Duration.ofMinutes(1));
+        var task = acquired();
+        var prepared = typedCommand(route);
+        var key = prepared.intent().seed().key();
+        when(workers.acquireTypedAgentDispatch(route)).thenReturn(new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, task));
+        when(workers.prepareTypedAgentDispatch(route, task, store)).thenReturn(prepared);
+        when(workers.isTypedAgentDispatchActive(any())).thenReturn(true);
+        when(store.refresh(key, true)).thenReturn(prepared.intent());
+        when(client.resolve(prepared.intent().query())).thenReturn(new LinkedAgentLookupResult(prepared.intent().query(), false, null));
+        when(client.submitRuntime(eq(prepared.command()))).thenReturn(new LinkedAgentRuntimeDTO("run-one", "node-foreign",
+                "QUEUED", 1, prepared.intent().seed().idempotencyKey()));
+
+        assertThrows(ProcessConflictException.class, () -> new AgentStartWorker(route, workers, store, client).runOnce());
+        verify(store, never()).recordTyped(any(), any());
+        verify(workers, never()).completeTypedAgentDispatch(any(), any(), any(), anyString());
+    }
+
+    private AgentStartWorker.TypedDispatch typedCommand(AgentDispatchStore.TypedRoute route) {
+        var legacy = pending.seed();
+        var chosen = route.binding("research", 2, "a".repeat(64));
+        var seed = new AgentDispatchStore.Seed(chosen, legacy.instanceId(), legacy.occurrenceId(), legacy.releaseKey(),
+                legacy.processDefinitionId(), legacy.processModelSha256(), legacy.elementId(), legacy.workerInputSha256(),
+                legacy.businessKey(), legacy.correlationId(), Map.of("nodeExecutionRef", "node-fixture",
+                        "inputSha256", legacy.workerInputSha256(), "configurationSha256", "c".repeat(64)));
+        var original = new AgentDispatchStore.Intent(seed, NOW, NOW.plusSeconds(60), AgentDispatchStore.State.PENDING, null, null);
+        var limits = new TechnicalLimitsVO(Duration.ofSeconds(70), Duration.ofSeconds(10), Duration.ofSeconds(5), 2, 2, 1, 2000, 100);
+        var command = new LinkedAgentRuntimeCommand(seed.idempotencyKey(), original.query().link(), "node-fixture", "research", 2,
+                chosen.definitionContentSha256(), "c".repeat(64), "d".repeat(64), "e".repeat(64), Map.of("case", Map.of("amount", 17)),
+                Map.of("lane", "supervisor"), limits, NOW.plusSeconds(75), seed.correlationId());
+        return new AgentStartWorker.TypedDispatch(original, command);
     }
 
     private WorkerTaskDTO acquired() {

@@ -52,7 +52,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.ListProcessInstances
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceCorrelationPageDTO.ReceiptDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessStartReceiptDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
+import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgeConfiguration.TypedRouteProvider;
 import top.egon.cola.platform.tianji.process.server.execution.GovernedProcessStartStore.Pointer;
 import top.egon.cola.platform.tianji.process.server.execution.GovernedProcessStartStore.Provenance;
 import top.egon.cola.platform.tianji.process.server.execution.ProcessCommandReceiptStore.CorrelationReceipt;
@@ -84,6 +87,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /** Internal process entry point; the caller must authenticate and authorize the supplied actor. */
 @Slf4j
@@ -229,7 +233,22 @@ public final class ProcessExecutionService {
     public record AutomationDependenciesVO(AutomationActivationStore activations, AutomationReleaseStore releases,
             ProcessInstanceBindingStore bindings, AutomationInstanceConverter converter, ProcessApiSchemaVerifier verifier,
             Environment environment, ObjectProvider<AutomationAdmissionAuthority> admissionAuthority,
-            ObjectProvider<TrustAuthority> trustAuthority) { }
+            ObjectProvider<TrustAuthority> trustAuthority, ObjectProvider<AgentTemplateAuthority> agentTemplates,
+            ObjectProvider<TypedRouteProvider> typedRoutes) {
+        public AutomationDependenciesVO(AutomationActivationStore activations, AutomationReleaseStore releases,
+                ProcessInstanceBindingStore bindings, AutomationInstanceConverter converter, ProcessApiSchemaVerifier verifier,
+                Environment environment, ObjectProvider<AutomationAdmissionAuthority> admissionAuthority,
+                ObjectProvider<TrustAuthority> trustAuthority) {
+            this(activations, releases, bindings, converter, verifier, environment, admissionAuthority, trustAuthority, null, null);
+        }
+    }
+
+    @FunctionalInterface
+    public interface AgentTemplateAuthority {
+        /** Attests the exact current source, template and any approved configuration against the template. */
+        AgentRuntimeTemplateCommand resolve(ProcessActor requester, String sourceId, TemplateRefVO templateRef,
+                TemplateRefVO configurationRef);
+    }
 
     public record AutomationObservationPermitVO(boolean ownerRead, boolean observe, boolean dataRead,
                                                 boolean diagnosticRead, boolean cancel, boolean dataReadOwnerOnly) {
@@ -280,7 +299,7 @@ public final class ProcessExecutionService {
         }));
         var release = pinned.release();
         var normalized = release.source().inputSchema().normalizeValue(intent.getVariables());
-        var configuration = effectiveManifest(release, intent.getAgentTaskOverrides());
+        var configuration = freezeAgentManifest(actor, release, intent.getAgentTaskOverrides());
         automation.bindings().requireConfigurationFits(configuration);
         String configurationSha = ProcessInstanceBindingStore.configurationSha256(configuration);
         var query = admissionQuery(Purpose.START, actor, release, pinned.activation().getRevision(), intent.getCommandId(), raw, configurationSha);
@@ -328,7 +347,7 @@ public final class ProcessExecutionService {
         command.validateForRoute(route);
         String routeSha = eventRouteSha(release, route);
         var normalized = map(release.source().inputSchema().normalizeValue(EventInboxBO.mapStartInput(route, command.getPayload())));
-        var configuration = effectiveManifest(release, Map.of());
+        var configuration = freezeAgentManifest(producer, release, Map.of());
         automation.bindings().requireConfigurationFits(configuration);
         String configurationSha = ProcessInstanceBindingStore.configurationSha256(configuration);
         var query = eventAdmissionQuery(Purpose.EVENT_ADMIT, producer, release, pinned.activation().getRevision(),
@@ -510,7 +529,7 @@ public final class ProcessExecutionService {
         var input = release.source().inputSchema().normalizeValue(EventInboxBO.mapStartInput(route, row.getPayload()));
         if (!input.equals(release.source().inputSchema().normalizeValue(admission.mappedStartInput().get("variables")))
                 || !Map.of().equals(admission.mappedStartInput().get("agentTaskOverrides"))
-                || !ProcessInstanceBindingStore.configurationSha256(effectiveManifest(release, Map.of())).equals(admission.configurationSha256())
+                || !matchesEventAgentManifest(release, admission.effectiveConfiguration())
                 || !ProcessInstanceBindingStore.configurationSha256(admission.effectiveConfiguration()).equals(admission.configurationSha256())) {
             throw automationUnavailable();
         }
@@ -764,6 +783,73 @@ public final class ProcessExecutionService {
                 Map.of("rawRequestSha256", raw, "tenantId", tenant, "definitionKey", definition, "releaseVersion", release,
                         "activationRevision", revision, "configurationSha256", configuration, "businessKey", business,
                         "correlationId", correlation, "normalizedInputSha256", rootInputSha256(normalized))));
+    }
+
+    private static final Set<String> AGENT_ROUTE_FIELDS = Set.of("sourceId", "issuer", "subject", "limits");
+
+    private Map<String, Object> freezeAgentManifest(ProcessActor requester, ImmutableReleaseVO release,
+            Map<String, AgentTaskOverrideVO> overrides) {
+        var base = effectiveManifest(release, overrides);
+        if (base.isEmpty()) return base;
+        var routeProvider = automation.typedRoutes() == null ? null : automation.typedRoutes().getIfAvailable();
+        var templates = automation.agentTemplates() == null ? null : automation.agentTemplates().getIfAvailable();
+        if (routeProvider == null || templates == null) throw automationUnavailable();
+        var route = routeProvider.route(requester.tenantId());
+        if (route == null || route.actor().tenantId() != requester.tenantId()) throw automationUnavailable();
+
+        var result = new TreeMap<String, Object>();
+        var observed = new HashMap<List<TemplateRefVO>, AgentRuntimeTemplateCommand>();
+        for (var node : release.source().nodeBindings()) {
+            if (node.agent() == null) continue;
+            var item = new LinkedHashMap<>(map(base.get(node.nodeId())));
+            var selected = templateRef(item.get("templateRef"));
+            var configuration = node.agent().configurationRef();
+            var identity = configuration == null ? List.of(selected) : List.of(selected, configuration);
+            var template = observed.computeIfAbsent(identity,
+                    refs -> templates.resolve(requester, route.sourceId(), selected, configuration));
+            if (template == null || !template.isTemplateConsistent()
+                    || !selected.key().equals(template.getTemplateKey()) || selected.version() != template.getTemplateVersion()
+                    || !selected.contentSha256().equals(template.contentSha256())
+                    || !node.inputSchema().toWire().equals(template.getInputSchema().toWire())
+                    || !node.outputSchema().toWire().equals(template.getOutputSchema().toWire())
+                    || !node.agent().parameterSchema().toWire().equals(template.getParameterSchema().toWire())) {
+                throw automationUnavailable();
+            }
+            item.put("sourceId", route.sourceId());
+            item.put("issuer", route.actor().issuerFingerprint());
+            item.put("subject", route.actor().subjectId());
+            item.put("limits", template.getLimits().toWire());
+            result.put(node.nodeId(), Map.copyOf(item));
+        }
+        return Map.copyOf(result);
+    }
+
+    private static boolean matchesEventAgentManifest(ImmutableReleaseVO release, Map<String, Object> manifest) {
+        var base = effectiveManifest(release, Map.of());
+        if (!manifest.keySet().equals(base.keySet())) return false;
+        // Historic event admissions retain their original proof and digest.
+        if (ProcessInstanceBindingStore.configurationSha256(base)
+                .equals(ProcessInstanceBindingStore.configurationSha256(manifest))) return true;
+        var baseFields = new TreeMap<String, Object>();
+        for (var entry : manifest.entrySet()) {
+            var item = new LinkedHashMap<>(map(entry.getValue()));
+            if (!(item.get("sourceId") instanceof String sourceId) || sourceId.isBlank()
+                    || !(item.get("issuer") instanceof String issuer) || !ProcessInstanceBindingStore.sha256(issuer)
+                    || !(item.get("subject") instanceof String subject) || subject.isBlank()) return false;
+            TechnicalLimitsVO.fromExactWire(map(item.get("limits")));
+            item.keySet().removeAll(AGENT_ROUTE_FIELDS);
+            baseFields.put(entry.getKey(), item);
+        }
+        return ProcessInstanceBindingStore.configurationSha256(base)
+                .equals(ProcessInstanceBindingStore.configurationSha256(baseFields));
+    }
+
+    private static TemplateRefVO templateRef(Object value) {
+        var ref = map(value);
+        if (!ref.keySet().equals(Set.of("key", "version", "contentSha256"))
+                || !(ref.get("key") instanceof String key) || !(ref.get("version") instanceof Number version)
+                || !(ref.get("contentSha256") instanceof String digest)) throw automationUnavailable();
+        return new TemplateRefVO(key, version.longValue(), digest);
     }
 
     private static Map<String, Object> effectiveManifest(ImmutableReleaseVO release, Map<String, AgentTaskOverrideVO> overrides) {

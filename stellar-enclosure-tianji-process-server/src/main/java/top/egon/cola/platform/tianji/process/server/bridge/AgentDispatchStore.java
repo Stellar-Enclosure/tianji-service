@@ -17,6 +17,11 @@ import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQue
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.KindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianji.process.server.execution.AutomationInstanceGuardCommandInterceptor;
+import top.egon.cola.platform.tianji.process.server.execution.ProcessNodeExecutionBO;
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
@@ -31,15 +36,27 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** Durable intent and close evidence. Network calls must occur after these short transactions commit. */
 public final class AgentDispatchStore {
+    public static final String TYPED_TOPIC = "tianji-v2-agent-dispatch";
+    public static final String TYPED_VERSION = "1";
+    private static final String TYPED_INSTRUCTION = "RUNTIME_V2_REFERENCE";
+    private static final Set<String> TYPED_INPUT_FIELDS = Set.of("nodeExecutionRef", "inputSha256", "configurationSha256");
+    private static final String TYPED_INPUT_SQL = "ARRAY['nodeExecutionRef','inputSha256','configurationSha256']";
+    private static final String TYPED_SQL = "(topic='" + TYPED_TOPIC + "' AND schema_version='" + TYPED_VERSION
+            + "' AND instruction='" + TYPED_INSTRUCTION + "' AND jsonb_exists_all(input_data," + TYPED_INPUT_SQL
+            + ") AND input_data-" + TYPED_INPUT_SQL + "='{}'::jsonb)";
     private static final ObjectMapper MAPPER = new ObjectMapper().enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.USE_LONG_FOR_INTS);
     private static final TypeReference<Map<String, Object>> INPUT = new TypeReference<>() { };
@@ -81,24 +98,95 @@ public final class AgentDispatchStore {
     public Intent prepare(Seed seed) {
         requireTransaction();
         Objects.requireNonNull(seed, "seed");
+        if (seed.typed()) throw invalid();
+        return insert(seed, null);
+    }
+
+    private Intent insert(Seed seed, Instant observed) {
         var binding = seed.binding();
         var actor = binding.actor();
-        jdbc.update("WITH observed AS (SELECT clock_timestamp() AS now) INSERT INTO " + table + " ("
+        var values = new ArrayList<Object>();
+        if (observed != null) values.add(OffsetDateTime.ofInstant(observed, ZoneOffset.UTC));
+        values.addAll(Arrays.asList(
+                actor.tenantId(), binding.sourceId(), seed.instanceId(), seed.occurrenceId(), actor.issuerFingerprint(), actor.subjectId(),
+                seed.idempotencyKey(), seed.releaseKey(), seed.processDefinitionId(), seed.processModelSha256(), seed.elementId(),
+                binding.topic(), binding.schemaVersion(), seed.workerInputSha256(), seed.fingerprint(), binding.definitionKey(), binding.definitionVersion(),
+                binding.definitionContentSha256(), binding.instruction(), encode(seed.inputs()), seed.businessKey(), seed.correlationId(),
+                binding.submissionTimeout().toMillis(), binding.submissionTimeout().toMillis()));
+        String clock = observed == null ? "clock_timestamp()" : "CAST(? AS timestamptz)";
+        jdbc.update("WITH observed AS (SELECT " + clock + " AS now) INSERT INTO " + table + " ("
                         + "tenant_id,source_id,scope_type,scope_id,occurrence_id,subject_issuer,subject_id,idempotency_key,"
                         + "release_key,process_definition_id,process_model_sha256,element_id,topic,schema_version,worker_input_sha256,seed_sha256,"
                         + "agent_definition_key,agent_definition_version,agent_definition_sha256,instruction,input_data,business_key,"
                         + "correlation_id,submission_timeout_ms,created_at,dispatch_not_after,next_check_at,state) "
                         + "SELECT ?,?,'BPMN',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CAST(? AS jsonb),?,?,?,now,"
                         + "now + (? * interval '1 millisecond'),now,'PENDING' FROM observed "
-                        + "ON CONFLICT (tenant_id,occurrence_id) DO NOTHING",
-                actor.tenantId(), binding.sourceId(), seed.instanceId(), seed.occurrenceId(), actor.issuerFingerprint(), actor.subjectId(),
-                seed.idempotencyKey(), seed.releaseKey(), seed.processDefinitionId(), seed.processModelSha256(), seed.elementId(),
-                binding.topic(), binding.schemaVersion(), seed.workerInputSha256(), seed.fingerprint(), binding.definitionKey(), binding.definitionVersion(),
-                binding.definitionContentSha256(), binding.instruction(), encode(seed.inputs()), seed.businessKey(), seed.correlationId(),
-                binding.submissionTimeout().toMillis(), binding.submissionTimeout().toMillis());
+                        + "ON CONFLICT DO NOTHING", values.toArray());
+        // A concurrent insert can collide with either the primary key or the occurrence constraint.
         Intent current = lock(seed.key());
         if (!seed.fingerprint().equals(current.seed().fingerprint())) throw conflict();
         return current;
+    }
+
+    public Intent prepareTyped(Seed seed, ProcessNodeExecutionBO node) {
+        requireTransaction();
+        Objects.requireNonNull(seed, "seed");
+        Objects.requireNonNull(node, "node");
+        AutomationInstanceGuardCommandInterceptor.requireHeld(seed.key().actor().tenantId(), seed.instanceId());
+        if (!seed.typed() || node.getKind() != KindEnum.AGENT || node.getTenantId() != seed.key().actor().tenantId()
+                || !seed.instanceId().equals(node.getInstanceId()) || !seed.occurrenceId().equals(node.getNativeJobId())
+                || !seed.workerInputSha256().equals(node.getInputSha256())
+                || !seed.inputs().equals(Map.of("nodeExecutionRef", node.getNodeExecutionRef(), "inputSha256", node.getInputSha256(),
+                        "configurationSha256", node.getConfigurationSha256()))) throw conflict();
+
+        // A re-acquired native job uses its original timeout and timestamp, even when the remaining window is shorter.
+        var existing = findLocked(seed.key());
+        if (existing != null) {
+            var expected = withTimeout(seed, existing.seed().binding().submissionTimeout());
+            if (!expected.fingerprint().equals(existing.seed().fingerprint())
+                    || existing.dispatchNotAfter().isAfter(node.getAttemptDeadlineAt())) throw conflict();
+            return existing;
+        }
+        int open = jdbc.queryForObject("SELECT count(*) FROM " + table
+                        + " WHERE tenant_id=? AND scope_id=? AND state<>'CLOSED'", Integer.class, node.getTenantId(), node.getInstanceId());
+        if (open >= 256) throw unavailable();
+        Instant observed = now();
+        long allowed = Math.min(seed.binding().submissionTimeout().toMillis(),
+                Duration.between(observed, node.getAttemptDeadlineAt()).toMillis());
+        if (allowed < 1000) throw conflict();
+        return insert(withTimeout(seed, Duration.ofMillis(allowed)), observed);
+    }
+
+    public Intent recordTyped(Key key, LinkedAgentRuntimeDTO outcome) {
+        return Objects.requireNonNull(transaction.execute(status -> {
+            var current = lock(key);
+            requireRuntimeOutcome(current, outcome);
+            return recordState(current, outcome.getRunId(), false);
+        }));
+    }
+
+    static void requireRuntimeOutcome(Intent current, LinkedAgentRuntimeDTO outcome) {
+        var seed = current.seed();
+        if (!seed.typed() || outcome == null || outcome.getRunId() == null || !outcome.getRunId().matches("[^\\p{Cc}]{1,64}")
+                || !seed.idempotencyKey().equals(outcome.getIdempotencyKey())
+                || !Objects.equals(seed.inputs().get("nodeExecutionRef"), outcome.getNodeExecutionRef())
+                || outcome.getRevision() < 1 || outcome.getRevision() > ProcessTypedJson.V2_MAX_WIRE_INTEGER
+                || !runtimeStatus(outcome.getState())) throw conflict();
+    }
+
+    private static boolean runtimeStatus(String value) {
+        return value != null && switch (value) {
+            case "CREATED", "QUEUED", "RUNNING", "WAITING", "SUSPENDED", "COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT" -> true;
+            default -> false;
+        };
+    }
+
+    private static Seed withTimeout(Seed seed, Duration timeout) {
+        var binding = seed.binding();
+        var bounded = new AgentDispatchBinding(binding.actor(), binding.sourceId(), binding.topic(), binding.schemaVersion(),
+                binding.definitionKey(), binding.definitionVersion(), binding.definitionContentSha256(), binding.instruction(), timeout);
+        return new Seed(bounded, seed.instanceId(), seed.occurrenceId(), seed.releaseKey(), seed.processDefinitionId(),
+                seed.processModelSha256(), seed.elementId(), seed.workerInputSha256(), seed.businessKey(), seed.correlationId(), seed.inputs());
     }
 
     /** The active observation is advisory; reconciliation repeats it after cancellation races. */
@@ -124,16 +212,24 @@ public final class AgentDispatchStore {
             AgentRunDTO run = submission.run();
             if (run != null && (!current.seed().binding().definitionKey().equals(run.definitionKey())
                     || current.seed().binding().definitionVersion() != run.definitionVersion() || run.sessionId() != null
-                    || current.runId() != null && !current.runId().equals(run.runId()))) throw conflict();
-            if (current.runId() != null && run == null) throw conflict();
-            if (current.state() == State.CLOSED && (!submission.closed()
-                    || !Objects.equals(current.runId(), run == null ? null : run.runId()))) throw conflict();
-            State next = submission.closed() ? State.CLOSED : current.state() == State.PENDING ? State.SUBMITTED : current.state();
-            if (next != State.CLOSED && next != State.ACKNOWLEDGED && !current.dispatchNotAfter().isAfter(now())) next = State.CLOSING;
-            jdbc.update("UPDATE " + table + " SET state=?,run_id=?,closed_at=CASE WHEN ?='CLOSED' THEN COALESCE(closed_at,clock_timestamp()) "
-                            + "ELSE NULL END,next_check_at=clock_timestamp() WHERE " + where(), recordArgs(next, run, key));
-            return lock(key);
+                    || current.seed().typed() && (run.revision() < 1 || run.revision() > ProcessTypedJson.V2_MAX_WIRE_INTEGER
+                            || !runtimeStatus(run.status().name())))) throw conflict();
+            return recordState(current, run == null ? null : run.runId(), submission.closed());
         }));
+    }
+
+    private Intent recordState(Intent current, String runId, boolean closed) {
+        if (current.runId() != null && !current.runId().equals(runId)) throw conflict();
+        if (current.state() == State.CLOSED) {
+            if (!closed || !Objects.equals(current.runId(), runId)) throw conflict();
+            return current;
+        }
+        State next = closed ? State.CLOSED : current.state() == State.PENDING ? State.SUBMITTED : current.state();
+        if (next != State.CLOSED && next != State.ACKNOWLEDGED && !current.dispatchNotAfter().isAfter(now())) next = State.CLOSING;
+        Key key = current.seed().key();
+        jdbc.update("UPDATE " + table + " SET state=?,run_id=?,closed_at=CASE WHEN ?='CLOSED' THEN COALESCE(closed_at,clock_timestamp()) "
+                        + "ELSE NULL END,next_check_at=clock_timestamp() WHERE " + where(), recordArgs(next, runId, key));
+        return lock(key);
     }
 
     /** Called in the transaction that completes the native Worker job and its receipt. */
@@ -149,16 +245,27 @@ public final class AgentDispatchStore {
 
     /** Claims bounded observations, not permission to submit. Overlapping observations can only repeat idempotent close. */
     public List<Intent> due(AgentDispatchBinding binding, int limit, Duration observationInterval) {
-        if (binding == null || limit < 1 || limit > 32 || observationInterval == null
+        Objects.requireNonNull(binding, "binding");
+        return due(binding.actor(), binding.sourceId(), false, limit, observationInterval);
+    }
+
+    public List<Intent> dueTyped(TypedRoute route, int limit, Duration observationInterval) {
+        Objects.requireNonNull(route, "route");
+        return due(route.actor(), route.sourceId(), true, limit, observationInterval);
+    }
+
+    private List<Intent> due(ProcessActor actor, String sourceId, boolean typed, int limit, Duration observationInterval) {
+        if (limit < 1 || limit > 32 || observationInterval == null
                 || observationInterval.compareTo(Duration.ofSeconds(1)) < 0 || observationInterval.compareTo(Duration.ofHours(1)) > 0
                 || observationInterval.toNanos() % 1_000_000 != 0) throw invalid();
-        ProcessActor actor = binding.actor();
+        String profile = typed ? TYPED_SQL : "NOT " + TYPED_SQL;
         return Objects.requireNonNull(transaction.execute(status -> jdbc.query("WITH candidates AS (SELECT tenant_id,occurrence_id FROM "
                         + table + " WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND source_id=? AND state<>'CLOSED' "
+                        + "AND " + profile + " "
                         + "AND next_check_at<=clock_timestamp() ORDER BY next_check_at,occurrence_id LIMIT ? FOR UPDATE SKIP LOCKED) "
                         + "UPDATE " + table + " d SET next_check_at=clock_timestamp() + (? * interval '1 millisecond') "
                         + "FROM candidates c WHERE d.tenant_id=c.tenant_id AND d.occurrence_id=c.occurrence_id RETURNING d.*",
-                (rs, row) -> read(rs), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), binding.sourceId(), limit,
+                (rs, row) -> read(rs), actor.tenantId(), actor.issuerFingerprint(), actor.subjectId(), sourceId, limit,
                 observationInterval.toMillis())));
     }
 
@@ -208,9 +315,15 @@ public final class AgentDispatchStore {
     }
 
     private Intent lock(Key key) {
+        var result = findLocked(key);
+        if (result == null) throw new ProcessResourceNotFoundException();
+        return result;
+    }
+
+    private Intent findLocked(Key key) {
         List<Intent> rows = jdbc.query("SELECT * FROM " + table + " WHERE " + where() + " FOR UPDATE", (rs, row) -> read(rs), args(key));
-        if (rows.size() != 1) throw new ProcessResourceNotFoundException();
-        return rows.getFirst();
+        if (rows.size() > 1) throw conflict();
+        return rows.isEmpty() ? null : rows.getFirst();
     }
 
     private static Intent read(ResultSet rs) throws SQLException {
@@ -244,10 +357,10 @@ public final class AgentDispatchStore {
     private static Object[] args(Key key) {
         return new Object[] {key.actor().tenantId(), key.actor().issuerFingerprint(), key.actor().subjectId(), key.sourceId(), key.instanceId(), key.occurrenceId()};
     }
-    private static Object[] recordArgs(State state, AgentRunDTO run, Key key) {
+    private static Object[] recordArgs(State state, String runId, Key key) {
         List<Object> values = new ArrayList<>();
         values.add(state.name());
-        values.add(run == null ? null : run.runId());
+        values.add(runId);
         values.add(state.name());
         values.addAll(List.of(args(key)));
         return values.toArray();
@@ -281,6 +394,35 @@ public final class AgentDispatchStore {
     private static IllegalStateException unavailable() { return new IllegalStateException("Agent dispatch closure is unavailable"); }
 
     public enum State { PENDING, SUBMITTED, ACKNOWLEDGED, CLOSING, CLOSED }
+
+    private static boolean typedBinding(AgentDispatchBinding binding) {
+        return TYPED_TOPIC.equals(binding.topic()) && TYPED_VERSION.equals(binding.schemaVersion())
+                && TYPED_INSTRUCTION.equals(binding.instruction());
+    }
+
+    public record TypedRoute(ProcessActor actor, String sourceId, Duration leaseDuration, Duration submissionTimeout) {
+        public TypedRoute {
+            new Key(actor, sourceId, "instance", "occurrence");
+            if (leaseDuration == null || submissionTimeout == null || leaseDuration.compareTo(Duration.ofSeconds(1)) < 0
+                    || submissionTimeout.compareTo(Duration.ofMinutes(15)) > 0 || leaseDuration.compareTo(submissionTimeout) >= 0
+                    || leaseDuration.toNanos() % 1_000_000 != 0 || submissionTimeout.toNanos() % 1_000_000 != 0) throw invalid();
+        }
+
+        public AgentDispatchBinding binding(String templateKey, long templateVersion, String templateSha256) {
+            return binding(templateKey, templateVersion, templateSha256, submissionTimeout);
+        }
+
+        public AgentDispatchBinding binding(String templateKey, long templateVersion, String templateSha256,
+                                           Duration policyDispatchTimeout) {
+            if (policyDispatchTimeout == null || !policyDispatchTimeout.isPositive()) throw invalid();
+            Duration timeout = policyDispatchTimeout.compareTo(submissionTimeout) < 0
+                    ? Duration.ofMillis(policyDispatchTimeout.toMillis()) : submissionTimeout;
+            return new AgentDispatchBinding(actor, sourceId, TYPED_TOPIC, TYPED_VERSION, templateKey, templateVersion,
+                    templateSha256, TYPED_INSTRUCTION, timeout);
+        }
+        @Override public String toString() { return "TypedAgentDispatchRoute[redacted]"; }
+    }
+
     public record ProcessClosureScope(ProcessActor owner, String instanceId, String releaseKey,
                                       String processDefinitionId, String processModelSha256,
                                       String businessKey, String correlationId) {
@@ -323,6 +465,12 @@ public final class AgentDispatchStore {
                 else throw invalid();
             }
             inputs = ProcessValues.inputs(types, inputs);
+            if (typedBinding(binding) && inputs.keySet().equals(TYPED_INPUT_FIELDS)) {
+                if (!(inputs.get("nodeExecutionRef") instanceof String nodeRef)
+                        || !nodeRef.matches("[A-Za-z][A-Za-z0-9_.:-]{0,127}") || !workerInputSha256.equals(inputs.get("inputSha256"))
+                        || !(inputs.get("configurationSha256") instanceof String configurationSha)) throw invalid();
+                hash(configurationSha);
+            }
             new StartAgentRunCommand(binding.definitionKey(), binding.definitionVersion(), null, "intent", businessKey, correlationId,
                     new AgentInputDTO(binding.instruction(), List.of(), inputs), null);
             new LinkedAgentLookupQuery(correlationId, new AgentProcessLink(binding.sourceId(), WorkerScopeTypeEnum.BPMN,
@@ -330,6 +478,7 @@ public final class AgentDispatchStore {
             if (encode(inputs).length() > 100_000) throw invalid();
         }
         public Key key() { return new Key(binding.actor(), binding.sourceId(), instanceId, occurrenceId); }
+        public boolean typed() { return typedBinding(binding) && inputs.keySet().equals(TYPED_INPUT_FIELDS); }
         public String idempotencyKey() {
             return AgentDispatchStore.idempotencyKey(key());
         }
@@ -357,6 +506,7 @@ public final class AgentDispatchStore {
                     seed.instanceId(), seed.occurrenceId(), seed.binding().definitionContentSha256(), dispatchNotAfter));
         }
         public LinkedAgentStartCommand command() {
+            if (seed.typed()) throw invalid();
             return new LinkedAgentStartCommand(new StartAgentRunCommand(seed.binding().definitionKey(), seed.binding().definitionVersion(),
                     null, seed.idempotencyKey(), seed.businessKey(), seed.correlationId(),
                     new AgentInputDTO(seed.binding().instruction(), List.of(), seed.inputs()), null), query().link());

@@ -109,6 +109,7 @@ import top.egon.cola.platform.tianji.process.server.worker.FlowableWorkerService
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicProperties;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerTopicRegistry;
 import top.egon.cola.platform.tianji.process.server.worker.WorkerNativeAvailability;
+import top.egon.cola.platform.tianji.process.server.bridge.ProcessAgentBridgeConfiguration.TypedRouteProvider;
 import top.egon.cola.platform.tianji.process.server.bridge.CaseSourceProperties;
 import top.egon.cola.platform.tianji.process.server.bridge.CaseSourceRegistry;
 import top.egon.cola.platform.tianji.process.server.bridge.CaseCompletionInbox;
@@ -669,9 +670,11 @@ public class ProcessSecurityConfiguration {
             @Qualifier("automationInstanceConverter") AutomationInstanceConverter converter,
             ProcessApiSchemaVerifier verifier, Environment environment,
             @Qualifier("automationAdmissionAuthority") ObjectProvider<AutomationAdmissionAuthority> admissionAuthority,
-            @Qualifier("automationReleaseTrustAuthority") ObjectProvider<AutomationReleaseTrustVerifier.TrustAuthority> trustAuthority) {
+            @Qualifier("automationReleaseTrustAuthority") ObjectProvider<AutomationReleaseTrustVerifier.TrustAuthority> trustAuthority,
+            @Qualifier("automationAgentTemplateAuthority") ObjectProvider<ProcessExecutionService.AgentTemplateAuthority> agentTemplates,
+            @Qualifier("automationAgentDispatchRoutes") ObjectProvider<TypedRouteProvider> typedRoutes) {
         var automation = new ProcessExecutionService.AutomationDependenciesVO(activations, releases, bindings, converter,
-                verifier, environment, admissionAuthority, trustAuthority);
+                verifier, environment, admissionAuthority, trustAuthority, agentTemplates, typedRoutes);
         return new ProcessExecutionService(processConfiguration(process), decisionConfiguration(dmn), validator, pilots,
                 pilots.pilots().isEmpty() ? null : requiredPilotAuthority(authorities), automation);
     }

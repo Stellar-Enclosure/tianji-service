@@ -6,6 +6,7 @@ import org.jspecify.annotations.Nullable;
 import tools.jackson.core.type.TypeReference;
 import tools.jackson.databind.json.JsonMapper;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
+import org.flowable.engine.impl.jobexecutor.ExternalWorkerTaskCompleteJobHandler;
 import org.flowable.engine.runtime.ProcessInstance;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -25,6 +26,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.WorkerReceiptOutcome
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerTaskDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.ProcessValueTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO.TemplateRefVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.KindEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.NodePolicyVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessNodeExecutionDTO.StateEnum;
@@ -41,6 +46,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.worker.Wo
 import top.egon.cola.platform.tianji.process.server.ProcessApiSchemaVerifier;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchBinding;
 import top.egon.cola.platform.tianji.process.server.bridge.AgentDispatchStore;
+import top.egon.cola.platform.tianji.process.server.bridge.AgentStartWorker;
 import top.egon.cola.platform.tianji.process.server.bridge.FlowableAgentWaitInspector;
 import top.egon.cola.platform.tianji.process.server.error.ProcessConflictException;
 import top.egon.cola.platform.tianji.process.server.error.AutomationOperationException;
@@ -76,6 +82,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.nio.charset.StandardCharsets;
 import java.sql.Timestamp;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
@@ -97,6 +104,9 @@ import java.util.stream.Collectors;
 /** Secured callers provide a verified SERVICE actor; all native job changes share the lease transaction. */
 @Slf4j
 public final class FlowableWorkerService {
+    private static final Map<String, ProcessValueTypeEnum> AGENT_LEASE_INPUT = Map.of(
+            "nodeExecutionRef", ProcessValueTypeEnum.STRING, "inputSha256", ProcessValueTypeEnum.STRING,
+            "configurationSha256", ProcessValueTypeEnum.STRING);
     private static final JsonMapper REPORT_JSON = JsonMapper.builder().build();
     private static final TypeReference<Map<String, Object>> REPORT_OBJECT = new TypeReference<>() { };
     private final SpringProcessEngineConfiguration process;
@@ -803,6 +813,12 @@ public final class FlowableWorkerService {
                 && value.chars().noneMatch(Character::isISOControl);
     }
 
+    private boolean typedAgentLease(WorkerLeaseStore.Lease lease) {
+        return automation != null && lease.scopeType() == WorkerScopeTypeEnum.BPMN
+                && AgentDispatchStore.TYPED_TOPIC.equals(lease.topic()) && AgentDispatchStore.TYPED_VERSION.equals(lease.schemaVersion())
+                && automation.bindings().find(lease.tenantId(), lease.scopeId()).isPresent();
+    }
+
     private static boolean automationLease(WorkerLeaseStore.Lease lease) {
         return !lease.jobId().equals(lease.occurrenceId());
     }
@@ -846,6 +862,254 @@ public final class FlowableWorkerService {
         private boolean completion() { return kind == null; }
         @Override public String toString() { return "WorkerReportCommandVO[redacted]"; }
     }
+
+    public static String typedAgentTopic() {
+        return AgentDispatchStore.TYPED_TOPIC;
+    }
+
+    public static String nativeTypedAgentTopic() {
+        return "tianji-v2:agent-dispatch:" + AgentDispatchStore.TYPED_VERSION;
+    }
+
+    public AcquireWorkerTaskResult acquireTypedAgentDispatch(AgentDispatchStore.TypedRoute route) {
+        requireAutomationStorage();
+        Objects.requireNonNull(route, "route");
+        WorkerNativeAvailability.require(process);
+        FlowableAgentWaitInspector.requireHistory(process);
+        var actor = route.actor();
+        return Objects.requireNonNull(transaction.execute(status -> {
+            var selected = agentCandidate(route).orElse(null);
+            if (selected == null) return empty();
+            var root = automation.guard().lockKnownRoot(actor.tenantId(), selected.instanceId());
+            var job = lockNative(actor.tenantId(), selected.jobId());
+            if (job == null || job.live() || !nativeTypedAgentTopic().equals(job.topic())
+                    || !root.getInstanceId().equals(job.processInstanceId())) return empty();
+            var node = automation.nodes().findAgentAttempt(actor.tenantId(), root.getInstanceId(), job.id()).orElse(null);
+            Instant now = automation.nodes().now();
+            if (node == null || !isAgentDispatchWaiting(node, now) || !currentAgentRoute(root, node, route)) return empty();
+            var scope = typedAgentScope(root, node, job);
+            var expiresAt = earlier(now.plus(route.leaseDuration()), earlier(node.getAttemptDeadlineAt(), node.getNodeDeadlineAt()))
+                    .truncatedTo(ChronoUnit.MILLIS);
+            if (!now.isBefore(expiresAt) || !leases.hasCapacity(actor, AgentDispatchStore.TYPED_TOPIC, AgentDispatchStore.TYPED_VERSION, 1)) return empty();
+
+            byte[] secret = new byte[32];
+            random.nextBytes(secret);
+            String token = Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
+            Arrays.fill(secret, (byte) 0);
+            String tokenHash = WorkerLeaseStore.tokenHash(token);
+            String owner = "tianji-" + tokenHash;
+            lockAutomationJob(root, job, owner, expiresAt);
+            var claim = new WorkerLeaseStore.Claim(actor, tokenHash, AgentDispatchStore.TYPED_TOPIC, AgentDispatchStore.TYPED_VERSION, job.id(), job.id(),
+                    WorkerScopeTypeEnum.BPMN, root.getInstanceId(), root.getReleaseKey(), job.definitionId(), job.elementId(),
+                    workerOccurrenceKey(actor.tenantId(), job.id()), scope.definition().modelSha256(), node.getInputSha256(),
+                    owner, expiresAt, route.leaseDuration());
+            var lease = leases.claim(claim);
+            return new AcquireWorkerTaskResult(WorkerAcquireStatusEnum.ACQUIRED, new WorkerTaskDTO(job.id(), job.id(),
+                    WorkerScopeTypeEnum.BPMN, root.getInstanceId(), null, root.getTenantId(), AgentDispatchStore.TYPED_TOPIC, AgentDispatchStore.TYPED_VERSION,
+                    WorkerEffectSafetyEnum.EXTERNAL_IDEMPOTENT, AGENT_LEASE_INPUT, Map.of("runId", ProcessValueTypeEnum.STRING),
+                    scope.businessKey(), scope.correlationId(), lease.idempotencyKey(), lease.leasedAt(), lease.leaseExpiresAt(),
+                    typedAgentSeedInputs(node), token));
+        }));
+    }
+
+    private Optional<WorkerCandidateVO> agentCandidate(AgentDispatchStore.TypedRoute route) {
+        var actor = route.actor();
+        var rows = jdbc.query("""
+                SELECT j.id_,j.process_instance_id_ FROM %1$s.act_ru_external_job j
+                JOIN %1$s.act_ru_execution root ON root.id_=j.process_instance_id_ AND root.parent_id_ IS NULL
+                    AND root.tenant_id_=j.tenant_id_ AND root.proc_def_id_=j.proc_def_id_ AND root.suspension_state_=1
+                JOIN %1$s.tianji_process_node_execution n ON n.native_job_id=j.id_ AND n.instance_id=j.process_instance_id_
+                    AND n.tenant_id=? AND n.kind='AGENT' AND n.state='WAITING' AND NOT n.excluded
+                    AND n.agent_run_id IS NULL AND n.native_subscription_id IS NULL
+                    AND n.attempt_deadline_at>clock_timestamp() AND n.node_deadline_at>clock_timestamp()
+                JOIN %1$s.tianji_process_instance_binding b ON b.tenant_id=n.tenant_id AND b.instance_id=n.instance_id
+                WHERE j.tenant_id_=? AND j.handler_cfg_=? AND j.retries_>0
+                    AND (j.lock_exp_time_ IS NULL OR j.lock_exp_time_<=clock_timestamp())
+                    AND (j.duedate_ IS NULL OR j.duedate_<=clock_timestamp())
+                    AND b.configuration -> n.node_id ->> 'sourceId' = ?
+                    AND b.configuration -> n.node_id ->> 'issuer' = ?
+                    AND b.configuration -> n.node_id ->> 'subject' = ?
+                ORDER BY j.create_time_, j.id_ COLLATE "C" LIMIT 1
+                """.formatted(schema), (rs, index) -> new WorkerCandidateVO(rs.getString(1), rs.getString(2)), actor.tenantId(),
+                Long.toString(actor.tenantId()), nativeTypedAgentTopic(), route.sourceId(), actor.issuerFingerprint(), actor.subjectId());
+        return rows.stream().findFirst();
+    }
+
+    public AgentStartWorker.TypedDispatch prepareTypedAgentDispatch(AgentDispatchStore.TypedRoute route,
+            WorkerTaskDTO task, AgentDispatchStore dispatch) {
+        requireAutomationStorage();
+        requireDispatchStorage(dispatch);
+        return Objects.requireNonNull(transaction.execute(status -> prepareTypedAgent(route, task, dispatch).prepared()));
+    }
+
+    private LockedTypedAgentVO prepareTypedAgent(AgentDispatchStore.TypedRoute route, WorkerTaskDTO task, AgentDispatchStore dispatch) {
+        var actor = route.actor();
+        if (task == null || task.tenantId() != actor.tenantId() || task.scopeType() != WorkerScopeTypeEnum.BPMN
+                || !AgentDispatchStore.TYPED_TOPIC.equals(task.topic()) || !AgentDispatchStore.TYPED_VERSION.equals(task.schemaVersion())
+                || !task.taskId().equals(task.activityOccurrenceId())) throw unavailable();
+
+        var root = automation.guard().lockKnownRoot(actor.tenantId(), task.processInstanceId());
+        var job = lockNative(actor.tenantId(), task.taskId());
+        String tokenHash = WorkerLeaseStore.tokenHash(task.leaseToken());
+        var lease = leases.lock(actor, task.taskId(), tokenHash);
+        var node = automation.nodes().findAgentAttempt(actor.tenantId(), root.getInstanceId(), task.taskId())
+                .orElseThrow(FlowableWorkerService::lost);
+        if (!isAgentDispatchWaiting(node, automation.nodes().now()) || !currentAgentRoute(root, node, route)
+                || job == null || !job.live() || !nativeTypedAgentTopic().equals(job.topic()) || !lease.nativeOwner().equals(job.owner())
+                || !"LEASED".equals(lease.state()) || !leases.isLive(actor, task.taskId(), tokenHash)) throw lost();
+        var scope = typedAgentScope(root, node, job);
+        var seedInputs = typedAgentSeedInputs(node);
+        if (lease.scopeType() != WorkerScopeTypeEnum.BPMN || !task.topic().equals(lease.topic())
+                || !task.schemaVersion().equals(lease.schemaVersion()) || !task.taskId().equals(lease.occurrenceId())
+                || !root.getInstanceId().equals(lease.scopeId()) || !root.getReleaseKey().equals(lease.releaseKey())
+                || !job.definitionId().equals(lease.definitionId()) || !job.elementId().equals(lease.elementId())
+                || !scope.definition().modelSha256().equals(lease.modelSha256()) || !node.getInputSha256().equals(lease.inputSha256())
+                || !scope.businessKey().equals(task.businessKey()) || !scope.correlationId().equals(task.correlationId())
+                || !seedInputs.equals(task.input()) || !lease.idempotencyKey().equals(task.idempotencyKey())) throw conflict();
+        var selected = scope.template();
+        var binding = route.binding(selected.key(), selected.version(), selected.contentSha256(), scope.dispatchTimeout());
+        var intent = dispatch.prepareTyped(new AgentDispatchStore.Seed(binding, root.getInstanceId(), job.id(), root.getReleaseKey(),
+                job.definitionId(), lease.modelSha256(), job.elementId(), lease.inputSha256(), scope.businessKey(),
+                scope.correlationId(), seedInputs), node);
+        var command = new LinkedAgentRuntimeCommand(intent.seed().idempotencyKey(), intent.query().link(), node.getNodeExecutionRef(),
+                selected.key(), selected.version(), selected.contentSha256(), node.getConfigurationSha256(), node.getInputSchemaSha256(),
+                node.getOutputSchemaSha256(), scope.input(), scope.parameters(), scope.limits(), node.getAttemptDeadlineAt(),
+                scope.correlationId());
+        return new LockedTypedAgentVO(new AgentStartWorker.TypedDispatch(intent, command), node, job, tokenHash);
+    }
+
+    private TypedAgentScopeVO typedAgentScope(AutomationInstanceBindingBO root, ProcessNodeExecutionBO node, NativeJob job) {
+        var release = automation.releases().find(root.getTenantId(), root.getReleaseKey()).orElseThrow(FlowableWorkerService::automationUnavailable);
+        if (!root.getDefinitionKey().equals(release.rootDefinitionKey())) throw automationUnavailable();
+        var verified = releases.verifiedAutomation(release);
+        var slot = verified.controlBindings().occurrenceSlots().get(node.getNodeId());
+        var definition = verified.root();
+        if (slot == null || !job.elementId().equals(slot.activityId()) || !job.definitionId().equals(definition.engineDefinitionId())
+                || !root.getInstanceId().equals(job.processInstanceId()) || !root.getConfigurationSha256().equals(node.getConfigurationSha256())) {
+            throw automationUnavailable();
+        }
+        var binding = release.source().nodeBindings().stream().filter(item -> item.nodeId().equals(node.getNodeId())).findFirst()
+                .orElseThrow(FlowableWorkerService::automationUnavailable);
+        if (binding.agent() == null || node.getKind() != KindEnum.AGENT) throw automationUnavailable();
+        var activity = process.getRuntimeService().createExecutionQuery().executionId(job.executionId())
+                .processInstanceId(root.getInstanceId()).executionTenantId(Long.toString(root.getTenantId())).singleResult();
+        if (activity == null || activity.isEnded() || !node.getAttemptScopeId().equals(activity.getParentId())
+                || !slot.activityId().equals(activity.getActivityId())) throw unavailable();
+
+        var frozen = typedObject(root.getEffectiveManifest().get(node.getNodeId()));
+        var ref = typedObject(frozen.get("templateRef"));
+        var selected = binding.agent().allowedTemplates().stream().filter(candidate -> ref.get("version") instanceof Number version
+                && candidate.version() == version.longValue() && candidate.key().equals(ref.get("key"))
+                && candidate.contentSha256().equals(ref.get("contentSha256"))).findFirst()
+                .orElseThrow(FlowableWorkerService::automationUnavailable);
+        var input = typedObject(binding.inputSchema().normalizeValue(node.getInput()));
+        if (!ProcessNodeLifecycleListener.schemaSha256(binding.inputSchema()).equals(node.getInputSchemaSha256())
+                || !ProcessNodeLifecycleListener.schemaSha256(binding.outputSchema()).equals(node.getOutputSchemaSha256())
+                || !Arrays.equals(ProcessTypedJson.canonicalBytes(input), ProcessTypedJson.canonicalBytes(node.getInput()))) {
+            throw automationUnavailable();
+        }
+        var nativeInstance = process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root.getInstanceId())
+                .processInstanceTenantId(Long.toString(root.getTenantId())).singleResult();
+        if (nativeInstance == null || nativeInstance.isSuspended() || !definition.engineDefinitionId().equals(nativeInstance.getProcessDefinitionId())
+                || nativeInstance.getBusinessKey() == null) throw unavailable();
+        return new TypedAgentScopeVO(selected, definition, nativeInstance.getBusinessKey(), automationStart(root).correlationId(), input,
+                typedObject(binding.agent().parameterSchema().normalizeValue(frozen.get("parameters"))),
+                TechnicalLimitsVO.fromExactWire(typedObject(frozen.get("limits"))), binding.policy().dispatchTimeout());
+    }
+
+    private static boolean currentAgentRoute(AutomationInstanceBindingBO root, ProcessNodeExecutionBO node,
+            AgentDispatchStore.TypedRoute route) {
+        var owner = route.actor();
+        var item = root.getEffectiveManifest().get(node.getNodeId());
+        return owner.tenantId() == root.getTenantId() && item instanceof Map<?, ?> frozen
+                && route.sourceId().equals(frozen.get("sourceId")) && owner.issuerFingerprint().equals(frozen.get("issuer"))
+                && owner.subjectId().equals(frozen.get("subject"));
+    }
+
+    private static boolean isAgentDispatchWaiting(ProcessNodeExecutionBO node, Instant now) {
+        return node.getKind() == KindEnum.AGENT && node.getState() == StateEnum.WAITING && !node.isExcluded()
+                && node.getAgentRunId() == null && node.getNativeSubscriptionId() == null
+                && now.isBefore(node.getAttemptDeadlineAt()) && now.isBefore(node.getNodeDeadlineAt());
+    }
+
+    private static Map<String, Object> typedAgentSeedInputs(ProcessNodeExecutionBO node) {
+        return Map.of("nodeExecutionRef", node.getNodeExecutionRef(), "inputSha256", node.getInputSha256(),
+                "configurationSha256", node.getConfigurationSha256());
+    }
+
+    public boolean isTypedAgentDispatchActive(AgentDispatchStore.Intent intent) {
+        requireAutomationStorage();
+        var seed = intent.seed();
+        var actor = seed.binding().actor();
+        return Boolean.TRUE.equals(automationRead.execute(status -> {
+            var root = automation.bindings().find(actor.tenantId(), seed.instanceId()).orElseThrow(FlowableWorkerService::automationUnavailable);
+            var row = automation.nodes().findAgentAttempt(actor.tenantId(), root.getInstanceId(), seed.occurrenceId())
+                    .orElseThrow(FlowableWorkerService::automationUnavailable);
+            if (!seed.releaseKey().equals(root.getReleaseKey()) || !typedAgentSeedInputs(row).equals(seed.inputs())
+                    || row.getAgentRunId() != null && !row.getAgentRunId().equals(intent.runId())) throw conflict();
+            var now = automation.nodes().now();
+            if (row.getState() != StateEnum.WAITING || row.isExcluded() || !now.isBefore(row.getAttemptDeadlineAt())
+                    || !now.isBefore(row.getNodeDeadlineAt())) return false;
+            String tenant = Long.toString(root.getTenantId());
+            var live = process.getRuntimeService().createProcessInstanceQuery().processInstanceId(root.getInstanceId())
+                    .processInstanceTenantId(tenant).singleResult();
+            if (live != null) {
+                if (!seed.processDefinitionId().equals(live.getProcessDefinitionId())
+                        || !seed.businessKey().equals(live.getBusinessKey())) throw conflict();
+                return true;
+            }
+            var ended = process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(root.getInstanceId())
+                    .processInstanceTenantId(tenant).singleResult();
+            if (ended == null || ended.getEndTime() == null || !seed.processDefinitionId().equals(ended.getProcessDefinitionId())
+                    || !seed.businessKey().equals(ended.getBusinessKey())) throw automationUnavailable();
+            return false;
+        }));
+    }
+
+    public void completeTypedAgentDispatch(AgentDispatchStore.TypedRoute route, WorkerTaskDTO task,
+            AgentDispatchStore dispatch, String runId) {
+        requireAutomationStorage();
+        requireDispatchStorage(dispatch);
+        transaction.executeWithoutResult(status -> {
+            var locked = prepareTypedAgent(route, task, dispatch);
+            dispatch.markAcknowledged(locked.prepared().intent().seed().key(), runId);
+            var job = locked.job();
+            automation.nodes().bindAgentDispatch(locked.node(), job.id(), runId);
+            String receiptId = "agent-" + runId;
+            String hash = ProcessRequestDigest.hash(List.of("worker-complete-v1", job.id(), job.id(), receiptId), Map.of("runId", runId));
+            var finish = new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.COMPLETED, hash, receiptId, null, null);
+            scheduleNativeAgentAck(locked.node(), job);
+            leases.finish(route.actor(), job.id(), locked.tokenHash(), finish);
+        });
+    }
+
+    private void scheduleNativeAgentAck(ProcessNodeExecutionBO node, NativeJob job) {
+        AutomationInstanceGuardCommandInterceptor.requireHeld(node.getTenantId(), node.getInstanceId());
+        process.getManagementService().executeCommand(context -> {
+            var jobs = process.getJobServiceConfiguration();
+            var entity = jobs.getExternalWorkerJobEntityManager().findById(job.id());
+            if (entity == null || entity.isExclusive() || !node.getInstanceId().equals(entity.getProcessInstanceId())
+                    || !Long.toString(node.getTenantId()).equals(entity.getTenantId())
+                    || !job.definitionId().equals(entity.getProcessDefinitionId()) || !job.executionId().equals(entity.getExecutionId())
+                    || !job.elementId().equals(entity.getElementId()) || !job.owner().equals(entity.getLockOwner())
+                    || !nativeTypedAgentTopic().equals(entity.getJobHandlerConfiguration())
+                    || !ExternalWorkerTaskCompleteJobHandler.TYPE.equals(entity.getJobHandlerType())) throw lost();
+            // Only the sidecar carries application data. The native command's out-parameter path
+            // casts to ExternalWorkerServiceTask, while the signed AGENT activity is a ServiceTask.
+            entity.setJobHandlerConfiguration(null);
+            var continuation = jobs.getJobManager().moveExternalWorkerJobToExecutableJob(entity);
+            if (continuation == null || !job.id().equals(continuation.getId())
+                    || !job.executionId().equals(continuation.getExecutionId())
+                    || continuation.getJobHandlerConfiguration() != null) throw conflict();
+            return null;
+        });
+    }
+
+    private record TypedAgentScopeVO(TemplateRefVO template, Definition definition, String businessKey, String correlationId,
+            Map<String, Object> input, Map<String, Object> parameters, TechnicalLimitsVO limits, Duration dispatchTimeout) { }
+
+    private record LockedTypedAgentVO(AgentStartWorker.TypedDispatch prepared, ProcessNodeExecutionBO node, NativeJob job,
+            String tokenHash) { }
 
     public AcquireWorkerTaskResult acquireAgentDispatch(AgentDispatchBinding binding) {
         Objects.requireNonNull(binding, "binding");
@@ -907,7 +1171,7 @@ public final class FlowableWorkerService {
         var finish = new WorkerLeaseStore.Finish(WorkerReceiptOutcomeEnum.COMPLETED, resultHash, command.businessReceiptId(), null, null);
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
-            if (automationLease(current)) throw unavailable();
+            if (automationLease(current) || typedAgentLease(current)) throw unavailable();
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
             requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();
@@ -1002,7 +1266,7 @@ public final class FlowableWorkerService {
                 command.kind().name(), command.errorCode()), Map.of());
         return Objects.requireNonNull(transaction.execute(status -> {
             var current = leases.find(actor, command.taskId(), hash);
-            if (automationLease(current)) throw unavailable();
+            if (automationLease(current) || typedAgentLease(current)) throw unavailable();
             var registration = registry.require(actor, current.topic(), current.schemaVersion());
             requireMode(registration, agentDispatch);
             if (!command.activityOccurrenceId().equals(current.occurrenceId())) throw conflict();

@@ -354,6 +354,23 @@ public class ProcessNodeExecutionStore {
                 utc(timestamp), tenantId, instanceId, nodeExecutionRef, expectedRevision) == 1;
     }
 
+    public Optional<ProcessNodeExecutionBO> findAgentAttempt(long tenantId, String instanceId, String nativeJobId) {
+        requireTransaction();
+        return first(jdbc.query("SELECT " + COLUMNS + " FROM " + table + SCOPED
+                + " AND kind='AGENT' AND native_job_id=? LIMIT 2", this::row, tenantId, instanceId, nativeJobId));
+    }
+
+    void bindAgentJob(ProcessNodeExecutionBO row, String nativeJobId) {
+        requireWaitingNode(row, KindEnum.AGENT);
+        if (!exactReference(nativeJobId, 255) || row.getAgentRunId() != null || row.getNativeSubscriptionId() != null
+                || !withinDeadline(row, waitingNodeTime(row))) throw unavailable();
+        if (row.getNativeJobId() != null) {
+            if (!row.getNativeJobId().equals(nativeJobId) || !matchesAgentWait(row)) throw unavailable();
+            return;
+        }
+        updateWait(" SET native_job_id=?,revision=revision+1", AGENT_WAIT_CAS, agentWaitIdentity(row), nativeJobId);
+    }
+
     /** Binds the ACK of the same verified V5 dispatch before Flowable enters the generated wait. */
     public void bindAgentDispatch(@NotNull @Valid ProcessNodeExecutionBO row, @NotBlank @Size(max = 255) String nativeJobId,
                                   @NotBlank @Size(max = 64) String runId) {
@@ -367,6 +384,14 @@ public class ProcessNodeExecutionStore {
         }
         if (row.getNativeSubscriptionId() != null || !withinDeadline(row, waitingNodeTime(row))) throw unavailable();
         updateWait(" SET native_job_id=?,agent_run_id=?,revision=revision+1", AGENT_WAIT_CAS, agentWaitIdentity(row), nativeJobId, runId);
+    }
+
+    void retireAgentWait(ProcessNodeExecutionBO row, boolean recoverable, SideEffectOutcomeEnum outcome, String errorCode) {
+        requireWaitingNode(row, KindEnum.AGENT);
+        Instant timestamp = waitingNodeTime(row);
+        updateWait(" SET state=?,revision=revision+1,side_effect_outcome=?,error_code=?,finished_at=?",
+                AGENT_WAIT_CAS, agentWaitIdentity(row), recoverable ? "WAIT_RECOVERY" : "TIMED_OUT",
+                outcome.name(), errorCode, recoverable ? null : utc(timestamp));
     }
 
     void bindAgentSubscription(ProcessNodeExecutionBO row, String nativeSubscriptionId) {
