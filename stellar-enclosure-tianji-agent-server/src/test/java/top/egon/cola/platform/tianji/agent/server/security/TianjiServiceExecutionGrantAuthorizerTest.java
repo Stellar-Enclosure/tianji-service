@@ -6,12 +6,13 @@ import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentServiceExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentServiceExecutionGrantStore;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
@@ -41,8 +42,10 @@ class TianjiServiceExecutionGrantAuthorizerTest {
     private final AgentLedgerService ledger = mock(AgentLedgerService.class);
     private final AgentServiceExecutionGrantStore store = mock(AgentServiceExecutionGrantStore.class);
     private final TianjiServiceExecutionBindings bindings = mock(TianjiServiceExecutionBindings.class);
-    private final AgentLedgerService.ExecutionMaterial material = mock(AgentLedgerService.ExecutionMaterial.class);
-    private final AgentExecutionSnapshot snapshot = mock(AgentExecutionSnapshot.class);
+    private final GetAgentRunQuery query = new GetAgentRunQuery(RUN);
+    private final AgentRunDTO run = new AgentRunDTO(RUN, request.definitionKey(), request.definitionVersion(), "session-1",
+            AgentRunStatusEnum.RUNNING, null, false, 1, 2, 3, request.deadlineAt(), NOW.minusSeconds(1), null);
+    private final AgentLedgerService.LinkedRunEvidenceVO evidence = new AgentLedgerService.LinkedRunEvidenceVO(run, link, request);
     private final TrustedIssuerRegistry issuers = mock(TrustedIssuerRegistry.class);
     private final HttpExecutionAuthorizationClient client = mock(HttpExecutionAuthorizationClient.class);
     private final TrustedIssuerRegistry.TrustedIssuerVO trust = new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER,
@@ -54,8 +57,7 @@ class TianjiServiceExecutionGrantAuthorizerTest {
         when(store.usesLedger(ledger)).thenReturn(true);
         when(bindings.usesIssuerRegistry(issuers)).thenReturn(true);
         when(issuers.findByIssuer(ISSUER.toASCIIString())).thenReturn(Optional.of(trust));
-        when(ledger.executionMaterial(actor, new GetAgentRunQuery(RUN))).thenReturn(material);
-        when(material.authorization()).thenReturn(request); when(material.snapshot()).thenReturn(snapshot); when(snapshot.processLink()).thenReturn(link);
+        when(ledger.linkedRunEvidence(actor, query)).thenReturn(evidence);
         when(bindings.resolve(request, link)).thenReturn(binding);
         when(store.current(request, RESOURCE, subject)).thenReturn(Optional.of(ticket));
         when(ledger.databaseNow()).thenReturn(NOW);
@@ -76,6 +78,8 @@ class TianjiServiceExecutionGrantAuthorizerTest {
         assertEquals(AgentServiceExecutionGrant.fingerprint(request, RESOURCE, subject), expected.getValue().intent().bindingSha256());
         assertEquals(request.deadlineAt(), expected.getValue().intent().deadlineAt());
         verify(store, times(4)).current(request, RESOURCE, subject);
+        verify(ledger, times(4)).linkedRunEvidence(actor, query);
+        verify(ledger, never()).executionMaterial(any(), any());
     }
 
     @Test void denial_is_definitive_only_when_the_same_fence_ticket_and_trust_remain_current() {
@@ -110,10 +114,18 @@ class TianjiServiceExecutionGrantAuthorizerTest {
         when(bindings.resolve(request, link)).thenReturn(binding);
         var changed = new AgentRunAuthorization.Request(actor, RUN, "review", 1, "a".repeat(64), "b".repeat(64),
                 "d".repeat(64), "policy-v1", true, request.deadlineAt());
-        var later = mock(AgentLedgerService.ExecutionMaterial.class);
-        when(later.authorization()).thenReturn(changed);
-        when(ledger.executionMaterial(actor, new GetAgentRunQuery(RUN))).thenReturn(material, later);
+        when(ledger.linkedRunEvidence(actor, query))
+                .thenReturn(evidence, new AgentLedgerService.LinkedRunEvidenceVO(run, link, changed));
         assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.evaluate(request));
+
+        var changedLink = new AgentProcessLink(link.sourceId(), link.scopeType(), link.scopeInstanceId(),
+                "different-activity", link.definitionContentSha256(), link.dispatchNotAfter());
+        when(ledger.linkedRunEvidence(actor, query))
+                .thenReturn(evidence, new AgentLedgerService.LinkedRunEvidenceVO(run, changedLink, request));
+        assertEquals(AgentRunAuthorization.Decision.UNAVAILABLE, authorizer.evaluate(request));
+
+        verify(client, times(3)).decideService(any(), any());
+        verify(bindings, never()).resolve(request, changedLink);
     }
 
     @Test void user_legacy_or_mismatched_configuration_does_not_gain_service_authority() {
