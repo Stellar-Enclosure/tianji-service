@@ -97,6 +97,24 @@ class MemoryIndexWorkTest {
         }
     }
 
+    static void assertEmbeddingCannotLandInChangedEpoch(org.springframework.jdbc.core.JdbcTemplate admin, DataSource source,
+                                                        PostgresMemoryService memory, PgVectorMemoryIndex index,
+                                                        MemoryIndexPublication.Event event, String scopeHash) {
+        when(index.bounded(any(), any())).thenAnswer(call -> call.<java.util.concurrent.Callable<Boolean>>getArgument(1).call());
+        when(index.compute(anyString())).thenAnswer(call -> {
+            assertFalse(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive());
+            assertEquals(1, admin.update("UPDATE egon_agent_memory.scope SET authority_epoch=4,state='FROZEN' WHERE scope_hash=? AND authority_epoch=3",
+                    scopeHash));
+            return response();
+        });
+        var work = new MemoryIndexWork(source, memory, index, ignored -> { }, Clock.systemUTC());
+        PostgresMemoryAuthorizationTest.assertScopeFailure(() -> work.apply(event, Instant.now().plusSeconds(10)));
+        verify(index, never()).addComputed(any(), any());
+        assertEquals("PENDING", admin.queryForObject("SELECT index_state FROM tianji_agent.agent_memory_index_manifest WHERE document_id=?",
+                String.class, event.documentId()));
+        assertEquals(0, admin.queryForObject("SELECT count(*) FROM tianji_agent.agent_memory_vector_v1 WHERE id=?", Integer.class, event.documentId()));
+    }
+
     private static void prepare(JdbcMemoryRepository repository, JdbcMemoryRepository.StoredMemory row, MemoryIndexPublication.Event event, JdbcMemoryRepository.Manifest manifest) {
         when(repository.databaseNow()).thenReturn(NOW); when(repository.tenantId()).thenReturn(20L); when(repository.issuer()).thenReturn(ISSUER);
         when(repository.owner()).thenReturn(OWNER); when(repository.scopeId()).thenReturn("research");

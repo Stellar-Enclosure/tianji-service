@@ -1,7 +1,6 @@
 package top.egon.cola.platform.tianji.agent.server.integration.memory;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryPreferenceExtraction;
@@ -22,8 +21,8 @@ import java.util.Objects;
 import java.util.function.BooleanSupplier;
 
 /** Bounded orchestration over the existing intent/fact transactions; it creates no scheduler or authority refresh. */
+@Slf4j
 public final class MemoryPreferenceWork {
-    private static final Logger log = LoggerFactory.getLogger(MemoryPreferenceWork.class);
     private final MemoryPreferenceIntentStore store;
     private final PostgresMemoryService memory;
     private final TianjiMemoryPreferenceWriteAuthorization authority;
@@ -74,7 +73,10 @@ public final class MemoryPreferenceWork {
                 while (lease != null && attempted < maximumFacts && live(deadline, monotonic, admitted)) {
                     var command = commands.get(lease.nextIndex()); var context = authority.permit(lease, command, deadline);
                     if (!live(deadline, monotonic, admitted)) break;
-                    attempted++; memory.upsert(context, command);
+                    attempted++;
+                    memory.upsert(context, command);
+                    // A committed fact has its original receipt. If local admission closed, the next lease replays it.
+                    if (!live(deadline, monotonic, admitted)) break;
                     var next = store.acknowledge(lease); acknowledged++; lease = next.orElse(null);
                 }
                 if (lease != null) store.defer(lease, "BUDGET_YIELD", retryDelay);

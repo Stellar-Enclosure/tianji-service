@@ -11,6 +11,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.util.ClassUtils;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
 import top.egon.cola.platform.tianji.agent.infrastructure.memory.MemoryContextProvider;
@@ -41,7 +42,10 @@ import java.time.Duration;
 public class TianjiMemoryContextConfiguration {
     @Bean
     static BeanFactoryPostProcessor memoryContextPrerequisites(Environment environment) {
-        return ignored -> {
+        return factory -> {
+            if (!ClassUtils.isPresent("org.springframework.ai.vectorstore.pgvector.PgVectorStore", factory.getBeanClassLoader())) {
+                throw new IllegalStateException("Memory context requires the configured optional storage classes");
+            }
             for (var capability : new String[]{"api", "storage", "runtime", "memory", "execution-grants", "execution-authorization", "context.snapshots"}) {
                 if (!environment.getProperty("stellar.tianji.agent." + capability + ".enabled", Boolean.class, false)) throw new IllegalStateException("Memory context requires governed storage, API, execution grants and preparation snapshots");
             }
@@ -82,7 +86,7 @@ public class TianjiMemoryContextConfiguration {
         };
     }
 
-    @Bean(destroyMethod = "close")
+    @Bean(name = {"memoryContextProvider", "tianjiMemoryContextProvider"}, destroyMethod = "close")
     MemoryContextProvider tianjiMemoryContextProvider(PostgresMemoryService memory, TianjiMemoryContextProperties properties, TianjiMemoryProperties storage) {
         return new MemoryContextProvider(memory, properties.bindings(), storage.policies(), properties.maxConcurrent(), Clock.systemUTC());
     }

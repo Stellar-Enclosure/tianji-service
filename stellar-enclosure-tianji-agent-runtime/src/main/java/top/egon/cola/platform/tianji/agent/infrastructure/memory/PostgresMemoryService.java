@@ -1,10 +1,22 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.memory;
 
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.document.DocumentMetadata;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.TransactionException;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.component.agentflow.api.capability.CallPermitVO;
+import top.egon.cola.component.agentflow.api.memory.MemoryDeleteCommand;
+import top.egon.cola.component.agentflow.api.memory.MemoryFactTypeEnum;
+import top.egon.cola.component.agentflow.api.memory.MemoryQuery;
+import top.egon.cola.component.agentflow.api.memory.MemoryRetrievalResult;
+import top.egon.cola.component.agentflow.api.memory.MemoryScopeVO;
+import top.egon.cola.component.agentflow.api.memory.MemoryStore;
+import top.egon.cola.component.agentflow.api.memory.MemoryWriteCommand;
+import top.egon.cola.component.agentflow.api.memory.MemoryWriteResult;
 import top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
@@ -22,6 +34,8 @@ import top.egon.cola.platform.tianji.contract.memory.MemoryCandidateQuery;
 import top.egon.cola.platform.tianji.contract.memory.MemoryCandidatePageDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryHitDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationOutcomeEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemoryKindEnum;
+import top.egon.cola.platform.tianji.contract.memory.MemorySensitivityEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryOwnerTypeEnum;
@@ -55,6 +69,7 @@ import java.util.function.BiFunction;
 import static top.egon.cola.platform.tianji.agent.infrastructure.memory.JdbcMemoryRepository.StoredMemory;
 
 /** A Domain Service for current authorization and short fact/revision/receipt/Outbox transactions; it runs no model in a transaction. */
+@Slf4j
 public final class PostgresMemoryService {
     private final DataSource source;
     private final MemoryAuthorization authorization;
@@ -63,22 +78,37 @@ public final class PostgresMemoryService {
     private final Map<String, MemoryRetentionPolicy> policies;
     private final Clock clock;
     private final PgVectorMemoryIndex index;
+    private final LegacyMemoryStoreAdapter hostAdapter;
     private final MemoryJsonCodec codec = new MemoryJsonCodec();
     private final AtomicBoolean initialized = new AtomicBoolean();
 
-    public PostgresMemoryService(AgentLedgerService ledger, DataSource source, MemoryAuthorization authorization,
-                                 List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock) {
+    PostgresMemoryService(AgentLedgerService ledger, DataSource source, MemoryAuthorization authorization,
+                          List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock) {
         this(ledger, source, authorization, policies, publication, clock, null);
     }
 
+    PostgresMemoryService(AgentLedgerService ledger, DataSource source, MemoryAuthorization authorization,
+                          List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock, PgVectorMemoryIndex index) {
+        this(ledger, source, authorization, policies, publication, clock, index, null, false);
+    }
+
     public PostgresMemoryService(AgentLedgerService ledger, DataSource source, MemoryAuthorization authorization,
-                                 List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock, PgVectorMemoryIndex index) {
+                                 List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock,
+                                 PgVectorMemoryIndex index, LegacyMemoryStoreAdapter adapter) {
+        this(ledger, source, authorization, policies, publication, clock, index, Objects.requireNonNull(adapter, "scope authority"), true);
+    }
+
+    private PostgresMemoryService(AgentLedgerService ledger, DataSource source, MemoryAuthorization authorization,
+                                  List<MemoryRetentionPolicy> policies, MemoryIndexPublication publication, Clock clock,
+                                  PgVectorMemoryIndex index, LegacyMemoryStoreAdapter adapter, boolean fencedHost) {
         this.source = Objects.requireNonNull(source, "source"); this.authorization = Objects.requireNonNull(authorization, "authorization");
         this.publication = Objects.requireNonNull(publication, "publication"); this.clock = Objects.requireNonNull(clock, "clock");
         if (!Objects.requireNonNull(ledger, "ledger").usesDataSource(source) || !publication.usesDataSource(source)
                 || policies == null || policies.isEmpty() || policies.size() > 32) throw new IllegalArgumentException("Memory storage/publication binding is invalid");
         binding = Objects.requireNonNull(publication.binding(), "index binding");
         this.index = index;
+        if (fencedHost && !adapter.usesDataSource(source)) throw new IllegalArgumentException("Memory scope authority requires the selected fact storage");
+        this.hostAdapter = adapter;
         if (index != null && (!index.usesDataSource(source) || !binding.equals(index.binding()))) throw new IllegalArgumentException("Memory vector source does not match its fact binding");
         var versions = new HashMap<String, String>(); var selected = new HashMap<String, MemoryRetentionPolicy>();
         for (var policy : policies) {
@@ -92,12 +122,17 @@ public final class PostgresMemoryService {
     public synchronized void verifyStorage(int baseVectorDimensions, String expectedVectorVersion) {
         noTransaction(); initialized.set(false);
         if (index != null) index.unverifiedStorage();
-        new MemoryStorageVerifier(source, baseVectorDimensions, expectedVectorVersion, binding).verify();
+        var verifier = new MemoryStorageVerifier(source, baseVectorDimensions, expectedVectorVersion, binding);
+        if (hostAdapter == null) verifier.verify();
+        else verifier.verifyGuardedHost();
         if (!binding.equals(publication.binding()) || !publication.usesDataSource(source)) throw unavailable();
         if (index != null) index.verifiedStorage();
         initialized.set(true);
     }
     public boolean usesDataSource(DataSource candidate) { return candidate == source; }
+    public boolean usesHostAuthority() { return hostAdapter != null; }
+    public boolean usesHostAuthority(LegacyMemoryStoreAdapter selected) { return hostAdapter != null && hostAdapter == selected; }
+    LegacyMemoryStoreAdapter hostAdapter() { return hostAdapter; }
     public List<String> policyReferences() { return policies.keySet().stream().sorted().toList(); }
     public MemoryIndexPublication.Binding indexBinding() { return binding; }
 
@@ -121,7 +156,7 @@ public final class PostgresMemoryService {
         }
         var authorized = authorize(context, command.owner(), command.scopeId(), MemoryAuthorization.Operation.UPSERT, command.memoryId(), 0, command.source());
         String requestHash = codec.commandSha256(command); String contentHash = codec.contentSha256(command.content());
-        return transaction(authorized, command.owner(), command.scopeId(), true, (repository, now) -> {
+        return transaction(authorized, command.owner(), command.scopeId(), true, true, null, (repository, now) -> {
             var receipt = repository.receipt(authorized.actor(), "UPSERT", command.commandId(), requestHash); if (receipt.isPresent()) return receipt.orElseThrow();
             var policy = policy(command.retentionPolicyRef()); repository.verifySource(authorized.actor(), command.source());
             var existing = repository.current(command.memoryId(), true);
@@ -251,6 +286,187 @@ public final class PostgresMemoryService {
         return new MemoryMergePageDTO(current, query.semantic(), selected, cursor);
     }
 
+    MemoryRetrievalResult hostRetrieve(MemoryQuery query, MemoryScopeVO scope, CallPermitVO permit,
+                                       LegacyMemoryStoreAdapter.HostAuthority host, LegacyMemoryFactConverter converter) {
+        var identity = LegacyMemoryStoreAdapter.identity(scope);
+        var fixed = query.snapshot();
+        String purpose = MemoryStore.MODEL_CAPABILITY_REF.equals(permit.capabilityRef()) ? MemoryStore.MODEL_READ_PURPOSE : MemoryStore.READ_PURPOSE;
+        MemoryOperationContext context = hostContext(scope, permit, host, identity, purpose);
+        var authorized = authorize(context, identity.owner(), identity.scopeId(), MemoryAuthorization.Operation.RETRIEVE, null, 0, null);
+        var policy = host.authorizeRead(scope, purpose);
+        if (policy == null) throw denied();
+        var types = new HashSet<MemoryKindEnum>();
+        for (MemoryFactTypeEnum type : policy.types()) {
+            if (fixed.getTypes().isEmpty() || fixed.getTypes().contains(type)) types.add(MemoryKindEnum.valueOf(type.code()));
+        }
+        var allowed = new ArrayList<PgVectorMemoryIndex.Allowed>();
+        for (String ref : policies.keySet().stream().sorted().toList()) {
+            if (!policy.retentionPolicyRefs().contains(ref)) continue;
+            for (var sensitivity : MemorySensitivityEnum.values()) {
+                if (policy.sensitivities().contains(sensitivity.name())) allowed.add(new PgVectorMemoryIndex.Allowed(ref, sensitivity));
+            }
+        }
+        return transaction(authorized, identity.owner(), identity.scopeId(), false, false, permit.authorityEpoch(), (repository, now) -> {
+            requireHostPermit(scope, permit, purpose);
+            var matches = new ArrayList<MemoryRetrievalResult.HitVO>();
+            String cursor = null;
+            for (int page = 0; page < 200 && matches.size() < fixed.getLimit(); page++) {
+                var rows = repository.listAuthorized(now, types, cursor, 50, allowed);
+                for (var item : rows) {
+                    var entry = item.entry();
+                    var source = repository.sourceVersion(entry.source(), item.sourceActorSha256()).orElse(null);
+                    if (source == null && (entry.source().sourceRunId() != null || repository.nativeUpsert(item))) continue;
+                    var fact = converter.toTarget(LegacyMemoryFactBO.from(repository, item, source));
+                    var metadata = new MemoryStore.WriteMetadataVO(entry.confirmed(), entry.effectiveAt(), entry.expiresAt(),
+                            entry.sensitivity().name(), entry.retentionPolicyRef());
+                    if (!policy.allows(scope, purpose, fact, metadata) || !hostTextMatches(entry.content(), fixed.getText())) continue;
+                    matches.add(new MemoryRetrievalResult.HitVO(fact.factId(), fact.type(), fact.revision(), fact.content(), fact.provenance(), null, now));
+                    if (matches.size() == fixed.getLimit()) break;
+                }
+                if (rows.size() < 50) break;
+                cursor = rows.getLast().entry().memoryId();
+            }
+            if (!policy.equals(host.authorizeRead(scope, purpose))) throw denied();
+            requireHostPermit(scope, permit, purpose);
+            return new MemoryRetrievalResult(List.copyOf(matches));
+        });
+    }
+
+    MemoryWriteResult hostUpsert(MemoryWriteCommand command, MemoryScopeVO scope, CallPermitVO permit,
+                                 LegacyMemoryStoreAdapter.HostAuthority host) {
+        var identity = LegacyMemoryStoreAdapter.identity(scope);
+        var fixed = command.snapshot();
+        MemoryOperationContext context = hostContext(scope, permit, host, identity, MemoryStore.UPSERT_PURPOSE);
+        var approved = host.authorizeWrite(scope, fixed.snapshot());
+        var proof = host.verifyWriteSource(scope, fixed.snapshot());
+        if (approved == null || proof == null) throw denied();
+        if (fixed.getProvenance().size() != 1
+                || !fixed.getProvenance().getFirst().sourceRef().equals(LegacyMemoryFactConverter.sourceRef(proof.source()))
+                || !fixed.getProvenance().getFirst().contentSha256().equals(proof.source().evidenceSha256())) throw denied();
+        var content = hostContent(fixed.getContent());
+        String hash = codec.contentSha256(content);
+        var kind = MemoryKindEnum.valueOf(fixed.getType().code());
+        var sensitivity = MemorySensitivityEnum.valueOf(approved.sensitivity());
+        var operation = fixed.getExpectedRevision() == 0 ? MemoryAuthorization.Operation.UPSERT : MemoryAuthorization.Operation.CORRECT;
+        var authorized = authorize(context, identity.owner(), identity.scopeId(), operation, fixed.getFactId(), fixed.getExpectedRevision(), proof.source());
+        String requestHash = MemoryStore.NativeCodec.upsertFingerprint(scope.hash(), fixed, approved);
+        return transaction(authorized, identity.owner(), identity.scopeId(), true, false, permit.authorityEpoch(), (repository, now) -> {
+            requireHostPermit(scope, permit, MemoryStore.UPSERT_PURPOSE);
+            if (!approved.equals(host.authorizeWrite(scope, fixed.snapshot()))) throw denied();
+            var source = repository.sourceVersion(proof.source(), authorized.actor().identityFingerprint()).orElseThrow(PostgresMemoryService::denied);
+            var supplied = fixed.getProvenance().getFirst();
+            if (source.sequence() != supplied.sourceRevision() || !source.occurredAt().equals(supplied.observedAt())) throw denied();
+            var receipt = repository.nativeReceipt("UPSERT", fixed.getCommandId(), requestHash);
+            if (receipt.isPresent()) {
+                if (!approved.equals(host.authorizeWrite(scope, fixed.snapshot()))) throw denied();
+                requireHostPermit(scope, permit, MemoryStore.UPSERT_PURPOSE);
+                return receipt.orElseThrow();
+            }
+            var policy = policy(approved.retentionPolicyRef());
+            requireHostWindow(approved, policy, now);
+            var previous = repository.current(fixed.getFactId(), true);
+            if (previous.isEmpty() != (fixed.getExpectedRevision() == 0)) throw revisionConflict();
+            var old = previous.map(StoredMemory::entry).orElse(null);
+            if (old != null && (old.revision() != fixed.getExpectedRevision() || old.kind() != kind || !live(old, now))) throw revisionConflict();
+            var duplicate = repository.duplicate(kind, hash);
+            if (duplicate.isPresent() && !duplicate.orElseThrow().entry().memoryId().equals(fixed.getFactId())) {
+                var other = duplicate.orElseThrow();
+                if (other.entry().expiresAt().isAfter(now)) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Memory content already belongs to another entry");
+                retire(repository, authorized, other, MemoryStateEnum.EXPIRED, "RETENTION_EXPIRED", now);
+            }
+            if (old == null && repository.activeCount(now) >= policy.maximumActiveEntries()) {
+                throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "Memory owner/scope quota is exhausted");
+            }
+            var entry = new MemoryEntryDTO(identity.owner(), identity.scopeId(), fixed.getFactId(),
+                    kind, old == null ? 1 : next(old.revision()), old == null ? null : old.revision(),
+                    approved.confirmed() ? MemoryStateEnum.ACTIVE : MemoryStateEnum.CANDIDATE, content, hash, proof.source(), proof.confidence(),
+                    approved.confirmed(), sensitivity, policy.reference(), approved.effectiveAt(), approved.expiresAt(), old == null ? now : old.createdAt(), now);
+            var stored = new StoredMemory(entry, binding.modelRef(), proof.source().evidenceSha256(),
+                    authorized.actor().identityFingerprint(), "NATIVE_UPSERT", null);
+            if (old == null) repository.insert(stored);
+            else {
+                repository.replace(stored, old.revision(), false);
+                publication.publish(event(authorized, old, MemoryIndexPublication.Action.DELETE_REVISION, null, null, old.updatedAt()));
+            }
+            var result = repository.recordNativeReceipt("UPSERT", fixed.getCommandId(), requestHash, stored);
+            if (!approved.equals(host.authorizeWrite(scope, fixed.snapshot()))) throw denied();
+            requireHostPermit(scope, permit, MemoryStore.UPSERT_PURPOSE);
+            return result;
+        });
+    }
+
+    MemoryWriteResult hostDelete(MemoryDeleteCommand command, MemoryScopeVO scope, CallPermitVO permit, LegacyMemoryStoreAdapter.HostAuthority host) {
+        var identity = LegacyMemoryStoreAdapter.identity(scope);
+        var fixed = command.snapshot();
+        var context = hostContext(scope, permit, host, identity, MemoryStore.DELETE_PURPOSE);
+        host.authorizeDelete(scope, fixed.snapshot());
+        var authorized = authorize(context, identity.owner(), identity.scopeId(), MemoryAuthorization.Operation.FORGET, fixed.getFactId(), fixed.getExpectedRevision(), null);
+        String requestHash = MemoryStore.NativeCodec.deleteFingerprint(scope.hash(), fixed);
+        return transaction(authorized, identity.owner(), identity.scopeId(), true, false, permit.authorityEpoch(), (repository, now) -> {
+            requireHostPermit(scope, permit, MemoryStore.DELETE_PURPOSE);
+            host.authorizeDelete(scope, fixed.snapshot());
+            var receipt = repository.nativeReceipt("DELETE", fixed.getCommandId(), requestHash);
+            if (receipt.isPresent()) {
+                host.authorizeDelete(scope, fixed.snapshot());
+                requireHostPermit(scope, permit, MemoryStore.DELETE_PURPOSE);
+                return receipt.orElseThrow();
+            }
+            var previous = repository.current(fixed.getFactId(), true).orElseThrow(PostgresMemoryService::notFound);
+            if (previous.entry().revision() != fixed.getExpectedRevision() || previous.entry().state() == MemoryStateEnum.FORGOTTEN) throw revisionConflict();
+            var retired = retire(repository, authorized, previous, MemoryStateEnum.FORGOTTEN, "NATIVE_DELETE", now);
+            var result = repository.recordNativeReceipt("DELETE", fixed.getCommandId(), requestHash, retired);
+            host.authorizeDelete(scope, fixed.snapshot());
+            requireHostPermit(scope, permit, MemoryStore.DELETE_PURPOSE);
+            return result;
+        });
+    }
+
+    private MemoryOperationContext hostContext(MemoryScopeVO scope, CallPermitVO permit, LegacyMemoryStoreAdapter.HostAuthority host,
+                                               LegacyMemoryStoreAdapter.HostIdentityVO identity, String purpose) {
+        if (hostAdapter == null) throw unavailable();
+        requireHostPermit(scope, permit, purpose);
+        var context = Objects.requireNonNull(host.context(scope), "Memory host context");
+        if (context.preferenceWrite() != null || context.actor().tenantId() != identity.tenantId()
+                || !identity.issuer().equals(context.actor().issuerFingerprint())) throw denied();
+        Instant deadline = context.deadlineAt().isBefore(permit.notAfter()) ? context.deadlineAt() : permit.notAfter();
+        return new MemoryOperationContext(context.actor(), deadline, context.runAuthorization());
+    }
+
+    private void requireHostPermit(MemoryScopeVO scope, CallPermitVO permit, String purpose) {
+        String capability = MemoryStore.MODEL_READ_PURPOSE.equals(purpose) ? MemoryStore.MODEL_CAPABILITY_REF : MemoryStore.CAPABILITY_REF;
+        MemoryStore.Access.requireCurrent(permit, scope.hash(), capability, purpose, clock);
+    }
+
+    private static void requireHostWindow(MemoryStore.WriteMetadataVO metadata, MemoryRetentionPolicy policy, Instant now) {
+        Instant effective = metadata.effectiveAt();
+        Instant expires = metadata.expiresAt();
+        if (effective == null || expires == null || !expires.isAfter(effective) || !expires.isAfter(now)
+                || expires.isAfter(now.plus(policy.maximumLifetime()))
+                || Duration.between(effective, expires).compareTo(policy.maximumLifetime()) > 0) throw invalidLifetime();
+    }
+
+    private static boolean hostTextMatches(MemoryContentDTO content, String query) {
+        return query == null || query.isBlank() || content.text() != null && content.text().contains(query)
+                || content.facts().values().stream().anyMatch(value -> value.contains(query));
+    }
+
+    private static MemoryContentDTO hostContent(Map<String, Object> content) {
+        if (!content.keySet().equals(Set.of("text", "facts")) || !(content.get("facts") instanceof Map<?, ?> fields)
+                || content.get("text") != null && !(content.get("text") instanceof String)) throw invalidHostContent();
+        var facts = new HashMap<String, String>();
+        for (var part : fields.entrySet()) {
+            if (!(part.getKey() instanceof String key) || !(part.getValue() instanceof String value)) throw invalidHostContent();
+            facts.put(key, value);
+        }
+        var result = new MemoryContentDTO((String) content.get("text"), facts);
+        if (!Objects.equals(result.text(), content.get("text")) || !result.facts().equals(facts)) throw invalidHostContent();
+        return result;
+    }
+
+    private static AgentLedgerException invalidHostContent() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_INVALID_COMMAND, "Memory content cannot be represented by the current host");
+    }
+
     private MemoryEntryDTO mergeCandidate(MemoryEntryDTO candidate, MemoryMergeQuery query) {
         if (candidate.state() != MemoryStateEnum.CANDIDATE || candidate.confirmed() || candidate.revision() != query.expectedRevision()
                 || candidate.expiresAt() != null && !candidate.expiresAt().isAfter(clock.instant())) throw revisionConflict();
@@ -292,7 +508,7 @@ public final class PostgresMemoryService {
         var ids = List.copyOf(memoryIds); if (ids.size() > 32 || new HashSet<>(ids).size() != ids.size()) throw new IllegalArgumentException("Memory context batch is invalid");
         for (var id : ids) new GetMemoryQuery(owner, scope, id);
         var authorized = authorize(context, owner, scope, MemoryAuthorization.Operation.RETRIEVE, null, 0, null);
-        if (ids.isEmpty()) return List.of();
+        if (ids.isEmpty() && hostAdapter == null) return List.of();
         return transaction(authorized, owner, scope, false, (repository, now) -> {
             var entries = new ArrayList<MemoryEntryDTO>();
             for (var id : ids) {
@@ -305,11 +521,13 @@ public final class PostgresMemoryService {
 
     private MemoryRetrievalPageDTO semantic(MemoryOperationContext context, MemoryRetrievalQuery query, Set<String> contextPolicies) {
         if (index == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Memory semantic index is not configured");
-        var prepared = transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> new SearchPreparation(now, allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding), contextPolicies)));
-        var candidates = index.search(context.actor().tenantId(), context.actor().issuerFingerprint(), query.owner(), query.scopeId(), query.kind(), query.text(), query.limit(),
-                prepared.allowed(), prepared.now(), context.deadlineAt());
+        var prepared = transaction(context, query.owner(), query.scopeId(), false, (repository, now) -> new SearchPreparationVO(now, allowed(context, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding), contextPolicies), repository.authorityEpoch()));
+        var candidates = hostAdapter != null && prepared.allowed().isEmpty() ? List.<org.springframework.ai.document.Document>of()
+                : index.search(context.actor().tenantId(), context.actor().issuerFingerprint(), query.owner(), query.scopeId(), query.kind(),
+                        query.text(), query.limit(), prepared.allowed(), prepared.now(), context.deadlineAt());
         var currentContext = authorize(context, query.owner(), query.scopeId(), MemoryAuthorization.Operation.SEARCH, null, 0, null);
-        return transaction(currentContext, query.owner(), query.scopeId(), false, (repository, now) -> {
+        return transaction(currentContext, query.owner(), query.scopeId(), false, false,
+                hostAdapter == null ? null : prepared.epoch(), (repository, now) -> {
             allowed(currentContext, query.owner(), query.scopeId(), repository.indexReadiness(now, query.kind(), binding), contextPolicies);
             var found = new ArrayList<MemoryHitDTO>(); var seen = new HashSet<String>();
             for (var candidate : candidates) {
@@ -324,11 +542,19 @@ public final class PostgresMemoryService {
                 if (!policy.semanticQueryAllowed() || !policy.embeddingAllowed().contains(entry.sensitivity())) continue;
                 var expectedId = MemoryIndexPublication.vectorDocumentId(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), entry.owner(), entry.scopeId(), id, entry.revision(), binding.modelRef());
                 if (!expectedId.toString().equals(candidate.getId()) || !binding.modelRef().equals(row.indexModelRef())
-                        || !PgVectorMemoryIndex.metadata(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), row, binding).equals(candidate.getMetadata())) throw unavailable();
+                        || !PgVectorMemoryIndex.metadata(currentContext.actor().tenantId(), currentContext.actor().issuerFingerprint(), row, binding).equals(vectorFacts(candidate.getMetadata()))) throw unavailable();
                 found.add(new MemoryHitDTO(entry, candidate.getScore()));
             }
             return new MemoryRetrievalPageDTO(query.owner(), query.scopeId(), found, null);
         });
+    }
+
+    private static Map<String, Object> vectorFacts(Map<String, Object> metadata) {
+        String distanceKey = DocumentMetadata.DISTANCE.value();
+        if (!metadata.containsKey(distanceKey)) return metadata;
+        var stored = new HashMap<>(metadata);
+        if (!(stored.remove(distanceKey) instanceof Number distance) || !Double.isFinite(distance.doubleValue())) throw unavailable();
+        return stored;
     }
 
     private List<PgVectorMemoryIndex.Allowed> contextAllowed(Set<String> references) {
@@ -374,13 +600,14 @@ public final class PostgresMemoryService {
         var entry = new MemoryEntryDTO(old.owner(), old.scopeId(), old.memoryId(), old.kind(), next(old.revision()), old.revision(), state, null, old.contentSha256(), null,
                 old.confidence(), old.confirmed(), old.sensitivity(), old.retentionPolicyRef(), old.effectiveAt(), old.expiresAt(), old.createdAt(), now);
         var retired = new StoredMemory(entry, previous.indexModelRef(), previous.sourceEvidenceSha256(), actorSha256, reason, now);
+        if (repository.component()) repository.redactLegacyCopy(retired, binding);
         repository.replace(retired, old.revision(), true);
         publication.publish(new MemoryIndexPublication.Event(MemoryIndexPublication.Action.DELETE_MEMORY, repository.tenantId(), repository.issuer(), entry.owner(), entry.scopeId(),
                 entry.memoryId(), entry.revision(), entry.contentSha256(), null, null, now)); return retired;
     }
 
     private void build(JdbcMemoryRepository repository, MemoryOperationContext context, StoredMemory stored, MemoryRetentionPolicy policy, Instant now) {
-        var entry = stored.entry(); if (entry.state() != MemoryStateEnum.ACTIVE || !policy.embeddingAllowed().contains(entry.sensitivity())) return;
+        var entry = stored.entry(); if (repository.component() || entry.state() != MemoryStateEnum.ACTIVE || !policy.embeddingAllowed().contains(entry.sensitivity())) return;
         if (index == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "Memory indexing is not configured");
         index.validateInput(codec.content(entry.content()));
         var id = MemoryIndexPublication.vectorDocumentId(context.actor().tenantId(), context.actor().issuerFingerprint(), entry.owner(), entry.scopeId(), entry.memoryId(), entry.revision(), binding.modelRef());
@@ -407,6 +634,11 @@ public final class PostgresMemoryService {
     }
 
     private <T> T transaction(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, boolean write, BiFunction<JdbcMemoryRepository, Instant, T> action) {
+        return transaction(context, owner, scope, write, false, null, action);
+    }
+
+    private <T> T transaction(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, boolean write,
+                              boolean create, Long expectedEpoch, BiFunction<JdbcMemoryRepository, Instant, T> action) {
         noTransaction(); checkDeadline(context, clock.instant());
         if (!binding.equals(publication.binding()) || !publication.usesDataSource(source)) throw unavailable();
         int seconds = Math.max(1, Math.toIntExact((Duration.between(clock.instant(), context.deadlineAt()).toNanos() + 999_999_999) / 1_000_000_000));
@@ -415,18 +647,30 @@ public final class PostgresMemoryService {
         try {
             T result = transaction.execute(status -> {
                 var repository = new JdbcMemoryRepository(jdbc, context.actor().tenantId(), context.actor().issuerFingerprint(), owner, scope, codec);
-                if (write) repository.lockScope();
-                Instant now = repository.databaseNow(); checkDeadline(context, now);
-                if (context.preferenceWrite() != null) {
-                    if (!write || !context.preferenceWrite().usesDataSource(source)) throw unavailable();
-                    context.preferenceWrite().verifyTransaction(); checkDeadline(context, repository.databaseNow());
-                }
-                T value = action.apply(repository, now); checkDeadline(context, repository.databaseNow());
-                if (!binding.equals(publication.binding())) throw unavailable(); return value;
+                if (hostAdapter == null) return apply(context, repository, write, action);
+                return hostAdapter.inScope(repository, context.deadlineAt(), write, create, expectedEpoch,
+                        () -> initialized.get() && binding.equals(publication.binding()),
+                        selected -> apply(context, selected, write, action));
             });
             if (result == null) throw unavailable(); return result;
         } catch (AgentLedgerException rejected) { throw rejected; }
-        catch (DataAccessException failed) { throw unavailable(); }
+        catch (DataAccessException | TransactionException failed) { log.debug("Memory transaction unavailable"); throw unavailable(); }
+    }
+
+    private <T> T apply(MemoryOperationContext context, JdbcMemoryRepository repository, boolean write,
+                        BiFunction<JdbcMemoryRepository, Instant, T> action) {
+        if (write) repository.lockScope();
+        Instant now = repository.databaseNow();
+        checkDeadline(context, now);
+        if (context.preferenceWrite() != null) {
+            if (!write || !context.preferenceWrite().usesDataSource(source)) throw unavailable();
+            context.preferenceWrite().verifyTransaction();
+            checkDeadline(context, repository.databaseNow());
+        }
+        T result = action.apply(repository, now);
+        checkDeadline(context, repository.databaseNow());
+        if (!binding.equals(publication.binding())) throw unavailable();
+        return result;
     }
 
     MemoryRetentionPolicy policy(String reference) { var policy = policies.get(reference); if (policy == null) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "The fixed Memory retention policy is unavailable"); return policy; }
@@ -445,5 +689,5 @@ public final class PostgresMemoryService {
     private static AgentLedgerException notFound() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "Memory entry was not found in the current scope"); }
     private static AgentLedgerException denied() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current Memory access is denied"); }
     private static AgentLedgerException unavailable() { return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Current Memory authority or storage is unavailable"); }
-    private record SearchPreparation(Instant now, List<PgVectorMemoryIndex.Allowed> allowed) { }
+    private record SearchPreparationVO(Instant now, List<PgVectorMemoryIndex.Allowed> allowed, long epoch) { }
 }

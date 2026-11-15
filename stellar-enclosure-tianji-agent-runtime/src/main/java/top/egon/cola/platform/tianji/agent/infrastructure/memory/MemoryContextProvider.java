@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.memory;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.component.common.trace.TraceContext;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
@@ -45,6 +46,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** Adapts current governed facts into USER evidence and revalidates exact revisions before model reuse. */
+@Slf4j
 public final class MemoryContextProvider implements ContextProvider, AutoCloseable {
     private static final String PREFIX = "memory-source-v1:";
     private final PostgresMemoryService memory;
@@ -170,7 +172,7 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
     }
 
     private boolean eligible(MemoryContextBinding binding, MemoryEntryDTO entry) {
-        if (entry.state() != MemoryStateEnum.ACTIVE || !entry.confirmed() || entry.content() == null || entry.expiresAt() == null
+        if (entry.state() != MemoryStateEnum.ACTIVE || !entry.confirmed() || entry.content() == null || entry.source() == null || entry.expiresAt() == null
                 || !entry.expiresAt().isAfter(clock.instant()) || entry.effectiveAt().isAfter(clock.instant()) || binding.kind() != null && binding.kind() != entry.kind()) throw unavailable();
         if (!binding.scopeId().equals(entry.scopeId()) || !binding.retentionPolicyRefs().contains(entry.retentionPolicyRef())) return false;
         var selected = policies.get(entry.retentionPolicyRef()); if (selected == null) throw unavailable();
@@ -204,7 +206,7 @@ public final class MemoryContextProvider implements ContextProvider, AutoCloseab
         catch (RejectedExecutionException closed) { release.run(); throw unavailable(); }
         try { return future.get(Math.max(1, deadline - System.nanoTime()), TimeUnit.NANOSECONDS); }
         catch (InterruptedException interrupted) { future.cancel(true); Thread.currentThread().interrupt(); throw unavailable(); }
-        catch (TimeoutException timedOut) { future.cancel(true); throw unavailable(); }
+        catch (TimeoutException timedOut) { future.cancel(true); log.debug("Memory context deadline elapsed"); throw unavailable(); }
         catch (ExecutionException failed) {
             if (failed.getCause() instanceof AgentLedgerException rejected && rejected.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Current Memory context access is denied");
             throw unavailable();

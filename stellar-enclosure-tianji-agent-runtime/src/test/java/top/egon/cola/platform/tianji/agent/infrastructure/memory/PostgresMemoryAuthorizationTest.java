@@ -159,6 +159,20 @@ class PostgresMemoryAuthorizationTest {
         }
     }
 
+    static void assertScopeFailure(org.junit.jupiter.api.function.Executable action) {
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class, action).code());
+    }
+
+    static void assertForeignIssuerCannotRead(PostgresMemoryService memory, GetMemoryQuery query, MemoryOperationContext context) {
+        var failure = assertThrows(AgentLedgerException.class, () -> memory.get(context, query));
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, failure.code());
+    }
+
+    static void assertActorWithoutPermissionCannotRead(PostgresMemoryService memory, GetMemoryQuery query, MemoryOperationContext context) {
+        var failure = assertThrows(AgentLedgerException.class, () -> memory.get(context, query));
+        assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, failure.code());
+    }
+
     private static GetMemoryQuery query(MemoryOwnerTypeEnum type, String owner) { return new GetMemoryQuery(new MemoryOwnerDTO(type, owner), "research", "memory"); }
     private static MemoryOperationContext context(TrustedAgentActor actor) { return new MemoryOperationContext(actor, NOW.plusSeconds(5), null); }
     private static PostgresMemoryService service(DataSource source, MemoryAuthorization authorization) { return service(source, authorization, null); }

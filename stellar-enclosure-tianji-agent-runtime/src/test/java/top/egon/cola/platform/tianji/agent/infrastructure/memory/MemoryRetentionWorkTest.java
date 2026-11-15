@@ -81,6 +81,51 @@ class MemoryRetentionWorkTest {
         verify(fixture.source(), times(2)).getConnection();
     }
 
+    static void assertOnlyCurrentAuthorityCanExpire(org.springframework.jdbc.core.JdbcTemplate admin, DataSource source,
+            PostgresMemoryService memory, MemoryIndexPublication publication,
+            top.egon.cola.component.agentflow.api.memory.MemoryScopeVO componentScope, String runtimeRole) {
+        var alice = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.USER, "alice", "https://idp.example/twenty");
+        var owner = new MemoryOwnerDTO(MemoryOwnerTypeEnum.TEAM, "team");
+        memory.upsert(MemoryHostAdapterTest.context(alice), MemoryHostAdapterTest.command("expiry-frozen", "blocked-expiry", "blocked",
+                "frozen candidate", false));
+        memory.upsert(MemoryHostAdapterTest.context(alice), MemoryHostAdapterTest.command("expiry-component", "frozen", "eventual-expiry",
+                "component-only candidate", false));
+        var frozen = LegacyMemoryStoreAdapter.scopeOf(alice.tenantId(), alice.issuerFingerprint(), owner, "blocked-expiry");
+        admin.update("UPDATE egon_agent_memory.scope SET authority_epoch=2,state='FROZEN' WHERE scope_hash=?", frozen.hash());
+        admin.update("""
+                UPDATE tianji_agent.agent_memory_entry SET effective_at='2000-01-01T00:00:00Z',expires_at='2000-01-02T00:00:00Z'
+                WHERE scope_id='blocked-expiry' AND memory_id='blocked'
+                """);
+        admin.update("""
+                UPDATE tianji_agent.agent_memory_revision SET effective_at='2000-01-01T00:00:00Z',expires_at='2000-01-02T00:00:00Z'
+                WHERE scope_id='blocked-expiry' AND memory_id='blocked'
+                """);
+        admin.update("""
+                UPDATE egon_agent_memory.revision SET effective_at='2000-01-04T00:00:00Z', expires_at='2000-01-05T00:00:00Z'
+                WHERE scope_hash=? AND fact_id='eventual-expiry'
+                """, componentScope.hash());
+        var origin = new MemoryRetentionWork.Origin(alice.tenantId(), alice.issuerFingerprint());
+        var work = new MemoryRetentionWork(source, memory, publication, List.of(origin), Set.copyOf(memory.policyReferences()), Clock.systemUTC());
+
+        admin.execute("REVOKE SELECT ON tianji_agent.agent_memory_index_manifest FROM " + runtimeRole);
+        PostgresMemoryAuthorizationTest.assertScopeFailure(() -> work.apply(origin, 1, Instant.now().plusSeconds(10)));
+        admin.execute("GRANT SELECT ON tianji_agent.agent_memory_index_manifest TO " + runtimeRole);
+        assertEquals(1L, admin.queryForObject("SELECT current_revision FROM egon_agent_memory.fact WHERE scope_hash=? AND fact_id='eventual-expiry'",
+                Long.class, componentScope.hash()));
+        assertEquals(new MemoryRetentionWork.Result(1, 1, 0), work.apply(origin, 1, Instant.now().plusSeconds(10)));
+        assertEquals("CANDIDATE", admin.queryForObject("SELECT state FROM tianji_agent.agent_memory_entry WHERE scope_id='blocked-expiry'", String.class));
+        assertEquals("EXPIRED", admin.queryForObject("""
+                SELECT r.state FROM egon_agent_memory.fact f JOIN egon_agent_memory.revision r
+                ON r.scope_hash=f.scope_hash AND r.fact_id=f.fact_id AND r.revision=f.current_revision
+                WHERE f.scope_hash=? AND f.fact_id='eventual-expiry'
+                """, String.class, componentScope.hash()));
+        assertEquals(0, admin.queryForObject("""
+                SELECT count(*) FROM egon_agent_memory.revision
+                WHERE scope_hash=? AND fact_id='eventual-expiry' AND (content IS NOT NULL OR host_metadata->'source'<>'null'::jsonb)
+                """, Integer.class, componentScope.hash()));
+        assertEquals(new MemoryRetentionWork.Result(0, 0, 0), work.apply(origin, 1, Instant.now().plusSeconds(10)));
+    }
+
     private static void prepare(JdbcMemoryRepository repository, JdbcMemoryRepository.StoredMemory row) {
         when(repository.tenantId()).thenReturn(20L); when(repository.issuer()).thenReturn(ISSUER); when(repository.databaseNow()).thenReturn(NOW);
         when(repository.current("memory", true)).thenReturn(Optional.of(row));
