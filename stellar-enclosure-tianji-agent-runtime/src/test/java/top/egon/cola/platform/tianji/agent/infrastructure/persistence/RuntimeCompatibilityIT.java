@@ -109,13 +109,19 @@ class RuntimeCompatibilityIT {
 
     private static void assertPackagedManifest() throws Exception {
         try (var manifest = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/manifest.json");
-             var sql = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/" + MIGRATION)) {
+             var runtime = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/" + MIGRATION);
+             var receiptEpoch = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/" + MemoryStorageVerifier.RECEIPT_EPOCH_FILE)) {
             assertNotNull(manifest);
-            assertNotNull(sql);
-            String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(sql.readAllBytes()));
+            assertNotNull(runtime);
+            assertNotNull(receiptEpoch);
+            var sha256 = MessageDigest.getInstance("SHA-256");
+            String runtimeDigest = HexFormat.of().formatHex(sha256.digest(runtime.readAllBytes()));
+            String receiptEpochDigest = HexFormat.of().formatHex(sha256.digest(receiptEpoch.readAllBytes()));
             var mapper = new ObjectMapper().enable(com.fasterxml.jackson.core.JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
             assertEquals(mapper.valueToTree(Map.of("schemaVersion", 1, "scripts",
-                    List.of(Map.of("version", 17, "file", MIGRATION, "sha256", digest)))), mapper.readTree(manifest));
+                    List.of(Map.of("version", 17, "file", MIGRATION, "sha256", runtimeDigest),
+                            Map.of("version", 18, "file", MemoryStorageVerifier.RECEIPT_EPOCH_FILE, "sha256", receiptEpochDigest)))),
+                    mapper.readTree(manifest));
         }
     }
 

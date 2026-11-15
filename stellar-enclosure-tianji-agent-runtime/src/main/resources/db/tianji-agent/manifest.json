@@ -5,6 +5,11 @@
       "version": 17,
       "file": "V17__add_runtime_safety_receipts.sql",
       "sha256": "fd049bac03c6c9ead463b457d15bc4670a6609dfe1dff648ca64300baf3c75d9"
+    },
+    {
+      "version": 18,
+      "file": "V18__record_legacy_memory_receipt_epoch.sql",
+      "sha256": "40505bad4a8255293e22831d776dbe18049a6cdbf3b3286413a20dae949506c7"
     }
   ]
 }

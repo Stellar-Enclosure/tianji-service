@@ -14,6 +14,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,6 +30,11 @@ import java.util.zip.CRC32;
 public final class MemoryStorageVerifier {
     private static final String FILE = "V10__add_memory_facts_and_index.sql";
     private static final String SERVICE_FILE = "V11__bind_memory_grant_ticket_to_principal.sql";
+    static final String RECEIPT_EPOCH_FILE = "V18__record_legacy_memory_receipt_epoch.sql";
+    static final String RECEIPT_EPOCH_VERSION = "18";
+    private static final String RECEIPT_TABLE = "agent_memory_command_receipt";
+    private static final String RECEIPT_EPOCH_COLUMN = "authority_epoch";
+    private static final String RECEIPT_EPOCH_CHECK = "memory_command_authority_epoch";
     private static final String BASE_VECTOR = "agent_memory_vector_v1";
     private static final List<String> OWNER = List.of("tenant_id", "owner_issuer", "owner_type", "owner_id", "scope_id");
     private static final Set<String> TABLES = Set.of("agent_memory_scope", "agent_memory_entry", "agent_memory_revision", "agent_memory_command_receipt", "agent_memory_index_manifest", "agent_memory_run_grant", BASE_VECTOR);
@@ -44,6 +50,15 @@ public final class MemoryStorageVerifier {
     }
 
     public void verify() {
+        verify(false);
+    }
+
+    /** Guarded HOST writers require a migrated column for the original commit epoch. */
+    public void verifyGuardedHost() {
+        verify(true);
+    }
+
+    private void verify(boolean requireReceiptEpoch) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) throw new IllegalStateException("Memory schema verification requires its own transaction");
         new AgentStorageVerifier(source).verifyContextSnapshots();
         String raw = migration(); String sql = raw.replace("${tianjiMemoryDimensions}", Integer.toString(baseDimensions)); Map<String, Table> expected = contract(sql);
@@ -63,6 +78,9 @@ public final class MemoryStorageVerifier {
                         (rs, row) -> rs.getBoolean(1) && rs.getObject(2) != null && rs.getInt(2) == checksum(raw));
                 if (history.size() != 1 || !history.getFirst()) throw invalid();
                 if (serviceGrantHistory(jdbc, false)) expected.put("agent_memory_run_grant", serviceGrantContract(expected.get("agent_memory_run_grant"), migration(SERVICE_FILE)));
+                if (receiptEpochHistory(jdbc, requireReceiptEpoch)) {
+                    expected.put(RECEIPT_TABLE, receiptEpochContract(expected.get(RECEIPT_TABLE)));
+                }
                 for (var table : expected.entrySet()) { columns(jdbc, table.getKey(), table.getValue()); checks(jdbc, table.getKey(), table.getValue()); privileges(jdbc, table.getKey()); }
                 keys(jdbc); indexes(jdbc, expected);
                 view(jdbc, BASE_VECTOR, baseDimensions);
@@ -94,6 +112,31 @@ public final class MemoryStorageVerifier {
         if (history.size() != 1 || !history.getFirst()) throw invalid(); return true;
     }
 
+    private static boolean receiptEpochHistory(JdbcTemplate jdbc, boolean required) {
+        var history = jdbc.query("""
+                SELECT version,type,script,checksum,success FROM ONLY tianji_agent.flyway_schema_history
+                WHERE version=? OR script=? LIMIT 2
+                """, (rs, row) -> matchesReceiptEpochHistory(rs), RECEIPT_EPOCH_VERSION, RECEIPT_EPOCH_FILE);
+        if (history.isEmpty() && !required) return false;
+        if (history.size() != 1 || !history.getFirst()) throw invalid();
+        return true;
+    }
+
+    static boolean matchesReceiptEpochHistory(ResultSet row) throws SQLException {
+        return RECEIPT_EPOCH_VERSION.equals(row.getString("version"))
+                && RECEIPT_EPOCH_FILE.equals(row.getString("script"))
+                && "SQL".equals(row.getString("type")) && row.getBoolean("success")
+                && row.getObject("checksum") != null && row.getInt("checksum") == checksum(migration(RECEIPT_EPOCH_FILE));
+    }
+
+    private static Table receiptEpochContract(Table base) {
+        var columns = new HashMap<>(base.columns());
+        columns.put(RECEIPT_EPOCH_COLUMN, new Column("bigint", false, false));
+        var checks = new HashMap<>(base.checks());
+        checks.put(RECEIPT_EPOCH_CHECK, booleanSignature("authority_epoch > 0"));
+        return new Table(Map.copyOf(columns), Map.copyOf(checks));
+    }
+
     static Table serviceGrantContract(Table base, String sql) {
         var constraint = Pattern.compile("ALTER TABLE tianji_agent\\.agent_memory_run_grant\\s+ADD CONSTRAINT memory_grant_ticket CHECK\\s*\\(").matcher(sql);
         if (!constraint.find()) throw invalid(); int open = constraint.end() - 1;
@@ -104,13 +147,16 @@ public final class MemoryStorageVerifier {
     private void columns(JdbcTemplate jdbc, String table, Table expected) {
         Map<String, Column> actual = new HashMap<>();
         jdbc.query("""
-                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,co.collname,t.relkind,a.atthasdef,a.attgenerated
+                SELECT a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,co.collname,t.relkind,a.atthasdef,a.attgenerated,a.attidentity
                 FROM pg_attribute a JOIN pg_class t ON t.oid=a.attrelid JOIN pg_namespace n ON n.oid=t.relnamespace
                 LEFT JOIN pg_collation co ON co.oid=a.attcollation
                 WHERE n.nspname='tianji_agent' AND t.relname=? AND a.attnum>0 AND NOT a.attisdropped
                 """, rs -> {
             if (!"r".equals(rs.getString("relkind"))) throw invalid();
             String name = rs.getString("attname");
+            if (RECEIPT_TABLE.equals(table) && RECEIPT_EPOCH_COLUMN.equals(name)
+                    && (!expected.columns().containsKey(name) || rs.getBoolean("atthasdef")
+                    || !rs.getString("attgenerated").isEmpty() || !rs.getString("attidentity").isEmpty())) throw invalid();
             actual.put(name, new Column(rs.getString("type").replace("public.vector", "vector"), rs.getBoolean("attnotnull"), "C".equals(rs.getString("collname"))));
             if (!expected.columns().containsKey(name) && rs.getBoolean("attnotnull") && !rs.getBoolean("atthasdef") && rs.getString("attgenerated").isEmpty()) throw invalid();
         }, table);
@@ -123,13 +169,16 @@ public final class MemoryStorageVerifier {
     private static void checks(JdbcTemplate jdbc, String table, Table expected) {
         Map<String, String> actual = new HashMap<>();
         jdbc.query("""
-                SELECT c.conname,c.convalidated,COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced,
+                SELECT c.conname,c.convalidated,c.connoinherit,COALESCE((to_jsonb(c)->>'conenforced')::boolean,true) AS enforced,
                        pg_get_expr(c.conbin,c.conrelid,false) AS expression
                 FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace
                 WHERE n.nspname='tianji_agent' AND t.relname=? AND c.contype='c'
                 """, rs -> {
             if (!rs.getBoolean("convalidated") || !rs.getBoolean("enforced")) throw invalid();
-            actual.put(rs.getString("conname"), booleanSignature(rs.getString("expression")));
+            String name = rs.getString("conname");
+            if (RECEIPT_TABLE.equals(table) && RECEIPT_EPOCH_CHECK.equals(name)
+                    && (!expected.checks().containsKey(name) || rs.getBoolean("connoinherit"))) throw invalid();
+            actual.put(name, booleanSignature(rs.getString("expression")));
         }, table);
         for (var check : expected.checks().entrySet()) if (!check.getValue().equals(actual.get(check.getKey()))) throw invalid();
     }

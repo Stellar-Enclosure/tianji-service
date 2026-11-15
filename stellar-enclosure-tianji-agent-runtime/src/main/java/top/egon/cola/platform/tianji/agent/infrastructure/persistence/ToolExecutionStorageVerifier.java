@@ -180,10 +180,19 @@ public final class ToolExecutionStorageVerifier {
         jdbc.query("SELECT version,type,script,checksum,success FROM tianji_agent.flyway_schema_history ORDER BY installed_rank", rs -> {
             if (!rs.getBoolean("success")) throw invalid();
             String version = rs.getString("version");
-            if (version == null) return;
             String script = rs.getString("script");
-            if (RUNTIME_FILE.equals(script) && !"17".equals(version)) throw invalid();
             int index = installed.size();
+            // V18 changes Memory receipts only. The complete V17 tool profile accepts exactly this checked tail.
+            // Older legacy prefixes keep their existing treatment of unrelated, successful extra migrations.
+            if (MemoryStorageVerifier.RECEIPT_EPOCH_FILE.equals(script)
+                    || MemoryStorageVerifier.RECEIPT_EPOCH_VERSION.equals(version) && index >= MIGRATIONS.size()) {
+                if (index != MIGRATIONS.size() || !unknownVersion.isEmpty()
+                        || !MemoryStorageVerifier.matchesReceiptEpochHistory(rs)) throw invalid();
+                installed.add(script);
+                return;
+            }
+            if (version == null) return;
+            if (RUNTIME_FILE.equals(script) && !"17".equals(version)) throw invalid();
             if (index >= MIGRATIONS.size() || !Integer.toString(index + 1).equals(version)) {
                 // A later successful migration never substitutes for any known version.
                 if (!version.matches("[1-9][0-9]{0,8}") || Integer.parseInt(version) <= MIGRATIONS.size()) throw invalid();
@@ -197,7 +206,7 @@ public final class ToolExecutionStorageVerifier {
             installed.add(expected);
         });
         if (installed.size() < minimum) throw invalid();
-        if (installed.size() == MIGRATIONS.size()) {
+        if (installed.size() >= MIGRATIONS.size()) {
             if (!unknownVersion.isEmpty()) throw invalid();
             return SchemaProfile.V17;
         }
