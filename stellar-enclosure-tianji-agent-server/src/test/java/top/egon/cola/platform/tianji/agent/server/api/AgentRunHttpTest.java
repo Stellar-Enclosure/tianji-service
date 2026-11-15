@@ -6,8 +6,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpInputMessage;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.mock.web.MockHttpServletRequest;
@@ -20,6 +22,7 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentPermissions;
 import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
+import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantIssuer;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventsQuery;
@@ -99,6 +102,111 @@ class AgentRunHttpTest {
         String body = mvc.perform(get(BASE + "/other")).andExpect(status().isNotFound())
                 .andReturn().getResponse().getContentAsString();
         assertFalse(body.contains("private detail"));
+    }
+
+    @Test
+    void disabled_legacy_direct_start_rejects_uncommitted_commands_before_writing() throws Exception {
+        var access = new TianjiAgentAccess(guard, Clock.systemUTC());
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TianjiExecutionGrantIssuer> issuer = mock(ObjectProvider.class);
+        var grantIssuer = mock(TianjiExecutionGrantIssuer.class);
+        when(issuer.getIfAvailable()).thenReturn(grantIssuer);
+        var environment = new MockEnvironment()
+                .withProperty("stellar.tianji.agent.legacy.direct-start.enabled", "false")
+                .withProperty("stellar.tianji.agent.execution-grants.enabled", "true");
+        mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access, issuer, environment),
+                        new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())))
+                .addFilters(new VerifiedAgentIssuerFilter())
+                .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
+
+        var rootCommand = new StartAgentRunCommand("research", 1, null, "retired-root", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        when(ledger.replayCommittedDirectStart(any(), any())).thenThrow(
+                new AgentLedgerException(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "Agent run was not found"));
+        mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(rootCommand)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+
+        var sessionCommand = new StartAgentRunCommand("research", 1, "session-retired", "retired-session", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(sessionCommand)))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+
+        verify(guard).requireExecution(TianjiAgentPermissions.START_API);
+        verify(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);
+        verify(ledger, times(2)).replayCommittedDirectStart(any(), any());
+        verify(ledger, never()).start(any(), any());
+        verify(issuer).getIfAvailable();
+        verifyNoInteractions(grantIssuer);
+    }
+
+    @Test
+    void disabled_legacy_direct_start_checks_current_permission_before_receipt_lookup() throws Exception {
+        var access = new TianjiAgentAccess(guard, Clock.systemUTC());
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TianjiExecutionGrantIssuer> issuer = mock(ObjectProvider.class);
+        var grantIssuer = mock(TianjiExecutionGrantIssuer.class);
+        when(issuer.getIfAvailable()).thenReturn(grantIssuer);
+        var environment = new MockEnvironment()
+                .withProperty("stellar.tianji.agent.legacy.direct-start.enabled", "false")
+                .withProperty("stellar.tianji.agent.execution-grants.enabled", "true");
+        mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access, issuer, environment),
+                        new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())))
+                .addFilters(new VerifiedAgentIssuerFilter())
+                .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
+
+        doThrow(new AccessDeniedException("revoked")).when(guard)
+                .requireExecution(TianjiAgentPermissions.START_API);
+        var command = new StartAgentRunCommand("research", 1, null, "revoked-retired", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        var denied = assertThrows(jakarta.servlet.ServletException.class,
+                () -> mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(command))));
+        assertInstanceOf(AccessDeniedException.class, denied.getCause());
+
+        verify(guard).requireExecution(TianjiAgentPermissions.START_API);
+        verify(issuer).getIfAvailable();
+        verifyNoInteractions(ledger, grantIssuer);
+    }
+
+    @Test
+    void disabled_legacy_direct_start_replays_existing_root_and_session_runs() throws Exception {
+        var access = new TianjiAgentAccess(guard, Clock.systemUTC());
+        @SuppressWarnings("unchecked")
+        ObjectProvider<TianjiExecutionGrantIssuer> issuer = mock(ObjectProvider.class);
+        var grantIssuer = mock(TianjiExecutionGrantIssuer.class);
+        when(issuer.getIfAvailable()).thenReturn(grantIssuer);
+        var environment = new MockEnvironment()
+                .withProperty("stellar.tianji.agent.legacy.direct-start.enabled", "false")
+                .withProperty("stellar.tianji.agent.execution-grants.enabled", "true");
+        mvc = MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access, issuer, environment),
+                        new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())))
+                .addFilters(new VerifiedAgentIssuerFilter())
+                .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
+
+        var rootCommand = new StartAgentRunCommand("research", 1, null, "retired-root-replay", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        var rootRun = run(AgentRunStatusEnum.QUEUED, 1);
+        when(ledger.replayCommittedDirectStart(any(), any())).thenReturn(rootRun);
+        mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(rootCommand)))
+                .andExpect(status().isAccepted()).andExpect(jsonPath("$.runId").value(rootRun.runId()));
+
+        var sessionCommand = new StartAgentRunCommand("research", 1, "legacy-session", "retired-session-replay", null, null,
+                new AgentInputDTO("question", List.of(), Map.of()), null);
+        var sessionRun = run(AgentRunStatusEnum.RUNNING, 2);
+        when(ledger.replayCommittedDirectStart(any(), any())).thenReturn(sessionRun);
+        mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(sessionCommand)))
+                .andExpect(status().isAccepted()).andExpect(jsonPath("$.runId").value(sessionRun.runId()));
+
+        verify(guard).requireExecution(TianjiAgentPermissions.START_API);
+        verify(guard).requireExecution(TianjiAgentPermissions.SESSION_START_API);
+        verify(ledger, times(2)).replayCommittedDirectStart(any(), any());
+        verify(ledger, never()).start(any(), any());
+        verify(issuer).getIfAvailable();
+        verifyNoInteractions(grantIssuer);
     }
 
     @Test

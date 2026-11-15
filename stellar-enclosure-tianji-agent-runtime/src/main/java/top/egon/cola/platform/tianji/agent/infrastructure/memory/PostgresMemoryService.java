@@ -1,11 +1,13 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.memory;
 
+import jakarta.validation.Valid;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.DocumentMetadata;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionException;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.agentflow.api.capability.CallPermitVO;
@@ -146,6 +148,54 @@ public final class PostgresMemoryService {
             data.append(codec.commandSha256(command));
         }
         return MemoryJsonCodec.sha256(data.toString());
+    }
+
+    public MemoryMutationResultDTO replayCommittedUpsert(MemoryOperationContext context, @Valid UpsertMemoryCommand command) {
+        return replayCommittedUpserts(context, List.of(command)).getFirst();
+    }
+
+    /** Preference extraction returns an outcome only when the full original item set exists in one authority snapshot. */
+    public List<MemoryMutationResultDTO> replayCommittedUpserts(MemoryOperationContext context, List<@Valid UpsertMemoryCommand> requested) {
+        var commands = List.copyOf(requested);
+        if (commands.isEmpty() || commands.size() > 32) throw new IllegalArgumentException("Memory receipt batch is invalid");
+        var first = commands.getFirst();
+        var authorized = context;
+        for (var command : commands) {
+            if (!first.owner().equals(command.owner()) || !first.scopeId().equals(command.scopeId())) {
+                throw new IllegalArgumentException("Memory receipt batch must have one scope");
+            }
+            authorized = authorize(authorized, command.owner(), command.scopeId(), MemoryAuthorization.Operation.UPSERT,
+                    command.memoryId(), 0, command.source());
+        }
+        var actor = authorized.actor();
+        return transaction(authorized, first.owner(), first.scopeId(), false, false, null, true, (repository, now) ->
+                commands.stream().map(command -> requireReceipt(repository, actor, MemoryAuthorization.Operation.UPSERT,
+                        command.commandId(), codec.commandSha256(command))).toList());
+    }
+
+    public MemoryMutationResultDTO replayCommittedCorrection(MemoryOperationContext context, @Valid CorrectMemoryCommand command) {
+        var operation = MemoryAuthorization.Operation.CORRECT;
+        var authorized = authorize(context, command.owner(), command.scopeId(), operation,
+                command.memoryId(), command.expectedRevision(), command.source());
+        return replayReceipt(authorized, command.owner(), command.scopeId(), operation, command.commandId(), codec.commandSha256(command));
+    }
+
+    public MemoryMutationResultDTO replayCommittedForget(MemoryOperationContext context, @Valid ForgetMemoryCommand command) {
+        var operation = MemoryAuthorization.Operation.FORGET;
+        var authorized = authorize(context, command.owner(), command.scopeId(), operation,
+                command.memoryId(), command.expectedRevision(), null);
+        return replayReceipt(authorized, command.owner(), command.scopeId(), operation, command.commandId(), codec.commandSha256(command));
+    }
+
+    private MemoryMutationResultDTO replayReceipt(MemoryOperationContext authorized, MemoryOwnerDTO owner, String scope,
+                                                  MemoryAuthorization.Operation operation, String commandId, String requestHash) {
+        return transaction(authorized, owner, scope, false, false, null, true, (repository, now) ->
+                requireReceipt(repository, authorized.actor(), operation, commandId, requestHash));
+    }
+
+    private static MemoryMutationResultDTO requireReceipt(JdbcMemoryRepository repository, TrustedAgentActor actor,
+                                                          MemoryAuthorization.Operation operation, String commandId, String requestHash) {
+        return repository.receipt(actor, operation.name(), commandId, requestHash).orElseThrow(PostgresMemoryService::notFound);
     }
 
     public MemoryMutationResultDTO upsert(MemoryOperationContext context, UpsertMemoryCommand command) {
@@ -639,15 +689,27 @@ public final class PostgresMemoryService {
 
     private <T> T transaction(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, boolean write,
                               boolean create, Long expectedEpoch, BiFunction<JdbcMemoryRepository, Instant, T> action) {
+        return transaction(context, owner, scope, write, create, expectedEpoch, false, action);
+    }
+
+    private <T> T transaction(MemoryOperationContext context, MemoryOwnerDTO owner, String scope, boolean write,
+                              boolean create, Long expectedEpoch, boolean receiptOnly,
+                              BiFunction<JdbcMemoryRepository, Instant, T> action) {
         noTransaction(); checkDeadline(context, clock.instant());
         if (!binding.equals(publication.binding()) || !publication.usesDataSource(source)) throw unavailable();
         int seconds = Math.max(1, Math.toIntExact((Duration.between(clock.instant(), context.deadlineAt()).toNanos() + 999_999_999) / 1_000_000_000));
         var jdbc = new JdbcTemplate(source); jdbc.setQueryTimeout(seconds);
         var transaction = new TransactionTemplate(new DataSourceTransactionManager(source)); transaction.setTimeout(seconds);
+        if (receiptOnly) transaction.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
         try {
             T result = transaction.execute(status -> {
                 var repository = new JdbcMemoryRepository(jdbc, context.actor().tenantId(), context.actor().issuerFingerprint(), owner, scope, codec);
                 if (hostAdapter == null) return apply(context, repository, write, action);
+                if (receiptOnly) {
+                    return hostAdapter.inReceiptScope(repository, context.deadlineAt(),
+                            () -> initialized.get() && binding.equals(publication.binding()),
+                            selected -> apply(context, selected, false, action));
+                }
                 return hostAdapter.inScope(repository, context.deadlineAt(), write, create, expectedEpoch,
                         () -> initialized.get() && binding.equals(publication.binding()),
                         selected -> apply(context, selected, write, action));

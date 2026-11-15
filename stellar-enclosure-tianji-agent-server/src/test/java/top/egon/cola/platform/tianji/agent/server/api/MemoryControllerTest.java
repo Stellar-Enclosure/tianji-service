@@ -74,6 +74,24 @@ class MemoryControllerTest {
     }
     @AfterEach void clear() { SecurityContextHolder.clearContext(); RequestContextHolder.resetRequestAttributes(); }
 
+    @Test void retired_mutation_requires_current_access_and_never_falls_through_to_the_writer() throws Exception {
+        doThrow(new AccessDeniedException("denied")).when(permissions).requireExecution(TianjiAgentPermissions.MEMORY_UPSERT_API);
+        var request = post("/api/tianji/v1/memories/upsert").contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(upsert()));
+        assertThrows(jakarta.servlet.ServletException.class, () -> mvc.perform(request));
+        verifyNoInteractions(memory);
+
+        reset(permissions);
+        when(memory.replayCommittedUpsert(any(), eq(upsert()))).thenThrow(new AgentLedgerException(
+                AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "No committed receipt"));
+        mvc.perform(request).andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+        doThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Changed command"))
+                .when(memory).replayCommittedUpsert(any(), eq(upsert()));
+        mvc.perform(request).andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_IDEMPOTENCY_CONFLICT"));
+        verify(memory, never()).upsert(any(), any());
+        verify(memory, never()).correct(any(), any());
+        verify(memory, never()).forget(any(), any());
+    }
+
     @Test void all_operations_preserve_commands_and_current_actor_with_bounded_non_cacheable_results() throws Exception {
         var get = new GetMemoryQuery(OWNER, "research", "memory"); var query = new MemoryRetrievalQuery(OWNER, "research", null, "preference", null, 5);
         var upsert = upsert(); var correct = new CorrectMemoryCommand("correct", OWNER, "research", "memory", 1, CONTENT, SOURCE, BigDecimal.ONE, "USER_CONFIRMED");
@@ -81,14 +99,25 @@ class MemoryControllerTest {
         var entry = new MemoryEntryDTO(OWNER, "research", "memory", MemoryKindEnum.PREFERENCE, 1, null, MemoryStateEnum.ACTIVE, CONTENT, "b".repeat(64), SOURCE,
                 BigDecimal.ONE, true, MemorySensitivityEnum.CONFIDENTIAL, "retention@1#" + "c".repeat(64), NOW, NOW.plusSeconds(60), NOW, NOW);
         when(memory.get(any(), eq(get))).thenReturn(entry); when(memory.retrieve(any(), eq(query))).thenReturn(new MemoryRetrievalPageDTO(OWNER, "research", List.of(), null));
-        when(memory.upsert(any(), eq(upsert))).thenReturn(receipt("create", 1, MemoryMutationOutcomeEnum.CREATED, MemoryStateEnum.ACTIVE));
-        when(memory.correct(any(), eq(correct))).thenReturn(receipt("correct", 2, MemoryMutationOutcomeEnum.CORRECTED, MemoryStateEnum.ACTIVE));
-        when(memory.forget(any(), eq(forget))).thenReturn(receipt("forget", 3, MemoryMutationOutcomeEnum.FORGOTTEN, MemoryStateEnum.FORGOTTEN));
+        var created = receipt("create", 1, MemoryMutationOutcomeEnum.CREATED, MemoryStateEnum.ACTIVE);
+        var corrected = receipt("correct", 2, MemoryMutationOutcomeEnum.CORRECTED, MemoryStateEnum.ACTIVE);
+        var forgotten = receipt("forget", 3, MemoryMutationOutcomeEnum.FORGOTTEN, MemoryStateEnum.FORGOTTEN);
+        when(memory.replayCommittedUpsert(any(), eq(upsert))).thenReturn(created);
+        when(memory.replayCommittedCorrection(any(), eq(correct))).thenReturn(corrected);
+        when(memory.replayCommittedForget(any(), eq(forget))).thenReturn(forgotten);
         var requests = Map.of("get", get, "retrieve", query, "upsert", upsert, "correct", correct, "forget", forget);
+        var receipts = Map.of("upsert", created, "correct", corrected, "forget", forgotten);
         for (var request : requests.entrySet()) mvc.perform(post("/api/tianji/v1/memories/" + request.getKey()).contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsBytes(request.getValue())))
-                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store")).andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON));
+                .andExpect(status().isOk()).andExpect(header().string("Cache-Control", "no-store")).andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(result -> {
+                    if (receipts.containsKey(request.getKey())) assertEquals(receipts.get(request.getKey()),
+                            json.readValue(result.getResponse().getContentAsByteArray(), MemoryMutationResultDTO.class));
+                });
         verify(memory).get(argThat(context -> context.actor().equals(TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, "worker", "https://idp.example/20"))
                 && context.runAuthorization() == null && context.deadlineAt().isAfter(NOW) && !context.deadlineAt().isAfter(Instant.now().plusSeconds(30))), eq(get));
+        verify(memory, never()).upsert(any(), any());
+        verify(memory, never()).correct(any(), any());
+        verify(memory, never()).forget(any(), any());
         for (var resource : List.of(TianjiAgentPermissions.MEMORY_GET_API, TianjiAgentPermissions.MEMORY_RETRIEVE_API, TianjiAgentPermissions.MEMORY_UPSERT_API,
                 TianjiAgentPermissions.MEMORY_CORRECT_API, TianjiAgentPermissions.MEMORY_FORGET_API)) verify(permissions).requireExecution(resource);
     }

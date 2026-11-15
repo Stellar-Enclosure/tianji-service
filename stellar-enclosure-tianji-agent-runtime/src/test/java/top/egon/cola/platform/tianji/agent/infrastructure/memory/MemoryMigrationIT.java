@@ -39,6 +39,7 @@ import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryOperationContext;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryRetentionPolicy;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.memory.CorrectMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.ForgetMemoryCommand;
 import top.egon.cola.platform.tianji.contract.memory.GetMemoryQuery;
@@ -201,9 +202,26 @@ class MemoryMigrationIT {
              var maintenanceIndex = new PgVectorMemoryIndex(maintenance, binding, embedding, 2, CLOCK)) {
             var store = new JdbcMemoryStore(source, AF, "COMPONENT", CLOCK, validator.getValidator());
             var adapter = new LegacyMemoryStoreAdapter(source, AF, store, CLOCK);
-            var memory = new PostgresMemoryService(new AgentLedgerService(source), source, ignored -> MemoryAuthorization.Decision.ALLOW,
+            var denied = new AtomicBoolean();
+            var memory = new PostgresMemoryService(new AgentLedgerService(source), source,
+                    ignored -> denied.get() ? MemoryAuthorization.Decision.DENY : MemoryAuthorization.Decision.ALLOW,
                     List.of(POLICY), publication(source, adapter), CLOCK, index, adapter);
             memory.verifyStorage(2, version);
+            var missing = upsert("uncommitted", "new-fact", large);
+            var changed = upsert(key, "fact", new MemoryContentDTO("changed", Map.of()));
+            var beforeReplay = retiredReplayState();
+            assertEquals(original, memory.replayCommittedUpsert(context(ALICE), first));
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpsert(context(BOB), first)).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpserts(context(ALICE), List.of(first, missing))).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpsert(context(ALICE), changed)).code());
+            denied.set(true);
+            assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpsert(context(ALICE), first)).code());
+            denied.set(false);
+            assertEquals(beforeReplay, retiredReplayState(), "Historical replay must leave absent authority and Outbox untouched");
             var secondActor = memory.upsert(context(BOB), first);
             assertEquals("DEDUPLICATED", secondActor.outcome().name());
             var scope = LegacyMemoryStoreAdapter.scopeOf(ALICE.tenantId(), ALICE.issuerFingerprint(), TEAM, SCOPE);
@@ -213,6 +231,11 @@ class MemoryMigrationIT {
                     new MemoryContentDTO("corrected", Map.of()), PROOF, BigDecimal.ONE, "REVIEWED");
             var corrected = memory.correct(context(ALICE), amended);
             assertEquals(2L, corrected.revision());
+            var legacyReplay = retiredReplayState();
+            assertEquals(original, memory.replayCommittedUpsert(context(ALICE), first));
+            assertEquals(secondActor, memory.replayCommittedUpsert(context(BOB), first));
+            assertEquals(corrected, memory.replayCommittedCorrection(context(ALICE), amended));
+            assertEquals(legacyReplay, retiredReplayState());
 
             var maintenanceStore = new JdbcMemoryStore(maintenance, AF, "COMPONENT", CLOCK, validator.getValidator());
             var maintenanceAdapter = new LegacyMemoryStoreAdapter(maintenance, AF, maintenanceStore, CLOCK);
@@ -242,8 +265,19 @@ class MemoryMigrationIT {
             assertEquals(original, memory.upsert(context(ALICE), first));
             assertEquals(secondActor, memory.upsert(context(BOB), first));
             assertEquals(corrected, memory.correct(context(ALICE), amended));
-            var forgotten = memory.forget(context(ALICE), new ForgetMemoryCommand(key, TEAM, SCOPE, "fact", 2, "USER_FORGET"));
+            var forget = new ForgetMemoryCommand(key, TEAM, SCOPE, "fact", 2, "USER_FORGET");
+            var forgotten = memory.forget(context(ALICE), forget);
             assertEquals(3L, forgotten.revision());
+            var nativeReplay = retiredReplayState();
+            assertEquals(List.of(original), memory.replayCommittedUpserts(context(ALICE), List.of(first)));
+            assertEquals(secondActor, memory.replayCommittedUpsert(context(BOB), first));
+            assertEquals(corrected, memory.replayCommittedCorrection(context(ALICE), amended));
+            assertEquals(forgotten, memory.replayCommittedForget(context(ALICE), forget));
+            assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpsert(context(ALICE), missing)).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> memory.replayCommittedUpsert(context(ALICE), changed)).code());
+            assertEquals(nativeReplay, retiredReplayState(), "Component replay must leave authority, history and Outbox untouched");
             var rebuild = service.rebuildHeads(scope, cut.authorityEpoch(), null, 0, 1, deadline());
             assertEquals(3L, rebuild.highWaterRevision());
             assertEquals("FORGOTTEN", rebuild.heads().getFirst().state());
@@ -260,6 +294,22 @@ class MemoryMigrationIT {
             concurrentOwnersAndTail(memory, maintenanceMemory, maintenanceIndex, maintenanceStore, indexes);
             ambiguousCommittedSwitch(memory, validator.getValidator());
         }
+    }
+
+    private Map<String, Object> retiredReplayState() {
+        return privileged.queryForMap("""
+                SELECT (SELECT count(*) FROM egon_agent_memory.scope) AS authority_count,
+                       (SELECT max(updated_at) FROM egon_agent_memory.scope) AS authority_changed_at,
+                       (SELECT count(*) FROM tianji_agent.agent_memory_scope) AS legacy_scope_count,
+                       (SELECT max(updated_at) FROM tianji_agent.agent_memory_scope) AS legacy_scope_changed_at,
+                       (SELECT count(*) FROM tianji_agent.agent_memory_entry) AS legacy_entries,
+                       (SELECT count(*) FROM tianji_agent.agent_memory_revision) AS legacy_revisions,
+                       (SELECT count(*) FROM tianji_agent.agent_memory_command_receipt) AS legacy_receipts,
+                       (SELECT count(*) FROM egon_agent_memory.fact) AS component_facts,
+                       (SELECT count(*) FROM egon_agent_memory.revision) AS component_revisions,
+                       (SELECT count(*) FROM egon_agent_memory.receipt) AS component_receipts,
+                       (SELECT count(*) FROM tianji_agent.egon_cola_outbox_message) AS outbox_messages
+                """);
     }
 
     private void blockedPendingAndUnsafePhysicalCopies(PostgresMemoryService memory, MemoryIndexWork liveIndex,

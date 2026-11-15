@@ -97,6 +97,47 @@ class MemoryPreferenceAdmissionTest {
         assertThrows(AgentLedgerException.class, () -> service.prepare(context(), query)); assertTrue(writes.isEmpty());
     }
 
+    @Test void retired_extraction_replays_all_original_item_results_without_admitting_new_writes() {
+        when(ledger.executionMaterial(any(), any())).thenReturn(material(AgentRunStatusEnum.COMPLETED,
+                "memory.preference.language=zh-CN\nmemory.preference.timezone=UTC", HASH));
+        var service = admission(policy());
+        var request = command(policy());
+        var original = service.extract(context(), request);
+        assertEquals(2, original.items().size());
+        var originalCommands = List.copyOf(writes);
+        clearInvocations(memory);
+
+        when(memory.replayCommittedUpserts(eq(context()), eq(originalCommands)))
+                .thenReturn(original.items().stream().map(item -> item.receipt()).toList());
+        assertEquals(original, service.replayCommittedExtraction(context(), request));
+        assertEquals(originalCommands, writes, "Retired extraction must only look up the original item receipts");
+        verify(memory).replayCommittedUpserts(eq(context()), eq(originalCommands));
+
+        doThrow(new AgentLedgerException(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, "One item has no committed receipt"))
+                .when(memory).replayCommittedUpserts(eq(context()), eq(originalCommands));
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> service.replayCommittedExtraction(context(), request)).code());
+
+        when(authorization.authorize(any())).thenReturn(MemoryAuthorization.Decision.DENY);
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> service.replayCommittedExtraction(context(), request)).code());
+        verify(memory, times(2)).replayCommittedUpserts(any(), any());
+        verify(memory, never()).upsert(any(), any());
+    }
+
+    @Test void retired_extraction_cannot_report_uncommitted_empty_or_unfinished_work() {
+        var service = admission(policy());
+        var request = command(policy());
+        when(ledger.executionMaterial(any(), any())).thenReturn(material(AgentRunStatusEnum.COMPLETED, "no explicit preference", HASH));
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> service.replayCommittedExtraction(context(), request)).code());
+        when(ledger.executionMaterial(any(), any())).thenReturn(material(AgentRunStatusEnum.RUNNING, "memory.preference.language=zh-CN", HASH));
+        assertEquals(AgentErrorCodeEnum.TIANJI_RESOURCE_NOT_FOUND, assertThrows(AgentLedgerException.class,
+                () -> service.replayCommittedExtraction(context(), request)).code());
+        verify(memory, never()).replayCommittedUpserts(any(), any());
+        verify(memory, never()).upsert(any(), any());
+    }
+
     @Test void deny_unavailable_and_current_revocation_never_become_an_empty_or_writable_source() {
         for (var decision : List.of(MemoryAuthorization.Decision.DENY, MemoryAuthorization.Decision.UNAVAILABLE)) {
             when(authorization.authorize(any())).thenReturn(decision);

@@ -46,7 +46,7 @@ stellar:
         enabled: false
       legacy:
         direct-start:
-          enabled: true
+          enabled: false
       terminal-events:
         span-links-enabled: false
       result-delivery:

@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.server.api;
 
+import jakarta.validation.Valid;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -47,11 +48,13 @@ public class AgentRunController {
     private final AgentLedgerService ledger;
     private final TianjiAgentAccess access;
     private final TianjiExecutionGrantIssuer executionGrants;
+    private final boolean legacyDirectStartEnabled;
 
     public AgentRunController(AgentLedgerService ledger, TianjiAgentAccess access) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.access = Objects.requireNonNull(access, "access");
         this.executionGrants = null;
+        this.legacyDirectStartEnabled = true;
     }
 
     @Autowired
@@ -60,6 +63,8 @@ public class AgentRunController {
                               org.springframework.core.env.Environment environment) {
         this.ledger = Objects.requireNonNull(ledger, "ledger");
         this.access = Objects.requireNonNull(access, "access");
+        this.legacyDirectStartEnabled = environment.getProperty(
+                "stellar.tianji.agent.legacy.direct-start.enabled", Boolean.class, true);
         boolean enabled = environment.getProperty("stellar.tianji.agent.execution-grants.enabled", Boolean.class, false);
         this.executionGrants = enabled ? executionGrants.getIfAvailable() : null;
         if (enabled && this.executionGrants == null) throw new IllegalStateException("TIANJI_EXECUTION_GRANT_ISSUER_REQUIRED");
@@ -71,7 +76,7 @@ public class AgentRunController {
             oauthScopes = TianjiAgentPermissions.START_SCOPE)
     @RequiresPermissions(codes = TianjiAgentPermissions.START)
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<AgentRunDTO> start(@RequestBody StartAgentRunCommand command) {
+    public ResponseEntity<AgentRunDTO> start(@RequestBody @Valid StartAgentRunCommand command) {
         var authorized = access.require(TianjiAgentPermissions.START_API);
         if (command.sessionId() != null) throw new IllegalArgumentException("session-backed runs use the session start endpoint");
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(start(authorized, command));
@@ -83,7 +88,7 @@ public class AgentRunController {
             oauthScopes = {TianjiAgentPermissions.START_SCOPE, TianjiAgentPermissions.READ_SCOPE})
     @RequiresPermissions(codes = {TianjiAgentPermissions.START, TianjiAgentPermissions.READ})
     @PostMapping(path = "/with-session", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public ResponseEntity<AgentRunDTO> startWithSession(@RequestBody StartAgentRunCommand command) {
+    public ResponseEntity<AgentRunDTO> startWithSession(@RequestBody @Valid StartAgentRunCommand command) {
         var authorized = access.require(TianjiAgentPermissions.SESSION_START_API);
         if (command.sessionId() == null) throw new IllegalArgumentException("session identifier is required");
         return ResponseEntity.accepted().cacheControl(CacheControl.noStore()).body(start(authorized, command));
@@ -156,6 +161,9 @@ public class AgentRunController {
     }
 
     private AgentRunDTO start(TianjiAgentAccess.Authorized authorized, StartAgentRunCommand command) {
+        if (!legacyDirectStartEnabled) {
+            return ledger.replayCommittedDirectStart(authorized.actor(), command);
+        }
         AgentRunDTO run = ledger.start(authorized.actor(), command);
         return executionGrants == null ? run : executionGrants.ensure(authorized, run);
     }

@@ -15,7 +15,7 @@ import top.egon.cola.component.agentflow.runtime.SpringAiModelAdapterFactory;
 import java.util.Map;
 import java.util.function.Function;
 
-/** Contributes reviewed Code-First factories without creating a model client or enabling the runtime. */
+/** Contributes the approved V1 Code-First factories retained for pinned legacy runs. */
 @Configuration(proxyBeanMethods = false)
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.native-templates", name = "enabled", havingValue = "true")
 @EnableConfigurationProperties(NativeAgentTemplateProperties.class)

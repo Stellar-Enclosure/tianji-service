@@ -1,9 +1,15 @@
 package top.egon.cola.platform.tianji.agent.server.api;
 
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -29,17 +35,19 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.RequiresPermissions;
 
 import java.time.Instant;
-import java.util.Objects;
 
 /** POST queries keep private semantic input and owner references out of URLs; every result is scoped and non-cacheable. */
-@RestController
+@Slf4j
+@Validated
+@RequiredArgsConstructor(onConstructor_ = @Autowired)
+@RestController("memoryController")
 @RequestMapping(path = MemoryClient.PATH, produces = MediaType.APPLICATION_JSON_VALUE, consumes = MediaType.APPLICATION_JSON_VALUE)
 @ConditionalOnProperty(prefix = "stellar.tianji.agent", name = {"api.enabled", "memory.enabled", "memory.http.enabled"}, havingValue = "true")
 public class MemoryController {
+    @Qualifier("tianjiMemoryService")
     private final PostgresMemoryService memory;
+    @Qualifier("tianjiAgentAccess")
     private final TianjiAgentAccess access;
-
-    public MemoryController(PostgresMemoryService memory, TianjiAgentAccess access) { this.memory = Objects.requireNonNull(memory, "memory"); this.access = Objects.requireNonNull(access, "access"); }
 
     @PermissionResource(key = TianjiAgentPermissions.MEMORY_GET_API, type = ResourceType.API,
             labelPage = "tianji.permissions", labelKey = "api.memory.get",
@@ -77,8 +85,8 @@ public class MemoryController {
             oauthScopes = TianjiAgentPermissions.MEMORY_WRITE_SCOPE)
     @RequiresPermissions(codes = TianjiAgentPermissions.MEMORY_WRITE)
     @PostMapping("/upsert")
-    public ResponseEntity<MemoryMutationResultDTO> upsert(@RequestBody UpsertMemoryCommand request) {
-        return noStore(memory.upsert(context(TianjiAgentPermissions.MEMORY_UPSERT_API), request));
+    public ResponseEntity<MemoryMutationResultDTO> upsert(@Valid @RequestBody UpsertMemoryCommand request) {
+        return noStore(memory.replayCommittedUpsert(context(TianjiAgentPermissions.MEMORY_UPSERT_API), request));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.MEMORY_CORRECT_API, type = ResourceType.API,
@@ -87,8 +95,8 @@ public class MemoryController {
             oauthScopes = TianjiAgentPermissions.MEMORY_WRITE_SCOPE)
     @RequiresPermissions(codes = TianjiAgentPermissions.MEMORY_WRITE)
     @PostMapping("/correct")
-    public ResponseEntity<MemoryMutationResultDTO> correct(@RequestBody CorrectMemoryCommand request) {
-        return noStore(memory.correct(context(TianjiAgentPermissions.MEMORY_CORRECT_API), request));
+    public ResponseEntity<MemoryMutationResultDTO> correct(@Valid @RequestBody CorrectMemoryCommand request) {
+        return noStore(memory.replayCommittedCorrection(context(TianjiAgentPermissions.MEMORY_CORRECT_API), request));
     }
 
     @PermissionResource(key = TianjiAgentPermissions.MEMORY_FORGET_API, type = ResourceType.API,
@@ -97,8 +105,8 @@ public class MemoryController {
             oauthScopes = TianjiAgentPermissions.MEMORY_FORGET_SCOPE)
     @RequiresPermissions(codes = TianjiAgentPermissions.MEMORY_FORGET)
     @PostMapping("/forget")
-    public ResponseEntity<MemoryMutationResultDTO> forget(@RequestBody ForgetMemoryCommand request) {
-        return noStore(memory.forget(context(TianjiAgentPermissions.MEMORY_FORGET_API), request));
+    public ResponseEntity<MemoryMutationResultDTO> forget(@Valid @RequestBody ForgetMemoryCommand request) {
+        return noStore(memory.replayCommittedForget(context(TianjiAgentPermissions.MEMORY_FORGET_API), request));
     }
 
     private MemoryOperationContext context(String resource) {

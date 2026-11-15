@@ -165,6 +165,18 @@ public final class LegacyMemoryStoreAdapter {
 
     <T> T inScope(JdbcMemoryRepository repository, Instant deadline, boolean write, boolean create,
                   Long expectedEpoch, BooleanSupplier current, Function<JdbcMemoryRepository, T> execute) {
+        return inScope(repository, deadline, write, create, expectedEpoch, current, execute, true);
+    }
+
+    /** A pre-guard legacy receipt remains readable without creating an authority row. */
+    <T> T inReceiptScope(JdbcMemoryRepository repository, Instant deadline, BooleanSupplier current,
+                         Function<JdbcMemoryRepository, T> lookup) {
+        return inScope(repository, deadline, false, false, null, current, lookup, false);
+    }
+
+    private <T> T inScope(JdbcMemoryRepository repository, Instant deadline, boolean write, boolean create,
+                          Long expectedEpoch, BooleanSupplier current, Function<JdbcMemoryRepository, T> execute,
+                          boolean materializeAuthority) {
         requireTransaction();
         var scope = scopeOf(repository.tenantId(), repository.issuer(), repository.owner(), repository.scopeId());
         try {
@@ -172,6 +184,7 @@ public final class LegacyMemoryStoreAdapter {
             var selected = jdbc.query("SELECT authority_epoch FROM " + schema + ".scope WHERE scope_hash=?",
                     (rs, row) -> rs.getLong("authority_epoch"), scope.hash());
             if (selected.isEmpty()) {
+                if (!materializeAuthority) return invokeHost(repository, execute);
                 if (expectedEpoch != null && expectedEpoch != 0L) throw unavailable();
                 if (!create && !repository.scopeExists()) return execute.apply(repository.absent());
                 if (expectedEpoch != null) throw unavailable();
@@ -192,9 +205,7 @@ public final class LegacyMemoryStoreAdapter {
                 var route = repository.fenced(schema, scope.hash(), fence);
                 TransactionSynchronizationManager.bindResource(this, new PublicationFenceVO(scope, write, route));
                 try {
-                    return execute.apply(route);
-                } catch (CommonException deniedByHost) {
-                    throw new HostCallbackException(deniedByHost);
+                    return invokeHost(route, execute);
                 } finally {
                     TransactionSynchronizationManager.unbindResource(this);
                 }
@@ -204,6 +215,14 @@ public final class LegacyMemoryStoreAdapter {
         } catch (CommonException | DataAccessException failure) {
             log.debug("Memory scope authority unavailable");
             throw unavailable();
+        }
+    }
+
+    private static <T> T invokeHost(JdbcMemoryRepository repository, Function<JdbcMemoryRepository, T> execute) {
+        try {
+            return execute.apply(repository);
+        } catch (CommonException deniedByHost) {
+            throw new HostCallbackException(deniedByHost);
         }
     }
 

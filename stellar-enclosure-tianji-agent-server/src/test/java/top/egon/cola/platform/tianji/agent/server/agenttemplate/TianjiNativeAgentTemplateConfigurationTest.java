@@ -29,6 +29,8 @@ import static org.mockito.Mockito.*;
 
 class TianjiNativeAgentTemplateConfigurationTest {
     private static final String PREFIX = "stellar.tianji.agent.native-templates.";
+    private static final String DIRECT_START = "stellar.tianji.agent.legacy.direct-start.enabled";
+    private static final String RUNTIME_V2 = "stellar.tianji.agent.runtime-v2.enabled";
     private static final String FACTORIES = "tianjiAgentCodeFirstFactories";
     private static final String MODEL_BEAN = "reviewedModel";
     private static final String MODEL = "gpt-4o-mini";
@@ -53,9 +55,11 @@ class TianjiNativeAgentTemplateConfigurationTest {
     }
 
     @Test
-    void base_yaml_has_the_complete_default_off_native_template_key_set() throws Exception {
+    void base_yaml_retires_direct_start_and_keeps_runtime_flags_independent() throws Exception {
         var source = new YamlPropertySourceLoader().load("agent-server", new ClassPathResource("application.yml")).getFirst();
         assertAll(
+                () -> assertEquals(Boolean.FALSE, source.getProperty(DIRECT_START)),
+                () -> assertEquals(Boolean.FALSE, source.getProperty(RUNTIME_V2)),
                 () -> assertEquals(Boolean.FALSE, source.getProperty(PREFIX + "enabled")),
                 () -> assertEquals("", source.getProperty(PREFIX + "model-bean-name")),
                 () -> assertEquals("", source.getProperty(PREFIX + "model-name")),
@@ -189,9 +193,10 @@ class TianjiNativeAgentTemplateConfigurationTest {
     }
 
     @Test
-    void both_flags_contribute_exactly_three_immutable_strategies_to_the_same_consumer() {
+    void retired_direct_start_preserves_all_three_opted_in_legacy_factories() {
         ChatModel model = model(MODEL);
-        enabled(runner(Map.of(MODEL_BEAN, model))).withPropertyValues(PREFIX + "decomposition-enabled=true")
+        enabled(runner(Map.of(MODEL_BEAN, model))).withPropertyValues(PREFIX + "decomposition-enabled=true",
+                        DIRECT_START + "=false", RUNTIME_V2 + "=true")
                 .withUserConfiguration(ConsumerConfiguration.class).run(context -> {
                     assertNull(context.getStartupFailure());
                     var properties = assertDoesNotThrow(() -> context.getBean(NativeAgentTemplateProperties.class));

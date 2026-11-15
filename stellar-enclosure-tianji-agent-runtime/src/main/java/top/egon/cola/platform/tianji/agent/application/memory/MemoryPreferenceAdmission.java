@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.agent.application.memory;
 
+import jakarta.validation.Valid;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.memory.MemoryAuthorization;
@@ -19,6 +21,8 @@ import top.egon.cola.platform.tianji.contract.memory.PrepareMemoryPreferencesQue
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferencePreparationDTO;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionOutcomeEnum;
 import top.egon.cola.platform.tianji.contract.memory.MemoryPreferenceExtractionResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.MemoryMutationResultDTO;
+import top.egon.cola.platform.tianji.contract.memory.UpsertMemoryCommand;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -29,6 +33,7 @@ import java.util.Map;
 import java.util.Objects;
 
 /** Current-request orchestration; every candidate owns its existing short receipt/fact/Outbox transaction. */
+@Slf4j
 public final class MemoryPreferenceAdmission {
     private final AgentLedgerService ledger;
     private final PostgresMemoryService memory;
@@ -60,23 +65,46 @@ public final class MemoryPreferenceAdmission {
     }
 
     public MemoryPreferenceExtractionResultDTO extract(MemoryOperationContext context, ExtractMemoryPreferencesCommand command) {
+        return extract(context, command, false);
+    }
+
+    public MemoryPreferenceExtractionResultDTO replayCommittedExtraction(MemoryOperationContext context,
+                                                                          @Valid ExtractMemoryPreferencesCommand command) {
+        return extract(context, command, true);
+    }
+
+    private MemoryPreferenceExtractionResultDTO extract(MemoryOperationContext context, ExtractMemoryPreferencesCommand command, boolean replayOnly) {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(command, "command");
         var binding = bindings.get(command.bindingId());
         if (binding == null || !binding.accepts(context.actor(), command)) throw denied();
         var loaded = source(context, command.sourceQuery());
         if (!binding.equals(loaded.binding())) throw denied();
         var material = loaded.material();
-        if (material.run().status() != AgentRunStatusEnum.COMPLETED) return result(command, MemoryPreferenceExtractionOutcomeEnum.RUN_NOT_COMPLETED, List.of());
+        if (material.run().status() != AgentRunStatusEnum.COMPLETED) {
+            if (replayOnly) throw denied();
+            return result(command, MemoryPreferenceExtractionOutcomeEnum.RUN_NOT_COMPLETED, List.of());
+        }
         var policy = policies.get(binding.policyRef());
         var prepared = extraction.evaluate(new MemoryPreferenceExtraction.Source(material.run().status(), MemoryPreferenceExtraction.SourceKind.USER_INPUT, true,
                 material.snapshot().input().text() == null ? "" : material.snapshot().input().text()), policy);
-        var receipts = new ArrayList<MemoryPreferenceExtractionItemDTO>();
-        for (var candidate : MemoryPreferenceCommands.create(context.actor(), command, policy, prepared)) {
-            if (!clock.instant().isBefore(context.deadlineAt())) throw unavailable();
-            var receipt = memory.upsert(context, candidate);
-            receipts.add(new MemoryPreferenceExtractionItemDTO(candidate.content().facts().keySet().iterator().next(), receipt));
+        var candidates = MemoryPreferenceCommands.create(context.actor(), command, policy, prepared);
+        if (replayOnly && candidates.isEmpty()) throw denied();
+        var committed = replayOnly ? memory.replayCommittedUpserts(context, candidates) : writeCandidates(context, candidates);
+        var receipts = new ArrayList<MemoryPreferenceExtractionItemDTO>(candidates.size());
+        for (int index = 0; index < candidates.size(); index++) {
+            var key = candidates.get(index).content().facts().keySet().iterator().next();
+            receipts.add(new MemoryPreferenceExtractionItemDTO(key, committed.get(index)));
         }
         return result(command, MemoryPreferenceExtractionOutcomeEnum.valueOf(prepared.outcome().name()), receipts);
+    }
+
+    private List<MemoryMutationResultDTO> writeCandidates(MemoryOperationContext context, List<UpsertMemoryCommand> candidates) {
+        var receipts = new ArrayList<MemoryMutationResultDTO>(candidates.size());
+        for (var candidate : candidates) {
+            if (!clock.instant().isBefore(context.deadlineAt())) throw unavailable();
+            receipts.add(memory.upsert(context, candidate));
+        }
+        return receipts;
     }
 
     public MemoryPreferencePreparationDTO prepare(MemoryOperationContext context, PrepareMemoryPreferencesQuery query) {

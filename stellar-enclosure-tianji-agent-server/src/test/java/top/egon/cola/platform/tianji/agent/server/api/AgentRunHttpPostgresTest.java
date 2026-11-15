@@ -20,6 +20,8 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.ChatOptions;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.mock.env.MockEnvironment;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DriverManagerDataSource;
@@ -47,6 +49,7 @@ import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManag
 import top.egon.cola.platform.tianji.agent.server.TianjiAgentServerApplication;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
+import top.egon.cola.platform.tianji.agent.server.security.TianjiExecutionGrantIssuer;
 import top.egon.cola.platform.tianji.agent.server.security.VerifiedAgentIssuerFilter;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
@@ -76,6 +79,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -386,12 +390,95 @@ class AgentRunHttpPostgresTest {
     }
 
     @Test
+    void retired_direct_start_replays_only_original_http_facts_without_writing() throws Exception {
+        String sessionsBase = "/api/tianji/v1/agent-sessions";
+        String suffix = UUID.randomUUID().toString();
+        String sessionId = "retired-session-" + suffix;
+        String unknownSessionId = "retired-unknown-session-" + suffix;
+        String rootKey = "retired-root-" + suffix;
+        String sessionKey = "retired-session-run-" + suffix;
+        String unknownRootKey = "retired-missing-root-" + suffix;
+        String unknownSessionKey = "retired-missing-session-" + suffix;
+
+        mvc.perform(put(sessionsBase).param("sessionId", sessionId)).andExpect(status().isOk());
+        mvc.perform(put(sessionsBase).param("sessionId", unknownSessionId)).andExpect(status().isOk());
+        var rootCommand = new StartAgentRunCommand("review", 1, null, rootKey, null, "trace-retired-root",
+                new AgentInputDTO("original root", List.of(), Map.of()), null);
+        var sessionCommand = new StartAgentRunCommand("review", 1, sessionId, sessionKey, null, "trace-retired-session",
+                new AgentInputDTO("original session", List.of(), Map.of()), null);
+        String rootBody = mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(rootCommand)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        String sessionBody = mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(sessionCommand)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        AgentRunDTO rootRun = mapper.readValue(rootBody, AgentRunDTO.class);
+        AgentRunDTO sessionRun = mapper.readValue(sessionBody, AgentRunDTO.class);
+
+        mvc = retiredMvc();
+        String rootReplay = mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(rootCommand)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        String sessionReplay = mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(sessionCommand)))
+                .andExpect(status().isAccepted()).andReturn().getResponse().getContentAsString();
+        assertEquals(mapper.readTree(rootBody), mapper.readTree(rootReplay));
+        assertEquals(mapper.readTree(sessionBody), mapper.readTree(sessionReplay));
+        assertEquals(rootRun.runId(), mapper.readValue(rootReplay, AgentRunDTO.class).runId());
+        assertEquals(sessionRun.runId(), mapper.readValue(sessionReplay, AgentRunDTO.class).runId());
+
+        var changedRoot = new StartAgentRunCommand("review", 1, null, rootKey, null, "trace-retired-root",
+                new AgentInputDTO("changed root", List.of(), Map.of()), null);
+        mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(changedRoot)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code").value("TIANJI_IDEMPOTENCY_CONFLICT"));
+        var missingRoot = new StartAgentRunCommand("review", 1, null, unknownRootKey, null, null,
+                new AgentInputDTO("unseen root", List.of(), Map.of()), null);
+        var missingSession = new StartAgentRunCommand("review", 1, unknownSessionId, unknownSessionKey, null, null,
+                new AgentInputDTO("unseen session", List.of(), Map.of()), null);
+        mvc.perform(post(BASE).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsBytes(missingRoot)))
+                .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+        mvc.perform(post(BASE + "/with-session").contentType(MediaType.APPLICATION_JSON)
+                        .content(mapper.writeValueAsBytes(missingSession)))
+                .andExpect(status().isNotFound()).andExpect(jsonPath("$.code").value("TIANJI_RESOURCE_NOT_FOUND"));
+
+        var jdbc = new JdbcTemplate(source);
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run WHERE run_id = ?", Integer.class,
+                rootRun.runId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run WHERE run_id = ?", Integer.class,
+                sessionRun.runId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_event WHERE run_id = ?", Integer.class,
+                rootRun.runId()));
+        assertEquals(1, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_event WHERE run_id = ?", Integer.class,
+                sessionRun.runId()));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run WHERE idempotency_key IN (?, ?, ?)",
+                Integer.class, unknownRootKey, unknownSessionKey, "unused-" + suffix));
+        assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM tianji_agent.agent_run_execution_grant WHERE run_id IN (?, ?)",
+                Integer.class, rootRun.runId(), sessionRun.runId()));
+    }
+
+    @SuppressWarnings("unchecked")
+    private MockMvc retiredMvc() {
+        var access = new TianjiAgentAccess(mock(PermissionExecutionGuard.class), Clock.systemUTC());
+        ObjectProvider<TianjiExecutionGrantIssuer> issuer = mock(ObjectProvider.class);
+        var environment = new MockEnvironment()
+                .withProperty("stellar.tianji.agent.legacy.direct-start.enabled", "false");
+        return MockMvcBuilders.standaloneSetup(new AgentRunController(ledger, access, issuer, environment),
+                        new AgentRunSseController(access, new AgentRunEventStream(ledger, access, Clock.systemUTC())),
+                        new AgentSessionController(sessions, access))
+                .addFilters(new VerifiedAgentIssuerFilter())
+                .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice()).build();
+    }
+
+    @Test
     void enabled_web_configuration_binds_session_manager_to_the_ledger_datasource() {
         WebApplicationContextRunner runner = new WebApplicationContextRunner().withUserConfiguration(TianjiAgentServerApplication.class)
                 .withPropertyValues("stellar.tianji.agent.api.enabled=true",
+                        "stellar.tianji.agent.legacy.direct-start.enabled=false",
                         "egon.cola.platform.tianquan.shoubing.register-filter=false",
                         "egon.cola.platform.tianquan.jianshen.register-filter=false",
                         "egon.cola.component.id.enabled=false",
+                        "egon.cola.component.transactional-outbox.enabled=false",
                         "spring.autoconfigure.exclude=org.redisson.spring.starter.RedissonAutoConfigurationV4")
                 .withBean(AgentLedgerService.class, () -> ledger)
                 .withBean(PermissionExecutionGuard.class, () -> mock(PermissionExecutionGuard.class))
@@ -399,8 +486,11 @@ class AgentRunHttpPostgresTest {
                 .withBean(IdpBearerAuthenticationFilter.class, () -> mock(IdpBearerAuthenticationFilter.class))
                 .withBean(Rbac3BearerAuthenticationFilter.class, () -> mock(Rbac3BearerAuthenticationFilter.class));
         runner.withBean(DataSource.class, () -> source).run(context -> {
-            assertNull(context.getStartupFailure());
+            if (context.getStartupFailure() != null) {
+                throw new AssertionError("Agent HTTP application did not start", context.getStartupFailure());
+            }
             assertNotNull(context.getBean(AgentSessionManager.class));
+            assertNotNull(context.getBean(AgentRunController.class));
         });
         runner.withBean(DataSource.class, () -> new DriverManagerDataSource(source.getUrl())).run(context -> {
             assertNotNull(context.getStartupFailure());

@@ -1,5 +1,6 @@
 package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
+import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
@@ -613,6 +614,16 @@ public final class AgentLedgerService {
     /** Atomically records the queued run and its first event; no model is called in this transaction. */
     public AgentRunDTO start(TrustedAgentActor actor, StartAgentRunCommand command) {
         return start(actor, command, null);
+    }
+
+    /** Replays an existing legacy direct-start command without admitting a new run. */
+    public AgentRunDTO replayCommittedDirectStart(TrustedAgentActor actor, @Valid StartAgentRunCommand command) {
+        Objects.requireNonNull(actor, "actor");
+        Objects.requireNonNull(command, "command");
+        String requestHash = json.requestHash(command);
+        var original = repository.byIdempotencyKey(actor, command.idempotencyKey())
+                .orElseThrow(AgentLedgerService::notFound);
+        return sameRequest(original, requestHash);
     }
 
     /** Called only while the linked-submission fence is locked in the same transaction. */
