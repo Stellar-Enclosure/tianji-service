@@ -1,6 +1,6 @@
 # Tianji Service
 
-Tianji is the business process and intelligent orchestration platform for Stellar Enclosure. The current delivery contains engine-neutral contracts, a PostgreSQL Agent ledger, a manually invoked single-run executor, an opt-in secured Agent HTTP adapter, and an independent Flowable process host with an opt-in initial API. Opt-in background discovery requires explicit host wiring; the remaining process and runtime capabilities are still being built.
+Tianji is the business process and intelligent orchestration platform for Stellar Enclosure. The delivery contains engine-neutral contracts, a PostgreSQL Agent ledger, an embedded Agent runtime, a secured Agent HTTP adapter and an independent Flowable process host. Agent and Process HTTP adapters remain opt-in.
 
 ## Modules
 
@@ -15,6 +15,38 @@ The selected dependency line is Java 25, Spring Boot 4.1.2, Spring AI 2.0.2, Goo
 The client uses JDK `HttpClient` and Jackson 3. Construct `HttpAgentClient` with a service URI, a client configured with `Redirect.NEVER`, a supplier of the current access token, a request timeout and a bounded event-stream reconnect policy. It sends writes once, limits JSON responses and resumes SSE using the last delivered persisted sequence. A subscriber controls demand and may cancel its subscription without cancelling the Agent run. A `stream.complete` frame closes a terminal stream; a planned `stream.reconnect` rotates the connection without treating it as a failed run; an expired cursor is reported as `TIANJI_EVENT_CURSOR_EXPIRED`. Error bodies and access tokens are not retained in client exceptions. The client has been tested against local HTTP stubs; real deployment integration remains to be verified.
 
 The engine-neutral `ProcessReleaseClient`, `ProcessClient` and `DecisionClient` contracts have a JDK HTTP implementation in `HttpProcessClient`. It sends writes once, bounds request/response sizes and deadlines, and checks the returned release version, model hashes and request correlation. Its transport has been tested with local stubs; the server adapter has also been exercised with MockMvc and a disposable PostgreSQL database, while real identity services and a deployed network path remain to be verified.
+
+## Automation v2 integration
+
+Use Process to start new business work. The formal start request names the process definition and supplies the business input. Process selects the active release and records its version, activation revision and fixed node bindings on the instance.
+
+1. Use `HttpProcessDraftClient` to create or reopen an owner-scoped draft. Save the draft revision even when its content is incomplete. Validate the saved revision, then publish it with its content digest.
+2. Use `HttpProcessActivationClient` to activate the published release with the current User identity and both release-read and release-activate permissions. When a release is already active, it serves new starts until activation succeeds. Recover an uncertain publication from the saved draft and its original command. Find an uncertain activation in activation history using its original `commandId`.
+3. Use `HttpProcessAutomationClient` to start with the definition key, business key, command ID, correlation ID and typed input. The response identifies the release version and activation revision used by the instance.
+4. If a start response is uncertain, keep the original command ID and request body. Derive `commandId` and `requestSha256` with `HttpProcessAutomationClient.startReceiptQuery`. Read the matching receipt through `ProcessStartReceiptClient` on `HttpProcessClient`. A matching receipt confirms the original start. Keep the same command pending after a 404 or timeout.
+5. Read the instance through Process. Business output can be redacted unless current data-read authorization covers it. Store forms, opinions and attachments in the consuming application.
+
+The versioned contracts live in the [Process Server OpenAPI](stellar-enclosure-tianji-process-server/src/main/resources/META-INF/tianji/openapi/automation-v2.json) and the [client OpenAPI copy](stellar-enclosure-tianji-client/src/main/resources/META-INF/tianji/openapi/automation-v2.json). The Java clients for [drafts](stellar-enclosure-tianji-client/src/main/java/top/egon/cola/platform/tianji/client/HttpProcessDraftClient.java), [activation](stellar-enclosure-tianji-client/src/main/java/top/egon/cola/platform/tianji/client/HttpProcessActivationClient.java), [automation](stellar-enclosure-tianji-client/src/main/java/top/egon/cola/platform/tianji/client/HttpProcessAutomationClient.java) and [events](stellar-enclosure-tianji-client/src/main/java/top/egon/cola/platform/tianji/client/HttpProcessEventClient.java) use a current-token supplier and bounded timeouts. They require `HttpClient.Redirect.NEVER` and accept HTTPS or HTTP loopback fixtures.
+
+For a HUMAN step, use the signed-in User and current candidate or assignment evidence. Query and claim through `HttpProcessClient`. Read and complete the typed v2 task through `HttpProcessAutomationClient` with its current expected version. API-009 and API-010 recheck the candidate or assignment. Completion validates the submitted result against the released schema. Store opinions and attachment bodies in the business application and submit their opaque `resultRef` as part of the declared typed result.
+
+A trusted event producer sends a declared event route through `HttpProcessEventClient`. Process pins the release when it first accepts the event. A duplicate event reuses its receipt, while a late or revoked route cannot select a newer release. Rule and Worker nodes refer to registered capability versions. Agent nodes refer to an immutable Agent template version. An active release change does not alter versions already pinned to an instance.
+
+The acceptance exercises human-only, event-driven, mixed and pure-Agent flows. Its human consumer stores a form, opinion and attachment in a separate business store, then sends only a `resultRef`. It runs separate Process, Agent and Worker processes against isolated PostgreSQL catalogs with local identity and model fixtures. See the [independent-services acceptance](stellar-enclosure-tianji-process-server/src/test/java/top/egon/cola/platform/tianji/process/server/acceptance/AutomationIndependentServicesIT.java).
+
+Run the acceptance from the Service root with JDK 25 and the authorized private fixture. Supply absolute paths for the worker-classpath file and the manifest. See the [acceptance command](scripts/acceptance/verify-automation-convergence.sh) and [convergence evidence](docs/egon/evidence/2026-11-13-intelligent-process-engine-convergence.md).
+
+```sh
+sh -n scripts/acceptance/verify-automation-convergence.sh
+sh scripts/acceptance/verify-automation-convergence.sh prepare "$TIANJI_AUTOMATION_FINAL_PRIVATE_WORKER_CLASSPATH"
+sh scripts/acceptance/verify-automation-convergence.sh run "$TIANJI_AUTOMATION_FINAL_PRIVATE_MANIFEST"
+```
+
+### Legacy Agent and Memory compatibility
+
+The checked-in Agent Server config sets `stellar.tianji.agent.legacy.direct-start.enabled` to `false`. The controller defaults to `true` when the property is absent. With the flag disabled, the old Agent start routes return only a previously committed Run with the same actor, `idempotencyKey` and request digest. Before a deployment disables direct start, an authorized operator checks queued legacy Runs with unissued or expired grants and confirms how those Runs will recover. Keep the old native-template and runtime configuration available for pending Runs that reference it. See the [Agent start controller](stellar-enclosure-tianji-agent-server/src/main/java/top/egon/cola/platform/tianji/agent/server/api/AgentRunController.java) and [base configuration](stellar-enclosure-tianji-agent-server/src/main/resources/application.yml).
+
+The old Memory HTTP upsert, correction and forget routes replay only already committed receipts after current authorization. Preference preparation is retired. Synchronous preference extraction returns a result when every original item receipt is present and matches. Existing owner checks still apply to accepted V12 intent status, cancellation and recovery. Once a scope switches to Component authority, it reads migrated receipts from `HOST_V1` and returns 404 for a missing receipt.
 
 The HTTP adapter is disabled by default. Enabling `stellar.tianji.agent.api.enabled` requires a servlet application, a configured ledger, the Tianquan-Shoubing and Tianquan-Jianshen filters and the compiled permission policy. It derives tenant and subject exclusively from verified USER or tenant-scoped SERVICE identity and checks the resource policy before accessing the ledger. The run list uses an exclusive cursor ordered by creation time and run ID and exposes only the caller's own runs; refresh from the first page to include newly created runs. No permission is granted by building the application. SSE keeps the verified request context for repeated authorization, allows at most 32 simultaneous streams, reads at most eight events per page and rotates connections after 30 seconds. Deployment must also bound servlet and proxy write timeouts for slow or disconnected clients. A result that has not yet been committed returns `TIANJI_RESULT_NOT_READY` with HTTP 409.
 
