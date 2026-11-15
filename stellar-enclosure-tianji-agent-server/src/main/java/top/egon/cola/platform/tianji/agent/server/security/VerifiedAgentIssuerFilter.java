@@ -6,6 +6,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.filter.OncePerRequestFilter;
+import top.egon.cola.platform.tianji.agent.server.api.LinkedAgentRuntimeController;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
 
@@ -32,7 +33,7 @@ public final class VerifiedAgentIssuerFilter extends OncePerRequestFilter {
             try {
                 request.setAttribute(ATTRIBUTE, authentication.verifiedIssuer().toString());
                 if (authentication.getPrincipal() instanceof ServiceIdentityPrincipal && "POST".equals(request.getMethod())
-                        && (request.getContextPath() + LINKED_SUBMIT_PATH).equals(request.getRequestURI())) {
+                        && isLinkedSubmit(request)) {
                     String token = bearer(request);
                     if (token != null) request.setAttribute(SERVICE_TOKEN_DIGEST, digest(token));
                 }
@@ -41,6 +42,11 @@ public final class VerifiedAgentIssuerFilter extends OncePerRequestFilter {
         }
         try { chain.doFilter(request, response); }
         finally { request.removeAttribute(ATTRIBUTE); request.removeAttribute(SERVICE_TOKEN_DIGEST); }
+    }
+
+    private static boolean isLinkedSubmit(HttpServletRequest request) {
+        return (request.getContextPath() + LINKED_SUBMIT_PATH).equals(request.getRequestURI())
+                || (request.getContextPath() + LinkedAgentRuntimeController.PATH).equals(request.getRequestURI());
     }
 
     static String currentServiceToken(HttpServletRequest request) {

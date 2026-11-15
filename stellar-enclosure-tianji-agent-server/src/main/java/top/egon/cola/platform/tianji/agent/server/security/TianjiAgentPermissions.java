@@ -17,6 +17,14 @@ import top.egon.cola.platform.tianquan.jianshen.contract.permission.annotation.P
         labelPage = "tianji.permissions", labelKey = "permission.agent.checkpointResume")
 @PermissionDefinition(code = TianjiAgentPermissions.SESSION_DELETE, meaning = "Delete an owned Agent session",
         labelPage = "tianji.permissions", labelKey = "permission.session.delete")
+@PermissionDefinition(code = TianjiAgentPermissions.TEMPLATE_PUBLISH, meaning = "Publish an immutable Agent runtime template",
+        labelPage = "tianji.permissions", labelKey = "permission.agent.templatePublish")
+@PermissionMessage(pageCode = "tianji.permissions", key = "permission.agent.templatePublish", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Publish Agent runtime templates"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.agent.templatePublish", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Publish an Agent runtime template"))
+@PermissionMessage(pageCode = "tianji.permissions", key = "api.linked.runtimeSubmit", defaultLocale = "en-US",
+        defaults = @LocalizedText(locale = "en-US", text = "Submit a process-linked Agent runtime node"))
 @PermissionDefinition(code = TianjiAgentPermissions.LINKED_SUBMIT, meaning = "Submit an authorized process-linked Agent run",
         labelPage = "tianji.permissions", labelKey = "permission.linked.submit")
 @PermissionDefinition(code = TianjiAgentPermissions.LINKED_RESOLVE, meaning = "Resolve an owned process-linked Agent submission",
@@ -135,6 +143,7 @@ public final class TianjiAgentPermissions {
     public static final String CANCEL = "TIANJI_AGENT_CANCEL";
     public static final String CHECKPOINT_RESUME = "TIANJI_AGENT_CHECKPOINT_RESUME";
     public static final String SESSION_DELETE = "TIANJI_SESSION_DELETE";
+    public static final String TEMPLATE_PUBLISH = "TIANJI_AGENT_TEMPLATE_PUBLISH";
     public static final String LINKED_SUBMIT = "TIANJI_LINKED_AGENT_SUBMIT";
     public static final String LINKED_RESOLVE = "TIANJI_LINKED_AGENT_RESOLVE";
     public static final String LINKED_CLOSE = "TIANJI_LINKED_AGENT_CLOSE";
@@ -153,6 +162,8 @@ public final class TianjiAgentPermissions {
     public static final String SESSION_GET_API = "tianji.api.session.get";
     public static final String SESSION_LIST_API = "tianji.api.session.list";
     public static final String SESSION_DELETE_API = "tianji.api.session.delete";
+    public static final String TEMPLATE_PUBLISH_API = "tianji.api.agent.template.publish.v2";
+    public static final String LINKED_RUNTIME_SUBMIT_API = "tianji.api.agent.linkedSubmit.v2";
     public static final String LINKED_SUBMIT_API = "tianji.api.agent.linkedSubmit";
     public static final String LINKED_RESOLVE_API = "tianji.api.agent.linkedResolve";
     public static final String LINKED_CLOSE_API = "tianji.api.agent.linkedClose";
@@ -161,6 +172,7 @@ public final class TianjiAgentPermissions {
     public static final String CANCEL_SCOPE = "tianji:agent:cancel";
     public static final String CHECKPOINT_RESUME_SCOPE = "tianji:agent:checkpoint-resume";
     public static final String SESSION_DELETE_SCOPE = "tianji:session:delete";
+    public static final String TEMPLATE_PUBLISH_SCOPE = "tianji:agent:template:publish";
     public static final String LINKED_SUBMIT_SCOPE = LinkedAgentClient.SUBMIT_SCOPE;
     public static final String LINKED_RESOLVE_SCOPE = LinkedAgentClient.RESOLVE_SCOPE;
     public static final String LINKED_CLOSE_SCOPE = LinkedAgentClient.CLOSE_SCOPE;

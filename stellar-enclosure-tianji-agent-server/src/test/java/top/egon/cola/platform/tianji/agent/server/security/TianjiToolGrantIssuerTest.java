@@ -21,6 +21,7 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentServiceExecutionGrantStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.ToolCapabilityStore;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -29,6 +30,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionDependenciesDTO;
 import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
+import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianquan.jianshen.contract.authorization.SystemAuthorizationSnapshot;
 import top.egon.cola.platform.tianquan.jianshen.contract.permission.EffectivePermissionSnapshot;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3AuthenticationToken;
@@ -211,6 +216,109 @@ class TianjiToolGrantIssuerTest {
         assertTrue(fixture.issuer.usesServices(fixture.services)); assertTrue(fixture.issuer.hasServiceBindings()); assertNull(VerifiedAgentIssuerFilter.currentServiceToken(fixture.servlet)); verify(fixture.client, never()).issue(any());
     }
 
+    @Test void v2_service_issues_and_reuses_the_existing_protocol_for_exact_persisted_tools() throws Exception {
+        var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ), Duration.ofSeconds(1), System::nanoTime);
+        fixture.servlet.setRequestURI("/api/tianji/v2/agent-process-dispatches/submit");
+        var runtime = fixture.runtimeMaterial();
+        when(fixture.ledger.toolRunEvidence(eq(fixture.actor), any())).thenReturn(runtime);
+        when(fixture.services.require(runtime.authorization(), runtime.processLink())).thenReturn(fixture.serviceSource);
+        var expected = fixture.bindings.resolveRuntime(runtime).getFirst().binding();
+
+        for (int request = 0; request < 2; request++) {
+            new VerifiedAgentIssuerFilter().doFilter(fixture.servlet, new MockHttpServletResponse(), (incoming, response) ->
+                    assertSame(runtime.run(), fixture.issuer.ensureRuntime(fixture.authorized, runtime.run())));
+        }
+
+        var proof = org.mockito.ArgumentCaptor.forClass(ServiceExecutionGrantContract.IssueRequest.class);
+        verify(fixture.client).issueService(proof.capture());
+        assertEquals(expected.bindingSha256(), proof.getValue().bindingSha256());
+        assertEquals(expected.capabilityId(), proof.getValue().intentId());
+        assertEquals(expected.serviceSubject(), fixture.attached.getFirst().reservation().binding().serviceSubject());
+        assertEquals(READ.reference(), fixture.attached.getFirst().reservation().binding().tool());
+        assertFalse(proof.getValue().sessionRequired());
+        verify(fixture.ledger, never()).executionMaterial(any(), any());
+        verify(fixture.client, never()).issue(any());
+    }
+
+    @Test void v2_service_grant_reuses_the_exact_fence_and_normalizes_wire_integer_representations() throws Exception {
+        var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ), Duration.ofSeconds(1), System::nanoTime);
+        fixture.servlet.setRequestURI("/api/tianji/v2/agent-process-dispatches/submit");
+        var runtime = fixture.runtimeMaterial();
+        var principal = fixture.servicePrincipal(Set.of(TianjiAgentPermissions.LINKED_SUBMIT_SCOPE), "app", RESOURCE);
+        fixture.service(principal);
+        when(fixture.ledger.toolRunEvidence(eq(fixture.actor), any())).thenReturn(runtime);
+        when(fixture.services.require(runtime.authorization(), runtime.processLink())).thenReturn(fixture.serviceSource);
+
+        var grantStore = mock(AgentServiceExecutionGrantStore.class);
+        when(grantStore.usesLedger(fixture.ledger)).thenReturn(true);
+        var reservation = new AgentServiceExecutionGrant.Reservation(runtime.authorization(), RESOURCE, fixture.serviceSource, 1,
+                AgentServiceExecutionGrant.fingerprint(runtime.authorization(), RESOURCE, fixture.serviceSource));
+        when(grantStore.current(runtime.authorization(), RESOURCE, fixture.serviceSource)).thenReturn(Optional.empty());
+        when(grantStore.reserve(fixture.actor, RUN, RESOURCE, fixture.serviceSource)).thenReturn(Optional.of(reservation));
+        when(grantStore.complete(eq(reservation), any())).thenReturn(true);
+        var serviceIssuer = new TianjiServiceExecutionGrantIssuer(fixture.ledger, grantStore, fixture.services, RESOURCE,
+                fixture.issuers, Map.of(ISSUER, fixture.client), fixture.clock, null, fixture.issuer);
+        var dispatch = new TianjiLinkedDispatchProperties.Binding(ISSUER, 20, "worker", "app", "business", "application", "test", "source",
+                Set.of(WorkerScopeTypeEnum.BPMN), List.of(new TianjiLinkedDispatchProperties.Definition("assistant", 1, HASH)));
+        var request = linkedCommand(runtime, 1);
+        var normalized = linkedCommand(runtime, 1L);
+        var template = mock(AgentRuntimeTemplateCommand.class);
+        when(fixture.ledger.runtimeExecutionMaterial(eq(fixture.actor), any())).thenReturn(
+                new AgentLedgerService.RuntimeExecutionMaterialVO(runtime.run(), template, normalized, HASH, runtime.authorization()));
+
+        new VerifiedAgentIssuerFilter().doFilter(fixture.servlet, new MockHttpServletResponse(), (incoming, response) ->
+                serviceIssuer.ensureRuntime(fixture.authorized, principal, dispatch, request, runtime.run()));
+
+        var calls = org.mockito.ArgumentCaptor.forClass(ServiceExecutionGrantContract.IssueRequest.class);
+        verify(fixture.client, times(2)).issueService(calls.capture());
+        assertNotEquals(AgentRunAuthorization.PURPOSE, calls.getAllValues().getFirst().purpose());
+        assertEquals(AgentRunAuthorization.PURPOSE, calls.getAllValues().getLast().purpose());
+        assertEquals(reservation.bindingSha256(), calls.getAllValues().getLast().bindingSha256());
+        assertEquals(RUN, calls.getAllValues().getLast().intentId());
+        verify(grantStore).complete(eq(reservation), any());
+        verify(fixture.ledger, never()).executionMaterial(any(), any());
+
+        new VerifiedAgentIssuerFilter().doFilter(fixture.servlet, new MockHttpServletResponse(), (incoming, response) ->
+                assertUnavailable(() -> serviceIssuer.ensureRuntime(fixture.authorized, principal, dispatch,
+                        linkedCommand(runtime, 2), runtime.run())));
+        verify(fixture.client, times(2)).issueService(any());
+        verify(grantStore).complete(eq(reservation), any());
+    }
+
+    private static LinkedAgentRuntimeCommand linkedCommand(AgentLedgerService.ToolRunEvidenceVO runtime, Number leaf) {
+        var limits = AgentRuntimeTemplateCommand.TechnicalLimitsVO.fromExactWire(Map.of("totalTimeout", "PT2M",
+                "modelIdleTimeout", "PT20S", "toolTimeout", "PT10S", "maxModelCalls", 2, "maxToolCalls", 2,
+                "maxParallelism", 1, "contextWindowTokens", 8192, "maxOutputTokensPerCall", 1024));
+        return new LinkedAgentRuntimeCommand("dispatch", runtime.processLink(), "node", "assistant", 1,
+                HASH, HASH, HASH, HASH, Map.of("nested", List.of(Map.of("value", leaf))),
+                Map.of("value", leaf), limits, NOW.plusSeconds(120), "trace");
+    }
+
+    @Test void v2_service_refuses_an_old_profile_and_never_attaches_a_changed_binding() throws Exception {
+        var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ), Duration.ofSeconds(1), System::nanoTime);
+        fixture.servlet.setRequestURI("/api/tianji/v2/agent-process-dispatches/submit");
+        var runtime = fixture.runtimeMaterial();
+        var legacy = new AgentLedgerService.ToolRunEvidenceVO(runtime.run(), runtime.authorization(), runtime.processLink(),
+                runtime.toolRefs(), runtime.maxToolCalls(), null, AgentLedgerService.RunProfileEnum.LEGACY_V1, null);
+        when(fixture.ledger.toolRunEvidence(eq(fixture.actor), any())).thenReturn(legacy);
+        assertUnavailable(() -> fixture.issuer.ensureRuntime(fixture.authorized, runtime.run()));
+        verifyNoInteractions(fixture.client);
+        verify(fixture.store, never()).reserve(any(), any());
+
+        var current = new AtomicReference<>(runtime);
+        when(fixture.ledger.toolRunEvidence(eq(fixture.actor), any())).thenAnswer(call -> current.get());
+        when(fixture.services.require(runtime.authorization(), runtime.processLink())).thenReturn(fixture.serviceSource);
+        doAnswer(call -> {
+            current.set(new AgentLedgerService.ToolRunEvidenceVO(runtime.run(), runtime.authorization(), runtime.processLink(),
+                    List.of(WRITE.reference()), runtime.maxToolCalls(), null, runtime.profile(), null));
+            return fixture.serviceIssued(call.getArgument(0));
+        }).when(fixture.client).issueService(any());
+        new VerifiedAgentIssuerFilter().doFilter(fixture.servlet, new MockHttpServletResponse(), (incoming, response) ->
+                assertUnavailable(() -> fixture.issuer.ensureRuntime(fixture.authorized, runtime.run())));
+        verify(fixture.client).issueService(any());
+        verify(fixture.store, never()).attach(any(), any());
+    }
+
     @Test void service_missing_filter_scope_or_original_source_tuple_never_calls_the_owner() throws Exception {
         var fixture = new Fixture(TrustedAgentActor.SubjectType.SERVICE, List.of(READ), Duration.ofSeconds(1), System::nanoTime);
         assertUnavailable(() -> fixture.issuer.ensure(fixture.authorized, fixture.submitted));
@@ -303,6 +411,16 @@ class TianjiToolGrantIssuerTest {
             if (type == TrustedAgentActor.SubjectType.USER) resetUser(); else { servlet.addHeader("Authorization", "Bearer " + TOKEN); service(servicePrincipal(Set.of(TianjiAgentPermissions.LINKED_SUBMIT_SCOPE), "app", RESOURCE)); }
             issuer = create(store, timeout);
         }
+        AgentLedgerService.ToolRunEvidenceVO runtimeMaterial() {
+            var grant = new AgentRunAuthorization.Request(actor, RUN, "assistant", 1, HASH, HASH, HASH, HASH, false, NOW.plusSeconds(600));
+            var view = new AgentRunDTO(RUN, "assistant", 1, null, AgentRunStatusEnum.QUEUED, null, false, 0, 0, 1,
+                    grant.deadlineAt(), NOW, null);
+            return new AgentLedgerService.ToolRunEvidenceVO(view, grant,
+                    new AgentProcessLink("source", WorkerScopeTypeEnum.BPMN, "root", "occurrence", HASH, NOW.plusSeconds(30)),
+                    List.of(READ.reference()),
+                    2, null, AgentLedgerService.RunProfileEnum.RUNTIME_V2, null);
+        }
+
         void resetUser() { VerifiedUserTokenCarrier.set(servlet, TOKEN); user("alice", "token-1", NOW.plusSeconds(300), Set.of(RESOURCE.toASCIIString()), ISSUER.toASCIIString(), Set.of(TianjiAgentPermissions.START_SCOPE)); }
         IdentityPrincipal userIdentity(String subject, String tokenId, Instant expires, Set<String> audience) { return new IdentityPrincipal(subject, "20", tokenId, audience, NOW.minusSeconds(10), expires, AuthenticationContext.of("PASSWORD", NOW.minusSeconds(10))); }
         void user(String subject, String tokenId, Instant expires, Set<String> audience, String issuer, Set<String> scopes) {

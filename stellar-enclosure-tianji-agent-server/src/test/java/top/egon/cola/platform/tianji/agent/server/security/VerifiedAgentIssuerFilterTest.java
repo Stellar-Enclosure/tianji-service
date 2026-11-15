@@ -77,6 +77,44 @@ class VerifiedAgentIssuerFilterTest {
         assertNull(request.getAttribute(VerifiedAgentIssuerFilter.SERVICE_TOKEN_DIGEST));
     }
 
+    @Test void only_the_exact_v2_linked_submit_path_carries_verified_service_bearer_evidence() throws Exception {
+        SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(service(), List.of(), ISSUER));
+        var filter = new VerifiedAgentIssuerFilter();
+        String linked = "/api/tianji/v2/agent-process-dispatches/submit";
+        var accepted = new MockHttpServletRequest("POST", "/agent" + linked);
+        accepted.setContextPath("/agent");
+        accepted.addHeader("Authorization", "Bearer service-proof");
+        filter.doFilter(accepted, new MockHttpServletResponse(), (incoming, response) -> {
+            assertEquals(ISSUER.toASCIIString(), accepted.getAttribute(VerifiedAgentIssuerFilter.ATTRIBUTE));
+            assertEquals("service-proof", VerifiedAgentIssuerFilter.currentServiceToken(accepted));
+        });
+        assertNull(VerifiedAgentIssuerFilter.currentServiceToken(accepted));
+
+        for (String path : List.of(linked + "/", linked + "/nested", linked + ";candidate=1", "/api/tianji/v2/agent-definitions")) {
+            var rejected = new MockHttpServletRequest("POST", path);
+            rejected.addHeader("Authorization", "Bearer service-proof");
+            filter.doFilter(rejected, new MockHttpServletResponse(), (incoming, response) ->
+                    assertNull(VerifiedAgentIssuerFilter.currentServiceToken(rejected)));
+        }
+    }
+
+    @Test void v2_paths_and_exact_service_scopes_agree_with_the_identity_policy() {
+        var configuration = new TianjiAgentSecurityConfiguration();
+        var policy = configuration.tianjiEndpointAuthenticationPolicy();
+        for (String path : List.of("/api/tianji/v2/agent-definitions", "/api/tianji/v2/agent-process-dispatches/submit", PATH)) {
+            assertEquals(top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy.Requirement.SERVICE,
+                    policy.requirement(new MockHttpServletRequest("POST", path)));
+        }
+        var linked = new IdpAuthenticationToken(service(), List.of(), ISSUER);
+        assertTrue(TianjiAgentSecurityConfiguration.serviceScope(linked, TianjiAgentPermissions.LINKED_SUBMIT_SCOPE));
+        assertFalse(TianjiAgentSecurityConfiguration.serviceScope(linked, TianjiAgentPermissions.TEMPLATE_PUBLISH_SCOPE));
+        assertFalse(TianjiAgentSecurityConfiguration.serviceScope(new IdpAuthenticationToken(service()), TianjiAgentPermissions.LINKED_SUBMIT_SCOPE));
+        var user = new IdentityPrincipal("alice", "21", "42", Set.of("https://api.example/tianji"),
+                NOW.minusSeconds(10), NOW.plusSeconds(300), AuthenticationContext.of("PASSWORD", NOW.minusSeconds(20)));
+        assertFalse(TianjiAgentSecurityConfiguration.serviceScope(new IdpAuthenticationToken(user, List.of(), ISSUER),
+                TianjiAgentPermissions.TEMPLATE_PUBLISH_SCOPE));
+    }
+
     private static ServiceIdentityPrincipal service() {
         return new ServiceIdentityPrincipal("worker", "21", "worker", "42", URI.create("https://api.example/tianji"), 1,
                 Set.of("tianji:agent:linked:submit"), "platform", "process", "test", "credential",

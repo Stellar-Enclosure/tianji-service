@@ -636,7 +636,7 @@ public final class AgentLedgerService {
             String runId = UUID.randomUUID().toString();
             int inserted = repository.insertRun(actor, runId, command.definitionKey(), command.definitionVersion(),
                     command.idempotencyKey(), requestHash, command.sessionId(), command.correlationId(),
-                    now.plus(policy.totalTimeout()), snapshot, now);
+                    now.plus(policy.totalTimeout()), snapshot, 0L, now);
             if (inserted == 0) {
                 if (processLink != null) requireDispatchTime(processLink);
                 return sameRequest(repository.byIdempotencyKey(actor, command.idempotencyKey()).orElseThrow(),
@@ -1068,7 +1068,7 @@ public final class AgentLedgerService {
         var snapshot = json.runtimeSnapshot(actor.identityFingerprint(), runId, input, template);
         int inserted = repository.insertRun(actor, runId, input.getTemplateKey(), input.getTemplateVersion(),
                 input.getIdempotencyKey(), requestSha256, null, input.getCorrelationId(), effectiveDeadline,
-                json.writeRuntimeSnapshot(snapshot), createdAt);
+                json.writeRuntimeSnapshot(snapshot), 1L, createdAt);
         if (inserted != 1) return replayRuntimeStart(actor,
                 repository.byIdempotencyKey(actor, input.getIdempotencyKey()).orElseThrow(AgentLedgerService::runtimeUnavailable), requestSha256);
         runtimeBindings.create(actor, new RuntimeBindingBO().setTenantId(actor.tenantId()).setRunId(runId).setProfile("RUNTIME_V2")

@@ -8,9 +8,11 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.authorization.AuthorizationDecision;
 import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.core.Authentication;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.web.filter.RequestContextFilter;
@@ -18,8 +20,13 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.application.session.AgentSessionManager;
 import top.egon.cola.platform.tianji.agent.server.api.AgentCheckpointResumeController;
 import top.egon.cola.platform.tianji.agent.server.api.AgentRunEventStream;
+import top.egon.cola.platform.tianji.agent.server.api.AgentRuntimeTemplateController;
+import top.egon.cola.platform.tianji.agent.server.api.LinkedAgentRuntimeController;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.jianshen.starter.security.Rbac3BearerAuthenticationFilter;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
+import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
+import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpAuthenticationToken;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpBearerAuthenticationFilter;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.IdpEndpointAuthenticationPolicy;
 
@@ -59,6 +66,12 @@ public class TianjiAgentSecurityConfiguration {
                                         && user.isAuthenticated()))
                         .requestMatchers("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**")
                             .authenticated()
+                        .requestMatchers(HttpMethod.POST, AgentRuntimeTemplateController.PATH)
+                        .access((authentication, context) -> new AuthorizationDecision(enabled
+                                && serviceScope(authentication.get(), TianjiAgentPermissions.TEMPLATE_PUBLISH_SCOPE)))
+                        .requestMatchers(HttpMethod.POST, LinkedAgentRuntimeController.PATH)
+                        .access((authentication, context) -> new AuthorizationDecision(enabled
+                                && serviceScope(authentication.get(), TianjiAgentPermissions.LINKED_SUBMIT_SCOPE)))
                         .anyRequest().denyAll())
                 .exceptionHandling(errors -> errors
                         .authenticationEntryPoint((request, response, failure) -> {
@@ -89,12 +102,24 @@ public class TianjiAgentSecurityConfiguration {
         return http.build();
     }
 
+    static boolean serviceScope(Authentication authentication, String requiredScope) {
+        if (!(authentication instanceof IdpAuthenticationToken token) || !token.isAuthenticated()
+                || !(token.getPrincipal() instanceof ServiceIdentityPrincipal service)
+                || service.scopeContext() != ServiceTokenContext.TENANT || !service.scopes().contains(requiredScope)) return false;
+        try {
+            return token.verifiedIssuer() != null;
+        } catch (IllegalStateException missing) {
+            return false;
+        }
+    }
+
     @Bean
     @ConditionalOnMissingBean(IdpEndpointAuthenticationPolicy.class)
     @ConditionalOnProperty(prefix = "stellar.tianji.agent.api", name = "enabled", havingValue = "true")
     IdpEndpointAuthenticationPolicy tianjiEndpointAuthenticationPolicy() {
         return new IdpEndpointAuthenticationPolicy(List.of("/actuator/health", "/actuator/health/**"),
-                List.of("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**"),
+                List.of("/api/tianji/v1/agent-process-dispatches", "/api/tianji/v1/agent-process-dispatches/**",
+                        AgentRuntimeTemplateController.PATH, LinkedAgentRuntimeController.PATH),
                 List.of("/api/tianji/v1/agent-runs", "/api/tianji/v1/agent-runs/**",
                         "/api/tianji/v1/agent-sessions", "/api/tianji/v1/agent-sessions/**",
                         "/api/tianji/v1/memories", "/api/tianji/v1/memories/**"), true);

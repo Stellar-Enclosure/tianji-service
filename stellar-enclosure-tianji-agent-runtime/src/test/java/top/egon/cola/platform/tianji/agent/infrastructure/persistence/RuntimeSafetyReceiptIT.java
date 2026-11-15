@@ -197,6 +197,8 @@ class RuntimeSafetyReceiptIT {
         var submissions = new AgentLinkedSubmissionService(database.source(), grantLedger);
         var command = linkedRuntimeCommand("runtime-grant");
         var run = submissions.submitRuntimeV2(V2_SERVICE, command, () -> true);
+        assertEquals(1L, run.revision());
+        assertEquals(run, submissions.submitRuntimeV2(V2_SERVICE, command, () -> false));
         var store = new AgentServiceExecutionGrantStore(database.source(), grantLedger);
         var resource = URI.create("https://runtime.example/tianji");
         var subject = new AgentServiceExecutionGrant.Subject(V2_SERVICE.subjectId(), "process", "platform",
@@ -212,9 +214,40 @@ class RuntimeSafetyReceiptIT {
         assertEquals(ticket, store.current(evidence.authorization(), resource, subject).orElseThrow());
         var otherOccurrence = new AgentProcessLink(command.getLink().sourceId(), command.getLink().scopeType(),
                 command.getLink().scopeInstanceId(), "wrong-occurrence", command.getTemplateSha256(), command.getLink().dispatchNotAfter());
-        assertTrue(submissions.resolveRuntimeV2(V2_SERVICE, new LinkedAgentLookupQuery(command.getIdempotencyKey(), otherOccurrence)).isEmpty());
+        var wrongOccurrence = new LinkedAgentLookupQuery(command.getIdempotencyKey(), otherOccurrence);
+        assertTrue(submissions.resolveRuntimeV2(V2_SERVICE, wrongOccurrence).isEmpty());
+        assertTrue(submissions.resolve(V2_SERVICE, wrongOccurrence).isEmpty());
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT,
+                assertThrows(AgentLedgerException.class, () -> submissions.close(V2_SERVICE, wrongOccurrence)).code());
         var query = new LinkedAgentLookupQuery(command.getIdempotencyKey(), command.getLink());
-        assertTrue(submissions.closeRuntimeV2(V2_SERVICE, query).closed());
+        var otherOwner = TrustedAgentActor.verified(V2_SERVICE.tenantId(), TrustedAgentActor.SubjectType.SERVICE,
+                "unrelated-runtime-owner", "https://idp.example");
+        assertTrue(submissions.resolve(otherOwner, query).isEmpty());
+        assertEquals(run, submissions.resolve(V2_SERVICE, query).orElseThrow().run());
+        String updateDigest = """
+                UPDATE tianji_agent.agent_process_dispatch SET request_sha256=?
+                WHERE tenant_id=? AND subject_issuer=? AND subject_id=? AND idempotency_key=?
+                """;
+        String requestDigest = evidence.authorization().requestSha256();
+        assertEquals(1, database.admin().update(updateDigest, "f".repeat(64), V2_SERVICE.tenantId(),
+                V2_SERVICE.issuerFingerprint(), V2_SERVICE.subjectId(), query.idempotencyKey()));
+        try {
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class, () -> submissions.resolve(V2_SERVICE, query)).code());
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class, () -> submissions.close(V2_SERVICE, query)).code());
+        } finally {
+            assertEquals(1, database.admin().update(updateDigest, requestDigest, V2_SERVICE.tenantId(),
+                    V2_SERVICE.issuerFingerprint(), V2_SERVICE.subjectId(), query.idempotencyKey()));
+        }
+        var lookup = submissions.resolveRuntimeV2(V2_SERVICE, query).orElseThrow();
+        assertFalse(lookup.closed());
+        var closed = submissions.close(V2_SERVICE, query);
+        assertTrue(closed.closed());
+        assertEquals(run.runId(), closed.run().runId());
+        assertEquals(AgentRunStatusEnum.CANCELLED, closed.run().status());
+        assertEquals(closed, submissions.resolve(V2_SERVICE, query).orElseThrow());
+        assertEquals(closed, submissions.closeRuntimeV2(V2_SERVICE, query));
         assertTrue(store.current(evidence.authorization(), resource, subject).isEmpty());
         assertFalse(store.complete(reservation, ticket));
 
@@ -226,6 +259,7 @@ class RuntimeSafetyReceiptIT {
         var legacyLink = new AgentProcessLink("process-source", WorkerScopeTypeEnum.BPMN, "legacy-instance", "legacy-occurrence",
                 legacy.contentSha256(), now(runtime).plusSeconds(40).truncatedTo(ChronoUnit.MICROS));
         var legacyRun = submissions.submit(legacyActor, new LinkedAgentStartCommand(legacyCommand, legacyLink));
+        assertEquals(0L, legacyRun.revision());
         var legacyGrant = store.reserve(legacyActor, legacyRun.runId(), resource, subject).orElseThrow();
         var oldMaterial = grantLedger.executionMaterial(legacyActor, new GetAgentRunQuery(legacyRun.runId()));
         assertEquals(oldMaterial.authorization(), legacyGrant.authorization());
@@ -233,6 +267,11 @@ class RuntimeSafetyReceiptIT {
                 now(runtime).plusSeconds(10));
         assertTrue(store.complete(legacyGrant, legacyTicket));
         assertEquals(legacyTicket, store.current(oldMaterial.authorization(), resource, subject).orElseThrow());
+        var legacyQuery = new LinkedAgentLookupQuery(legacyCommand.idempotencyKey(), legacyLink);
+        assertEquals(legacyRun, submissions.resolve(legacyActor, legacyQuery).orElseThrow().run());
+        var legacyClosed = submissions.close(legacyActor, legacyQuery);
+        assertEquals(AgentRunStatusEnum.CANCELLED, legacyClosed.run().status());
+        assertEquals(legacyClosed, submissions.resolve(legacyActor, legacyQuery).orElseThrow());
     }
 
     @Test

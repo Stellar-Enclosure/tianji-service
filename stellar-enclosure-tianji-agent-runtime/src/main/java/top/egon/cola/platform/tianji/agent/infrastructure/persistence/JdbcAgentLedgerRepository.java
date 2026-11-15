@@ -370,17 +370,17 @@ final class JdbcAgentLedgerRepository {
 
     int insertRun(TrustedAgentActor actor, String runId, String definitionKey, long definitionVersion,
                   String idempotencyKey, String requestHash, String sessionId, String correlationId,
-                  Instant deadline, String snapshot, Instant now) {
+                  Instant deadline, String snapshot, long initialRevision, Instant now) {
         return jdbc.update("""
                 INSERT INTO tianji_agent.agent_run
                     (tenant_id, run_id, definition_key, definition_version, subject_type, subject_issuer, subject_id,
                      idempotency_key, request_hash, session_id, correlation_id, status, revision,
                      last_event_sequence, deadline_at, execution_snapshot, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', 0, 1, ?, CAST(? AS jsonb), ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'QUEUED', ?, 1, ?, CAST(? AS jsonb), ?)
                 ON CONFLICT (tenant_id, subject_type, subject_issuer, subject_id, idempotency_key) DO NOTHING
                 """, actor.tenantId(), runId, definitionKey, definitionVersion, actor.subjectType().name(),
                 actor.issuerFingerprint(), actor.subjectId(), idempotencyKey, requestHash, sessionId, correlationId,
-                Timestamp.from(deadline), snapshot, Timestamp.from(now));
+                initialRevision, Timestamp.from(deadline), snapshot, Timestamp.from(now));
     }
 
     Optional<StoredRun> claim(TrustedAgentActor actor, String runId, long expectedRevision,

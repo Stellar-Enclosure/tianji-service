@@ -2,6 +2,7 @@ package top.egon.cola.platform.tianji.agent.server.security;
 
 import java.time.Clock;
 import javax.sql.DataSource;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -15,16 +16,16 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRe
 @ConditionalOnProperty(prefix = "stellar.tianji.agent.linked", name = "enabled", havingValue = "true")
 @EnableConfigurationProperties(TianjiLinkedDispatchProperties.class)
 public class TianjiLinkedDispatchConfiguration {
-    @Bean
+    @Bean("tianjiLinkedDispatchBindings")
     TianjiLinkedDispatchBindings tianjiLinkedDispatchBindings(TianjiLinkedDispatchProperties properties,
-                                                                 TrustedIssuerRegistry issuers, Environment environment) {
+            @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers, Environment environment) {
         if (!environment.getProperty("stellar.tianji.agent.api.enabled", Boolean.class, false)) {
             throw new IllegalStateException("TIANJI_LINKED_REQUIRES_AGENT_API");
         }
         return new TianjiLinkedDispatchBindings(properties, issuers, Clock.systemUTC());
     }
 
-    @Bean
+    @Bean("agentLinkedSubmissionService")
     AgentLinkedSubmissionService agentLinkedSubmissionService(DataSource source, AgentLedgerService ledger) {
         return new AgentLinkedSubmissionService(source, ledger);
     }

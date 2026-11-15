@@ -42,6 +42,11 @@ egon:
 stellar:
   tianji:
     agent:
+      runtime-v2:
+        enabled: false
+      legacy:
+        direct-start:
+          enabled: true
       terminal-events:
         span-links-enabled: false
       result-delivery:

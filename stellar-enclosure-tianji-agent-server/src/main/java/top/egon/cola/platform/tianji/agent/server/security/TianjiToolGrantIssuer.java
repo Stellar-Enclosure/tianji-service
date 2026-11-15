@@ -1,6 +1,7 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -45,6 +46,7 @@ import java.util.function.LongSupplier;
 import java.util.stream.Collectors;
 
 /** Obtains independent tool grants only while the actual submission owner and verified request carrier remain present. */
+@Slf4j
 public final class TianjiToolGrantIssuer {
     private final AgentLedgerService ledger;
     private final ToolCapabilityStore store;
@@ -84,13 +86,25 @@ public final class TianjiToolGrantIssuer {
     }
 
     public AgentRunDTO ensure(TianjiAgentAccess.Authorized authorized, AgentRunDTO submitted) {
-        try { return prepare(authorized, submitted); }
+        return ensure(authorized, submitted, AgentLedgerService.RunProfileEnum.LEGACY_V1);
+    }
+
+    public AgentRunDTO ensureRuntime(TianjiAgentAccess.Authorized authorized, AgentRunDTO submitted) {
+        return ensure(authorized, submitted, AgentLedgerService.RunProfileEnum.RUNTIME_V2);
+    }
+
+    private AgentRunDTO ensure(TianjiAgentAccess.Authorized authorized, AgentRunDTO submitted,
+            AgentLedgerService.RunProfileEnum profile) {
+        try { return prepare(authorized, submitted, profile); }
         catch (AgentLedgerException failure) {
             throw new AgentLedgerException(failure.code(), failure.code() == AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED
                     ? "Tool grant issuance was denied" : "Tool grant preparation is unavailable or changed");
         } catch (HttpExecutionGrantClient.ExecutionGrantDeniedException denied) {
             throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Tool grant issuance was denied");
-        } catch (RuntimeException failure) { throw unavailable(); }
+        } catch (RuntimeException failure) {
+            log.debug("Agent tool grant is unavailable for execution profile {}", profile);
+            throw unavailable();
+        }
     }
 
     public boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate && store.usesLedger(candidate); }
@@ -100,13 +114,14 @@ public final class TianjiToolGrantIssuer {
     public boolean usesServices(TianjiServiceExecutionBindings candidate) { return bindings.usesServices(candidate); }
     public boolean hasServiceBindings() { return bindings.hasServiceBindings(); }
 
-    private AgentRunDTO prepare(TianjiAgentAccess.Authorized authorized, AgentRunDTO submitted) {
+    private AgentRunDTO prepare(TianjiAgentAccess.Authorized authorized, AgentRunDTO submitted,
+            AgentLedgerService.RunProfileEnum profile) {
         outsideTransaction(); long started = nanoTime.getAsLong(); Instant wallStarted = clock.instant();
         if (authorized == null || authorized.actor() == null || authorized.expiresAt() == null || authorized.issuer() == null || submitted == null) throw unavailable();
         var actor = authorized.actor();
         if (!actor.equals(TrustedAgentActor.verified(actor.tenantId(), actor.subjectType(), actor.subjectId(), authorized.issuer().toASCIIString()))) throw unavailable();
-        var material = material(actor, submitted.runId()); if (!queued(material)) return material.run();
-        var selected = bindings.resolve(material); if (selected.isEmpty()) return material.run();
+        var material = material(actor, submitted.runId(), profile); if (!queued(material)) return material.run();
+        var selected = resolve(material); if (selected.isEmpty()) return material.run();
         var run = material.authorization(); var window = window(authorized, run, wallStarted, started); check(window);
         var trust = trust(authorized); var identity = identity(authorized, selected); String bearer = bearer(actor.subjectType());
         var client = (actor.subjectType() == TrustedAgentActor.SubjectType.USER ? users : clients).get(authorized.issuer()); if (client == null) throw unavailable();
@@ -151,24 +166,41 @@ public final class TianjiToolGrantIssuer {
         return postflight(authorized, material, selected, trust, identity, bearer, window).run();
     }
 
-    private AgentLedgerService.ExecutionMaterial material(TrustedAgentActor actor, String runId) {
-        outsideTransaction(); var material = ledger.executionMaterial(actor, new GetAgentRunQuery(runId));
+    private IssuanceMaterialVO material(TrustedAgentActor actor, String runId, AgentLedgerService.RunProfileEnum profile) {
+        outsideTransaction();
+        var query = new GetAgentRunQuery(runId);
+        if (profile == AgentLedgerService.RunProfileEnum.RUNTIME_V2) {
+            var pinned = ledger.toolRunEvidence(actor, query);
+            if (pinned == null || pinned.profile() != profile || pinned.run() == null || pinned.authorization() == null
+                    || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || !actor.equals(pinned.authorization().actor())
+                    || !runId.equals(pinned.run().runId()) || !runId.equals(pinned.authorization().runId())
+                    || pinned.processLink() == null || !pinned.authorization().definitionSha256().equals(pinned.processLink().definitionContentSha256())
+                    || pinned.authorization().sessionRequired() || pinned.run().sessionId() != null) throw unavailable();
+            return new IssuanceMaterialVO(pinned.run(), pinned.authorization(), null, pinned);
+        }
+        var material = ledger.executionMaterial(actor, query);
         if (material == null || material.run() == null || material.authorization() == null || material.snapshot() == null) throw unavailable();
         var run = material.authorization(); var view = material.run(); var snapshot = material.snapshot(); var definition = snapshot.definition();
         if (!actor.equals(run.actor()) || !runId.equals(run.runId()) || !runId.equals(view.runId()) || !run.definitionKey().equals(view.definitionKey())
                 || run.definitionVersion() != view.definitionVersion() || run.sessionRequired() != (view.sessionId() != null) || !run.deadlineAt().equals(view.deadlineAt())
                 || !run.definitionKey().equals(definition.definitionKey()) || run.definitionVersion() != definition.version()
                 || !run.definitionSha256().equals(snapshot.definitionContentSha256()) || !run.policyVersionRef().equals(definition.dependencies().policyVersionRef())) throw unavailable();
-        return material;
+        return new IssuanceMaterialVO(view, run, material, null);
     }
 
-    private AgentLedgerService.ExecutionMaterial postflight(TianjiAgentAccess.Authorized authorized, AgentLedgerService.ExecutionMaterial expected,
+    private List<TianjiToolGrantBindings.ResolvedToolResult> resolve(IssuanceMaterialVO material) {
+        return material.runtime() == null ? bindings.resolve(material.legacy()) : bindings.resolveRuntime(material.runtime());
+    }
+
+    private IssuanceMaterialVO postflight(TianjiAgentAccess.Authorized authorized, IssuanceMaterialVO expected,
             List<TianjiToolGrantBindings.ResolvedToolResult> selected, TrustedIssuerRegistry.TrustedIssuerVO originalTrust, OwnerIdentityVO identity,
             String bearer, WindowVO window) {
-        check(window); var current = material(authorized.actor(), expected.authorization().runId());
-        if (!current.authorization().equals(expected.authorization()) || !sameSnapshot(expected.snapshot(), current.snapshot())) throw unavailable();
+        check(window);
+        var profile = expected.runtime() == null ? AgentLedgerService.RunProfileEnum.LEGACY_V1 : AgentLedgerService.RunProfileEnum.RUNTIME_V2;
+        var current = material(authorized.actor(), expected.authorization().runId(), profile);
+        if (!current.authorization().equals(expected.authorization()) || !samePinnedScope(expected, current)) throw unavailable();
         if (!queued(current)) return current;
-        var resolved = bindings.resolve(current);
+        var resolved = resolve(current);
         if (!selected.equals(resolved) || !sameTrust(originalTrust, trust(authorized)) || !identity.equals(identity(authorized, resolved))
                 || !bearer.equals(bearer(authorized.actor().subjectType()))) throw unavailable();
         check(window); if (!current.authorization().deadlineAt().isAfter(ledger.databaseNow())) throw unavailable(); check(window); return current;
@@ -231,13 +263,27 @@ public final class TianjiToolGrantIssuer {
         if (check(window) < issueTimeout.toNanos() || Duration.between(clock.instant(), window.deadlineAt()).compareTo(issueTimeout) < 0) throw unavailable();
     }
     private static void outsideTransaction() { if (TransactionSynchronizationManager.isActualTransactionActive()) throw unavailable(); }
-    private static boolean queued(AgentLedgerService.ExecutionMaterial material) { return material.run().status() == AgentRunStatusEnum.QUEUED && !material.run().cancelRequested(); }
+    private static boolean queued(IssuanceMaterialVO material) {
+        return material.run().status() == AgentRunStatusEnum.QUEUED && !material.run().cancelRequested();
+    }
+    private static boolean samePinnedScope(IssuanceMaterialVO expected, IssuanceMaterialVO current) {
+        if (expected.runtime() == null) return sameSnapshot(expected.legacy().snapshot(), current.legacy().snapshot());
+        var left = expected.runtime();
+        var right = current.runtime();
+        return left.profile() == right.profile() && left.processLink().equals(right.processLink())
+                && left.toolRefs().equals(right.toolRefs()) && left.maxToolCalls() == right.maxToolCalls()
+                && Objects.equals(left.legacyApprovalPolicyRef(), right.legacyApprovalPolicyRef());
+    }
     private static boolean sameSnapshot(AgentExecutionSnapshot expected, AgentExecutionSnapshot current) {
         return expected.definition().equals(current.definition()) && expected.definitionContentSha256().equals(current.definitionContentSha256())
                 && expected.effectivePolicy().equals(current.effectivePolicy()) && Objects.equals(expected.processLink(), current.processLink());
     }
     private static boolean sameTrust(TrustedIssuerRegistry.TrustedIssuerVO expected, TrustedIssuerRegistry.TrustedIssuerVO current) {
         return expected.equals(current) && expected.issuer().toASCIIString().equals(current.issuer().toASCIIString()) && expected.jwksUri().toASCIIString().equals(current.jwksUri().toASCIIString());
+    }
+    private record IssuanceMaterialVO(AgentRunDTO run, AgentRunAuthorization.Request authorization,
+            AgentLedgerService.ExecutionMaterial legacy, AgentLedgerService.ToolRunEvidenceVO runtime) {
+        @Override public String toString() { return "ToolGrantMaterial[redacted]"; }
     }
     private record WindowVO(Instant deadlineAt, long nanoDeadline) { }
     private record OwnerIdentityVO(IdpPrincipal principal, Set<String> scopes) {

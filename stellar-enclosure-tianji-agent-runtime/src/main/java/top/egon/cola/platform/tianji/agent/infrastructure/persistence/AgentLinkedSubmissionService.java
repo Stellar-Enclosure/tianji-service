@@ -107,7 +107,7 @@ public final class AgentLinkedSubmissionService {
             if (rows.isEmpty()) return Optional.empty();
             if (rows.size() != 1 || !matches(rows.getFirst(), query.link())) return Optional.empty();
             Fence fence = rows.getFirst();
-            AgentRunDTO run = fence.runId() == null ? null : verifyRun(actor, query.link(), fence.runId(), fence.requestSha256(), runtimeV2);
+            AgentRunDTO run = fence.runId() == null ? null : verifyRecoveryRun(actor, query.link(), fence, runtimeV2);
             if (!fence.closed() && run == null) throw unavailable();
             return Optional.of(new LinkedAgentSubmissionDTO(fence.closed(), run));
         });
@@ -131,7 +131,7 @@ public final class AgentLinkedSubmissionService {
             AgentRunDTO run = null;
             if (fence.runId() != null) {
                 run = ledger.lockForLinkedClose(actor, fence.runId());
-                verifyRun(actor, query.link(), fence.runId(), fence.requestSha256(), runtimeV2);
+                verifyRecoveryRun(actor, query.link(), fence, runtimeV2);
             }
             if (!fence.closed()) {
                 if (jdbc.update("""
@@ -184,6 +184,14 @@ public final class AgentLinkedSubmissionService {
                 && link.scopeInstanceId().equals(fence.scopeId()) && link.activityOccurrenceId().equals(fence.occurrenceId())
                 && link.definitionContentSha256().equals(fence.definitionSha256()) && link.dispatchNotAfter().equals(fence.notAfter())
                 && json.processLinkHash(link).equals(fence.linkSha256());
+    }
+
+    private AgentRunDTO verifyRecoveryRun(TrustedAgentActor actor, AgentProcessLink link, Fence fence, boolean requireRuntimeV2) {
+        if (requireRuntimeV2) return verifyRun(actor, link, fence.runId(), fence.requestSha256(), true);
+        var evidence = ledger.linkedRunEvidence(actor, new GetAgentRunQuery(fence.runId()));
+        if (!link.equals(evidence.processLink()) || fence.requestSha256() == null
+                || !fence.requestSha256().equals(evidence.authorization().requestSha256())) throw unavailable();
+        return evidence.run();
     }
 
     private AgentRunDTO verifyRun(TrustedAgentActor actor, AgentProcessLink link, String runId, String requestHash, boolean runtimeV2) {

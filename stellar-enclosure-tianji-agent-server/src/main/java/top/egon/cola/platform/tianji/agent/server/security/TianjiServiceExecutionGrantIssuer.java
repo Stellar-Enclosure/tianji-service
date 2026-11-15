@@ -1,12 +1,16 @@
 package top.egon.cola.platform.tianji.agent.server.security;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
 import java.net.URI;
 import java.time.Clock;
+import java.util.Arrays;
+import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -19,7 +23,10 @@ import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.contract.execution.ServiceExecutionGrantContract;
@@ -32,6 +39,7 @@ import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRe
 import top.egon.cola.platform.tianquan.shoubing.starter.state.IdentityAuthorityProperties;
 
 /** Obtains one owner-sealed SERVICE intent outside the ledger transaction and publishes it behind the process fence. */
+@Slf4j
 public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServiceAdmission {
     private final AgentLedgerService ledger;
     private final AgentServiceExecutionGrantStore store;
@@ -110,47 +118,120 @@ public final class TianjiServiceExecutionGrantIssuer implements TianjiLinkedServ
         } catch (RuntimeException failure) { throw unavailable(); }
     }
 
+    public void ensureRuntime(TianjiAgentAccess.Authorized authorized, ServiceIdentityPrincipal principal,
+            TianjiLinkedDispatchProperties.Binding binding, LinkedAgentRuntimeCommand command, AgentRunDTO run) {
+        try {
+            if (TransactionSynchronizationManager.isActualTransactionActive()) throw unavailable();
+            Objects.requireNonNull(command, "command");
+            Objects.requireNonNull(run, "run");
+            requireIdentity(authorized, principal);
+            var authority = requireIssuer(authorized);
+            var actor = authorized.actor();
+            var material = ledger.runtimeExecutionMaterial(actor, new GetAgentRunQuery(run.runId()));
+            if (material == null || !sameRuntimeCommand(command, material.command())) throw unavailable();
+            var authorization = material.authorization();
+            var subject = requireSubject(authorized, principal, binding, command.getLink(), run, material.run(), authorization);
+            if (material.run().status() != AgentRunStatusEnum.QUEUED || material.run().cancelRequested()) return;
+            if (tools != null) {
+                var toolReady = tools.ensureRuntime(authorized, material.run());
+                if (toolReady.status() != AgentRunStatusEnum.QUEUED || toolReady.cancelRequested()) return;
+            } else if (hasRuntimeTools(material)) {
+                throw unavailable();
+            }
+            requireIdentity(authorized, principal);
+            issue(authorized, principal, command.getLink(), authorization, subject, authority);
+        } catch (AgentLedgerException known) {
+            throw known;
+        } catch (HttpExecutionGrantClient.ExecutionGrantDeniedException denied) {
+            throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, "Service execution authorization was denied");
+        } catch (RuntimeException failure) {
+            log.debug("Linked Agent runtime SERVICE grant is unavailable");
+            throw unavailable();
+        }
+    }
+
+    private static boolean sameRuntimeCommand(LinkedAgentRuntimeCommand requested, LinkedAgentRuntimeCommand stored) {
+        return stored != null && runtimeCommandPins(requested).equals(runtimeCommandPins(stored))
+                && Arrays.equals(ProcessTypedJson.canonicalBytes(requested.getInput()), ProcessTypedJson.canonicalBytes(stored.getInput()))
+                && Arrays.equals(ProcessTypedJson.canonicalBytes(requested.getParameters()), ProcessTypedJson.canonicalBytes(stored.getParameters()));
+    }
+
+    private static List<?> runtimeCommandPins(LinkedAgentRuntimeCommand command) {
+        return List.of(command.getIdempotencyKey(), command.getLink(), command.getNodeExecutionRef(),
+                command.getTemplateKey(), command.getTemplateVersion(), command.getTemplateSha256(), command.getConfigurationSha256(),
+                command.getInputSchemaSha256(), command.getOutputSchemaSha256(), command.getLimits(), command.getAttemptDeadlineAt(),
+                command.getCorrelationId());
+    }
+
+    private static boolean hasRuntimeTools(AgentLedgerService.RuntimeExecutionMaterialVO material) {
+        var configuration = material.template().getConfiguration();
+        var plan = configuration.agenticPlan();
+        return plan == null ? !configuration.toolRefs().isEmpty()
+                : plan.agents().stream().anyMatch(agent -> !agent.toolRefs().isEmpty());
+    }
+
     private void ensureInternal(TianjiAgentAccess.Authorized authorized, ServiceIdentityPrincipal principal,
             TianjiLinkedDispatchProperties.Binding binding, LinkedAgentStartCommand command, AgentRunDTO run) {
         Objects.requireNonNull(binding, "binding"); Objects.requireNonNull(command, "command"); Objects.requireNonNull(run, "run");
         requireIdentity(authorized, principal);
-        var actor = authorized.actor(); URI issuer = authorized.issuer();
-        var trusted = issuers.findByIssuer(issuer.toASCIIString()).orElseThrow(TianjiServiceExecutionGrantIssuer::unavailable);
-        if (trusted.realmType() != TrustedIssuerRegistry.RealmType.TENANT
-                || !Long.toString(actor.tenantId()).equals(trusted.tenantId())) throw unavailable();
-        var client = clients.get(issuer);
-        if (client == null) throw unavailable();
-        var material = ledger.executionMaterial(actor, new GetAgentRunQuery(run.runId()));
-        if (!command.link().equals(material.snapshot().processLink()) || !run.runId().equals(material.run().runId())
-                || !material.authorization().actor().equals(actor)) throw unavailable();
-        var subject = bindings.require(material.authorization(), material.snapshot().processLink());
+        var authority = requireIssuer(authorized);
+        var material = ledger.executionMaterial(authorized.actor(), new GetAgentRunQuery(run.runId()));
+        if (!command.link().equals(material.snapshot().processLink())) throw unavailable();
+        var authorization = material.authorization();
+        var subject = requireSubject(authorized, principal, binding, command.link(), run, material.run(), authorization);
+        if (material.run().status() != AgentRunStatusEnum.QUEUED) return;
+        issue(authorized, principal, command.link(), authorization, subject, authority);
+    }
+
+    private AgentServiceExecutionGrant.Subject requireSubject(TianjiAgentAccess.Authorized authorized,
+            ServiceIdentityPrincipal principal, TianjiLinkedDispatchProperties.Binding binding, AgentProcessLink link,
+            AgentRunDTO submitted, AgentRunDTO stored, AgentRunAuthorization.Request authorization) {
+        if (binding == null || link == null || authorization == null || stored == null || !submitted.runId().equals(stored.runId())
+                || !authorization.actor().equals(authorized.actor())) throw unavailable();
+        var subject = bindings.require(authorization, link);
         if (!subject.clientId().equals(principal.clientId()) || !subject.appId().equals(principal.appId())
                 || !subject.businessCode().equals(principal.sourceBizCode()) || !subject.applicationCode().equals(principal.sourceAppCode())
                 || !subject.environment().equals(principal.sourceEnvironment()) || !binding.clientId().equals(subject.clientId())
-                || !binding.issuer().toASCIIString().equals(issuer.toASCIIString()) || binding.tenantId() != actor.tenantId()
-                || !binding.sourceId().equals(command.link().sourceId())) throw unavailable();
-        if (material.run().status() != AgentRunStatusEnum.QUEUED) return;
-        if (store.current(material.authorization(), resource, subject).isPresent()) return;
-        var reserved = store.reserve(actor, run.runId(), resource, subject);
+                || !binding.issuer().toASCIIString().equals(authorized.issuer().toASCIIString())
+                || binding.tenantId() != authorized.actor().tenantId() || !binding.sourceId().equals(link.sourceId())) throw unavailable();
+        return subject;
+    }
+
+    private IssuerVO requireIssuer(TianjiAgentAccess.Authorized authorized) {
+        URI issuer = authorized.issuer();
+        var trust = issuers.findByIssuer(issuer.toASCIIString()).orElseThrow(TianjiServiceExecutionGrantIssuer::unavailable);
+        var client = clients.get(issuer);
+        if (client == null || trust.realmType() != TrustedIssuerRegistry.RealmType.TENANT
+                || !Long.toString(authorized.actor().tenantId()).equals(trust.tenantId())) throw unavailable();
+        return new IssuerVO(trust, client);
+    }
+
+    private void issue(TianjiAgentAccess.Authorized authorized, ServiceIdentityPrincipal principal, AgentProcessLink link,
+            AgentRunAuthorization.Request authorization, AgentServiceExecutionGrant.Subject subject, IssuerVO authority) {
+        var actor = authorized.actor();
+        if (store.current(authorization, resource, subject).isPresent()) return;
+        var reserved = store.reserve(actor, authorization.runId(), resource, subject);
         if (reserved.isEmpty()) {
-            if (store.current(material.authorization(), resource, subject).isPresent()) return;
+            if (store.current(authorization, resource, subject).isPresent()) return;
             throw unavailable();
         }
         var reservation = reserved.get();
-        if (!reservation.authorization().equals(material.authorization())) throw unavailable();
+        if (!reservation.authorization().equals(authorization)) throw unavailable();
         String token = RequestContextHolder.getRequestAttributes() instanceof ServletRequestAttributes servlet
                 ? VerifiedAgentIssuerFilter.currentServiceToken(servlet.getRequest()) : null;
         if (token == null) throw unavailable();
-        var issued = client.issueService(new ServiceExecutionGrantContract.IssueRequest(token, AgentRunAuthorization.PURPOSE,
-                run.runId(), reservation.bindingSha256(), reservation.authorization().sessionRequired(), reservation.authorization().deadlineAt()));
+        var issued = authority.client().issueService(new ServiceExecutionGrantContract.IssueRequest(token, AgentRunAuthorization.PURPOSE,
+                authorization.runId(), reservation.bindingSha256(), authorization.sessionRequired(), authorization.deadlineAt()));
         requireIdentity(authorized, principal);
-        var currentSubject = bindings.require(reservation.authorization(), command.link());
-        if (!issuers.findByIssuer(issuer.toASCIIString()).filter(trusted::equals).isPresent() || !subject.equals(currentSubject)
+        var currentSubject = bindings.require(authorization, link);
+        if (issuers.findByIssuer(authorized.issuer().toASCIIString()).filter(authority.trust()::equals).isEmpty() || !subject.equals(currentSubject)
                 || !subject.resourceUri().toASCIIString().equals(currentSubject.resourceUri().toASCIIString())) throw unavailable();
         var ticket = new AgentServiceExecutionGrant.Ticket(issued.ticket().grantId(), issued.ticket().ciphertext(), issued.expiresAt());
-        if (store.complete(reservation, ticket) || store.current(reservation.authorization(), resource, subject).isPresent()) return;
+        if (store.complete(reservation, ticket) || store.current(authorization, resource, subject).isPresent()) return;
         throw unavailable();
     }
+
+    private record IssuerVO(TrustedIssuerRegistry.TrustedIssuerVO trust, HttpExecutionGrantClient client) { }
 
     private void requireIdentity(TianjiAgentAccess.Authorized authorized, ServiceIdentityPrincipal principal) {
         if (authorized == null || authorized.actor() == null || authorized.issuer() == null || principal == null
