@@ -17,6 +17,7 @@ public final class OutboxMemoryIndexPublication implements MemoryIndexPublicatio
     public static final String CHANNEL = "tianji-memory-index";
     public static final String DESTINATION = "agent-memory";
     static final String FINGERPRINT = "tianji-memory-index-fingerprint";
+    private static final String EVENT_ID_PREFIX = "memory-index:";
     private final DataSource source;
     private final Binding binding;
     private final TransactionalOutbox outbox;
@@ -46,8 +47,14 @@ public final class OutboxMemoryIndexPublication implements MemoryIndexPublicatio
         Objects.requireNonNull(event, "event");
         if (authority != null) authority.requirePublication(event);
         if (event.action() == Action.BUILD && !binding.modelRef().equals(event.modelRef())) throw new IllegalArgumentException("Memory event model does not match its publication binding");
-        var receipt = outbox.enqueue(OutboxMessage.builder().messageId(event.eventId()).idempotencyKey(event.eventId()).channel(CHANNEL).destination(DESTINATION)
+        String messageId = transportMessageId(event);
+        String eventId = event.eventId();
+        var receipt = outbox.enqueue(OutboxMessage.builder().messageId(messageId).idempotencyKey(eventId).channel(CHANNEL).destination(DESTINATION)
                 .schemaVersion("1").contentType("application/json").payload(MemoryIndexEventJson.encode(event)).headers(Map.of(FINGERPRINT, event.fingerprint())).build());
-        if (receipt == null || !event.eventId().equals(receipt.messageId()) || !event.eventId().equals(receipt.idempotencyKey())) throw new IllegalStateException("Memory index Outbox receipt does not match its intention");
+        if (receipt == null || !messageId.equals(receipt.messageId()) || !eventId.equals(receipt.idempotencyKey())) throw new IllegalStateException("Memory index Outbox receipt does not match its intention");
+    }
+
+    static String transportMessageId(Event event) {
+        return event.eventId().substring(EVENT_ID_PREFIX.length());
     }
 }

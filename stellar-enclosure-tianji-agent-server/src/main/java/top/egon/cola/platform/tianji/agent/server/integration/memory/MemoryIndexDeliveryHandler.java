@@ -30,7 +30,8 @@ public final class MemoryIndexDeliveryHandler implements DeliveryHandler {
         final top.egon.cola.platform.tianji.agent.application.memory.MemoryIndexPublication.Event event;
         try {
             event = MemoryIndexEventJson.decode(context.payload());
-            if (!event.eventId().equals(context.messageId()) || !event.fingerprint().equals(context.headers().get(OutboxMemoryIndexPublication.FINGERPRINT))) return invalid();
+            if (!OutboxMemoryIndexPublication.transportMessageId(event).equals(context.messageId())
+                    || !event.fingerprint().equals(context.headers().get(OutboxMemoryIndexPublication.FINGERPRINT))) return invalid();
         } catch (IllegalArgumentException malformed) { return invalid(); }
         try {
             if (!admitted(context)) return deadline();
