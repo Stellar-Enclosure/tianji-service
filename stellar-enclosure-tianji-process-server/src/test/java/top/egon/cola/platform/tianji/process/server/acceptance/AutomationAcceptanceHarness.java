@@ -685,22 +685,41 @@ final class AutomationAcceptanceHarness implements AutoCloseable {
     private record ExternalObservationVO(long dispatchGeneration, String inputSha256, boolean applied,
                                          String businessReceiptId, String observedAt) { }
 
-    String persistForm(long tenant, String task, String choice) {
+    String persistForm(long tenant, String task, String choice, String opinion, String attachmentRef, byte[] attachment) {
         requireTenant(tenant);
         checkedReference(task);
         checkedReference(choice);
+        checkedReference(attachmentRef);
+        if (opinion == null || opinion.isBlank() || attachment == null || attachment.length == 0) throw invalid();
         String result = "form-" + sha256((runId() + ":" + tenant + ":" + task).getBytes(StandardCharsets.UTF_8));
         var jdbc = stores.get(Role.WORKER).setup();
         jdbc.update("""
-                INSERT INTO automation_fixture.business_form (run_id,tenant_id,task_id,result_ref,fixture_choice)
-                VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING
-                """, runId(), tenant, task, result, choice);
+                INSERT INTO automation_fixture.business_form
+                    (run_id,tenant_id,task_id,result_ref,fixture_choice,fixture_opinion,attachment_ref,attachment_bytes)
+                VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING
+                """, runId(), tenant, task, result, choice, opinion, attachmentRef, attachment);
         var matches = jdbc.queryForObject("""
                 SELECT count(*) FROM automation_fixture.business_form
                 WHERE run_id=? AND tenant_id=? AND task_id=? AND result_ref=? AND fixture_choice=?
-                """, Integer.class, runId(), tenant, task, result, choice);
+                  AND fixture_opinion=? AND attachment_ref=? AND attachment_bytes=?
+                """, Integer.class, runId(), tenant, task, result, choice, opinion, attachmentRef, attachment);
         if (!Objects.equals(matches, 1)) throw invalid();
         return result;
+    }
+
+    Optional<BusinessFormVO> readForm(long tenant, String result) {
+        requireTenant(tenant);
+        checkedReference(result);
+        return observe(Role.WORKER).query("""
+                SELECT fixture_choice,fixture_opinion,attachment_ref,attachment_bytes
+                FROM automation_fixture.business_form WHERE run_id=? AND tenant_id=? AND result_ref=?
+                """, (row, index) -> new BusinessFormVO(row.getString("fixture_choice"), row.getString("fixture_opinion"),
+                        row.getString("attachment_ref"), HexFormat.of().formatHex(row.getBytes("attachment_bytes"))),
+                runId(), tenant, result).stream().findFirst();
+    }
+
+    record BusinessFormVO(String choice, String opinion, String attachmentRef, String attachmentHex) {
+        @Override public String toString() { return "BusinessFormVO[redacted]"; }
     }
 
     private void requireTenant(long tenant) {
@@ -729,6 +748,7 @@ final class AutomationAcceptanceHarness implements AutoCloseable {
                 CREATE TABLE automation_fixture.business_form (
                     run_id text NOT NULL, tenant_id bigint NOT NULL, task_id text NOT NULL,
                     result_ref text NOT NULL, fixture_choice text NOT NULL,
+                    fixture_opinion text NOT NULL, attachment_ref text NOT NULL, attachment_bytes bytea NOT NULL,
                     PRIMARY KEY (run_id,tenant_id,task_id), UNIQUE (run_id,tenant_id,result_ref))
                 """);
         jdbc.execute("""

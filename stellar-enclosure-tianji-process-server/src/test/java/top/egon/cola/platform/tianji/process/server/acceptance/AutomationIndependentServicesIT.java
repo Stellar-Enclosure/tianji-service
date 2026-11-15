@@ -18,6 +18,10 @@ import top.egon.cola.platform.tianji.client.ProcessClientException;
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.ClaimHumanTaskCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskKindEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.HumanTaskSelectionEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.ListHumanTasksQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentTaskBindingVO.TemplateRefVO;
@@ -55,6 +59,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,6 +72,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static top.egon.cola.platform.tianji.process.server.acceptance.AutomationAcceptanceHarness.BusinessFormVO;
 import static top.egon.cola.platform.tianji.process.server.acceptance.AutomationAcceptanceHarness.Cut;
 import static top.egon.cola.platform.tianji.process.server.acceptance.AutomationAcceptanceHarness.CutWitnessVO;
 import static top.egon.cola.platform.tianji.process.server.acceptance.AutomationAcceptanceHarness.GateMode;
@@ -92,7 +98,7 @@ final class AutomationIndependentServicesIT {
     private static final Map<String, Object> TEXT = Map.of("type", "string");
     private static final Map<String, Object> BOOLEAN = Map.of("type", "boolean");
     private static final Map<String, Object> INTEGER = Map.of("type", "integer");
-    private static final ProcessSchemaVO RESULT_FORM = schema(Map.of("resultRef", TEXT, "decision", BOOLEAN), "resultRef", "decision");
+    private static final ProcessSchemaVO HUMAN_RESULT_REFERENCE = schema(Map.of("resultRef", TEXT), "resultRef");
     private static final ProcessSchemaVO WORK_IN = schema(Map.of("value", TEXT, "waitToken", TEXT));
     private static final ProcessSchemaVO ACCEPTED = schema(Map.of("accepted", BOOLEAN), "accepted");
     private static final ProcessSchemaVO VALUE = schema(Map.of("value", TEXT), "value");
@@ -127,14 +133,35 @@ final class AutomationIndependentServicesIT {
         for (var tenant : fixture.tenants()) {
             publishActivate(tenant, humanModel(), "fx-human-r1", 0);
             var instance = submit(tenant, start("fx_human", "human-" + tenant.tenantId(), Map.of(), Map.of()));
-            var taskId = task(tenant, instance, "review");
+            var nativeTaskId = task(tenant, instance, "review");
+            var query = new ListHumanTasksQuery(HumanTaskScopeTypeEnum.PROCESS, HumanTaskSelectionEnum.CANDIDATE,
+                    null, instance.getInstanceId(), null, null, 10);
+            var candidateClient = legacy(tenant, Identity.CANDIDATE);
+            var tasks = awaitAvailable("current candidate task query", () -> candidateClient.humanTasks(query)).items();
+            assertEquals(1, tasks.size());
+            var selected = tasks.getFirst();
+            var taskId = selected.taskId();
+            assertEquals(nativeTaskId, taskId);
+            assertEquals(HumanTaskKindEnum.ACTION, selected.kind());
+            assertFalse(selected.assigned());
             var foreign = fixture.tenants().stream().filter(candidate -> candidate.tenantId() != tenant.tenantId()).findFirst().orElseThrow();
+            var foreignCandidate = legacy(foreign, Identity.CANDIDATE);
+            assertTrue(awaitAvailable("foreign candidate task query", () -> foreignCandidate.humanTasks(query)).items().isEmpty());
             try (var wrong = process(foreign, Identity.CANDIDATE)) {
                 assertClientDenied(() -> wrong.getTask(taskId));
             }
-            String form = fixture.persistForm(tenant.tenantId(), taskId, "approved");
-            String receipt = complete(tenant, taskId, Map.of("resultRef", form, "decision", true));
-            requireFinished(tenant, instance, AutomationInstanceDTO.StateEnum.COMPLETED);
+            String choice = "approved";
+            String opinion = "Reviewed in the business application fixture";
+            byte[] attachment = ("Synthetic review attachment " + tenant.tenantId()).getBytes(StandardCharsets.UTF_8);
+            String attachmentRef = "review-" + AutomationAcceptanceHarness.sha256(attachment);
+            String form = fixture.persistForm(tenant.tenantId(), taskId, choice, opinion, attachmentRef, attachment);
+            assertEquals(new BusinessFormVO(choice, opinion, attachmentRef, HexFormat.of().formatHex(attachment)),
+                    fixture.readForm(tenant.tenantId(), form).orElseThrow(), "The tenant can read its saved business form and attachment");
+            assertTrue(fixture.readForm(foreign.tenantId(), form).isEmpty(), "A foreign tenant cannot resolve the saved form reference");
+            var result = Map.<String, Object>of("resultRef", form);
+            String receipt = complete(tenant, taskId, result);
+            var finished = requireFinished(tenant, instance, AutomationInstanceDTO.StateEnum.COMPLETED);
+            assertEquals(result, finished.getOutput(), "The completed human process exposes exactly the business result reference");
             assertEquals(1, count(Role.WORKER, """
                     SELECT count(*) FROM automation_fixture.business_form
                     WHERE run_id=? AND tenant_id=? AND task_id=? AND result_ref=?
@@ -144,8 +171,10 @@ final class AutomationIndependentServicesIT {
                     """, instance.getInstanceId()));
             assertEquals(1, count(Role.PROCESS, """
                     SELECT count(*) FROM tianji_process.tianji_process_node_execution
-                    WHERE tenant_id=? AND instance_id=? AND output_json->>'resultRef'=?
-                    """, tenant.tenantId(), instance.getInstanceId(), form));
+                    WHERE tenant_id=? AND instance_id=? AND node_id='review' AND state='COMPLETED'
+                      AND output_json=jsonb_build_object('resultRef', CAST(? AS text))
+                    """, tenant.tenantId(), instance.getInstanceId(), form),
+                    "The completed human node stores exactly the business result reference");
             witnesses.add(witness(tenant, instance, receipt, 0, 0));
         }
         fixture.record(Scenario.human_only, witnesses);
@@ -688,11 +717,11 @@ final class AutomationIndependentServicesIT {
         try (var owner = process(tenant, identity)) { return owner.getInstance(instance); }
     }
 
-    private static void requireFinished(TenantFixtureVO tenant, AutomationInstanceDTO instance, AutomationInstanceDTO.StateEnum expected) {
-        requireFinished(tenant, instance, expected, Identity.REQUESTER);
+    private static AutomationInstanceDTO requireFinished(TenantFixtureVO tenant, AutomationInstanceDTO instance, AutomationInstanceDTO.StateEnum expected) {
+        return requireFinished(tenant, instance, expected, Identity.REQUESTER);
     }
 
-    private static void requireFinished(TenantFixtureVO tenant, AutomationInstanceDTO instance, AutomationInstanceDTO.StateEnum expected,
+    private static AutomationInstanceDTO requireFinished(TenantFixtureVO tenant, AutomationInstanceDTO instance, AutomationInstanceDTO.StateEnum expected,
             Identity identity) {
         fixture.await("persisted terminal Process state for " + instance.getDefinitionKey(), () ->
                 count(Role.PROCESS, "SELECT count(*) FROM tianji_process.act_hi_procinst WHERE proc_inst_id_=? AND end_time_ IS NOT NULL",
@@ -705,6 +734,7 @@ final class AutomationIndependentServicesIT {
         assertEquals(1, count(Role.PROCESS, "SELECT count(*) FROM tianji_process.act_hi_procinst WHERE proc_inst_id_=? AND end_time_ IS NOT NULL",
                 instance.getInstanceId()));
         assertEquals(0, count(Role.PROCESS, "SELECT count(*) FROM tianji_process.act_ru_execution WHERE proc_inst_id_=?", instance.getInstanceId()));
+        return observed;
     }
 
     private static <T> T awaitAvailable(String description, Supplier<T> call) {
@@ -961,10 +991,9 @@ final class AutomationIndependentServicesIT {
     }
 
     private static AutomationModelSourceVO humanModel() {
-        var mappings = List.of(new MappingVO("resultRef", "nodes.review.output.resultRef"),
-                new MappingVO("decision", "nodes.review.output.decision"));
-        return model("fx_human", "", linear(List.of("review"), List.of("<userTask id=\"review\"/>")), EMPTY, RESULT_FORM,
-                List.of(human("review", RESULT_FORM, mappings)), List.of(), List.of());
+        var mappings = List.of(new MappingVO("resultRef", "nodes.review.output.resultRef"));
+        return model("fx_human", "", linear(List.of("review"), List.of("<userTask id=\"review\"/>")), EMPTY, HUMAN_RESULT_REFERENCE,
+                List.of(human("review", HUMAN_RESULT_REFERENCE, mappings)), List.of(), List.of());
     }
 
     private static AutomationModelSourceVO businessModel() throws IOException {
