@@ -6,6 +6,8 @@ import org.flowable.common.engine.impl.interceptor.Command;
 import org.flowable.common.engine.impl.interceptor.CommandConfig;
 import org.flowable.common.engine.impl.interceptor.CommandExecutor;
 import org.flowable.dmn.spring.SpringDmnEngineConfiguration;
+import org.flowable.job.api.Job;
+import org.flowable.job.api.JobNotFoundException;
 import org.flowable.spring.SpringProcessEngineConfiguration;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -32,8 +34,10 @@ import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessCommand
 import top.egon.cola.platform.tianji.contract.orchestration.CancelProcessResult;
 import top.egon.cola.platform.tianji.contract.orchestration.GetProcessInstanceQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.ProcessInstanceStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationModelSourceVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AutomationNodeBindingVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.EngineHumanTaskCompletionDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.NodePolicyVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.activation.ActivationCommand;
@@ -85,20 +89,27 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
+import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.sql.DataSource;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 
 @Isolated("Owns one explicitly provisioned empty Process database")
-@Timeout(120)
+@Timeout(240)
 class AutomationConcurrencyIT {
     private static final String SCHEMA = "tianji_process";
     private static final String ENABLED = "stellar.tianji.process.automation.enabled";
@@ -169,7 +180,8 @@ class AutomationConcurrencyIT {
                     "Raw Flowable completion cannot bypass typed ACTION");
             var humanReceipts = new HumanTaskReceiptStore(((DataSourceTransactionManager) process.getTransactionManager()).getDataSource(), SCHEMA);
             humanReceipts.verifyStorage();
-            var human = new FlowableHumanTaskService(process, null, application.getBean(SpringDmnEngineConfiguration.class),
+            var dmn = application.getBean(SpringDmnEngineConfiguration.class);
+            var human = new FlowableHumanTaskService(process, null, dmn,
                     new ProcessModelValidator(), humanReceipts, null, HumanTaskCompletionObservation.disabled(),
                     new FlowableHumanTaskService.AutomationTaskParticipants(wiring.bindings, wiring.releases, wiring.guard, wiring.nodes, wiring.lifecycle));
             var expires = Instant.now().plusSeconds(60);
@@ -196,8 +208,10 @@ class AutomationConcurrencyIT {
                     SELECT count(*) FROM tianji_process.tianji_process_node_execution
                     WHERE instance_id=? AND state='COMPLETED' AND output_sha256 IS NOT NULL AND output_json->>'resultRef'='accepted'
                     """, Integer.class, taskRoot.getInstanceId()));
-            verifyTypedCancellation(database, services.execution(), process, application.getBean(SpringDmnEngineConfiguration.class),
-                    wiring, nativeProbe, human, reader, claimant, completer);
+            var cancellation = cancellationFixture(process, dmn, wiring);
+            verifyTypedCancellation(database, services.execution(), process, cancellation, wiring, nativeProbe, human, reader, claimant, completer);
+            verifyHardDeadlineMicros(database, services.execution(), process, human, wiring.clock);
+            verifyTerminalRaces(database, services.execution(), process, human, cancellation.control(), wiring.clock, nativeProbe);
             assertNotNull(process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(first.getInstanceId())
                     .singleResult().getDeleteReason());
             assertNotNull(process.getHistoryService().createHistoricProcessInstanceQuery().processInstanceId(second.getInstanceId())
@@ -207,6 +221,262 @@ class AutomationConcurrencyIT {
             verifyAcceptedWorkerResultOrdering(workerHarness);
         }
     }
+
+    private static void verifyHardDeadlineMicros(DatabaseVO database, ProcessExecutionService execution,
+            SpringProcessEngineConfiguration process, FlowableHumanTaskService human, BoundaryClockJdbcTemplate clock) {
+        var before = startHumanRace(execution, process, human, "before-hard-deadline");
+        var exact = startHumanRace(execution, process, human, "at-hard-deadline");
+        // The database requires attempt <= hard. Align these two attempts so the earlier attempt deadline
+        // cannot decide either case independently of the hard deadline.
+        for (var waiting : List.of(before, exact)) {
+            assertEquals(1, database.owner().update("""
+                    UPDATE tianji_process.tianji_process_node_execution SET attempt_deadline_at=node_deadline_at
+                    WHERE tenant_id=? AND instance_id=? AND node_id='approve' AND attempt=1 AND state='WAITING'
+                    """, OWNER.tenantId(), waiting.root()));
+        }
+        var beforeDeadline = deadlineSample(database, before.root(), -1);
+        var accepted = new AtomicReference<EngineHumanTaskCompletionDTO>();
+        clock.atDeadline(beforeDeadline, () -> accepted.set(human.completeAction(before.completer(), before.taskId(), before.command())));
+        assertNotNull(accepted.get());
+        assertEquals(accepted.get(), human.completeAction(before.completer(), before.taskId(), before.command()));
+        assertEquals(1, database.owner().queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_process_node_execution
+                WHERE tenant_id=? AND instance_id=? AND state='COMPLETED' AND accepted_at=?
+                    AND accepted_at=node_deadline_at-interval '1 microsecond'
+                """, Integer.class, OWNER.tenantId(), before.root(), beforeDeadline.at()));
+
+        var exactDeadline = deadlineSample(database, exact.root(), 0);
+        clock.atDeadline(exactDeadline, () -> assertThrows(ProcessVersionConflictException.class,
+                () -> human.completeAction(exact.completer(), exact.taskId(), exact.command())));
+        assertEquals(1, database.owner().queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_process_node_execution
+                WHERE tenant_id=? AND instance_id=? AND state='WAITING' AND output_json IS NULL AND accepted_at IS NULL
+                    AND node_deadline_at=?
+                """, Integer.class, OWNER.tenantId(), exact.root(), exactDeadline.at()));
+        assertEquals(0, completionReceipts(database, exact.taskId()));
+        String timerId = executableHardTimer(process, exact.root());
+        clock.atDeadline(exactDeadline, () -> process.getManagementService().executeJob(timerId));
+        assertEquals(1, database.owner().queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_process_node_execution
+                WHERE tenant_id=? AND instance_id=? AND state='TIMED_OUT' AND finished_at=node_deadline_at
+                """, Integer.class, OWNER.tenantId(), exact.root()));
+        assertTerminalFacts(database, exact, TerminalAction.TIMER);
+    }
+
+    private static void verifyTerminalRaces(DatabaseVO database, ProcessExecutionService execution,
+            SpringProcessEngineConfiguration process, FlowableHumanTaskService human, ProcessControlService control,
+            BoundaryClockJdbcTemplate clock, NativeEntryProbe probe) throws Exception {
+        long initialDeadlocks = deadlocks(database);
+        var contenders = TerminalAction.values();
+        var winners = new EnumMap<TerminalAction, Integer>(TerminalAction.class);
+        var runtime = new JdbcTemplate(((DataSourceTransactionManager) process.getTransactionManager()).getDataSource());
+        try (var pool = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int index = 0; index < 100; index++) {
+                var winner = contenders[index % contenders.length];
+                var waiting = startHumanRace(execution, process, human, "terminal-" + index);
+                String jobId = executableHardTimer(process, waiting.root());
+                var snapshot = control.control(OWNER, new GetProcessInstanceQuery(waiting.root()));
+                var cancel = new CancelProcessCommand(waiting.root(), "cancel-terminal-" + index, snapshot.version(), "fixture terminal race");
+                var cancelled = new AtomicReference<CancelProcessResult>();
+                var completed = new AtomicReference<EngineHumanTaskCompletionDTO>();
+                Runnable cancellation = () -> cancelled.set(control.cancel(OWNER, cancel));
+                Runnable completion = () -> {
+                    if (winner == TerminalAction.COMPLETE) {
+                        completed.set(human.completeAction(waiting.completer(), waiting.taskId(), waiting.command()));
+                    } else {
+                        assertThrows(ProcessResourceNotFoundException.class,
+                                () -> human.completeAction(waiting.completer(), waiting.taskId(), waiting.command()));
+                    }
+                };
+                Runnable timer = () -> process.getManagementService().executeJob(jobId);
+                Runnable timerCommand = winner == TerminalAction.TIMER
+                        ? atPersistedDeadline(database, clock, waiting.root(), timer)
+                        : () -> assertEquals(jobId, assertThrows(JobNotFoundException.class, timer::run).getJobId());
+                raceOnRoot(database, runtime, pool, probe, waiting.root(), winner,
+                        Map.of(TerminalAction.CANCEL, cancellation, TerminalAction.COMPLETE, completion, TerminalAction.TIMER, timerCommand));
+
+                assertNotNull(cancelled.get());
+                assertEquals(winner == TerminalAction.CANCEL, cancelled.get().accepted());
+                assertEquals(winner == TerminalAction.COMPLETE ? ProcessInstanceStatusEnum.COMPLETED : ProcessInstanceStatusEnum.CANCELLED,
+                        cancelled.get().status());
+                assertEquals(cancelled.get(), control.cancel(OWNER, cancel));
+                var terminal = control.control(OWNER, new GetProcessInstanceQuery(waiting.root()));
+                assertEquals(cancelled.get().resultingVersion(), terminal.version());
+                if (winner == TerminalAction.COMPLETE) {
+                    assertNotNull(completed.get());
+                    assertEquals(completed.get(), human.completeAction(waiting.completer(), waiting.taskId(), waiting.command()));
+                }
+                var late = new CompleteEngineHumanTaskCommand("late-terminal-" + index,
+                        waiting.expectedVersion(), Map.of("resultRef", "late"));
+                assertThrows(ProcessResourceNotFoundException.class,
+                        () -> human.completeAction(waiting.completer(), waiting.taskId(), late));
+                assertTerminalFacts(database, waiting, winner);
+                winners.merge(winner, 1, Integer::sum);
+            }
+        }
+        assertEquals(Map.of(TerminalAction.CANCEL, 34, TerminalAction.COMPLETE, 33, TerminalAction.TIMER, 33), winners);
+        assertEquals(initialDeadlocks, deadlocks(database), "The independent PostgreSQL transactions must not deadlock");
+    }
+
+    private static Runnable atPersistedDeadline(DatabaseVO database, BoundaryClockJdbcTemplate clock, String root, Runnable timer) {
+        var deadline = deadlineSample(database, root, 0);
+        return () -> clock.atDeadline(deadline, timer);
+    }
+
+    private static void raceOnRoot(DatabaseVO database, JdbcTemplate runtime, ExecutorService pool, NativeEntryProbe probe,
+            String root, TerminalAction winner, Map<TerminalAction, Runnable> actions) throws Exception {
+        var entered = new CountDownLatch(1);
+        var proceed = new CountDownLatch(1);
+        var ownerPid = new AtomicInteger();
+        var pending = new EnumMap<TerminalAction, Future<?>>(TerminalAction.class);
+        probe.observe(winner.nativeCommand, entered, proceed, () -> {
+            AutomationInstanceGuardCommandInterceptor.requireHeld(OWNER.tenantId(), root);
+            ownerPid.set(runtime.queryForObject("SELECT pg_backend_pid()", Integer.class));
+        });
+        try {
+            pending.put(winner, pool.submit(actions.get(winner)));
+            try {
+                assertTrue(entered.await(4, TimeUnit.SECONDS), () -> "The first " + winner + " never entered its guarded native command");
+                for (var action : actions.entrySet()) {
+                    if (action.getKey() != winner) pending.put(action.getKey(), pool.submit(action.getValue()));
+                }
+                await().alias("two PostgreSQL backends blocked by " + winner + " on " + root)
+                        .pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(2)).until(() ->
+                                blockedBackends(database, ownerPid.get()) == 2L);
+                assertTrue(pending.values().stream().noneMatch(Future::isDone));
+            } finally {
+                proceed.countDown();
+            }
+            for (var action : pending.entrySet()) action.getValue().get(8, TimeUnit.SECONDS);
+        } finally {
+            probe.stop();
+        }
+    }
+
+    private static long blockedBackends(DatabaseVO database, int rootLockPid) {
+        return database.owner().queryForObject("""
+                WITH RECURSIVE waiting AS (
+                    SELECT DISTINCT pid FROM pg_catalog.pg_locks WHERE NOT granted AND pid IS NOT NULL
+                ), blockers(pid) AS (
+                    SELECT ?::integer
+                    UNION
+                    SELECT waiting.pid FROM waiting JOIN blockers
+                      ON blockers.pid=ANY(pg_catalog.pg_blocking_pids(waiting.pid))
+                )
+                SELECT count(*)-1 FROM blockers
+                """, Long.class, rootLockPid);
+    }
+
+    private static long deadlocks(DatabaseVO database) {
+        return database.owner().queryForObject("""
+                SELECT deadlocks FROM pg_catalog.pg_stat_database WHERE datname=current_database()
+                """, Long.class);
+    }
+
+    private static WaitingHumanTaskVO startHumanRace(ProcessExecutionService execution, SpringProcessEngineConfiguration process,
+            FlowableHumanTaskService human, String key) {
+        var instance = execution.startAutomation(OWNER, new AutomationStartCommand("approval", "business-" + key,
+                "start-" + key, "trace-" + key, Map.of(), Map.of()));
+        String root = instance.getInstanceId();
+        var jobs = process.getManagementService();
+        jobs.executeJob(jobs.createJobQuery().processInstanceId(root).singleResult().getId());
+        var task = process.getTaskService().createTaskQuery().processInstanceId(root).singleResult();
+        assertNotNull(task);
+        var expires = Instant.now().plusSeconds(60);
+        var reader = new HumanTaskContext(OWNER, "tianji.api.process.task.get.v2", Set.of("901"), expires, 1, 1);
+        var claimant = new HumanTaskContext(OWNER, "tianji.api.process.task.claim", Set.of("901"), expires, 1, 1);
+        var completer = new HumanTaskContext(OWNER, "tianji.api.process.task.complete.v2", Set.of("901"), expires, 1, 1);
+        var ready = human.observeAction(reader, task.getId());
+        human.claim(claimant, new ClaimHumanTaskCommand("claim-" + key, task.getId(), ready.getVersion()));
+        var claimed = human.observeAction(reader, task.getId());
+        return new WaitingHumanTaskVO(root, task.getId(), completer, "complete-" + key, claimed.getVersion(), "result-" + key);
+    }
+
+    private static String executableHardTimer(SpringProcessEngineConfiguration process, String root) {
+        var jobs = process.getManagementService();
+        var timers = jobs.createTimerJobQuery().processInstanceId(root).list().stream().sorted(Comparator.comparing(Job::getDuedate)).toList();
+        assertEquals(2, timers.size());
+        assertTrue(timers.getFirst().getDuedate().before(timers.getLast().getDuedate()));
+        return jobs.moveTimerToExecutableJob(timers.getLast().getId()).getId();
+    }
+
+    private static DeadlineSampleVO deadlineSample(DatabaseVO database, String root, int offsetMicros) {
+        var deadline = database.owner().queryForObject("""
+                SELECT node_deadline_at::timestamptz(6) FROM tianji_process.tianji_process_node_execution
+                WHERE tenant_id=? AND instance_id=? AND node_id='approve' AND attempt=1
+                """, OffsetDateTime.class, OWNER.tenantId(), root);
+        assertNotNull(deadline);
+        assertEquals(0, deadline.getNano() % 1000);
+        return new DeadlineSampleVO(root, offsetMicros, deadline.plus(offsetMicros, ChronoUnit.MICROS));
+    }
+
+    private static void assertTerminalFacts(DatabaseVO database, WaitingHumanTaskVO waiting, TerminalAction winner) {
+        boolean completed = winner == TerminalAction.COMPLETE;
+        database.owner().queryForObject("""
+                SELECT n.state, n.output_json->>'resultRef', n.output_sha256, n.accepted_at, n.finished_at,
+                    (SELECT count(*) FROM tianji_process.act_hi_procinst p WHERE p.proc_inst_id_=n.instance_id AND p.end_time_ IS NOT NULL),
+                    (SELECT count(*) FROM tianji_process.act_hi_taskinst t WHERE t.proc_inst_id_=n.instance_id AND t.end_time_ IS NOT NULL),
+                    (SELECT count(*) FROM tianji_process.act_ru_execution e WHERE e.proc_inst_id_=n.instance_id)
+                    + (SELECT count(*) FROM tianji_process.act_ru_task t WHERE t.proc_inst_id_=n.instance_id)
+                    + (SELECT count(*) FROM tianji_process.act_ru_job j WHERE j.process_instance_id_=n.instance_id)
+                    + (SELECT count(*) FROM tianji_process.act_ru_timer_job j WHERE j.process_instance_id_=n.instance_id)
+                    + (SELECT count(*) FROM tianji_process.act_ru_deadletter_job j WHERE j.process_instance_id_=n.instance_id)
+                    + (SELECT count(*) FROM tianji_process.act_ru_suspended_job j WHERE j.process_instance_id_=n.instance_id),
+                    history.delete_reason_, history.end_act_id_, n.output_schema_sha256
+                FROM tianji_process.tianji_process_node_execution n
+                JOIN tianji_process.act_hi_procinst history ON history.proc_inst_id_=n.instance_id
+                WHERE n.tenant_id=? AND n.instance_id=?
+                """, (row, index) -> {
+            assertEquals(winner.nodeState, row.getString(1));
+            assertEquals(completed ? waiting.resultRef() : null, row.getString(2));
+            String resultSha = completed ? ProcessNodeExecutionStore.digest("AUTOMATION_NODE_OUTPUT_V2", row.getString(11),
+                    Map.of("resultRef", waiting.resultRef())) : null;
+            assertEquals(resultSha, row.getString(3));
+            assertEquals(completed, row.getObject(4) != null);
+            assertNotNull(row.getObject(5));
+            assertEquals(1L, row.getLong(6));
+            assertEquals(1L, row.getLong(7));
+            assertEquals(0L, row.getLong(8));
+            switch (winner) {
+                case CANCEL -> assertEquals("TIANJI_PROCESS_CANCELLED", row.getString(9));
+                case COMPLETE -> assertNull(row.getString(9));
+                case TIMER -> {
+                    assertNotNull(row.getString(10));
+                    assertEquals("terminate end event (" + row.getString(10) + ")", row.getString(9));
+                }
+            }
+            return true;
+        }, OWNER.tenantId(), waiting.root());
+        assertEquals(completed ? 1 : 0, completionReceipts(database, waiting.taskId()));
+    }
+
+    private static int completionReceipts(DatabaseVO database, String taskId) {
+        return database.owner().queryForObject("""
+                SELECT count(*) FROM tianji_process.tianji_human_task_receipt
+                WHERE tenant_id=? AND task_id=? AND command_type='TASK_COMPLETE'
+                """, Integer.class, OWNER.tenantId(), taskId);
+    }
+
+    private enum TerminalAction {
+        CANCEL("DeleteProcessInstanceCmd", "CANCELLED"), COMPLETE("CompleteTaskCmd", "COMPLETED"), TIMER("ExecuteJobCmd", "TIMED_OUT");
+
+        private final String nativeCommand;
+        private final String nodeState;
+
+        TerminalAction(String nativeCommand, String nodeState) {
+            this.nativeCommand = nativeCommand;
+            this.nodeState = nodeState;
+        }
+    }
+
+    private record WaitingHumanTaskVO(String root, String taskId, HumanTaskContext completer,
+                                      String commandId, String expectedVersion, String resultRef) {
+        CompleteEngineHumanTaskCommand command() {
+            return new CompleteEngineHumanTaskCommand(commandId, expectedVersion, Map.of("resultRef", resultRef));
+        }
+    }
+
+    private record DeadlineSampleVO(String root, int offsetMicros, OffsetDateTime at) { }
 
     private static void verifyAcceptedWorkerResultOrdering(Harness fixture) {
         String definition = "workerDeadlineRace";
@@ -258,7 +528,7 @@ class AutomationConcurrencyIT {
     }
 
     private static void verifyTypedCancellation(DatabaseVO database, ProcessExecutionService execution,
-            SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn, NativeWiring wiring,
+            SpringProcessEngineConfiguration process, CancellationFixtureVO cancellationFixture, NativeWiring wiring,
             NativeEntryProbe probe, FlowableHumanTaskService human, HumanTaskContext reader,
             HumanTaskContext claimant, HumanTaskContext completer) throws Exception {
         var root = execution.startAutomation(OWNER, new AutomationStartCommand("approval", "approval-cancel",
@@ -269,16 +539,10 @@ class AutomationConcurrencyIT {
         var unclaimed = human.observeAction(reader, nativeTask.getId());
         human.claim(claimant, new ClaimHumanTaskCommand("claim-for-cancel", nativeTask.getId(), unclaimed.getVersion()));
         var claimed = human.observeAction(reader, nativeTask.getId());
-        var transactions = (DataSourceTransactionManager) process.getTransactionManager();
-        var source = transactions.getDataSource();
-        var receiptStore = new ProcessCancellationReceiptStore(source, SCHEMA);
-        receiptStore.verifyStorage();
-        var validator = new ProcessModelValidator();
-        var releaseService = new ProcessReleaseService(process, dmn, validator);
-        var nativeAccess = new ProcessControlNativeAccess(source, process);
-        var dispatch = new AgentDispatchStore(source, transactions, SCHEMA);
-        var control = new ProcessControlService(process, dmn, validator, releaseService, nativeAccess, receiptStore, dispatch,
-                new ProcessControlService.AutomationControlParticipants(wiring.bindings, wiring.releases, wiring.guard, wiring.nodes));
+        var control = cancellationFixture.control();
+        var nativeAccess = cancellationFixture.nativeAccess();
+        var dispatch = cancellationFixture.dispatch();
+        var transactions = cancellationFixture.transactions();
         var snapshot = control.control(OWNER, new GetProcessInstanceQuery(root.getInstanceId()));
         var cancel = new CancelProcessCommand(root.getInstanceId(), "cancel-human", snapshot.version(), "fixture cancellation");
         var worker = ProcessActor.verified(OWNER.tenantId(), ProcessActor.SubjectType.SERVICE, "legacy-dispatch", "https://idp.test/main");
@@ -346,6 +610,24 @@ class AutomationConcurrencyIT {
                 WHERE tenant_id=? AND scope_type='BPMN' AND scope_id=? AND state=?
                 """, Integer.class, OWNER.tenantId(), instanceId, state);
     }
+
+    private static CancellationFixtureVO cancellationFixture(SpringProcessEngineConfiguration process, SpringDmnEngineConfiguration dmn,
+                                                              NativeWiring wiring) {
+        var transactions = (DataSourceTransactionManager) process.getTransactionManager();
+        var source = transactions.getDataSource();
+        var receiptStore = new ProcessCancellationReceiptStore(source, SCHEMA);
+        receiptStore.verifyStorage();
+        var validator = new ProcessModelValidator();
+        var releaseService = new ProcessReleaseService(process, dmn, validator);
+        var nativeAccess = new ProcessControlNativeAccess(source, process);
+        var dispatch = new AgentDispatchStore(source, transactions, SCHEMA);
+        var control = new ProcessControlService(process, dmn, validator, releaseService, nativeAccess, receiptStore, dispatch,
+                new ProcessControlService.AutomationControlParticipants(wiring.bindings, wiring.releases, wiring.guard, wiring.nodes));
+        return new CancellationFixtureVO(transactions, nativeAccess, dispatch, control);
+    }
+
+    private record CancellationFixtureVO(DataSourceTransactionManager transactions, ProcessControlNativeAccess nativeAccess,
+                                         AgentDispatchStore dispatch, ProcessControlService control) { }
 
     private static void verifyFailedJobAccounting(DatabaseVO database, ProcessExecutionService execution,
                                                   SpringProcessEngineConfiguration process, NativeWiring wiring) {
@@ -639,34 +921,34 @@ class AutomationConcurrencyIT {
     }
 
     static final class NativeEntryProbe extends AbstractCommandInterceptor {
-        private volatile String expected;
-        private volatile CountDownLatch entered;
-        private volatile CountDownLatch proceed;
+        private volatile NativeProbeVO observation;
 
         void observe(String command, CountDownLatch reached) {
             observe(command, reached, null);
         }
 
         void observe(String command, CountDownLatch reached, CountDownLatch continueNative) {
-            entered = reached;
-            proceed = continueNative;
-            expected = command;
+            observe(command, reached, continueNative, () -> { });
+        }
+
+        void observe(String command, CountDownLatch reached, CountDownLatch continueNative, Runnable onEntry) {
+            observation = new NativeProbeVO(command, reached, continueNative, onEntry);
         }
 
         void stop() {
-            expected = null;
-            entered = null;
-            proceed = null;
+            observation = null;
         }
 
         @Override
         public <T> T execute(CommandConfig config, Command<T> command, CommandExecutor executor) {
-            if (command.getClass().getSimpleName().equals(expected)) {
+            var active = observation;
+            if (active != null && command.getClass().getSimpleName().equals(active.command())) {
                 assertTrue(TransactionSynchronizationManager.isActualTransactionActive());
-                entered.countDown();
-                if (proceed != null) {
+                active.onEntry().run();
+                active.entered().countDown();
+                if (active.proceed() != null) {
                     try {
-                        assertTrue(proceed.await(8, TimeUnit.SECONDS), "Native fixture command was not released");
+                        assertTrue(active.proceed().await(8, TimeUnit.SECONDS), "Native fixture command was not released");
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         throw new AssertionError(interrupted);
@@ -674,6 +956,51 @@ class AutomationConcurrencyIT {
                 }
             }
             return next.execute(config, command, executor);
+        }
+
+        private record NativeProbeVO(String command, CountDownLatch entered, CountDownLatch proceed, Runnable onEntry) { }
+    }
+
+    private static final class BoundaryClockJdbcTemplate extends JdbcTemplate {
+        private static final String NODE_CLOCK = "SELECT pg_catalog.clock_timestamp()::timestamptz(6)";
+        private final ThreadLocal<DeadlineSampleVO> deadline = new ThreadLocal<>();
+        private final ThreadLocal<AtomicInteger> samples = new ThreadLocal<>();
+
+        BoundaryClockJdbcTemplate(DataSource source) {
+            super(source);
+        }
+
+        void atDeadline(DeadlineSampleVO selection, Runnable command) {
+            assertNull(deadline.get());
+            var observations = new AtomicInteger();
+            deadline.set(selection);
+            samples.set(observations);
+            try {
+                command.run();
+                assertTrue(observations.get() > 0, "The production node clock must observe the persisted deadline");
+            } finally {
+                samples.remove();
+                deadline.remove();
+            }
+        }
+
+        @Override
+        public <T> T queryForObject(String sql, Class<T> requiredType) {
+            var selection = deadline.get();
+            if (selection == null || !NODE_CLOCK.equals(sql)) return super.queryForObject(sql, requiredType);
+
+            // Override only this operation's node clock. Use the same transaction connection and the
+            // actual persisted PostgreSQL timestamptz rather than guessing when two wall reads will coincide.
+            AutomationInstanceGuardCommandInterceptor.requireHeld(OWNER.tenantId(), selection.root());
+            assertEquals(OffsetDateTime.class, requiredType);
+            T instant = super.queryForObject("""
+                    SELECT (node_deadline_at + (?::integer * interval '1 microsecond'))::timestamptz(6)
+                    FROM tianji_process.tianji_process_node_execution
+                    WHERE tenant_id=? AND instance_id=? AND node_id='approve' AND attempt=1
+                    """, requiredType, selection.offsetMicros(), OWNER.tenantId(), selection.root());
+            assertEquals(selection.at(), instant);
+            samples.get().incrementAndGet();
+            return instant;
         }
     }
 
@@ -684,6 +1011,7 @@ class AutomationConcurrencyIT {
         AutomationInstanceGuardCommandInterceptor guard;
         ProcessNodeExecutionStore nodes;
         ProcessNodeLifecycleListener lifecycle;
+        BoundaryClockJdbcTemplate clock;
     }
 
     @Configuration(proxyBeanMethods = false)
@@ -703,6 +1031,7 @@ class AutomationConcurrencyIT {
         org.flowable.spring.boot.EngineConfigurationConfigurer<SpringProcessEngineConfiguration> bootstrap(NativeEntryProbe probe,
                                                                                               NativeWiring wiring) {
             return config -> {
+                config.setEnabledJobCategories(List.of("fixture-manual-jobs"));
                 var source = ((DataSourceTransactionManager) config.getTransactionManager()).getDataSource();
                 var jdbc = new JdbcTemplate(source);
                 var bindings = new ProcessInstanceBindingStore(jdbc, SCHEMA);
@@ -714,7 +1043,8 @@ class AutomationConcurrencyIT {
                                         && "approvers".equals(ref) && "a".repeat(64).equals(hash)
                                         ? Optional.of(new ProcessNodeLifecycleListener.HumanCandidatePolicyVO(Set.of("901"), hash))
                                         : Optional.empty()));
-                var nodeStore = new ProcessNodeExecutionStore(jdbc, SCHEMA);
+                wiring.clock = new BoundaryClockJdbcTemplate(source);
+                var nodeStore = new ProcessNodeExecutionStore(wiring.clock, SCHEMA);
                 wiring.bindings = bindings;
                 wiring.releases = releaseStore;
                 wiring.nodes = nodeStore;
