@@ -1,13 +1,21 @@
 package top.egon.cola.platform.tianji.agent.server.integration.process;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.outbox.api.OutboxMessage;
 import top.egon.cola.component.outbox.api.OutboxReceipt;
 import top.egon.cola.component.outbox.api.TransactionalOutbox;
 import top.egon.cola.component.outbox.autoconfigure.OutboxInfrastructure;
+import top.egon.cola.component.outbox.autoconfigure.TransactionalOutboxProperties;
+import top.egon.cola.component.outbox.delivery.DeliveryHandler;
+import top.egon.cola.component.outbox.delivery.DeliveryHandlerRegistry;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
+import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentTerminalEvent;
@@ -21,6 +29,7 @@ import java.sql.Connection;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,6 +40,43 @@ class OutboxAgentTerminalEventPublisherTest {
     private final DataSource source = mock(DataSource.class);
     private final DataSourceTransactionManager manager = new DataSourceTransactionManager(source);
     private final TransactionalOutbox outbox = mock(TransactionalOutbox.class);
+
+    @Test
+    void active_terminal_outbox_exposes_one_mapper_to_both_outbox_and_identity() {
+        var ledger = mock(AgentLedgerService.class);
+        when(ledger.usesDataSource(source)).thenReturn(true);
+        when(ledger.hasTerminalPublisher(any())).thenReturn(true);
+        var properties = new TransactionalOutboxProperties();
+        properties.getStorage().setValidateSchema(true);
+        properties.getStorage().getJdbc().setSchema("tianji_agent");
+        var handler = mock(DeliveryHandler.class);
+        when(handler.channel()).thenReturn(OutboxAgentTerminalEventPublisher.CHANNEL);
+        try (var verifier = mockConstruction(AgentStorageVerifier.class)) {
+            new ApplicationContextRunner()
+                    .withUserConfiguration(TianjiAgentTerminalOutboxConfiguration.class, IdentityMapperConfiguration.class)
+                    .withBean(DataSource.class, () -> source)
+                    .withBean(AgentLedgerService.class, () -> ledger)
+                    .withBean(OutboxInfrastructure.class, this::infrastructure)
+                    .withBean(TransactionalOutbox.class, () -> outbox)
+                    .withBean(TransactionalOutboxProperties.class, () -> properties)
+                    .withBean(DeliveryHandlerRegistry.class, () -> new DeliveryHandlerRegistry(List.of(handler)))
+                    .withPropertyValues("stellar.tianji.agent.terminal-events.enabled=true",
+                            "stellar.tianji.agent.terminal-events.producer-id=agent-east",
+                            "stellar.tianji.agent.terminal-events.destinations.process-east=process-destination",
+                            "stellar.tianji.agent.storage.enabled=true", "spring.flyway.enabled=false", "spring.sql.init.mode=never",
+                            "egon.cola.component.transactional-outbox.enabled=true",
+                            "egon.cola.component.transactional-outbox.storage.type=JDBC")
+                    .run(context -> {
+                        assertNull(context.getStartupFailure());
+                        var fallback = context.getBean("tianjiAgentOutboxObjectMapper", ObjectMapper.class);
+                        assertSame(fallback, context.getBean(IdentityMapperConsumer.class).mapper());
+                        assertSame(fallback, context.getBeanProvider(ObjectMapper.class).getIfUnique());
+                        assertEquals(1, context.getBeansOfType(ObjectMapper.class).size());
+                        verify(verifier.constructed().getFirst()).verifyLinked();
+                        verify(handler).validateDestination("process-destination");
+                    });
+        }
+    }
 
     @Test
     void outbox_json_round_trips_through_the_process_side_mapper_without_changing_its_fingerprint() throws Exception {
@@ -199,5 +245,14 @@ class OutboxAgentTerminalEventPublisherTest {
         return new AgentTerminalEvent(1, producer, AgentTerminalEvent.eventIdFor(producer, 20, "b".repeat(64), "process-worker", "run-one", 3),
                 20, "b".repeat(64), "process-worker", "intent", link, "research", 2, "run-one", 3,
                 AgentRunStatusEnum.COMPLETED, finished, "c".repeat(64), null, "UNKNOWN");
+    }
+
+    private record IdentityMapperConsumer(ObjectMapper mapper) {}
+
+    static class IdentityMapperConfiguration {
+        @Bean
+        IdentityMapperConsumer identityMapperConsumer(@Qualifier("jacksonObjectMapper") ObjectMapper mapper) {
+            return new IdentityMapperConsumer(mapper);
+        }
     }
 }

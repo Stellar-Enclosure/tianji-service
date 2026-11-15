@@ -44,7 +44,8 @@ public class TianjiAgentResultDeliveryConfiguration {
     }
 
     @Bean(destroyMethod = "close")
-    ResultDeliveryClients tianjiAgentResultDeliveryClients(AgentResultDeliveryProperties properties, IdpStarterProperties starter,
+    ResultDeliveryClients tianjiAgentResultDeliveryClients(AgentResultDeliveryProperties properties,
+                                                          @Qualifier("idpStarterProperties") IdpStarterProperties starter,
                                                           TrustedIssuerRegistry issuers, IdpServiceOAuth2Client oauth,
                                                           TransactionalOutboxProperties outbox) {
         if (properties.destinations().isEmpty() || starter.getServiceClient() == null) throw invalid();

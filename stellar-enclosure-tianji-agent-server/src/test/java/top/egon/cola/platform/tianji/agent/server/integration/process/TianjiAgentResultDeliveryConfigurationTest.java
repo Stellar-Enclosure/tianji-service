@@ -51,15 +51,38 @@ class TianjiAgentResultDeliveryConfigurationTest {
         try (var construction = mockConstruction(HttpAgentResultClient.class, (client, context) -> {
             captured.set((HttpAgentResultClient.TokenProvider) context.arguments().get(2));
             when(client.timeout()).thenReturn((Duration) context.arguments().get(3));
-        }); var clients = configuration.tianjiAgentResultDeliveryClients(properties(Duration.ofSeconds(3)), starter, registry, oauth, new TransactionalOutboxProperties())) {
-            assertEquals(1, clients.routes().size());
-            assertEquals("service-token", captured.get().acquire(20));
-            captured.get().rejected(20);
-            assertThrows(IllegalStateException.class, () -> captured.get().acquire(21));
-            var expected = new IdpServiceTokenRequest("process-client", "agent-app", RESOURCE, ServiceTokenContext.TENANT, "20", Set.of(AgentResultClient.RECEIVE_SCOPE));
-            verify(oauth).authorizeBounded(expected, ISSUER.toASCIIString(), Duration.ofSeconds(3));
-            verify(oauth).invalidateBounded(expected, ISSUER.toASCIIString(), Duration.ofSeconds(3));
-            verify(oauth, never()).authorize(any());
+        })) {
+            var other = new IdpStarterProperties();
+            other.getServiceClient().setAppId("different-app");
+            var destination = "stellar.tianji.agent.result-delivery.destinations[0].";
+            new ApplicationContextRunner().withUserConfiguration(TianjiAgentResultDeliveryConfiguration.class)
+                    .withBean("idpStarterProperties", IdpStarterProperties.class, () -> starter)
+                    .withBean("egon.cola.platform.tianquan.shoubing-" + IdpStarterProperties.class.getName(),
+                            IdpStarterProperties.class, () -> other)
+                    .withBean(TrustedIssuerRegistry.class, () -> registry)
+                    .withBean(IdpServiceOAuth2Client.class, () -> oauth)
+                    .withBean(TransactionalOutboxProperties.class, TransactionalOutboxProperties::new)
+                    .withPropertyValues("stellar.tianji.agent.result-delivery.enabled=true",
+                            "stellar.tianji.agent.terminal-events.enabled=true", "stellar.tianji.agent.storage.enabled=true",
+                            destination + "id=process-one", destination + "tenant-id=20",
+                            destination + "base-uri=https://process.example/", destination + "resource-uri=" + RESOURCE,
+                            destination + "issuer=" + ISSUER, destination + "registration-id=process-client",
+                            destination + "owners[0].issuer=" + ISSUER, destination + "owners[0].subject-id=process-worker",
+                            destination + "owners[0].source-id=process-east")
+                    .run(context -> {
+                        assertNull(context.getStartupFailure());
+                        assertEquals(2, context.getBeansOfType(IdpStarterProperties.class).size());
+                        var clients = context.getBean(TianjiAgentResultDeliveryConfiguration.ResultDeliveryClients.class);
+                        assertEquals(1, clients.routes().size());
+                        assertEquals("service-token", captured.get().acquire(20));
+                        captured.get().rejected(20);
+                        assertThrows(IllegalStateException.class, () -> captured.get().acquire(21));
+                        var expected = new IdpServiceTokenRequest("process-client", "agent-app", RESOURCE,
+                                ServiceTokenContext.TENANT, "20", Set.of(AgentResultClient.RECEIVE_SCOPE));
+                        verify(oauth).authorizeBounded(expected, ISSUER.toASCIIString(), Duration.ofSeconds(3));
+                        verify(oauth).invalidateBounded(expected, ISSUER.toASCIIString(), Duration.ofSeconds(3));
+                        verify(oauth, never()).authorize(any());
+                    });
         }
     }
 

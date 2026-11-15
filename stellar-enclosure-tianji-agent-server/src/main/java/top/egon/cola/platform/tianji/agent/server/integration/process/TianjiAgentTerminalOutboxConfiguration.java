@@ -45,7 +45,7 @@ public class TianjiAgentTerminalOutboxConfiguration {
         };
     }
 
-    @Bean
+    @Bean({"tianjiAgentOutboxObjectMapper", "jacksonObjectMapper"})
     @ConditionalOnProperty(name = ENABLED, havingValue = "true")
     @ConditionalOnMissingBean(ObjectMapper.class)
     ObjectMapper tianjiAgentOutboxObjectMapper() { return new ObjectMapper().findAndRegisterModules(); }
