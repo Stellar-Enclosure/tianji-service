@@ -40,6 +40,14 @@ egon:
           validate-schema: true
         polling:
           enabled: false
+      tianshu:
+        si:
+          client:
+            enabled: false
+            env-code: prod
+            cache-ttl: 60s
+            debounce-window: 2s
+            strict-activation-check: true
     platform:
       tianquan:
         shoubing:

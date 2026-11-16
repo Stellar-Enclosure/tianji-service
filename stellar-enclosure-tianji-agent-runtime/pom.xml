@@ -25,6 +25,11 @@
         </dependency>
         <dependency>
             <groupId>top.egon</groupId>
+            <artifactId>stellar-enclosure-tianshu-starter</artifactId>
+            <version>0.0.1</version>
+        </dependency>
+        <dependency>
+            <groupId>top.egon</groupId>
             <artifactId>stellar-enclosure-component-agent-flow-starter</artifactId>
             <version>${agent-flow.version}</version>
         </dependency>

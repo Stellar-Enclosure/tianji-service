@@ -20,6 +20,18 @@ egon:
         enabled: false
       id:
         enabled: false
+      agent-flow:
+        legacy-static-workflow:
+          enabled: false
+      tianshu:
+        si:
+          client:
+            enabled: false
+            env-code: prod
+            cache-ttl: 60s
+            debounce-window: 2s
+            fail-fast-on-startup: false
+            self-registration-backoff: 200ms
     platform:
       tianquan:
         shoubing:

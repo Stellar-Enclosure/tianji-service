@@ -6,7 +6,6 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
 import jakarta.validation.constraints.Size;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,6 +27,7 @@ import top.egon.cola.platform.tianji.process.server.error.ProcessConflictExcepti
 import top.egon.cola.platform.tianji.process.server.error.ProcessResourceNotFoundException;
 import top.egon.cola.platform.tianji.process.server.error.ProcessVersionConflictException;
 import top.egon.cola.platform.tianji.process.server.identity.ProcessActor;
+import top.egon.cola.platform.tianji.process.server.integration.TianshuAgentBindingVerifier;
 import top.egon.cola.platform.tianji.process.server.release.AutomationAdmissionQuery.Purpose;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseStore.ImmutableReleaseVO;
 import top.egon.cola.platform.tianji.process.server.release.AutomationReleaseTrustVerifier.TrustAuthority;
@@ -45,20 +45,67 @@ import static top.egon.cola.platform.tianji.process.server.release.AutomationAdm
 @Lazy
 @Service("automationActivationService")
 @Validated
-@RequiredArgsConstructor(onConstructor_ = @Autowired)
 public class AutomationActivationService {
     private static final String ENABLED = "stellar.tianji.process.automation.enabled";
     private static final String CURSOR = "[A-Za-z0-9_-]{1,2048}";
 
-    @Qualifier("automationActivationStore") private final AutomationActivationStore store;
-    @Qualifier("automationReleaseStore") private final AutomationReleaseStore automation;
-    @Qualifier("processReleaseService") private final ProcessReleaseService releases;
-    @Qualifier("automationActivationConverter") private final AutomationActivationConverter converter;
-    @Qualifier("processApiSchemaVerifier") private final ProcessApiSchemaVerifier verifier;
-    @Qualifier("processDraftTransactionTemplate") private final TransactionTemplate transaction;
-    @Qualifier("environment") private final Environment environment;
-    @Qualifier("automationAdmissionAuthority") private final ObjectProvider<AutomationAdmissionAuthority> authority;
-    @Qualifier("automationReleaseTrustAuthority") private final ObjectProvider<TrustAuthority> trustAuthority;
+    private final AutomationActivationStore store;
+    private final AutomationReleaseStore automation;
+    private final ProcessReleaseService releases;
+    private final AutomationActivationConverter converter;
+    private final ProcessApiSchemaVerifier verifier;
+    private final TransactionTemplate transaction;
+    private final Environment environment;
+    private final ObjectProvider<AutomationAdmissionAuthority> authority;
+    private final ObjectProvider<TrustAuthority> trustAuthority;
+    private final ObjectProvider<TianshuAgentBindingVerifier> tianshuBindingVerifier;
+
+    public AutomationActivationService(
+            AutomationActivationStore store,
+            AutomationReleaseStore automation,
+            ProcessReleaseService releases,
+            AutomationActivationConverter converter,
+            ProcessApiSchemaVerifier verifier,
+            TransactionTemplate transaction,
+            Environment environment,
+            ObjectProvider<AutomationAdmissionAuthority> authority,
+            ObjectProvider<TrustAuthority> trustAuthority) {
+        this(store, automation, releases, converter, verifier, transaction, environment, authority, trustAuthority,
+                emptyVerifierProvider());
+    }
+
+    @Autowired
+    public AutomationActivationService(
+            @Qualifier("automationActivationStore") AutomationActivationStore store,
+            @Qualifier("automationReleaseStore") AutomationReleaseStore automation,
+            @Qualifier("processReleaseService") ProcessReleaseService releases,
+            @Qualifier("automationActivationConverter") AutomationActivationConverter converter,
+            @Qualifier("processApiSchemaVerifier") ProcessApiSchemaVerifier verifier,
+            @Qualifier("processDraftTransactionTemplate") TransactionTemplate transaction,
+            @Qualifier("environment") Environment environment,
+            @Qualifier("automationAdmissionAuthority") ObjectProvider<AutomationAdmissionAuthority> authority,
+            @Qualifier("automationReleaseTrustAuthority") ObjectProvider<TrustAuthority> trustAuthority,
+            @Qualifier("tianshuAgentBindingVerifier") ObjectProvider<TianshuAgentBindingVerifier> tianshuBindingVerifier) {
+        this.store = store;
+        this.automation = automation;
+        this.releases = releases;
+        this.converter = converter;
+        this.verifier = verifier;
+        this.transaction = transaction;
+        this.environment = environment;
+        this.authority = authority;
+        this.trustAuthority = trustAuthority;
+        this.tianshuBindingVerifier = tianshuBindingVerifier != null ? tianshuBindingVerifier : emptyVerifierProvider();
+    }
+
+    private static ObjectProvider<TianshuAgentBindingVerifier> emptyVerifierProvider() {
+        return new ObjectProvider<>() {
+            @Override public TianshuAgentBindingVerifier getObject(Object... args) { throw new IllegalStateException("Unavailable"); }
+            @Override public TianshuAgentBindingVerifier getIfAvailable() { return null; }
+            @Override public TianshuAgentBindingVerifier getIfUnique() { return null; }
+            @Override public TianshuAgentBindingVerifier getObject() { throw new IllegalStateException("Unavailable"); }
+        };
+    }
 
     public AutomationActivationDTO activate(@NotNull ProcessActor actor, @NotNull @Pattern(regexp = DEFINITION_KEY) String definitionKey,
                                             @NotNull @Valid ActivationCommand command) {
@@ -83,8 +130,22 @@ public class AutomationActivationService {
             throw failedPreparation;
         }
 
+        // Pre-activation Tianshu SI verification stays strictly outside the DB write transaction.
+        TianshuAgentBindingVerifier siVerifier = tianshuBindingVerifier.getIfAvailable();
+        if (siVerifier != null) {
+            siVerifier.verifyAndRegisterProcessBindings(actor.tenantId(), definitionKey, prepared.release().source());
+        }
+
         WriteResultVO result = Objects.requireNonNull(transaction.execute(status -> write(intent, prepared)));
         return result.replay() ? replay(intent, result.row()) : receipt(result.row());
+    }
+
+    /** Releases Tianshu SI process binding locks after deactivation; failures are non-blocking. */
+    public void onDeactivated(long tenantId, @NotNull String definitionKey) {
+        TianshuAgentBindingVerifier siVerifier = tianshuBindingVerifier.getIfAvailable();
+        if (siVerifier != null) {
+            siVerifier.releaseProcessBindings(tenantId, definitionKey);
+        }
     }
 
     public ActivationPageDTO list(@NotNull ProcessActor actor, @NotNull @Pattern(regexp = DEFINITION_KEY) String definitionKey,

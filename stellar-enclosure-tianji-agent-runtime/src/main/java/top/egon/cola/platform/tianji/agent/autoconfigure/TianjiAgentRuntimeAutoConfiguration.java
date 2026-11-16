@@ -53,6 +53,8 @@ import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedge
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeBindingStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentRuntimeCallReceiptStore;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentStorageVerifier;
+import top.egon.cola.platform.tianji.agent.si.TianshuTemplateResolver;
+import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
 
 /** Assembles the runtime only when the host supplies its storage, authorization and execution resources. */
 @AutoConfiguration(after = {AgentFlowAutoConfiguration.class, AgentExecutionAutoConfiguration.class})
@@ -139,6 +141,13 @@ public class TianjiAgentRuntimeAutoConfiguration {
         var tools = toolExecution.getIfAvailable();
         if (tools != null && !tools.usesLedger(ledger)) throw new IllegalStateException("TIANJI_RUNTIME_TOOL_LEDGER_MISMATCH");
         return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts, receiptTransaction, tools);
+    }
+
+    @Bean("tianshuTemplateResolver")
+    @ConditionalOnBean(DdcSiCatalogClient.class)
+    @ConditionalOnMissingBean(TianshuTemplateResolver.class)
+    TianshuTemplateResolver tianshuTemplateResolver(DdcSiCatalogClient catalogClient) {
+        return new TianshuTemplateResolver(catalogClient);
     }
 
     @Bean("tianjiAgentRuntimeV2AdmissionGuard")
