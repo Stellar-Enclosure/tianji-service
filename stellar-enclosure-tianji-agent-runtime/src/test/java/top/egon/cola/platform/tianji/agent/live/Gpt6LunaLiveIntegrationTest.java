@@ -184,4 +184,89 @@ class Gpt6LunaLiveIntegrationTest {
         System.out.println("Resolved bundle live execution answer: " + answer);
         assertThat(answer).isNotBlank();
     }
+
+    @Test
+    void testSpringAiContextChatClientWithGpt6LunaAndThreeTierMemory() {
+        // 1. Setup ChatModel with gpt-6-luna
+        OpenAiChatOptions options = OpenAiChatOptions.builder()
+                .apiKey(apiKey)
+                .model("gpt-6-luna")
+                .reasoningEffort("none")
+                .maxCompletionTokens(200)
+                .build();
+        OpenAiChatModel chatModel = OpenAiChatModel.builder()
+                .options(options)
+                .build();
+
+        // 2. Setup Three-tier Memory fixtures & SpringAiContextChatClient
+        var validationUtils = new top.egon.cola.component.common.core.validation.ValidationUtils(
+                jakarta.validation.Validation.buildDefaultValidatorFactory().getValidator());
+        var clock = java.time.Clock.systemUTC();
+        var repo = new top.egon.cola.component.agentflow.memory.InMemorySessionChatMemoryRepository(clock);
+        var chatMemory = new top.egon.cola.component.agentflow.memory.TurnAlignedChatMemory(repo, 20, clock);
+        var textService = new top.egon.cola.component.agentflow.memory.InMemoryTextMemoryService(clock, validationUtils, 10_000);
+        var docReader = new top.egon.cola.component.agentflow.memory.InMemoryDocMemoryReader(validationUtils, 32);
+        var engine = new top.egon.cola.component.agentflow.context.ContextAssemblyEngine(
+                new org.springframework.ai.tokenizer.JTokkitTokenCountEstimator());
+        var properties = new top.egon.cola.component.agentflow.autoconfigure.AgentFlowProperties(true, null, null, java.util.Map.of());
+
+        // Level 1: History turn
+        chatMemory.appendTurn("tenant-luna", "sess-luna-1", "turn-1", List.of(
+                new UserMessage("Hello, my name is Alice."),
+                new AssistantMessage("Hello Alice! How can I help you today?")
+        ));
+
+        // Level 2: Mid-term Text Memory
+        var bound = textService.bindOrCreate(top.egon.cola.component.agentflow.api.memory.TextMemoryBindCommand.builder()
+                .tenantKey("tenant-luna").namespace("crm")
+                .ownerType(top.egon.cola.component.agentflow.api.memory.MemoryOwnerTypeEnum.AGENT).ownerKey("agent-luna").build());
+        textService.save(top.egon.cola.component.agentflow.api.memory.TextMemorySaveCommand.builder()
+                .tenantKey("tenant-luna").id(bound.id())
+                .contentText("Alice loves green tea and works as a Senior Software Architect.")
+                .expectedVersion(1L).build());
+
+        // Level 3: Long-term Doc Memory
+        docReader.put("tenant-luna", new top.egon.cola.component.agentflow.api.memory.DocMemoryVO(
+                "doc-greeting-policy",
+                "VIP Greeting Policy",
+                "# VIP Policy\nAlways salute VIP guests with high respect and address them by their profession if known.",
+                null,
+                clock.instant()
+        ), false);
+
+        var client = new top.egon.cola.component.agentflow.adapter.springai.SpringAiContextChatClient(
+                new top.egon.cola.component.agentflow.adapter.springai.ContextInitAdvisor(properties),
+                new top.egon.cola.component.agentflow.adapter.springai.SessionHistoryAdvisor(chatMemory),
+                new top.egon.cola.component.agentflow.adapter.springai.TextMemoryAdvisor(textService),
+                new top.egon.cola.component.agentflow.adapter.springai.DocMemoryAdvisor(docReader),
+                new top.egon.cola.component.agentflow.adapter.springai.OthersContextAdvisor(),
+                new top.egon.cola.component.agentflow.adapter.springai.ContextAssemblyAdvisor(engine),
+                validationUtils,
+                properties
+        );
+
+        var scope = new top.egon.cola.component.agentflow.api.context.ContextScopeVO(
+                "crm", "tenant-luna", "user-alice", "agent-luna", "sess-luna-1", "chat");
+
+        var callBO = top.egon.cola.component.agentflow.adapter.springai.SpringAiContextChatClient.AgentContextCallBO.builder()
+                .chatModel(chatModel)
+                .scope(scope)
+                .systemPrompt("You are an intelligent AI concierge.")
+                .userPrompt("What is my name and what beverage do I like?")
+                .textMemoryId(bound.id())
+                .docMemoryIds(List.of("doc-greeting-policy"))
+                .build();
+
+        var result = client.call(callBO);
+        assertThat(result).isNotNull();
+        String answer = result.content();
+        System.out.println("SpringAiContextChatClient with gpt-6-luna and 3-tier memory answer: " + answer);
+        assertThat(answer).containsIgnoringCase("Alice");
+        assertThat(answer).containsIgnoringCase("tea");
+
+        // Verify Level 1 session memory was automatically appended with the new turn
+        var historyTurns = chatMemory.getTurns("tenant-luna", "sess-luna-1", 10);
+        assertThat(historyTurns).hasSize(2);
+        System.out.println("Level 1 turn count after call: " + historyTurns.size());
+    }
 }
