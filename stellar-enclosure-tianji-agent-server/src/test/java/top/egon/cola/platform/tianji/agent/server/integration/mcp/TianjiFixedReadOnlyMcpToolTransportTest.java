@@ -13,6 +13,8 @@ import org.springframework.security.oauth2.core.OAuth2AccessToken;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.component.common.trace.TraceContext;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
@@ -74,7 +76,9 @@ import static top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpTo
 /** Actual credential verifier and native MCP SDK over a driven JDK subscriber, without a listener. */
 class TianjiFixedReadOnlyMcpToolTransportTest {
     private static final Instant NOW = Instant.parse("2026-11-01T10:00:00Z");
-    private static final URI ISSUER = URI.create("https://idp.example/20"), RESOURCE = URI.create("https://mcp.example/tenant/20"), ENDPOINT = URI.create("https://mcp.example/mcp");
+    private static final URI ISSUER = URI.create("https://idp.example/20");
+    private static final URI RESOURCE = URI.create("https://mcp.example/tenant/20");
+    private static final URI ENDPOINT = URI.create("http://catalog-mcp-v3.apps.svc.cluster.local:8080/mcp");
     private static final String CLIENT = "agent-executor", APP = "tianji-agent", TOKEN = "private.service.token", DEF = "c".repeat(64);
     private static final String RUN = "10000000-0000-0000-0000-000000000001", SESSION = "50000000-0000-0000-0000-000000000001";
     private static final UUID INVOCATION = UUID.fromString("20000000-0000-0000-0000-000000000001");
@@ -100,6 +104,7 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
             verify(fixture.authentication).authenticate(TOKEN, RESOURCE); verify(fixture.converter).toServicePrincipal(any(), eq(RESOURCE));
             for (var request : fixture.requests) {
                 assertEquals(ENDPOINT.toASCIIString(), request.uri().toASCIIString()); assertEquals("Bearer " + TOKEN, request.headers().firstValue("Authorization").orElseThrow());
+                assertEquals(HttpClient.Version.HTTP_1_1, request.version().orElseThrow());
                 assertTrue(request.headers().firstValue("Cookie").isEmpty()); assertTrue(request.headers().firstValue("Proxy-Authorization").isEmpty());
                 assertTrue(request.timeout().orElseThrow().compareTo(Duration.ofSeconds(5)) <= 0);
                 assertEquals("2025-11-25", request.headers().firstValue("Mcp-Protocol-Version").orElseThrow());
@@ -119,6 +124,48 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
                 operation.call(executor.expiresAt()); assertFailure(CANCELLED, () -> operation.call(executor.expiresAt())); return "once";
             });
             assertEquals(1, fixture.methods().stream().filter("tools/call"::equals).count());
+        }
+    }
+
+    @Test void a_new_catalogue_with_identical_tool_document_cannot_replace_the_pinned_catalogue() {
+        String v3 = "3".repeat(64);
+        var publication = new TianjiFixedReadOnlyMcpToolBindings.McpPublicationPinVO(
+                new VersionIdentityVO("101", "12", "33", "3", DdcSiKindEnum.MCP, "test", "c".repeat(64)),
+                "business", "tools", "agent", "catalog-owner", "catalog", "mcp.catalog",
+                URI.create("https://mcp.example/mcp"), "catalog-v3-post", "catalog-v3-delete", 3, v3);
+        for (String wrong : Arrays.asList(null, "4".repeat(64))) {
+            try (var fixture = new Fixture(Duration.ofSeconds(5), publication)) {
+                fixture.actualCatalogue.set(wrong);
+                assertFailure(PROFILE_CHANGED, fixture::call);
+                assertEquals(List.of("initialize"), fixture.methods());
+            }
+        }
+        try (var fixture = new Fixture(Duration.ofSeconds(5), publication)) {
+            fixture.actualCatalogue.set(v3);
+            assertEquals(ReadOnlyMcpToolTransport.Status.SUCCESS, fixture.call().status());
+            assertEquals(List.of("initialize", "notifications/initialized", "tools/list", "tools/call", "DELETE"),
+                    fixture.methods());
+            assertTrue(fixture.requests.stream().allMatch(request -> ENDPOINT.equals(request.uri())));
+        }
+    }
+
+    @Test void current_si_denial_stops_the_production_binding_before_token_or_http() {
+        var selected = TianjiFixedReadOnlyMcpToolBindingsTest.approvedMcpFixture(3, "catalog-mcp");
+        var request = selected.request();
+        try (var fixture = new Fixture()) {
+            var authority = mock(TianjiFixedReadOnlyMcpToolTransport.PublicationAuthority.class);
+            doThrow(new IllegalStateException("revoked publication")).when(authority).requireCurrent(
+                    request.run().actor(), request.siMaterial());
+            var clock = Clock.fixed(request.deadlineAt().minusSeconds(10), ZoneOffset.UTC);
+            try (var transport = new TianjiFixedReadOnlyMcpToolTransport(selected.fixedBindings(), fixture.oauth,
+                    fixture.authentication, fixture.converter, fixture.issuers, fixture.http, 1, clock, System::nanoTime, authority)) {
+                assertFailure(CREDENTIAL_UNAVAILABLE, () -> transport.withVerifiedCall(request, (executor, operation) -> {
+                    throw new AssertionError("Revoked SI publication reached the execution callback");
+                }));
+            }
+            verify(authority).requireCurrent(request.run().actor(), request.siMaterial());
+            verifyNoInteractions(fixture.oauth, fixture.authentication, fixture.converter, fixture.issuers);
+            assertTrue(fixture.requests.isEmpty());
         }
     }
 
@@ -355,6 +402,7 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
         final AtomicLong nano = new AtomicLong(), callStatus = new AtomicLong(200), deliveredBytes = new AtomicLong();
         final AtomicBoolean badCall = new AtomicBoolean(), toolError = new AtomicBoolean(), deleteFailure = new AtomicBoolean(), oversize = new AtomicBoolean(), upstreamCancelled = new AtomicBoolean(), callBodyProduced = new AtomicBoolean();
         final AtomicReference<String> ioMethod = new AtomicReference<>(""), pendingMethod = new AtomicReference<>("");
+        final AtomicReference<String> actualCatalogue = new AtomicReference<>();
         final CountDownLatch pendingStarted = new CountDownLatch(1);
         final AtomicReference<Runnable> beforeFutureCancel = new AtomicReference<>(() -> {});
         final CompletableFuture<HttpResponse<byte[]>> pendingFuture = new CompletableFuture<>() { @Override public boolean cancel(boolean interrupt) { beforeFutureCancel.get().run(); return super.cancel(interrupt); } };
@@ -366,8 +414,9 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
         final TianjiFixedReadOnlyMcpToolTransport transport;
         final Clock clock = new Clock() { @Override public ZoneId getZone() { return ZoneOffset.UTC; } @Override public Clock withZone(ZoneId zone) { return this; } @Override public Instant instant() { return wall.get(); } };
         Fixture() { this(Duration.ofSeconds(5)); }
-        Fixture(Duration timeout) {
-            var backend = new TianjiFixedReadOnlyMcpToolBindings.BackendVO(20, ISSUER, ENDPOINT, RESOURCE, "tools", CLIENT, APP, "business", "agent", "test", SCOPES, "yuheng", "1.0", "catalog.read", TianjiFixedReadOnlyMcpToolBindings.remoteToolDocumentSha256(TOOL), INPUT, OUTPUT, true, timeout);
+        Fixture(Duration timeout) { this(timeout, null); }
+        Fixture(Duration timeout, TianjiFixedReadOnlyMcpToolBindings.McpPublicationPinVO publication) {
+            var backend = new TianjiFixedReadOnlyMcpToolBindings.BackendVO(20, ISSUER, ENDPOINT, RESOURCE, "tools", CLIENT, APP, "business", "agent", "test", SCOPES, "yuheng", "1.0", "catalog.read", TianjiFixedReadOnlyMcpToolBindings.remoteToolDocumentSha256(TOOL), INPUT, OUTPUT, true, timeout, publication);
             descriptor = new ToolDescriptor("mcp.catalog", 1, "read_catalog", "Fixed read-only MCP", INPUT, OUTPUT, new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "mcp.catalog", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, backend.bindingSha256(), null));
             bindings = new TianjiFixedReadOnlyMcpToolBindings(List.of(descriptor), List.of(new TianjiFixedReadOnlyMcpToolBindings.BindingVO(20, OWNER.issuerFingerprint(), OWNER.subjectType(), "assistant", 1, DEF, descriptor.reference(), backend)));
             when(http.followRedirects()).thenReturn(HttpClient.Redirect.NEVER); when(http.cookieHandler()).thenReturn(Optional.empty()); when(http.authenticator()).thenReturn(Optional.empty());
@@ -391,7 +440,7 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
             if (method.equals("DELETE") || method.equals("notifications/initialized")) { status = method.equals("DELETE") ? 204 : 202; bytes = new byte[0]; }
             else {
                 Object result = switch (method) {
-                    case "initialize" -> Map.of("protocolVersion", "2025-11-25", "serverInfo", Map.of("name", "yuheng", "version", "1.0"), "capabilities", Map.of("tools", Map.of()));
+                    case "initialize" -> initializeResult();
                     case "tools/list" -> Map.of("tools", List.of(TOOL));
                     case "tools/call" -> toolError.get() ? Map.of("isError", true, "content", List.of(Map.of("type", "text", "text", TOKEN)), "structuredContent", Map.of("code", 400, "message", TOKEN, "data", TOKEN)) : Map.of("isError", false, "structuredContent", Map.of("eligible", true));
                     default -> throw new AssertionError("Unexpected native MCP method");
@@ -406,6 +455,15 @@ class TianjiFixedReadOnlyMcpToolTransportTest {
             for (int offset = 0; offset < bytes.length && !cancelled.get(); offset += 8192) { int count = Math.min(8192, bytes.length - offset); if (method.equals("tools/call")) deliveredBytes.addAndGet(count); subscriber.onNext(List.of(ByteBuffer.wrap(bytes, offset, count))); }
             if (!cancelled.get()) subscriber.onComplete(); final int code = status;
             return subscriber.getBody().toCompletableFuture().thenApply(received -> { if (method.equals("tools/call")) callBodyProduced.set(true); afterHttp.get().accept(method); return response(code, received, headers); });
+        }
+        private Map<String, Object> initializeResult() {
+            var result = new java.util.LinkedHashMap<String, Object>();
+            result.put("protocolVersion", "2025-11-25");
+            result.put("serverInfo", Map.of("name", "yuheng", "version", "1.0"));
+            result.put("capabilities", Map.of("tools", Map.of()));
+            String selected = actualCatalogue.get();
+            if (selected != null) result.put("_meta", Map.of("top.egon/selectedMcpCatalogueSha256", selected));
+            return result;
         }
         @Override public void close() { transport.close(); }
     }

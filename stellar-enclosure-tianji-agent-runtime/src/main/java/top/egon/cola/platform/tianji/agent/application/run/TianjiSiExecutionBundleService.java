@@ -107,21 +107,22 @@ public class TianjiSiExecutionBundleService {
             throw unavailable();
         }
         try {
-            var root = bundle.root();
-            if (!root.key().equals(template.getTemplateKey())
-                    || !root.identity().versionNo().equals(Long.toString(template.getTemplateVersion()))) {
-                throw invalid();
-            }
-            var configuration = template.getConfiguration();
-            verifyAgent(bundle, root.key(), configuration.modelRef(), configuration.instructionRef(),
-                    configuration.toolRefs());
-            if (configuration.agenticPlan() != null) {
-                for (var leaf : configuration.agenticPlan().agents()) {
-                    verifyAgent(bundle, leaf.agentKey(), leaf.modelRef(), leaf.instructionRef(), leaf.toolRefs());
-                }
-            }
+            verifyTemplateBundle(template, bundle);
         } catch (IllegalArgumentException | NullPointerException malformed) {
             throw unavailable();
+        }
+    }
+
+    private static void verifyTemplateBundle(AgentRuntimeTemplateCommand template, FrozenSiBundleVO bundle) {
+        var root = bundle.root();
+        if (!root.key().equals(template.getTemplateKey())
+                || !root.identity().versionNo().equals(Long.toString(template.getTemplateVersion()))) throw invalid();
+        var configuration = template.getConfiguration();
+        verifyAgent(bundle, root.key(), configuration.modelRef(), configuration.instructionRef(), configuration.toolRefs());
+        if (configuration.agenticPlan() != null) {
+            for (var leaf : configuration.agenticPlan().agents()) {
+                verifyAgent(bundle, leaf.agentKey(), leaf.modelRef(), leaf.instructionRef(), leaf.toolRefs());
+            }
         }
     }
 
@@ -154,6 +155,22 @@ public class TianjiSiExecutionBundleService {
             owner(ownerAppCode);
             coordinate(callerAppCode);
         }
+    }
+
+    /** Immutable publication evidence; current execution authority is still checked at every tool boundary. */
+    public record McpToolMaterialVO(long identityTenantId, ScopeVO scope, String closureDigest,
+                                    SiResourceVO publication, String toolId, String toolName) {
+        public McpToolMaterialVO {
+            if (identityTenantId < 1 || scope == null || closureDigest == null || !closureDigest.matches("[0-9a-f]{64}")
+                    || publication == null || publication.identity().kind() != DdcSiKindEnum.MCP
+                    || !scope.envCode().equals(publication.identity().envCode())) throw invalid();
+            coordinate(toolId);
+            coordinate(toolName);
+            var declared = declaredTool(publication, toolId);
+            if (!toolId.equals(declared.toolId()) || !toolName.equals(declared.name())) throw invalid();
+        }
+
+        @Override public String toString() { return "McpToolMaterialVO[redacted]"; }
     }
 
     public record FrozenSiBundleVO(long identityTenantId, String bizCode, String namespaceCode, String envCode,
@@ -211,6 +228,39 @@ public class TianjiSiExecutionBundleService {
             return instruction;
         }
 
+        /** Resolves only the fixed template's exact tool; applicable leaves must select identical publications. */
+        public McpToolMaterialVO mcpToolMaterial(AgentRuntimeTemplateCommand template, TemplateDependencyRefVO reference) {
+            try {
+                if (template == null || !template.isTemplateConsistent() || reference == null) throw invalid();
+                verifyTemplateBundle(template, this);
+                var configuration = template.getConfiguration();
+                var agents = new ArrayList<String>();
+                if (configuration.agenticPlan() == null) {
+                    if (applicable(configuration.toolRefs(), reference)) agents.add(root().key());
+                } else {
+                    for (var leaf : configuration.agenticPlan().agents()) {
+                        if (applicable(leaf.toolRefs(), reference)) agents.add(leaf.agentKey());
+                    }
+                }
+                if (agents.isEmpty()) throw invalid();
+                McpToolMaterialVO selected = null;
+                for (String agentKey : agents) {
+                    var publication = one(directDependencies(namedAgent(agentKey), DdcSiKindEnum.MCP).stream()
+                            .filter(candidate -> candidate.identity().versionNo().equals(Long.toString(reference.version()))
+                                    && candidate.declaresTool(reference.key())).toList());
+                    var declared = declaredTool(publication, reference.key());
+                    var material = new McpToolMaterialVO(identityTenantId,
+                            new ScopeVO(bizCode, namespaceCode, envCode, ownerAppCode, callerAppCode),
+                            closureDigest(), publication, declared.toolId(), declared.name());
+                    if (selected != null && !selected.equals(material)) throw invalid();
+                    selected = material;
+                }
+                return Objects.requireNonNull(selected);
+            } catch (IllegalArgumentException | NullPointerException malformed) {
+                throw unavailable();
+            }
+        }
+
         private List<SiResourceVO> directDependencies(SiResourceVO agent, DdcSiKindEnum kind) {
             var targets = new HashSet<String>();
             for (var edge : manifest.edges()) {
@@ -247,6 +297,37 @@ public class TianjiSiExecutionBundleService {
         }
 
         @Override public String toString() { return "FrozenSiBundleVO[redacted]"; }
+    }
+
+    private static boolean applicable(List<TemplateDependencyRefVO> references, TemplateDependencyRefVO expected) {
+        boolean present = false;
+        for (var reference : references) {
+            if (reference.key().equals(expected.key()) && reference.version() == expected.version()) {
+                if (!reference.equals(expected)) throw invalid();
+                present = true;
+            }
+        }
+        return present;
+    }
+
+    private record DeclaredToolVO(String toolId, String name) { }
+
+    private static DeclaredToolVO declaredTool(SiResourceVO publication, String key) {
+        JsonNode selected = null;
+        var tools = publication.body().path("tools");
+        if (!tools.isArray()) throw invalid();
+        for (var tool : tools) {
+            if (key.equals(tool.path("toolId").textValue()) || key.equals(tool.path("name").textValue())) {
+                if (selected != null) throw invalid();
+                selected = tool;
+            }
+        }
+        if (selected == null || !selected.path("enabled").isBoolean() || !selected.path("enabled").booleanValue()) throw invalid();
+        String name = selected.path("name").textValue();
+        String id = selected.has("toolId") ? selected.path("toolId").textValue() : name;
+        coordinate(id);
+        coordinate(name);
+        return new DeclaredToolVO(id, name);
     }
 
     public record SiResourceVO(VersionIdentityVO identity, String key, @Nullable String ownerAppCode, String specJson) {

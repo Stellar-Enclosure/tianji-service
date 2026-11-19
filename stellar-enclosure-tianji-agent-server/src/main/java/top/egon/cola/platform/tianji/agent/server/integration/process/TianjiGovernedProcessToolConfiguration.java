@@ -39,6 +39,7 @@ import top.egon.cola.platform.tianji.agent.server.security.TianjiToolAuthorityPr
 import top.egon.cola.platform.tianji.agent.server.security.TianjiToolGrantAuthorizer;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiToolGrantBindings;
 import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpServiceOAuth2Client;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpTransportBindingRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TenantIssuerAuthenticationManagerComponent;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.VerifiedPrincipalConverter;
@@ -205,13 +206,15 @@ public class TianjiGovernedProcessToolConfiguration {
     @Lazy
     TianjiFixedReadOnlyMcpToolBindings tianjiGovernedProcessMcpBindings(TianjiToolAuthorityProperties authority,
             TianjiGovernedProcessToolProperties properties,
-            @Qualifier("tianjiToolGrantBindings") TianjiToolGrantBindings grants, Environment environment) {
+            @Qualifier("tianjiToolGrantBindings") TianjiToolGrantBindings grants,
+            @Qualifier("idpTransportBindingRegistry") ObjectProvider<IdpTransportBindingRegistry> transportBindings,
+            Environment environment) {
         requirePrerequisites(environment);
         try {
             if (!authority.enabled() || !properties.enabled()) throw unavailable();
             requireMcpSlots(authority, properties, grants);
             if (properties.mcpBindings().isEmpty()) return null;
-            return new TianjiFixedReadOnlyMcpToolBindings(authority.descriptors(), properties.mcpBindings());
+            return new TianjiFixedReadOnlyMcpToolBindings(authority.descriptors(), properties.mcpBindings(), transportBindings.getObject());
         } catch (RuntimeException privateConfiguration) { throw unavailable(); }
     }
 
@@ -223,20 +226,22 @@ public class TianjiGovernedProcessToolConfiguration {
             @Qualifier("tenantIssuerAuthenticationManagerComponent") ObjectProvider<TenantIssuerAuthenticationManagerComponent> authentication,
             @Qualifier("verifiedPrincipalConverter") ObjectProvider<VerifiedPrincipalConverter> converter,
             @Qualifier("trustedIssuerRegistry") ObjectProvider<TrustedIssuerRegistry> issuers,
-            @Qualifier("tianjiGovernedProcessHttpClient") ObjectProvider<HttpClient> http, Environment environment) {
+            @Qualifier("tianjiGovernedProcessHttpClient") ObjectProvider<HttpClient> http,
+            @Qualifier("tianjiMcpSiPublicationAuthority") ObjectProvider<TianjiFixedReadOnlyMcpToolTransport.PublicationAuthority> authority,
+            Environment environment) {
         requirePrerequisites(environment);
         try {
             if (!properties.enabled()) throw unavailable();
             if (properties.mcpBindings().isEmpty()) return null;
             return new TianjiFixedReadOnlyMcpToolTransport(bindings.getObject(), oauth.getObject(), authentication.getObject(),
-                    converter.getObject(), issuers.getObject(), http.getObject(), properties.concurrency());
+                    converter.getObject(), issuers.getObject(), http.getObject(), properties.concurrency(), authority.getObject());
         } catch (RuntimeException privateConfiguration) { throw unavailable(); }
     }
 
     @Bean(name = "tianjiGovernedProcessHttpClient", destroyMethod = "shutdownNow")
     HttpClient tianjiGovernedProcessHttpClient(Environment environment) {
         requirePrerequisites(environment);
-        return HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).connectTimeout(Duration.ofSeconds(3)).build();
+        return HttpClient.newBuilder().proxy(HttpClient.Builder.NO_PROXY).followRedirects(HttpClient.Redirect.NEVER).connectTimeout(Duration.ofSeconds(3)).build();
     }
 
     @Bean(name = "tianjiGovernedProcessDecisionTransport", destroyMethod = "close")

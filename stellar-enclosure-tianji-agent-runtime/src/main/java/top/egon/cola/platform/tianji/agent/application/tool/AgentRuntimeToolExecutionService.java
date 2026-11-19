@@ -10,6 +10,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.validation.annotation.Validated;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO.ToolCallBoundary;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO.ToolCallRequestVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -153,8 +154,13 @@ public class AgentRuntimeToolExecutionService {
             }
             case ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY -> {
                 if (mcp == null) throw unavailable();
+                TianjiSiExecutionBundleService.verifyFrozenBundle(call.run().actor(), call.material().template(), call.material().siBundle());
+                var reference = call.descriptor().reference();
+                var material = call.material().siBundle().mcpToolMaterial(call.material().template(),
+                        new top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TemplateDependencyRefVO(
+                                reference.key(), reference.version(), reference.contentSha256()));
                 var request = new ReadOnlyMcpToolTransport.Request(call.run(), call.lease(), call.descriptor(),
-                        call.arguments(), call.callId(), call.deadline());
+                        call.arguments(), call.callId(), call.deadline(), material);
                 yield mcp.withVerifiedCall(request, (executor, operation) -> {
                     if (operation == null) throw unavailable();
                     return read(call, executor, deadline -> {

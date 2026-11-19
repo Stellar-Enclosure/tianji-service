@@ -4,11 +4,29 @@ import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.McpToolMaterialVO;
+import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
+import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
+import top.egon.cola.component.agentflow.api.context.ContextScopeVO;
+import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionAuthorization;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolExecutionGrant;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
+import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
 import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
 import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
 import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentRunDTO;
+import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
+import top.egon.cola.platform.tianji.contract.agent.GetAgentRunQuery;
+import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
@@ -31,16 +49,156 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class AgentJsonCodecTest {
     private final AgentJsonCodec codec = new AgentJsonCodec();
     static final String SI_PROMPT_SPEC = "{\"promptText\":\"Approved governed instruction\"}";
     static final String SI_PROMPT_DIGEST = rawSiDigest(SI_PROMPT_SPEC);
+
+    @Test
+    void persistedMcpMaterialRetainsIdentityTenantPublicationOwnerAndExactBody() throws Exception {
+        var fixture = mcpFixture(false, false, true);
+        var snapshot = codec.runtimeSnapshot("a".repeat(64), "fixed-run", runtimeCommand(fixture.template()),
+                fixture.template(), fixture.bundle());
+        var stored = codec.readRuntimeSnapshot(codec.writeRuntimeSnapshot(snapshot));
+        var material = stored.siBundle().mcpToolMaterial(stored.template(), fixture.reference());
+        assertEquals(9001L, material.identityTenantId());
+        assertEquals("31", material.publication().identity().tenantId());
+        assertEquals("mcp-owner", material.publication().ownerAppCode());
+        assertEquals("agent-owner", material.scope().ownerAppCode());
+        assertEquals("3", material.publication().identity().versionNo());
+        assertEquals("203", material.publication().identity().versionId());
+        assertEquals("lookup", material.toolId());
+        assertEquals("remote_lookup", material.toolName());
+        assertEquals(fixture.bundle().closureDigest(), material.closureDigest());
+        assertEquals(fixture.bundle().mcpToolMaterial(fixture.template(), fixture.reference()), material);
+        assertNotEquals(fixture.reference().contentSha256(), material.publication().identity().digestSha256());
+        assertFalse(material.toString().contains("remote_lookup"));
+    }
+
+    @Test
+    void applicableLeavesMayShareOnePublicationButCannotSelectDifferentMcpTargets() {
+        var shared = mcpFixture(true, false, true);
+        var fixed = shared.bundle().mcpToolMaterial(shared.template(), shared.reference());
+        assertEquals("203", fixed.publication().identity().versionId());
+        var ambiguous = mcpFixture(true, true, true);
+        assertThrows(AgentLedgerException.class,
+                () -> ambiguous.bundle().mcpToolMaterial(ambiguous.template(), ambiguous.reference()));
+    }
+
+    @Test
+    void disabledUndeclaredOrChangedDescriptorReferencesCannotSelectFrozenMcpMaterial() {
+        var disabled = mcpFixture(false, false, false);
+        assertThrows(AgentLedgerException.class,
+                () -> disabled.bundle().mcpToolMaterial(disabled.template(), disabled.reference()));
+        var fixed = mcpFixture(false, false, true);
+        assertThrows(AgentLedgerException.class, () -> fixed.bundle().mcpToolMaterial(fixed.template(),
+                new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("other", 3, fixed.reference().contentSha256())));
+        assertThrows(AgentLedgerException.class, () -> fixed.bundle().mcpToolMaterial(fixed.template(),
+                new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("lookup", 3, "f".repeat(64))));
+        assertThrows(AgentLedgerException.class, () -> fixed.bundle().mcpToolMaterial(fixed.template(),
+                new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("lookup", 4, fixed.reference().contentSha256())));
+        assertThrows(AgentLedgerException.class, () -> fixed.bundle().mcpToolMaterial(fixed.template(), null));
+    }
+
+    @Test
+    void requestCarriesTheImmutableSiPinAndRejectsMismatchedIdentityToolAndVersion() {
+        var fixture = mcpFixture(false, false, true);
+        var material = fixture.bundle().mcpToolMaterial(fixture.template(), fixture.reference());
+        var deadline = Instant.parse("2026-11-19T23:01:00Z");
+        var actor = new TrustedAgentActor(9001L, TrustedAgentActor.SubjectType.SERVICE, "process", "a".repeat(64));
+        var run = new AgentRunAuthorization.Request(actor, "fixed-run", "billing", 1, fixture.template().contentSha256(),
+                "b".repeat(64), "c".repeat(64), "policy-v1", false, deadline);
+        var lease = new AgentRunLease(run.runId(), "worker", 1, deadline);
+        var invocation = UUID.randomUUID();
+        var pinned = new ReadOnlyMcpToolTransport.Request(run, lease, fixture.descriptor(), Map.of("key", "one"),
+                invocation, deadline, material);
+        assertSame(material, pinned.siMaterial());
+        assertNull(new ReadOnlyMcpToolTransport.Request(run, lease, fixture.descriptor(), Map.of("key", "one"),
+                invocation, deadline).siMaterial());
+        var wrongTenant = new McpToolMaterialVO(9002L, material.scope(), material.closureDigest(), material.publication(),
+                material.toolId(), material.toolName());
+        assertThrows(IllegalArgumentException.class, () -> new ReadOnlyMcpToolTransport.Request(run, lease,
+                fixture.descriptor(), Map.of("key", "one"), invocation, deadline, wrongTenant));
+        for (var descriptor : List.of(new ToolDescriptor("other", 3, "local_lookup", "Fixture", fixture.descriptor().input(),
+                fixture.descriptor().output(), fixture.descriptor().policy()),
+                new ToolDescriptor("lookup", 4, "local_lookup", "Fixture", fixture.descriptor().input(),
+                        fixture.descriptor().output(), fixture.descriptor().policy()))) {
+            assertThrows(IllegalArgumentException.class, () -> new ReadOnlyMcpToolTransport.Request(run, lease,
+                    descriptor, Map.of("key", "one"), invocation, deadline, material));
+        }
+        assertThrows(IllegalArgumentException.class, () -> new McpToolMaterialVO(9001L, material.scope(),
+                material.closureDigest(), material.publication(), material.toolId(), "forged_name"));
+    }
+
+    @Test
+    void actualRuntimeToolServicePassesFrozenPinAndRejectsMissingMaterialBeforeTransport() throws Exception {
+        var fixture = mcpFixture(false, false, true);
+        var deadline = Instant.parse("2026-11-19T23:00:00Z");
+        var actor = new TrustedAgentActor(9001L, TrustedAgentActor.SubjectType.SERVICE, "process", "a".repeat(64));
+        var authorization = new AgentRunAuthorization.Request(actor, "fixed-run", "billing", 1,
+                fixture.template().contentSha256(), "b".repeat(64), "c".repeat(64), "policy-v1", false, deadline);
+        var run = new AgentRunDTO("fixed-run", "billing", 1, null, AgentRunStatusEnum.RUNNING, null, false,
+                1, 2, 2, deadline, deadline.minusSeconds(30), null);
+        var lease = new AgentRunLease(run.runId(), "worker", 1, deadline);
+        var command = runtimeCommand(fixture.template());
+        var ledger = mock(AgentLedgerService.class);
+        when(ledger.databaseNow()).thenReturn(deadline.minusSeconds(10));
+        when(ledger.toolRunEvidence(actor, new GetAgentRunQuery(run.runId()))).thenReturn(new AgentLedgerService.ToolRunEvidenceVO(
+                run, authorization, command.getLink(), List.of(fixture.descriptor().reference()), 2, null,
+                AgentLedgerService.RunProfileEnum.RUNTIME_V2, lease));
+        var binding = mock(ToolExecutionGrant.BindingVO.class);
+        when(binding.run()).thenReturn(authorization);
+        when(binding.tool()).thenReturn(fixture.descriptor().reference());
+        when(binding.backendBindingSha256()).thenReturn(fixture.descriptor().policy().bindingSha256());
+        var evidence = mock(ToolExecutionGrant.EvidenceVO.class);
+        when(evidence.reservation()).thenReturn(new ToolExecutionGrant.ReservationVO(binding, 1));
+        when(evidence.expiresAt()).thenReturn(deadline);
+        var capabilities = mock(ToolCapabilityStore.class);
+        when(capabilities.current(binding, fixture.descriptor())).thenReturn(Optional.of(evidence));
+        var audit = mock(ToolExecutionAuthorization.class);
+        var receipts = mock(AgentRuntimeCallReceiptStore.class);
+        var transaction = mock(TransactionTemplate.class);
+        var captured = new AtomicReference<ReadOnlyMcpToolTransport.Request>();
+        var probe = new ReadOnlyMcpToolTransport() {
+            @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
+                assertNull(captured.getAndSet(request));
+                assertEquals(fixture.bundle().mcpToolMaterial(fixture.template(), fixture.reference()), request.siMaterial());
+                throw new Failure(FailureKind.OPERATION_NOT_SENT);
+            }
+        };
+        var service = new AgentRuntimeToolExecutionService(ledger, capabilities, mock(ToolActionIntentStore.class),
+                mock(ToolResultAccessStore.class), audit, null, probe, null, null,
+                (source, reference) -> new AgentRuntimeToolExecutionService.SelectedToolVO(fixture.descriptor(), binding),
+                null, null, receipts, transaction);
+        var scope = new ContextScopeVO("tianji-agent-runtime", "9001", actor.identityFingerprint(), run.runId(), run.runId(), "EXECUTE");
+        var request = new AgentExecutionContextVO.ToolCallRequestVO(run.runId(), scope,
+                new AgentExecutionContextVO.ToolReferenceVO(fixture.reference().key(), fixture.reference().version(),
+                        fixture.reference().contentSha256()), Map.of("key", "one"), false, deadline);
+        var boundary = mock(AgentExecutionContextVO.ToolCallBoundary.class);
+        var material = new AgentLedgerService.RuntimeExecutionMaterialVO(run, fixture.template(), command,
+                authorization.snapshotSha256(), authorization, fixture.bundle());
+        assertEquals(ReadOnlyMcpToolTransport.FailureKind.OPERATION_NOT_SENT,
+                assertThrows(ReadOnlyMcpToolTransport.Failure.class,
+                        () -> service.execute(material, lease, request, boundary, () -> { })).kind());
+        assertNotNull(captured.getAndSet(null));
+        var missing = new AgentLedgerService.RuntimeExecutionMaterialVO(run, fixture.template(), command,
+                authorization.snapshotSha256(), authorization);
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class,
+                () -> service.execute(missing, lease, request, boundary, () -> { })).code());
+        assertNull(captured.get());
+        verifyNoInteractions(boundary, audit, receipts, transaction);
+    }
 
     @Test
     void native_authorization_and_future_unknown_event_types_keep_the_existing_json_envelope() {
@@ -262,6 +420,67 @@ class AgentJsonCodecTest {
         assertThrows(IllegalArgumentException.class, () -> codec.runtimeRequestHash(command));
         assertThrows(IllegalStateException.class,
                 () -> codec.readRuntimeSnapshot(stored + " ".repeat(AgentJsonCodec.MAX_SI_SNAPSHOT_BYTES)));
+    }
+
+    private record McpFixtureVO(AgentRuntimeTemplateCommand template, FrozenSiBundleVO bundle,
+                                AgentRuntimeTemplateCommand.TemplateDependencyRefVO reference, ToolDescriptor descriptor) { }
+
+    private static McpFixtureVO mcpFixture(boolean agentic, boolean separateTargets, boolean enabled) {
+        var descriptor = new ToolDescriptor("lookup", 3, "local_lookup", "Fixture",
+                new ToolSchema(Map.of("key", ToolSchema.ValueType.STRING), Set.of("key")),
+                new ToolSchema(Map.of("value", ToolSchema.ValueType.STRING), Set.of("value")),
+                new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "mcp.lookup", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY,
+                        "a".repeat(64), null));
+        var descriptorRef = descriptor.reference();
+        var reference = new AgentRuntimeTemplateCommand.TemplateDependencyRefVO(descriptorRef.key(), descriptorRef.version(),
+                descriptorRef.contentSha256());
+        var base = runtimeTemplate(SI_PROMPT_DIGEST);
+        var original = base.getConfiguration();
+        AgentRuntimeTemplateCommand.AgenticTemplatePlanVO plan = null;
+        if (agentic) {
+            plan = new AgentRuntimeTemplateCommand.AgenticTemplatePlanVO(AgentRuntimeTemplateCommand.AgenticStrategyEnum.PARALLEL,
+                    List.of(new AgentRuntimeTemplateCommand.AgenticTemplateLeafVO("left", original.instructionRef(),
+                                    original.modelRef(), List.of(reference)),
+                            new AgentRuntimeTemplateCommand.AgenticTemplateLeafVO("right", original.instructionRef(),
+                                    original.modelRef(), List.of(reference))), List.of(), null, 1, "right",
+                    AgentRuntimeTemplateCommand.AgenticMergeEnum.OUTPUT_AGENT, List.of(),
+                    new AgentRuntimeTemplateCommand.AgenticRootTerminalVO(AgentRuntimeTemplateCommand.AgenticTerminationModeEnum.ROOT_TERMINAL));
+        }
+        var template = new AgentRuntimeTemplateCommand(base.getTemplateKey(), base.getTemplateVersion(), base.getRuntimeProfile(),
+                base.getExecutorRef(), base.getInputSchema(), base.getOutputSchema(), base.getParameterSchema(),
+                new AgentRuntimeTemplateCommand.TemplateConfigurationVO(original.instructionRef(), original.modelRef(), List.of(reference), plan),
+                base.getLimits());
+        String agentSpec = "{\"modelKey\":\"registered-model\",\"systemInstruction\":\"Use the approved prompt\"}";
+        String mcpSpec = "{\"tools\":[{\"toolId\":\"lookup\",\"name\":\"remote_lookup\",\"enabled\":" + enabled + "}]}";
+        var root = new VersionIdentityVO("31", "101", "201", "1", DdcSiKindEnum.AGENT, "test", rawSiDigest(agentSpec));
+        var prompt = new VersionIdentityVO("31", "102", "202", "1", DdcSiKindEnum.PROMPT, "test", SI_PROMPT_DIGEST);
+        var mcp = new VersionIdentityVO("31", "103", "203", "3", DdcSiKindEnum.MCP, "test", rawSiDigest(mcpSpec));
+        var nodes = new ArrayList<VersionIdentityVO>(List.of(prompt, mcp));
+        var edges = new ArrayList<EdgeVO>(List.of(new EdgeVO("201", "202"), new EdgeVO("201", "203")));
+        var resources = new ArrayList<SiResourceVO>(List.of(
+                new SiResourceVO(root, "billing", "agent-owner", agentSpec),
+                new SiResourceVO(prompt, original.instructionRef().key(), "agent-owner", SI_PROMPT_SPEC),
+                new SiResourceVO(mcp, "fixed-mcp", "mcp-owner", mcpSpec)));
+        if (agentic) {
+            for (int index = 0; index < 2; index++) {
+                String id = Integer.toString(204 + index);
+                var leaf = new VersionIdentityVO("31", Integer.toString(104 + index), id, "1", DdcSiKindEnum.AGENT,
+                        "test", rawSiDigest(agentSpec));
+                nodes.add(leaf);
+                resources.add(new SiResourceVO(leaf, index == 0 ? "left" : "right", "agent-owner", agentSpec));
+                edges.add(new EdgeVO("201", id));
+                edges.add(new EdgeVO(id, "202"));
+                edges.add(new EdgeVO(id, index == 1 && separateTargets ? "206" : "203"));
+            }
+            if (separateTargets) {
+                var otherMcp = new VersionIdentityVO("31", "106", "206", "3", DdcSiKindEnum.MCP, "test", rawSiDigest(mcpSpec));
+                nodes.add(otherMcp);
+                resources.add(new SiResourceVO(otherMcp, "other-mcp", "other-owner", mcpSpec));
+            }
+        }
+        var manifest = DdcSiDependencyManifestVO.create(root, null, nodes, edges);
+        var bundle = new FrozenSiBundleVO(9001L, "fixture-biz", "default", "test", "agent-owner", "tianji-caller", manifest, resources);
+        return new McpFixtureVO(template, bundle, reference, descriptor);
     }
 
     static FrozenSiBundleVO frozenBundle(long tenantId, AgentRuntimeTemplateCommand template, String promptSpec) {

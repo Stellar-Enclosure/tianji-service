@@ -2,6 +2,15 @@ package top.egon.cola.platform.tianji.agent.server.integration.mcp;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.McpToolMaterialVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.ScopeVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
@@ -11,16 +20,25 @@ import top.egon.cola.platform.tianji.agent.domain.tool.ToolPolicy;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolSchema;
 import top.egon.cola.platform.tianji.contract.agent.DefinitionResourceRef;
 import top.egon.cola.platform.tianji.contract.orchestration.OrchestrationRequestDigests;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpTransportBindingRegistry;
+import top.egon.cola.platform.tianquan.shoubing.starter.client.IdpTransportBindingVO;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +57,28 @@ class TianjiFixedReadOnlyMcpToolBindingsTest {
     private static final ToolSchema INPUT = new ToolSchema(Map.of("amount", ToolSchema.ValueType.INTEGER), Set.of("amount"));
     private static final ToolSchema OUTPUT = new ToolSchema(Map.of("eligible", ToolSchema.ValueType.BOOLEAN), Set.of("eligible"));
 
+    @Test void canonical_oauth_identity_is_independent_of_the_pinned_plain_http_service() {
+        var first = URI.create("http://catalog-mcp.apps.svc.cluster.local:8080/mcp");
+        var second = URI.create("http://catalog-mcp-v4.apps.svc.cluster.local:8080/mcp");
+
+        var v3 = changed("endpoint", first);
+        var v4 = changed("endpoint", second);
+        assertEquals(RESOURCE, v3.resourceUri());
+        assertEquals(ISSUER, v3.issuer());
+        assertEquals(first, v3.endpoint());
+        assertNotEquals(v3.bindingSha256(), v4.bindingSha256());
+
+        for (String destination : List.of("http://catalog-mcp.example:8080/mcp",
+                "http://catalog-mcp.apps.svc.cluster.local.attacker.example:8080/mcp",
+                "http://10.96.20.51:8080/mcp",
+                "http://catalog-mcp.apps.svc.cluster.local:8080/a/../mcp",
+                "http://catalog-mcp.apps.svc.cluster.local:8080/mcp?route=other")) {
+            assertInvalid(() -> changed("endpoint", URI.create(destination)));
+        }
+        assertInvalid(() -> changed("resourceUri", first));
+        assertInvalid(() -> changed("issuer", first));
+    }
+
     @Test void the_backend_fingerprint_pins_all_fields_and_fixed_protocol_limits_before_descriptor_identity() {
         var backend = backend();
         var scopes = Map.<String, Object>of("catalog:read", true, "price:read", true);
@@ -54,7 +94,7 @@ class TianjiFixedReadOnlyMcpToolBindingsTest {
         var another = descriptor("mcp.other", 2, INPUT, OUTPUT, descriptor.policy());
         assertEquals(backend.bindingSha256(), mapping(USER, another, backend).backend().bindingSha256());
         assertEquals(Set.of("tenantId", "issuer", "endpoint", "resourceUri", "registrationId", "expectedClientId", "expectedAppId", "expectedSourceBiz", "expectedSourceApp",
-                "expectedEnvironment", "businessScopes", "expectedServerName", "expectedServerVersion", "remoteToolName", "remoteToolDocumentSha256", "inputSchema", "outputSchema", "nonBillable", "timeout"),
+                "expectedEnvironment", "businessScopes", "expectedServerName", "expectedServerVersion", "remoteToolName", "remoteToolDocumentSha256", "inputSchema", "outputSchema", "nonBillable", "timeout", "publication"),
                 Arrays.stream(TianjiFixedReadOnlyMcpToolBindings.BackendVO.class.getRecordComponents()).map(java.lang.reflect.RecordComponent::getName).collect(Collectors.toSet()));
         assertEquals("YUHENG_STABLE_JSON_POST", TianjiFixedReadOnlyMcpToolBindings.TRANSPORT_MODE);
         assertEquals("2025-11-25", TianjiFixedReadOnlyMcpToolBindings.PROTOCOL_VERSION);
@@ -275,6 +315,151 @@ class TianjiFixedReadOnlyMcpToolBindingsTest {
         assertNotNull(documentHash(Map.of("number", new BigDecimal("1E+128"), "emoji", "😀")));
     }
 
+    @Test
+    void production_routes_keep_two_frozen_revisions_of_one_resource_on_their_own_services() {
+        var v3 = approvedMcpFixture(3, "catalog-mcp");
+        var v4 = approvedMcpFixture(4, "catalog-mcp-v4");
+        var registry = new IdpTransportBindingRegistry(List.of(v3.post(), v3.delete(), v4.post(), v4.delete()));
+        var fixed = new TianjiFixedReadOnlyMcpToolBindings(List.of(v3.descriptor(), v4.descriptor()),
+                List.of(v3.binding(), v4.binding()), registry);
+
+        assertEquals(v3.binding(), fixed.resolve(v3.request()).binding());
+        assertEquals(v4.binding(), fixed.resolve(v4.request()).binding());
+        assertEquals(7, v3.template().getTemplateVersion());
+        assertEquals("103", v3.material().publication().identity().resourceId());
+        assertEquals("103", v4.material().publication().identity().resourceId());
+        assertEquals("3", v3.material().publication().identity().versionNo());
+        assertEquals("4", v4.material().publication().identity().versionNo());
+        assertEquals(RESOURCE, v3.backend().resourceUri());
+        assertEquals(RESOURCE, v4.backend().resourceUri());
+        assertEquals(ISSUER, v3.backend().issuer());
+        assertEquals(v3.backend().registrationId(), v4.backend().registrationId());
+        assertNotEquals(v3.backend().publication().canonicalEndpoint(), v4.backend().publication().canonicalEndpoint());
+        assertNotEquals(v3.backend().endpoint(), v4.backend().endpoint());
+        assertNotEquals(v3.backend().bindingSha256(), v4.backend().bindingSha256());
+        assertNotEquals(v3.backend().remoteToolDocumentSha256(), v4.backend().remoteToolDocumentSha256());
+        assertNotEquals(v3.material().publication().identity().digestSha256(), v4.material().publication().identity().digestSha256());
+        assertNotEquals(v3.material().closureDigest(), v4.material().closureDigest());
+        assertEquals(v3.bundle().closureDigest(), v3.material().closureDigest());
+        assertEquals(v3.material(), FrozenSiBundleVO.fromExactWire(v3.bundle().toWire())
+                .mcpToolMaterial(v3.template(), v3.template().getConfiguration().toolRefs().getFirst()));
+        TianjiSiExecutionBundleService.verifyFrozenBundle(SERVICE, v3.template(), v3.bundle());
+        assertEquals("http://catalog-mcp.apps.svc.cluster.local:8080/mcp/catalog-v3",
+                fixed.resolve(v3.request()).binding().backend().endpoint().toASCIIString());
+        assertThrows(IllegalArgumentException.class, () -> approvedRequest(v3, v4.material()),
+                "a frozen v3 descriptor must never acquire a v4 publication by resource alias");
+    }
+
+    @Test
+    void production_three_argument_bindings_require_si_evidence_and_never_inherit_legacy_metadata_authority() {
+        var fixture = approvedMcpFixture(3, "catalog-mcp");
+        var fixed = fixture.fixedBindings();
+        assertUnavailable(() -> fixed.resolve(approvedRequest(fixture, null)));
+
+        var unpinnedBackend = backend();
+        var unpinnedDescriptor = descriptor(unpinnedBackend);
+        var unpinnedBinding = mapping(USER, unpinnedDescriptor, unpinnedBackend);
+        assertInvalid(() -> new TianjiFixedReadOnlyMcpToolBindings(List.of(unpinnedDescriptor),
+                List.of(unpinnedBinding), IdpTransportBindingRegistry.empty()));
+        assertEquals(fixture.binding(), fixed.resolve(fixture.request()).binding());
+    }
+
+    @Test
+    void production_startup_requires_both_exact_post_and_delete_routes_with_no_registry_fallback() {
+        var fixture = approvedMcpFixture(3, "catalog-mcp");
+        List<List<IdpTransportBindingVO>> invalidRegistries = List.of(
+                List.of(), List.of(fixture.post()), List.of(fixture.delete()),
+                List.of(routeChanged(fixture.post(), "bindingId", "different-post"), fixture.delete()),
+                List.of(fixture.post(), routeChanged(fixture.delete(), "bindingId", "different-delete")),
+                List.of(routeChanged(fixture.post(), "version", 4L), fixture.delete()),
+                List.of(fixture.post(), routeChanged(fixture.delete(), "version", 4L)),
+                List.of(routeChanged(fixture.post(), "service", "unapproved-mcp"), fixture.delete()),
+                List.of(fixture.post(), routeChanged(fixture.delete(), "service", "unapproved-mcp")),
+                List.of(routeChanged(fixture.post(), "namespace", "other-apps"), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "port", 8081), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "canonicalEndpoint", URI.create("https://mcp.example/wrong-path")), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "resource", URI.create("https://other.example/api")), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "canonicalIssuer", URI.create("https://other-idp.example/21")), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "registrationId", "other-registration"), fixture.delete()),
+                List.of(routeChanged(fixture.post(), "operation", IdpTransportBindingVO.Operation.TOKEN), fixture.delete()),
+                List.of(fixture.post(), routeChanged(fixture.delete(), "method", "GET")));
+        for (var routes : invalidRegistries) {
+            var failure = assertThrows(IllegalArgumentException.class,
+                    () -> new TianjiFixedReadOnlyMcpToolBindings(List.of(fixture.descriptor()),
+                            List.of(fixture.binding()), new IdpTransportBindingRegistry(routes)));
+            assertNull(failure.getCause());
+        }
+        assertEquals(fixture.binding(), fixture.fixedBindings().resolve(fixture.request()).binding());
+    }
+
+    @Test
+    void production_resolution_rejects_wrong_si_owner_tenant_and_frozen_scope() {
+        var fixture = approvedMcpFixture(3, "catalog-mcp");
+        var fixed = fixture.fixedBindings();
+        var material = fixture.material();
+        var scope = material.scope();
+        for (var wrongScope : List.of(
+                new ScopeVO("other-business", scope.namespaceCode(), scope.envCode(), scope.ownerAppCode(), scope.callerAppCode()),
+                new ScopeVO(scope.bizCode(), "other-namespace", scope.envCode(), scope.ownerAppCode(), scope.callerAppCode()),
+                new ScopeVO(scope.bizCode(), scope.namespaceCode(), scope.envCode(), scope.ownerAppCode(), "another-caller"))) {
+            var wrong = new McpToolMaterialVO(21, wrongScope, material.closureDigest(), material.publication(),
+                    material.toolId(), material.toolName());
+            assertUnavailable(() -> fixed.resolve(approvedRequest(fixture, wrong)));
+        }
+        var publication = material.publication();
+        for (var wrong : List.of(
+                new SiResourceVO(publication.identity(), publication.key(), "other-owner", publication.specJson()),
+                new SiResourceVO(publication.identity(), "different-resource-key", publication.ownerAppCode(), publication.specJson()),
+                new SiResourceVO(identityChanged(publication.identity(), "tenantId", "22"), publication.key(), publication.ownerAppCode(), publication.specJson()),
+                new SiResourceVO(identityChanged(publication.identity(), "versionId", "999"), publication.key(), publication.ownerAppCode(), publication.specJson()))) {
+            var substituted = new McpToolMaterialVO(21, scope, material.closureDigest(), wrong, material.toolId(), material.toolName());
+            assertUnavailable(() -> fixed.resolve(approvedRequest(fixture, substituted)));
+        }
+        var foreignIdentity = new McpToolMaterialVO(22, scope, material.closureDigest(), publication,
+                material.toolId(), material.toolName());
+        assertThrows(IllegalArgumentException.class, () -> approvedRequest(fixture, foreignIdentity));
+        assertThrows(IllegalArgumentException.class, () -> new McpToolMaterialVO(21,
+                new ScopeVO(scope.bizCode(), scope.namespaceCode(), "prod", scope.ownerAppCode(), scope.callerAppCode()),
+                material.closureDigest(), publication, material.toolId(), material.toolName()));
+        assertEquals(fixture.binding(), fixed.resolve(fixture.request()).binding());
+    }
+
+    @Test
+    void a_valid_frozen_digest_cannot_approve_a_different_service_binding_or_protocol() {
+        var service = Map.<String, Object>of("bindingId", "catalog-v3-post", "revision", "3",
+                "namespace", "apps", "serviceName", "catalog-mcp", "port", 8080);
+        var alteredBindings = new ArrayList<Map<String, Object>>();
+        for (var change : Map.<String, Object>of("bindingId", "different-post", "revision", "4",
+                "namespace", "other-apps", "serviceName", "catalog-mcp-v4", "port", 8081).entrySet()) {
+            var changed = new LinkedHashMap<>(service);
+            changed.put(change.getKey(), change.getValue());
+            alteredBindings.add(Map.of("serviceBinding", changed));
+        }
+        alteredBindings.add(Map.of("endpoint", "http://catalog-mcp-v4.apps.svc.cluster.local:8080/mcp/catalog-v3"));
+        alteredBindings.add(Map.of("schemaVersion", "mcp-server-v1"));
+        alteredBindings.add(Map.of("transport", "SSE"));
+        alteredBindings.add(Map.of("protocolVersion", "2026-11-25"));
+        alteredBindings.add(Map.of("sourceType", "EXTERNAL_HTTP"));
+        for (var changes : alteredBindings) {
+            var fixture = approvedMcpFixture(3, "catalog-mcp", changes);
+            TianjiSiExecutionBundleService.verifyFrozenBundle(SERVICE, fixture.template(), fixture.bundle());
+            assertUnavailable(() -> fixture.fixedBindings().resolve(fixture.request()));
+        }
+    }
+
+    @Test
+    void si_tool_schema_drift_is_rejected_even_when_all_publication_and_transport_pins_match() {
+        for (String schema : List.of("inputSchema", "outputSchema")) {
+            var tool = new LinkedHashMap<>(toolDocument(3));
+            tool.put("toolId", "mcp.catalog");
+            tool.put("enabled", true);
+            tool.put(schema, Map.of("type", "object", "properties", Map.of("other", Map.of("type", "string")),
+                    "required", List.of("other"), "additionalProperties", false));
+            var fixture = approvedMcpFixture(3, "catalog-mcp", Map.of("tools", List.of(tool)));
+            assertUnavailable(() -> fixture.fixedBindings().resolve(fixture.request()));
+        }
+    }
+
     private static TianjiFixedReadOnlyMcpToolBindings.BackendVO backend() { return backend(Map.of()); }
     private static TianjiFixedReadOnlyMcpToolBindings.BackendVO changed(String field, Object value) { var changes = new HashMap<String, Object>(); changes.put(field, value); return backend(changes); }
     @SuppressWarnings("unchecked")
@@ -285,7 +470,137 @@ class TianjiFixedReadOnlyMcpToolBindingsTest {
                 (String) values.getOrDefault("expectedSourceApp", "agent"), (String) values.getOrDefault("expectedEnvironment", "test"), (Set<String>) values.getOrDefault("businessScopes", Set.of("catalog:read", "price:read")),
                 (String) values.getOrDefault("expectedServerName", "yuheng"), (String) values.getOrDefault("expectedServerVersion", "1.0"), (String) values.getOrDefault("remoteToolName", "catalog.read"),
                 (String) values.getOrDefault("remoteToolDocumentSha256", DOCUMENT), (ToolSchema) values.getOrDefault("inputSchema", INPUT), (ToolSchema) values.getOrDefault("outputSchema", OUTPUT),
-                (Boolean) values.getOrDefault("nonBillable", true), (Duration) values.getOrDefault("timeout", Duration.ofSeconds(3)));
+                (Boolean) values.getOrDefault("nonBillable", true), (Duration) values.getOrDefault("timeout", Duration.ofSeconds(3)),
+                (TianjiFixedReadOnlyMcpToolBindings.McpPublicationPinVO) values.get("publication"));
+    }
+
+    /** Real immutable AGENT -> PROMPT + MCP evidence, without a network authority or live service. */
+    static ApprovedMcpFixtureVO approvedMcpFixture(long version, String serviceName) {
+        return approvedMcpFixture(version, serviceName, Map.of());
+    }
+
+    private static ApprovedMcpFixtureVO approvedMcpFixture(long version, String serviceName,
+                                                          Map<String, Object> publicationChanges) {
+        String path = "/mcp/catalog-v" + version;
+        URI canonical = URI.create("https://mcp.example" + path);
+        URI physical = URI.create("http://" + serviceName + ".apps.svc.cluster.local:8080" + path);
+        String postId = "catalog-v" + version + "-post";
+        String deleteId = "catalog-v" + version + "-delete";
+        var declaredTool = new LinkedHashMap<>(toolDocument(version));
+        declaredTool.put("toolId", "mcp.catalog");
+        declaredTool.put("enabled", true);
+        var publicationBody = new LinkedHashMap<String, Object>();
+        publicationBody.put("schemaVersion", "mcp-server-v2");
+        publicationBody.put("sourceType", "INTERNAL_SERVICE");
+        publicationBody.put("transport", "STREAMABLE_HTTP");
+        publicationBody.put("protocolVersion", TianjiFixedReadOnlyMcpToolBindings.PROTOCOL_VERSION);
+        publicationBody.put("endpoint", physical.toASCIIString());
+        publicationBody.put("serviceBinding", Map.of("bindingId", postId, "revision", Long.toString(version),
+                "namespace", "apps", "serviceName", serviceName, "port", 8080));
+        publicationBody.put("tools", List.of(declaredTool));
+        publicationBody.putAll(publicationChanges);
+        String mcpJson = new String(ProcessTypedJson.canonicalBytes(publicationBody), StandardCharsets.UTF_8);
+        var mcpIdentity = new VersionIdentityVO("21", "103", Long.toString(300 + version), Long.toString(version),
+                DdcSiKindEnum.MCP, "test", rawSha256(mcpJson));
+        var pin = new TianjiFixedReadOnlyMcpToolBindings.McpPublicationPinVO(mcpIdentity, "business", "default",
+                "tianji-caller", "agent", "catalog-mcp", "mcp.catalog", canonical, postId, deleteId, version);
+        var backend = backend(Map.of("endpoint", physical, "publication", pin,
+                "remoteToolDocumentSha256", documentHash(toolDocument(version))));
+        var descriptor = descriptor("mcp.catalog", version, INPUT, OUTPUT, new ToolPolicy(ToolPolicy.Risk.READ_ONLY,
+                "mcp.read", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, backend.bindingSha256(), null));
+        var toolRef = new AgentRuntimeTemplateCommand.TemplateDependencyRefVO(descriptor.key(), version,
+                descriptor.reference().contentSha256());
+        String promptJson = "{\"promptText\":\"Read the governed catalogue only\"}";
+        var empty = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
+                "required", List.of(), "additionalProperties", false));
+        var template = new AgentRuntimeTemplateCommand("catalog-agent", version + 4,
+                AgentRuntimeTemplateCommand.RuntimeProfileEnum.RUNTIME_V2, "agent-executor", empty, empty, empty,
+                new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
+                        new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("catalog-instructions", 1, rawSha256(promptJson)),
+                        "registered-model", List.of(toolRef), null),
+                new AgentRuntimeTemplateCommand.TechnicalLimitsVO(Duration.ofMinutes(1), Duration.ofSeconds(10),
+                        Duration.ofSeconds(10), 2, 2, 1, 4096, 1024));
+        String agentJson = "{\"modelKey\":\"registered-model\",\"systemInstruction\":\"Read governed catalogue\"}";
+        var agentIdentity = new VersionIdentityVO("21", "101", Long.toString(200 + template.getTemplateVersion()),
+                Long.toString(template.getTemplateVersion()), DdcSiKindEnum.AGENT, "test", rawSha256(agentJson));
+        var promptIdentity = new VersionIdentityVO("21", "102", "202", "1", DdcSiKindEnum.PROMPT, "test", rawSha256(promptJson));
+        var manifest = DdcSiDependencyManifestVO.create(agentIdentity, null, List.of(promptIdentity, mcpIdentity),
+                List.of(new EdgeVO(agentIdentity.versionId(), promptIdentity.versionId()),
+                        new EdgeVO(agentIdentity.versionId(), mcpIdentity.versionId())));
+        var frozen = new FrozenSiBundleVO(21, "business", "default", "test", "agent", "tianji-caller", manifest,
+                List.of(new SiResourceVO(agentIdentity, template.getTemplateKey(), "agent", agentJson),
+                        new SiResourceVO(promptIdentity, "catalog-instructions", "agent", promptJson),
+                        new SiResourceVO(mcpIdentity, "catalog-mcp", "agent", mcpJson)));
+        var material = frozen.mcpToolMaterial(template, toolRef);
+        var binding = new TianjiFixedReadOnlyMcpToolBindings.BindingVO(21, SERVICE.issuerFingerprint(), SERVICE.subjectType(),
+                template.getTemplateKey(), template.getTemplateVersion(), template.contentSha256(), descriptor.reference(), backend);
+        var post = new IdpTransportBindingVO(postId, version, ISSUER, canonical, RESOURCE, backend.registrationId(),
+                IdpTransportBindingVO.Operation.RESOURCE, "POST", path, "apps", serviceName, 8080, IdpTransportBindingVO.Transport.HTTP);
+        var delete = new IdpTransportBindingVO(deleteId, version, ISSUER, canonical, RESOURCE, backend.registrationId(),
+                IdpTransportBindingVO.Operation.RESOURCE, "DELETE", path, "apps", serviceName, 8080, IdpTransportBindingVO.Transport.HTTP);
+        return new ApprovedMcpFixtureVO(frozen, template, material, backend, descriptor, binding, post, delete,
+                new IdpTransportBindingRegistry(List.of(post, delete)));
+    }
+
+    record ApprovedMcpFixtureVO(FrozenSiBundleVO bundle, AgentRuntimeTemplateCommand template,
+                                McpToolMaterialVO material, TianjiFixedReadOnlyMcpToolBindings.BackendVO backend,
+                                ToolDescriptor descriptor, TianjiFixedReadOnlyMcpToolBindings.BindingVO binding,
+                                IdpTransportBindingVO post, IdpTransportBindingVO delete,
+                                IdpTransportBindingRegistry registry) {
+        TianjiFixedReadOnlyMcpToolBindings fixedBindings() {
+            return new TianjiFixedReadOnlyMcpToolBindings(List.of(descriptor), List.of(binding), registry);
+        }
+
+        ReadOnlyMcpToolTransport.Request request() {
+            return approvedRequest(this, material);
+        }
+    }
+
+    private static ReadOnlyMcpToolTransport.Request approvedRequest(ApprovedMcpFixtureVO fixture,
+                                                                  McpToolMaterialVO material) {
+        var template = fixture.template();
+        var run = new AgentRunAuthorization.Request(SERVICE, RUN, template.getTemplateKey(), template.getTemplateVersion(),
+                template.contentSha256(), "d".repeat(64), "e".repeat(64), "policy-v1", false, NOW.plusSeconds(300));
+        return new ReadOnlyMcpToolTransport.Request(run, new AgentRunLease(RUN, "worker", 1, NOW.plusSeconds(60)),
+                fixture.descriptor(), Map.of("amount", 20L), UUID.fromString("20000000-0000-0000-0000-000000000001"),
+                NOW.plusSeconds(30), material);
+    }
+
+    private static Map<String, Object> toolDocument(long version) {
+        return Map.of("name", "catalog.read", "description", "Read catalogue publication " + version,
+                "inputSchema", Map.of("type", "object", "properties", Map.of("amount", Map.of("type", "integer")),
+                        "required", List.of("amount"), "additionalProperties", false),
+                "outputSchema", Map.of("type", "object", "properties", Map.of("eligible", Map.of("type", "boolean")),
+                        "required", List.of("eligible"), "additionalProperties", false),
+                "annotations", Map.of("readOnlyHint", true));
+    }
+
+    private static VersionIdentityVO identityChanged(VersionIdentityVO value, String field, String replacement) {
+        return new VersionIdentityVO(field.equals("tenantId") ? replacement : value.tenantId(), value.resourceId(),
+                field.equals("versionId") ? replacement : value.versionId(), value.versionNo(), value.kind(),
+                value.envCode(), value.digestSha256());
+    }
+
+    private static IdpTransportBindingVO routeChanged(IdpTransportBindingVO value, String field, Object replacement) {
+        URI endpoint = field.equals("canonicalEndpoint") ? (URI) replacement : value.canonicalEndpoint();
+        return new IdpTransportBindingVO(field.equals("bindingId") ? (String) replacement : value.bindingId(),
+                field.equals("version") ? (long) replacement : value.version(),
+                field.equals("canonicalIssuer") ? (URI) replacement : value.canonicalIssuer(), endpoint,
+                field.equals("resource") ? (URI) replacement : value.resource(),
+                field.equals("registrationId") ? (String) replacement : value.registrationId(),
+                field.equals("operation") ? (IdpTransportBindingVO.Operation) replacement : value.operation(),
+                field.equals("method") ? (String) replacement : value.method(), endpoint.getRawPath(),
+                field.equals("namespace") ? (String) replacement : value.namespace(),
+                field.equals("service") ? (String) replacement : value.service(),
+                field.equals("port") ? (int) replacement : value.port(), value.transport());
+    }
+
+    private static String rawSha256(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException unsupportedRuntime) {
+            throw new IllegalStateException(unsupportedRuntime);
+        }
     }
     private static ToolDescriptor descriptor(TianjiFixedReadOnlyMcpToolBindings.BackendVO backend) {
         return descriptor("mcp.catalog", 1, INPUT, OUTPUT, new ToolPolicy(ToolPolicy.Risk.READ_ONLY, "mcp.read", ReadOnlyMcpToolTransport.EXECUTE_RESOURCE_KEY, backend.bindingSha256(), null));

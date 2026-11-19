@@ -19,13 +19,23 @@ import top.egon.cola.component.rpc.tianshu.contract.proto.v1.ResolveSiResourceRe
 import top.egon.cola.component.rpc.tianshu.contract.proto.v1.ResolveSiResourceResponse;
 import top.egon.cola.component.rpc.tianshu.mapping.DdcSiProtoMapper;
 import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.component.tianshu.model.si.DdcSiLifecycleStatusEnum;
+import top.egon.cola.component.tianshu.model.si.DdcSiResourceDescriptor;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.McpToolMaterialVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.ScopeVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.TrustedIssuerRegistry;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.rpc.IdpRpcClientCredentialInterceptorFactory;
 import top.egon.cola.platform.tianquan.shoubing.starter.security.rpc.IdpRpcClientTenantResolver;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -118,6 +128,41 @@ class TianshuContextConfigurationTest {
         return top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.verified(tenant,
                 top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.SubjectType.SERVICE, "process-worker",
                 ISSUER.toASCIIString());
+    }
+
+    @Test
+    void mcp_current_authority_rechecks_the_same_publication_and_never_follows_the_current_version() throws Exception {
+        var authority = configuration.tianjiMcpSiPublicationAuthority(properties(), catalog,
+                transport(), bindings(), PROCESS, idp(Set.of("20")), credentials);
+        var actor = verifiedServiceActor(20);
+        var tenantResolver = configuration.tianshuContextTenantResolver();
+        var invocation = invocation(TARGET, PROCESS);
+        String body = "{\"schemaVersion\":\"mcp-server-v2\",\"tools\":["
+                + "{\"toolId\":\"stable-catalog\",\"name\":\"catalog.read\",\"enabled\":true}]}";
+        String digest = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                .digest(body.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        var identity = new VersionIdentityVO("101", "40", "43", "3", DdcSiKindEnum.MCP, "test", digest);
+        var scope = new ScopeVO("xingyuan", "tools", "test", "agent-owner", "tianji");
+        var material = new McpToolMaterialVO(20, scope, "d".repeat(64),
+                new SiResourceVO(identity, "catalog", "mcp-owner", body), "stable-catalog", "catalog.read");
+        var current = new DdcSiResourceDescriptor().setTenantId(101L).setResourceId(40L)
+                .setKind(DdcSiKindEnum.MCP).setEnvCode("test").setBizCode("xingyuan").setNamespaceCode("tools")
+                .setOwnerAppCode("mcp-owner").setResourceKey("catalog").setStatus(DdcSiLifecycleStatusEnum.PUBLISHED)
+                .setActiveVersionNo(4).setResolvedVersionId(43L).setResolvedVersionNo(3L).setDigestSha256(digest)
+                .setSpecJson(body).setDependencyManifest(DdcSiDependencyManifestVO.create(identity, null, List.of(), List.of()));
+        when(catalog.resolveExecutionResource(101, "xingyuan", "tools", "test", "mcp-owner", "tianji",
+                DdcSiKindEnum.MCP, "catalog", 3L)).thenAnswer(call -> {
+            assertEquals(Optional.of("20"), tenantResolver.resolve(invocation, null));
+            return Optional.of(current);
+        }).thenReturn(Optional.empty());
+
+        assertDoesNotThrow(() -> authority.requireCurrent(actor, material));
+        assertThrows(StatusRuntimeException.class, () -> tenantResolver.resolve(invocation, null));
+        assertThrows(AgentLedgerException.class, () -> authority.requireCurrent(actor, material));
+        assertThrows(AgentLedgerException.class, () -> authority.requireCurrent(verifiedServiceActor(21), material));
+        verify(catalog, times(2)).resolveExecutionResource(101, "xingyuan", "tools", "test", "mcp-owner",
+                "tianji", DdcSiKindEnum.MCP, "catalog", 3L);
+        verifyNoMoreInteractions(catalog);
     }
 
     @Test

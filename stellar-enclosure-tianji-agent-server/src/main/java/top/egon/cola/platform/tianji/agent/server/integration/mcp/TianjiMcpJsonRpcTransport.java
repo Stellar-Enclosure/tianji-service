@@ -204,6 +204,13 @@ final class TianjiMcpJsonRpcTransport implements McpClientTransport {
                 || !TianjiFixedReadOnlyMcpToolBindings.PROTOCOL_VERSION.equals(result.get("protocolVersion"))) throw failure(changed);
         var server = object(result.get("serverInfo"), changed); var capabilities = object(result.get("capabilities"), changed);
         if (!backend.expectedServerName().equals(server.get("name")) || !backend.expectedServerVersion().equals(server.get("version"))) throw failure(changed);
+        var publication = backend.publication();
+        if (publication != null && publication.catalogueFileSha256() != null) {
+            var metadata = object(result.get("_meta"), changed);
+            if (!publication.catalogueFileSha256().equals(metadata.get("top.egon/selectedMcpCatalogueSha256"))) {
+                throw failure(changed);
+            }
+        }
         object(capabilities.get("tools"), changed);
         var sessions = response.headers().allValues("Mcp-Session-Id");
         if (sessions.size() != 1) throw failure(ReadOnlyMcpToolTransport.FailureKind.PROFILE_UNAVAILABLE);
@@ -237,7 +244,7 @@ final class TianjiMcpJsonRpcTransport implements McpClientTransport {
         return new OpaqueResultVO(McpSchema.ListToolsResult.class, new McpSchema.ListToolsResult(List.of(tool), null, null));
     }
 
-    private Map<String, Object> schema(Object supplied, ToolSchema expected) {
+    static Map<String, Object> schema(Object supplied, ToolSchema expected) {
         var changed = ReadOnlyMcpToolTransport.FailureKind.PROFILE_CHANGED; var schema = object(supplied, changed);
         if (!SCHEMA_FIELDS.containsAll(schema.keySet()) || !"object".equals(schema.get("type"))
                 || schema.containsKey("additionalProperties") && !(schema.get("additionalProperties") instanceof Boolean)

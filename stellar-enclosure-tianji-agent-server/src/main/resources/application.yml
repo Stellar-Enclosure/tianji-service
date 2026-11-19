@@ -102,6 +102,8 @@ stellar:
           decision-bindings: []
           start-bindings: []
           approval-bindings: []
+          # Mount versioned MCP and POST/DELETE Service bindings as platform-owned bootstrap configuration.
+          # The OAuth issuer and resource keep their canonical HTTPS values.
           mcp-bindings: []
       memory:
         enabled: false

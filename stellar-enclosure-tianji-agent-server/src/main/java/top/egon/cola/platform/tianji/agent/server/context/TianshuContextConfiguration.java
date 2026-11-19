@@ -10,6 +10,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.core.env.Environment;
 import top.egon.cola.component.common.id.snowflake.SnowflakeIdGenerator;
 import top.egon.cola.component.rpc.consumer.interceptor.RpcClientInvocation;
@@ -18,7 +19,9 @@ import top.egon.cola.component.rpc.consumer.reference.RpcServiceTargetVO;
 import top.egon.cola.component.rpc.context.identity.RpcProcessIdentity;
 import top.egon.cola.component.rpc.contract.identity.RpcServiceIdentity;
 import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
 import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties.RpcConsumerModeEnum;
@@ -36,7 +39,8 @@ import java.util.function.Supplier;
 
 /** Binds published Prompt and Skill reads to the approved native SI Service. */
 @Configuration(value = "tianjiTianshuContextConfiguration", proxyBeanMethods = false)
-@ConditionalOnExpression("${stellar.tianji.agent.context.tianshu.enabled:false} or (" + TianshuContextConfiguration.RUN_ADMISSION + ")")
+@ConditionalOnExpression("${stellar.tianji.agent.context.tianshu.enabled:false} or ("
+        + TianshuContextConfiguration.RUN_ADMISSION + ") or (" + TianshuContextConfiguration.MCP_PUBLICATION_READ + ")")
 @EnableConfigurationProperties(TianshuContextProperties.class)
 public class TianshuContextConfiguration {
     static final String SERVICE = "egon.tianshu.v1.DdcSiResourceGrpcService";
@@ -46,6 +50,8 @@ public class TianshuContextConfiguration {
     private static final String SI_RPC = "egon.cola.component.tianshu.si.rpc.";
     static final String RUN_ADMISSION = "${stellar.tianji.agent.api.enabled:false} and "
             + "${stellar.tianji.agent.linked.enabled:false} and ${stellar.tianji.agent.runtime-v2.enabled:false}";
+    static final String MCP_PUBLICATION_READ = "${stellar.tianji.agent.tools.governed-process.enabled:false} and "
+            + "${stellar.tianji.agent.runtime-v2.enabled:false}";
     private static final ScopedValue<CatalogAuthorityVO> READ_AUTHORITY = ScopedValue.newInstance();
 
     @Bean("tianshuContextPrerequisites")
@@ -94,15 +100,61 @@ public class TianshuContextConfiguration {
         if (properties.connections().isEmpty() || !environment.getProperty(SI_RPC + "enabled", Boolean.class, false)) throw invalid();
         credentials.validateConfiguration();
         return (actor, scope, read) -> {
-            var selected = properties.connections().stream().filter(connection ->
-                    connection.identityTenantId() == actor.tenantId() && connection.bizCode().equals(scope.bizCode())
-                            && connection.env().equals(scope.envCode()) && connection.appCode().equals(scope.callerAppCode()))
-                    .toList();
-            if (selected.size() != 1) throw TianjiSiExecutionBundleService.unavailable();
-            var connection = selected.getFirst();
+            var connection = selectConnection(properties, actor.tenantId(), scope);
             var approved = executionAuthority(connection, environment, definitions, process, idp);
             return withAuthority(approved, () -> read.apply(connection.tianshuTenantId()));
         };
+    }
+
+    @Bean("tianjiMcpSiPublicationAuthority")
+    @Lazy
+    @ConditionalOnExpression(MCP_PUBLICATION_READ)
+    TianjiFixedReadOnlyMcpToolTransport.PublicationAuthority tianjiMcpSiPublicationAuthority(
+            TianshuContextProperties properties, @Qualifier("ddcSiCatalogRpcClient") DdcSiCatalogClient catalog,
+            @Qualifier("environment") Environment environment,
+            @Qualifier("rpcReferenceDefinitionResolver") RpcReferenceDefinitionResolver definitions,
+            @Qualifier("rpcProcessIdentity") RpcProcessIdentity process,
+            @Qualifier("idpStarterProperties") IdpStarterProperties idp,
+            @Qualifier("idpRpcClientCredentialInterceptorFactory") IdpRpcClientCredentialInterceptorFactory credentials) {
+        if (properties.connections().isEmpty() || !environment.getProperty(SI_RPC + "enabled", Boolean.class, false)) throw invalid();
+        credentials.validateConfiguration();
+        return (actor, material) -> {
+            var scope = material.scope();
+            var publication = material.publication();
+            var identity = publication.identity();
+            var connection = selectConnection(properties, actor.tenantId(), scope);
+            long tenant = connection.tianshuTenantId();
+            long versionNo = Long.parseLong(identity.versionNo());
+            if (actor.tenantId() != material.identityTenantId() || !Long.toString(tenant).equals(identity.tenantId())) {
+                throw TianjiSiExecutionBundleService.unavailable();
+            }
+            var approved = executionAuthority(connection, environment, definitions, process, idp);
+            var current = withAuthority(approved, () -> catalog.resolveExecutionResource(tenant, scope.bizCode(),
+                    scope.namespaceCode(), scope.envCode(), publication.ownerAppCode(), scope.callerAppCode(),
+                    DdcSiKindEnum.MCP, publication.key(), versionNo)).orElseThrow(TianjiSiExecutionBundleService::unavailable);
+            if (!current.isExecutionSnapshotShapeValid() || current.getStatus() == null
+                    || !current.getStatus().isQueryableByRuntime() || !Objects.equals(current.getTenantId(), tenant)
+                    || current.getKind() != DdcSiKindEnum.MCP || !scope.bizCode().equals(current.getBizCode())
+                    || !scope.namespaceCode().equals(current.getNamespaceCode()) || !scope.envCode().equals(current.getEnvCode())
+                    || !Objects.equals(publication.ownerAppCode(), current.getOwnerAppCode())
+                    || !publication.key().equals(current.getResourceKey())
+                    || !Objects.equals(current.getResourceId(), Long.valueOf(identity.resourceId()))
+                    || !Objects.equals(current.getResolvedVersionId(), Long.valueOf(identity.versionId()))
+                    || !Objects.equals(current.getResolvedVersionNo(), versionNo)
+                    || !identity.digestSha256().equals(current.getDigestSha256())
+                    || !publication.specJson().equals(current.getSpecJson())) {
+                throw TianjiSiExecutionBundleService.unavailable();
+            }
+        };
+    }
+
+    private static TianshuContextProperties.Connection selectConnection(TianshuContextProperties properties, long identityTenantId,
+            TianjiSiExecutionBundleService.ScopeVO scope) {
+        var selected = properties.connections().stream().filter(connection ->
+                connection.identityTenantId() == identityTenantId && connection.bizCode().equals(scope.bizCode())
+                        && connection.env().equals(scope.envCode()) && connection.appCode().equals(scope.callerAppCode())).toList();
+        if (selected.size() != 1) throw TianjiSiExecutionBundleService.unavailable();
+        return selected.getFirst();
     }
 
     private static CatalogAuthorityVO executionAuthority(TianshuContextProperties.Connection connection,

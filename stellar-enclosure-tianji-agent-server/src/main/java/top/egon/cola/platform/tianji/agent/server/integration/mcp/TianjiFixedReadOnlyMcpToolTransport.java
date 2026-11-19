@@ -8,9 +8,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import top.egon.cola.component.common.trace.TraceContext;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.McpToolMaterialVO;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyDecisionToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.ReadOnlyMcpToolTransport;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
+import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.server.integration.mcp.TianjiFixedReadOnlyMcpToolBindings.BackendVO;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier;
 import top.egon.cola.platform.tianji.agent.server.integration.process.TianjiProcessToolCredentialVerifier.CredentialVO;
@@ -62,6 +64,7 @@ public final class TianjiFixedReadOnlyMcpToolTransport implements ReadOnlyMcpToo
     private final Clock clock;
     private final LongSupplier nanoTime;
     private final TianjiProcessToolCredentialVerifier credentialVerifier;
+    private final PublicationAuthority publicationAuthority;
     private final ThreadPoolExecutor calls;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<Runnable> cancellations = ConcurrentHashMap.newKeySet();
@@ -71,13 +74,28 @@ public final class TianjiFixedReadOnlyMcpToolTransport implements ReadOnlyMcpToo
             HttpClient http, int concurrency) {
         this(bindings, oauth, authentication, converter, issuers, http, concurrency, Clock.systemUTC(), System::nanoTime);
     }
+
+    public TianjiFixedReadOnlyMcpToolTransport(TianjiFixedReadOnlyMcpToolBindings bindings, IdpServiceOAuth2Client oauth,
+            TenantIssuerAuthenticationManagerComponent authentication, VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers,
+            HttpClient http, int concurrency, PublicationAuthority publicationAuthority) {
+        this(bindings, oauth, authentication, converter, issuers, http, concurrency, Clock.systemUTC(), System::nanoTime,
+                Objects.requireNonNull(publicationAuthority, "publication authority"));
+    }
+
     TianjiFixedReadOnlyMcpToolTransport(TianjiFixedReadOnlyMcpToolBindings bindings, IdpServiceOAuth2Client oauth,
             TenantIssuerAuthenticationManagerComponent authentication, VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers,
             HttpClient http, int concurrency, Clock clock, LongSupplier nanoTime) {
+        this(bindings, oauth, authentication, converter, issuers, http, concurrency, clock, nanoTime, null);
+    }
+
+    TianjiFixedReadOnlyMcpToolTransport(TianjiFixedReadOnlyMcpToolBindings bindings, IdpServiceOAuth2Client oauth,
+            TenantIssuerAuthenticationManagerComponent authentication, VerifiedPrincipalConverter converter, TrustedIssuerRegistry issuers,
+            HttpClient http, int concurrency, Clock clock, LongSupplier nanoTime, PublicationAuthority publicationAuthority) {
         this.bindings = Objects.requireNonNull(bindings, "bindings"); this.oauth = Objects.requireNonNull(oauth, "oauth");
         this.authentication = Objects.requireNonNull(authentication, "authentication"); this.converter = Objects.requireNonNull(converter, "converter");
         this.issuers = Objects.requireNonNull(issuers, "issuers"); this.http = Objects.requireNonNull(http, "http");
         this.clock = Objects.requireNonNull(clock, "clock"); this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
+        this.publicationAuthority = publicationAuthority;
         if (concurrency < 1 || concurrency > 8 || http.followRedirects() != HttpClient.Redirect.NEVER
                 || http.cookieHandler().isPresent() || http.authenticator().isPresent()) throw new IllegalArgumentException("Fixed MCP transport configuration is invalid");
         credentialVerifier = new TianjiProcessToolCredentialVerifier(this.oauth, this.authentication, this.converter, this.issuers, this.clock);
@@ -91,6 +109,11 @@ public final class TianjiFixedReadOnlyMcpToolTransport implements ReadOnlyMcpToo
     public boolean usesConverter(VerifiedPrincipalConverter candidate) { return candidate == converter; }
     public boolean usesIssuerRegistry(TrustedIssuerRegistry candidate) { return candidate == issuers; }
     public boolean usesHttpClient(HttpClient candidate) { return candidate == http; }
+
+    @FunctionalInterface
+    public interface PublicationAuthority {
+        void requireCurrent(TrustedAgentActor actor, McpToolMaterialVO material);
+    }
 
     @Override public <T> T withVerifiedCall(Request request, Callback<T> callback) {
         if (request == null || callback == null) throw new IllegalArgumentException("Fixed MCP request and callback are required");
@@ -133,6 +156,10 @@ public final class TianjiFixedReadOnlyMcpToolTransport implements ReadOnlyMcpToo
         try {
             scope.remaining();
             if (TransactionSynchronizationManager.isActualTransactionActive()) throw failure(FailureKind.CREDENTIAL_UNAVAILABLE);
+            if (publicationAuthority != null) {
+                publicationAuthority.requireCurrent(request.run().actor(), Objects.requireNonNull(request.siMaterial()));
+                scope.remaining();
+            }
             credential = credentialVerifier.credentials(target(scope.backend), scope.window.deadlineAt(), scope::remaining, scope::publishBearer, scope::currentBearer);
             synchronized (scope.publishLock) { scope.remaining(); scope.credential = credential; }
             current(scope);
@@ -263,6 +290,9 @@ public final class TianjiFixedReadOnlyMcpToolTransport implements ReadOnlyMcpToo
                     if (!suppliedSession.equals(sessionId)) throw failure(FailureKind.OPERATION_NOT_SENT);
                 } else if (sessionId != null || deleting || toolsCall) throw failure(FailureKind.OPERATION_NOT_SENT);
                 var builder = HttpRequest.newBuilder(backend.endpoint()).timeout(Duration.ofNanos(remaining()));
+                if (TianjiFixedReadOnlyMcpToolBindings.isInternalService(backend.endpoint())) {
+                    builder.version(HttpClient.Version.HTTP_1_1);
+                }
                 prepared.headers().map().forEach((name, values) -> builder.header(name, values.getFirst()));
                 builder.header("Authorization", "Bearer " + bearer); if (trace.hasTrace()) trace.inject(builder::header);
                 if (deleting) { if (prepared.bodyPublisher().isPresent()) throw failure(FailureKind.OPERATION_NOT_SENT); builder.DELETE(); }

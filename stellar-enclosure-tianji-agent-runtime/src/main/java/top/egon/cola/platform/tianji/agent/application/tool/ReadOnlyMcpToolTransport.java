@@ -1,5 +1,7 @@
 package top.egon.cola.platform.tianji.agent.application.tool;
 
+import org.springframework.lang.Nullable;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.McpToolMaterialVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.tool.ToolDescriptor;
@@ -22,13 +24,24 @@ public interface ReadOnlyMcpToolTransport {
     <T> T withVerifiedCall(Request request, Callback<T> callback);
 
     record Request(AgentRunAuthorization.Request run, AgentRunLease lease, ToolDescriptor descriptor,
-                   Map<String, Object> arguments, UUID invocationId, Instant deadlineAt) {
+                   Map<String, Object> arguments, UUID invocationId, Instant deadlineAt,
+                   @Nullable McpToolMaterialVO siMaterial) {
+        /** Existing explicitly authorized historical V1 callers carry no SI execution material. */
+        public Request(AgentRunAuthorization.Request run, AgentRunLease lease, ToolDescriptor descriptor,
+                       Map<String, Object> arguments, UUID invocationId, Instant deadlineAt) {
+            this(run, lease, descriptor, arguments, invocationId, deadlineAt, null);
+        }
+
         public Request {
             try {
                 if (run == null || lease == null || descriptor == null || invocationId == null || deadlineAt == null
                         || "LEGACY".equals(run.actor().issuerFingerprint()) || !run.runId().equals(lease.runId())
                         || descriptor.policy().risk() != ToolPolicy.Risk.READ_ONLY
                         || !EXECUTE_RESOURCE_KEY.equals(descriptor.policy().executionResourceKey()) || deadlineAt.isAfter(run.deadlineAt())) throw invalid();
+                if (siMaterial != null && (run.actor().subjectType() != top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.SubjectType.SERVICE
+                        || run.sessionRequired() || siMaterial.identityTenantId() != run.actor().tenantId()
+                        || !siMaterial.publication().identity().versionNo().equals(Long.toString(descriptor.version()))
+                        || !descriptor.key().equals(siMaterial.toolId()) && !descriptor.key().equals(siMaterial.toolName()))) throw invalid();
                 arguments = descriptor.input().values(arguments);
             } catch (RuntimeException malformed) { throw invalid(); }
         }
