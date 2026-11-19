@@ -1,16 +1,19 @@
 package top.egon.cola.platform.tianji.agent.server.context;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
+import lombok.extern.slf4j.Slf4j;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
-import top.egon.cola.component.tianshu.api.client.DdcPromptClient;
-import top.egon.cola.component.tianshu.api.client.DdcSkillClient;
-import top.egon.cola.component.tianshu.error.DdcException;
+import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
+import top.egon.cola.component.tianshu.format.DdcConfigCanonicalJson;
 import top.egon.cola.component.tianshu.model.ai.DdcAiClientScope;
 import top.egon.cola.component.tianshu.model.ai.DdcAiContentDTO;
 import top.egon.cola.component.tianshu.model.ai.DdcAiNodeDTO;
-import top.egon.cola.component.tianshu.model.ai.DdcAiNodeTypeEnum;
-import top.egon.cola.component.tianshu.model.ai.DdcAiResourceQuery;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.component.tianshu.model.si.DdcSiResourceDescriptor;
 import top.egon.cola.component.tianshu.model.ai.validation.AiContentValidator;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -35,12 +38,14 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Supplier;
 import java.util.Set;
 import java.util.concurrent.Semaphore;
 
 /** Adapter for literal published text and Skill files. It neither evaluates templates nor executes package assets. */
+@Slf4j
 public final class TianshuContextProvider implements ContextProvider {
-    private static final byte[] CONTENT_DOMAIN = "tianshu-ai-content-v1".getBytes(StandardCharsets.UTF_8);
+    private static final int MAX_SNAPSHOT_BYTES = 1_048_576;
     private static final AiContentValidator VALIDATOR = new AiContentValidator();
     private static final JsonMapper JSON = JsonMapper.builder().build();
     private final Map<Key, TianshuContextProperties.Binding> bindings;
@@ -70,7 +75,7 @@ public final class TianshuContextProvider implements ContextProvider {
         for (var binding : properties.bindings()) {
             var ports = this.connections.get(binding.connectionId());
             if (ports == null || values.putIfAbsent(new Key(binding.tenantId(), binding.issuerFingerprint(), binding.kind(), binding.key()), binding) != null) throw unavailable();
-            requireIssuer(binding, issuers); ports.requireScope(binding.kind());
+            requireIssuer(binding, issuers);
         }
         this.bindings = Map.copyOf(values);
     }
@@ -89,7 +94,7 @@ public final class TianshuContextProvider implements ContextProvider {
         try {
             var digest = MessageDigest.getInstance("SHA-256");
             try (var output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
-                write(output, "TIANJI_TIANSHU_LITERAL_CONTEXT_V1");
+                write(output, "TIANJI_TIANSHU_SI_LITERAL_CONTEXT_V1");
                 var declared = new ArrayList<Map.Entry<Kind, DefinitionResourceRef>>();
                 request.snapshot().definition().dependencies().prompts().forEach(reference -> declared.add(Map.entry(Kind.PROMPT, reference)));
                 request.snapshot().definition().dependencies().skills().forEach(reference -> declared.add(Map.entry(Kind.SKILL, reference)));
@@ -101,7 +106,10 @@ public final class TianshuContextProvider implements ContextProvider {
                     write(output, item.getKey().name()); write(output, item.getValue().key());
                     write(output, Long.toString(actor.tenantId())); write(output, actor.issuerFingerprint());
                     write(output, binding.connectionId());
-                    for (var coordinate : coordinates(connections.get(binding.connectionId()).scope, binding)) write(output, coordinate);
+                    var ports = connections.get(binding.connectionId());
+                    write(output, ports.authority.target().bindingId());
+                    write(output, Long.toString(ports.authority.target().version()));
+                    for (var coordinate : coordinates(ports.scope, binding)) write(output, coordinate);
                 }
             }
             return HexFormat.of().formatHex(digest.digest());
@@ -126,42 +134,70 @@ public final class TianshuContextProvider implements ContextProvider {
         var binding = bindings.get(new Key(actor.tenantId(), actor.issuerFingerprint(), kind, reference.key()));
         if (binding == null) throw denied();
         var ports = connections.get(binding.connectionId());
-        requireIssuer(binding, issuers); ports.requireScope(kind);
+        requireIssuer(binding, issuers);
         if (deadline - System.nanoTime() < ports.timeout.toNanos()) throw unavailable();
         if (!ports.slots.tryAcquire()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_CAPACITY_EXCEEDED, "Tianshu context source capacity is unavailable");
         try {
-            var query = new DdcAiResourceQuery(binding.namespace(), binding.resourceKey(), reference.version(), binding.resourceId());
-            String text;
-            Long versionId;
-            if (kind == Kind.PROMPT) {
-                var value = ports.prompt.get(query);
-                if (value == null) throw unavailable();
-                match(binding, reference, value.getResourceId(), value.getResourceKey(), value.getVersionNo(), value.getContentSha256());
-                text = value.getTemplate(); versionId = value.getVersionId();
-                var content = DdcAiContentDTO.builder().promptText(text).nodes(List.of()).build();
-                if (text == null || text.isBlank() || text.getBytes(StandardCharsets.UTF_8).length > 1_048_576
-                        || !VALIDATOR.isValid(content, null) || !reference.contentSha256().equals(contentHash(text, List.of()))) throw unavailable();
-            } else {
-                var value = ports.skill.get(query);
-                if (value == null || value.getFiles() == null || value.getFiles().size() > 257) throw unavailable();
-                match(binding, reference, value.getResourceId(), value.getResourceKey(), value.getVersionNo(), value.getContentSha256());
-                versionId = value.getVersionId();
-                var nodes = value.getFiles().stream().map(node -> DdcAiNodeDTO.builder().path(node.getPath()).nodeType(node.getNodeType()).content(node.getContent()).build()).toList();
-                if (!VALIDATOR.isValid(DdcAiContentDTO.builder().nodes(nodes).build(), null)) throw unavailable();
-                var sorted = new ArrayList<>(nodes);
-                sorted.sort((left, right) -> Arrays.compareUnsigned(left.getPath().getBytes(StandardCharsets.UTF_8), right.getPath().getBytes(StandardCharsets.UTF_8)));
-                if (!reference.contentSha256().equals(contentHash(null, sorted))) throw unavailable();
-                text = "Published Skill files (read-only text):\n" + JSON.writeValueAsString(sorted.stream()
-                        .map(node -> new SkillTextNode(node.getPath(), node.getNodeType().name(), node.getContent())).toList());
-            }
-            requireIssuer(binding, issuers); ports.requireScope(kind);
-            if (versionId == null || versionId < 1 || deadline - System.nanoTime() < 0) throw unavailable();
+            var siKind = DdcSiKindEnum.valueOf(kind.name());
+            var snapshot = ports.read(binding, siKind, reference.version());
+            String text = checkedText(ports.scope, binding, siKind, reference, snapshot);
+            requireIssuer(binding, issuers);
+            if (deadline - System.nanoTime() < 0) throw unavailable();
             return new Fragment(kind, reference.key(), Long.toString(reference.version()), reference.contentSha256(),
-                    provenance(ports.scope, binding, versionId, reference.version()), text, clock.instant());
-        } catch (AgentLedgerException failure) { throw failure; }
-        catch (DdcException failure) { throw "TIANSHU_AI_SCOPE_FORBIDDEN".equals(failure.getStatus()) ? denied() : unavailable(); }
-        catch (RuntimeException | JsonProcessingException failure) { throw unavailable(); }
-        finally { ports.slots.release(); }
+                    provenance(ports.scope, binding, snapshot), text, clock.instant());
+        } catch (AgentLedgerException failure) {
+            throw failure;
+        } catch (StatusRuntimeException failure) {
+            if (failure.getStatus().getCode() == Status.Code.PERMISSION_DENIED) throw denied();
+            throw unavailable();
+        } catch (RuntimeException | JsonProcessingException failure) {
+            log.debug("Rejected a Tianshu context source");
+            throw unavailable();
+        } finally {
+            ports.slots.release();
+        }
+    }
+
+    private static String checkedText(DdcAiClientScope scope, TianshuContextProperties.Binding binding,
+            DdcSiKindEnum kind, DefinitionResourceRef reference, DdcSiResourceDescriptor snapshot) throws JsonProcessingException {
+        if (!Objects.equals(snapshot.getTenantId(), scope.tenantId())
+                || !scope.bizCode().equals(snapshot.getBizCode()) || !scope.env().equals(snapshot.getEnvCode())
+                || !binding.namespace().equals(snapshot.getNamespaceCode())
+                || !Objects.equals(binding.resourceId(), snapshot.getResourceId())
+                || !binding.resourceKey().equals(snapshot.getResourceKey())
+                || !Objects.equals(binding.ownerAppCode(), snapshot.getOwnerAppCode())
+                || kind != snapshot.getKind() || snapshot.getStatus() == null || !snapshot.getStatus().isQueryableByRuntime()
+                || !Objects.equals(reference.version(), snapshot.getResolvedVersionNo())
+                || snapshot.getDependencyManifest() == null || !snapshot.isExecutionSnapshotShapeValid()
+                || !reference.contentSha256().equals(snapshot.getDigestSha256())) throw unavailable();
+        String body = snapshot.getSpecJson();
+        if (body == null || body.length() > MAX_SNAPSHOT_BYTES) throw unavailable();
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > MAX_SNAPSHOT_BYTES || !reference.contentSha256().equals(modelTextHash(body))) throw unavailable();
+        JsonNode spec = DdcConfigCanonicalJson.parse(bytes);
+        if (!spec.isObject()) throw unavailable();
+        return kind == DdcSiKindEnum.PROMPT ? literal(spec.get("promptText")) : skillText(spec);
+    }
+
+    private static String skillText(JsonNode spec) throws JsonProcessingException {
+        if (spec.has("skillMarkdown")) {
+            if (spec.has("files")) throw unavailable();
+            return literal(spec.get("skillMarkdown"));
+        }
+        JsonNode files = spec.get("files");
+        if (files == null || !files.isArray() || files.size() > 257) throw unavailable();
+        var nodes = new ArrayList<DdcAiNodeDTO>(files.size());
+        for (JsonNode file : files) nodes.add(JSON.treeToValue(file, DdcAiNodeDTO.class));
+        if (!VALIDATOR.isValid(DdcAiContentDTO.builder().nodes(nodes).build(), null)) throw unavailable();
+        nodes.sort((left, right) -> Arrays.compareUnsigned(left.getPath().getBytes(StandardCharsets.UTF_8),
+                right.getPath().getBytes(StandardCharsets.UTF_8)));
+        return "Published Skill files (read-only text):\n" + JSON.writeValueAsString(nodes.stream()
+                .map(node -> new SkillTextNode(node.getPath(), node.getNodeType().name(), node.getContent())).toList());
+    }
+
+    private static String literal(JsonNode node) {
+        if (node == null || !node.isTextual() || node.textValue().isBlank()) throw unavailable();
+        return node.textValue();
     }
 
     static void requireIssuer(TianshuContextProperties.Binding binding, TrustedIssuerRegistry issuers) {
@@ -169,63 +205,54 @@ public final class TianshuContextProvider implements ContextProvider {
         if (trusted.status() != TrustedIssuerRegistry.Status.ACTIVE || trusted.realmType() != TrustedIssuerRegistry.RealmType.TENANT
                 || !Long.toString(binding.tenantId()).equals(trusted.tenantId())) throw unavailable();
     }
-    private static void match(TianshuContextProperties.Binding binding, DefinitionResourceRef reference, Long resourceId, String key, Long version, String hash) {
-        if (resourceId == null || resourceId != binding.resourceId() || !binding.resourceKey().equals(key) || version == null
-                || version != reference.version() || !reference.contentSha256().equals(hash)) throw unavailable();
-    }
-
-    /** Recomputes Tianshu's v1 domain-separated wire digest, including the complete Skill tree. */
-    static String contentHash(String prompt, List<DdcAiNodeDTO> sortedNodes) {
-        try {
-            var digest = MessageDigest.getInstance("SHA-256");
-            try (var output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
-                output.write(CONTENT_DOMAIN); output.writeByte(0); output.writeByte(prompt == null ? 2 : 1);
-                if (prompt != null) write(output, prompt);
-                else {
-                    output.writeInt(sortedNodes.size());
-                    for (var node : sortedNodes) {
-                        write(output, node.getPath());
-                        output.writeByte(node.getNodeType() == DdcAiNodeTypeEnum.DIRECTORY ? 0 : 1);
-                        if (node.getNodeType() == DdcAiNodeTypeEnum.FILE) write(output, node.getContent());
-                    }
-                }
-            }
-            return HexFormat.of().formatHex(digest.digest());
-        } catch (NoSuchAlgorithmException | IOException failure) { throw new IllegalStateException("Tianshu content digest is unavailable"); }
-    }
     private static void write(DataOutputStream output, String value) throws IOException {
         byte[] bytes = value.getBytes(StandardCharsets.UTF_8); output.writeLong(bytes.length); output.write(bytes);
     }
-    private static String provenance(DdcAiClientScope scope, TianshuContextProperties.Binding binding, long versionId, long version) {
-        var value = new StringBuilder("tianshu:v1:");
-        var fields = new ArrayList<>(coordinates(scope, binding));
-        fields.add(Long.toString(versionId)); fields.add(Long.toString(version));
-        for (var field : fields) {
-            value.append(field.length()).append(':').append(field);
+
+    private static String provenance(DdcAiClientScope scope, TianshuContextProperties.Binding binding, DdcSiResourceDescriptor value) {
+        try {
+            var digest = MessageDigest.getInstance("SHA-256");
+            try (var output = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
+                write(output, "TIANJI_TIANSHU_SI_CONTEXT_SOURCE_V1");
+                for (var coordinate : coordinates(scope, binding)) write(output, coordinate);
+                write(output, Long.toString(value.getResolvedVersionId()));
+                write(output, Long.toString(value.getResolvedVersionNo()));
+                write(output, value.getDependencyManifest().closureDigest());
+            }
+            return "tianshu-si:v1:" + HexFormat.of().formatHex(digest.digest());
+        } catch (NoSuchAlgorithmException | IOException failure) {
+            throw unavailable();
         }
-        return value.toString();
-    }
-    private static List<String> coordinates(DdcAiClientScope scope, TianshuContextProperties.Binding binding) {
-        return List.of(Long.toString(scope.tenantId()), scope.bizCode(), scope.env(), scope.appCode(), binding.namespace(), binding.resourceKey(), Long.toString(binding.resourceId()));
     }
 
-    public static final class Ports {
+    private static List<String> coordinates(DdcAiClientScope scope, TianshuContextProperties.Binding binding) {
+        return List.of(Long.toString(scope.tenantId()), scope.bizCode(), scope.env(), scope.appCode(), binding.namespace(),
+                Objects.requireNonNullElse(binding.ownerAppCode(), ""), binding.resourceKey(), Long.toString(binding.resourceId()));
+    }
+
+    static final class Ports {
         private final DdcAiClientScope scope;
-        private final DdcPromptClient prompt;
-        private final DdcSkillClient skill;
+        private final DdcSiCatalogClient catalog;
+        private final TianshuContextConfiguration.CatalogAuthorityVO authority;
         private final Duration timeout;
         private final Semaphore slots;
-        public Ports(DdcAiClientScope scope, DdcPromptClient prompt, DdcSkillClient skill, Duration timeout, int maxConcurrent) {
-            this.scope = Objects.requireNonNull(scope, "scope"); this.prompt = prompt; this.skill = skill;
-            if (timeout == null || timeout.compareTo(Duration.ofMillis(100)) < 0 || timeout.compareTo(Duration.ofSeconds(30)) > 0
+
+        Ports(DdcAiClientScope scope, DdcSiCatalogClient catalog, Duration timeout, int maxConcurrent,
+              TianshuContextConfiguration.CatalogAuthorityVO authority) {
+            this.scope = Objects.requireNonNull(scope, "scope");
+            this.catalog = Objects.requireNonNull(catalog, "catalog");
+            this.authority = Objects.requireNonNull(authority, "authority");
+            if (timeout == null || timeout.compareTo(Duration.ofMillis(100)) < 0 || timeout.compareTo(Duration.ofSeconds(5)) > 0
                     || maxConcurrent < 1 || maxConcurrent > 16) throw unavailable();
-            this.timeout = timeout; this.slots = new Semaphore(maxConcurrent);
+            this.timeout = timeout;
+            this.slots = new Semaphore(maxConcurrent);
         }
-        private void requireScope(Kind kind) {
-            try {
-                var actual = kind == Kind.PROMPT ? Objects.requireNonNull(prompt).scope() : Objects.requireNonNull(skill).scope();
-                if (!scope.equals(actual)) throw unavailable();
-            } catch (RuntimeException failure) { throw unavailable(); }
+
+        private DdcSiResourceDescriptor read(TianshuContextProperties.Binding binding, DdcSiKindEnum kind, long version) {
+            Supplier<DdcSiResourceDescriptor> exact = () -> catalog.resolveExecutionResource(scope.tenantId(), scope.bizCode(),
+                    binding.namespace(), scope.env(), binding.ownerAppCode(), scope.appCode(), kind, binding.resourceKey(), version)
+                    .orElseThrow(TianshuContextProvider::unavailable);
+            return TianshuContextConfiguration.withAuthority(authority, exact);
         }
     }
     private record Key(long tenant, String issuer, Kind kind, String key) { }

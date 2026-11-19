@@ -1,17 +1,17 @@
 package top.egon.cola.platform.tianji.agent.server.context;
 
+import io.grpc.Status;
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
-import top.egon.cola.component.rpc.tianshu.autoconfigure.DdcRpcProperties;
-import top.egon.cola.component.tianshu.api.client.DdcPromptClient;
-import top.egon.cola.component.tianshu.api.client.DdcSkillClient;
-import top.egon.cola.component.tianshu.error.DdcException;
+import top.egon.cola.component.rpc.consumer.reference.RpcServiceTargetVO;
+import top.egon.cola.component.rpc.context.identity.RpcProcessIdentity;
+import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.component.tianshu.model.si.DdcSiLifecycleStatusEnum;
+import top.egon.cola.component.tianshu.model.si.DdcSiResourceDescriptor;
+import top.egon.cola.component.tianshu.model.si.DdcSiSourceTypeEnum;
 import top.egon.cola.component.tianshu.model.ai.DdcAiClientScope;
-import top.egon.cola.component.tianshu.model.ai.DdcAiNodeDTO;
-import top.egon.cola.component.tianshu.model.ai.DdcAiNodeTypeEnum;
-import top.egon.cola.component.tianshu.model.ai.DdcAiResourceQuery;
-import top.egon.cola.component.tianshu.model.ai.DdcPromptResult;
-import top.egon.cola.component.tianshu.model.ai.DdcSkillResult;
 import top.egon.cola.platform.tianji.agent.application.context.ContextProvider;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
@@ -51,16 +51,24 @@ class TianshuContextProviderTest {
     static final Instant NOW = Instant.parse("2026-10-30T00:00:00Z");
     static final URI ISSUER = URI.create("https://idp.example/20");
     static final DdcAiClientScope SCOPE = new DdcAiClientScope(101, "xingyuan", "test", "tianji");
-    static final String PROMPT_HASH = "20456df72878d3281630add2a2dc2d19baf9cda3f8b9efc8860e5ba00baa7a68";
-    static final String SKILL_HASH = "5d572227769bb0863b83e66e4e732513e41995b78700e9688cad60300794de62";
-    private final DdcPromptClient prompt = mock(DdcPromptClient.class);
-    private final DdcSkillClient skill = mock(DdcSkillClient.class);
+    static final RpcServiceTargetVO TARGET = new RpcServiceTargetVO(
+            "si-context", 1L, "platform", "tianshu-si", 19080, Set.of(TianshuContextConfiguration.METHOD));
+    static final RpcProcessIdentity PROCESS = new RpcProcessIdentity("tianji-agent-server", "test", "localhost", 10L, "agent-test");
+    static final TianshuContextConfiguration.CatalogAuthorityVO AUTHORITY =
+            new TianshuContextConfiguration.CatalogAuthorityVO(TARGET, PROCESS, "20");
+    private static final String PROMPT_SPEC = "{\"promptText\":\"Review\"}";
+    private static final String SKILL_SPEC = "{\"files\":[{\"path\":\"\",\"nodeType\":\"DIRECTORY\",\"content\":null},"
+            + "{\"path\":\"SKILL.md\",\"nodeType\":\"FILE\",\"content\":\"Review\"}]}";
+    static final String PROMPT_HASH = sha256(PROMPT_SPEC);
+    static final String SKILL_HASH = sha256(SKILL_SPEC);
+    private final DdcSiCatalogClient catalog = mock(DdcSiCatalogClient.class);
     private final TrustedIssuerRegistry issuers = issuers();
 
     @Test
-    void canonical_prompt_and_complete_skill_tree_match_independent_v1_wire_vectors() {
-        assertEquals(PROMPT_HASH, TianshuContextProvider.contentHash("Review", List.of()));
-        assertEquals(SKILL_HASH, TianshuContextProvider.contentHash(null, nodes()));
+    void contextTransportAcceptsTheFixedSiCatalogInsteadOfLegacyAiClientHandles() throws Exception {
+        assertNotNull(TianshuContextProvider.Ports.class.getDeclaredConstructor(
+                DdcAiClientScope.class, DdcSiCatalogClient.class, Duration.class, int.class,
+                TianshuContextConfiguration.CatalogAuthorityVO.class));
     }
 
     @Test
@@ -71,24 +79,21 @@ class TianshuContextProviderTest {
         assertEquals(List.of(ContextProvider.Kind.PROMPT, ContextProvider.Kind.SKILL), result.stream().map(ContextProvider.Fragment::kind).toList());
         assertEquals("Review", result.getFirst().text());
         assertTrue(result.getLast().text().contains("SKILL.md"));
-        assertTrue(result.getFirst().provenanceId().contains("3:101"));
+        assertTrue(result.getFirst().provenanceId().startsWith("tianshu-si:v1:"));
         provider.revalidate(request, result);
-        verify(prompt, times(2)).get(new DdcAiResourceQuery("prompts", "review", 2L, 10L));
-        verify(skill, times(2)).get(new DdcAiResourceQuery("skills", "review-skill", 3L, 20L));
+        verify(catalog, times(2)).resolveExecutionResource(101L, "xingyuan", "prompts", "test", "prompt-owner", "tianji", DdcSiKindEnum.PROMPT, "review", 2L);
+        verify(catalog, times(2)).resolveExecutionResource(101L, "xingyuan", "skills", "test", null, "tianji", DdcSiKindEnum.SKILL, "review-skill", 3L);
         assertEquals(PROMPT_HASH, result.getFirst().sourceSha256());
         assertEquals(NOW, result.getFirst().observedAt());
     }
 
     @Test
-    void wrong_origin_or_unproven_transport_scope_is_rejected_before_remote_reads() {
+    void wrong_actor_tenant_or_issuer_is_rejected_before_remote_reads() {
         var provider = provider();
         assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class,
                 () -> provider.provide(request(21, ISSUER, true, false))).code());
         assertThrows(AgentLedgerException.class, () -> provider.provide(request(20, URI.create("https://other-idp.example/20"), true, false)));
-        verify(prompt, never()).get(any()); verify(skill, never()).get(any());
-        when(prompt.scope()).thenReturn(new DdcAiClientScope(202, "xingyuan", "test", "tianji"));
-        assertThrows(AgentLedgerException.class, () -> provider.provide(request(20, ISSUER, true, false)));
-        verify(prompt, never()).get(any());
+        verifyNoInteractions(catalog);
     }
 
     @Test
@@ -102,22 +107,41 @@ class TianshuContextProviderTest {
                 authorization.requestSha256(), authorization.snapshotSha256(), authorization.policyVersionRef(), true, authorization.deadlineAt());
         var verified = new ContextProvider.Request(current, original.snapshot(), original.leaseEpoch(), original.timeout(), true);
         assertDoesNotThrow(() -> provider.revalidateHistory(verified, List.of(source)));
-        verify(prompt, times(2)).get(new DdcAiResourceQuery("prompts", "review", 2L, 10L));
-        doThrow(new DdcException(56307, "TIANSHU_AI_SCOPE_FORBIDDEN", "private-denial-detail")).when(prompt).get(any());
+        verify(catalog, times(2)).resolveExecutionResource(101L, "xingyuan", "prompts", "test", "prompt-owner", "tianji", DdcSiKindEnum.PROMPT, "review", 2L);
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenThrow(Status.PERMISSION_DENIED
+                .withDescription("private-denial-detail").asRuntimeException());
         assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class, () -> provider.revalidateHistory(verified, List.of(source))).code());
     }
 
     @Test
     void response_identity_version_hash_and_actual_text_are_all_checked() {
         var provider = provider();
-        List<Consumer<DdcPromptResult>> changes = List.of(value -> value.setResourceId(11L), value -> value.setResourceKey("other"),
-                value -> value.setVersionNo(3L), value -> value.setContentSha256("a".repeat(64)), value -> value.setTemplate("tampered"),
-                value -> value.setVersionId(null));
+        List<Consumer<DdcSiResourceDescriptor>> changes = List.of(value -> value.setResourceId(11L),
+                value -> value.setResourceKey("other"), value -> value.setTenantId(102L), value -> value.setEnvCode("foreign"),
+                value -> value.setOwnerAppCode("foreign"), value -> value.setNamespaceCode("other"),
+                value -> value.setResolvedVersionNo(3L), value -> value.setDigestSha256("a".repeat(64)),
+                value -> value.setSpecJson("{}"), value -> value.setResolvedVersionId(null),
+                value -> value.setDependencyManifest(null), value -> value.setStatus(DdcSiLifecycleStatusEnum.ARCHIVED));
         for (var change : changes) {
-            var response = prompt(); change.accept(response); when(prompt.get(any())).thenReturn(response);
+            var response = prompt(11L);
+            change.accept(response);
+            when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                    eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenReturn(Optional.of(response));
             assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class,
                     () -> provider.provide(request(20, ISSUER, true, false))).code());
         }
+    }
+
+    @Test
+    void legacyAiDigestCannotBeSubstitutedForThePublishedSiBodyDigest() {
+        var originalAiDigest = "20456df72878d3281630add2a2dc2d19baf9cda3f8b9efc8860e5ba00baa7a68";
+        var original = request(20, ISSUER, true, false, originalAiDigest);
+
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                assertThrows(AgentLedgerException.class, () -> provider().provide(original)).code());
+        verify(catalog).resolveExecutionResource(101L, "xingyuan", "prompts", "test", "prompt-owner", "tianji",
+                DdcSiKindEnum.PROMPT, "review", 2L);
     }
 
     @Test
@@ -125,12 +149,16 @@ class TianshuContextProviderTest {
         var provider = provider();
         var request = request(20, ISSUER, true, false);
         var previous = provider.provide(request);
-        when(prompt.get(any())).thenReturn(prompt().setVersionId(12L));
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenReturn(Optional.of(prompt(12L)));
         assertThrows(AgentLedgerException.class, () -> provider.revalidate(request, previous));
-        doThrow(new DdcException(56307, "TIANSHU_AI_SCOPE_FORBIDDEN", "private-denial-detail")).when(prompt).get(any());
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenThrow(Status.PERMISSION_DENIED
+                .withDescription("private-denial-detail").asRuntimeException());
         assertEquals(AgentErrorCodeEnum.TIANJI_PERMISSION_DENIED, assertThrows(AgentLedgerException.class,
                 () -> provider.revalidate(request, previous)).code());
-        doThrow(new IllegalStateException("private-transport-detail")).when(prompt).get(any());
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenThrow(new IllegalStateException("private-transport-detail"));
         var failure = assertThrows(AgentLedgerException.class, () -> provider.revalidate(request, previous));
         assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, failure.code());
         assertFalse(failure.toString().contains("private-transport-detail")); assertNull(failure.getCause());
@@ -143,7 +171,7 @@ class TianshuContextProviderTest {
         var original = request(20, ISSUER, true, false);
         var shortRequest = new ContextProvider.Request(original.authorization(), original.snapshot(), 1, Duration.ofMillis(200));
         assertThrows(AgentLedgerException.class, () -> provider.provide(shortRequest));
-        verify(prompt, never()).get(any());
+        verifyNoInteractions(catalog);
     }
 
     @Test
@@ -154,14 +182,19 @@ class TianshuContextProviderTest {
             assertThrows(IllegalStateException.class, () -> provider.provide(request(20, ISSUER, true, false)));
             assertThrows(IllegalStateException.class, () -> provider.revalidate(request(20, ISSUER, true, false), List.of()));
         } finally { TransactionSynchronizationManager.setActualTransactionActive(false); }
-        verify(prompt, never()).get(any()); verify(skill, never()).get(any());
+        verifyNoInteractions(catalog);
     }
 
     @Test
     void concurrent_reads_have_no_queue_and_release_capacity_after_completion() throws Exception {
         var provider = provider();
         var started = new CountDownLatch(1); var release = new CountDownLatch(1);
-        when(prompt.get(any())).thenAnswer(call -> { started.countDown(); if (!release.await(3, TimeUnit.SECONDS)) throw new IllegalStateException(); return prompt(); });
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenAnswer(call -> {
+                    started.countDown();
+                    if (!release.await(3, TimeUnit.SECONDS)) throw new IllegalStateException();
+                    return Optional.of(prompt(11L));
+                });
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             var first = executor.submit(() -> provider.provide(request(20, ISSUER, true, false)));
             try {
@@ -175,38 +208,66 @@ class TianshuContextProviderTest {
     }
 
     private TianshuContextProvider provider() {
-        when(prompt.scope()).thenReturn(SCOPE); when(skill.scope()).thenReturn(SCOPE);
-        when(prompt.get(any())).thenReturn(prompt());
-        when(skill.get(any())).thenReturn(new DdcSkillResult().setResourceId(20L).setResourceKey("review-skill").setVersionId(21L)
-                .setVersionNo(3L).setContentSha256(SKILL_HASH).setFiles(nodes()));
-        return new TianshuContextProvider(properties(), Map.of("library", new TianshuContextProvider.Ports(SCOPE, prompt, skill, Duration.ofSeconds(1), 1)),
-                issuers, Clock.fixed(NOW, ZoneOffset.UTC));
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.PROMPT), anyString(), any())).thenReturn(Optional.of(prompt(11L)));
+        when(catalog.resolveExecutionResource(anyLong(), anyString(), anyString(), anyString(), any(), anyString(),
+                eq(DdcSiKindEnum.SKILL), anyString(), any())).thenReturn(Optional.of(
+                snapshot(DdcSiKindEnum.SKILL, "skills", null, "review-skill", 20L, 21L, 3L, SKILL_SPEC)));
+        return new TianshuContextProvider(properties(), Map.of("library", new TianshuContextProvider.Ports(
+                SCOPE, catalog, Duration.ofSeconds(1), 1, AUTHORITY)), issuers, Clock.fixed(NOW, ZoneOffset.UTC));
     }
+
     static TianshuContextProperties properties() {
-        var rpc = new DdcRpcProperties(); rpc.setTarget("localhost:19080"); rpc.setDefaultTimeout(Duration.ofSeconds(1)); rpc.setConnectTimeout(Duration.ofMillis(100));
-        rpc.getTls().setEnabled(true); rpc.getTls().setDevelopmentPlaintext(false);
-        return new TianshuContextProperties(List.of(new TianshuContextProperties.Connection("library", 101, "xingyuan", "test", "tianji", rpc, 1)),
-                List.of(new TianshuContextProperties.Binding(20, ISSUER, "library", ContextProvider.Kind.PROMPT, "fixed", "prompts", "review", 10),
-                        new TianshuContextProperties.Binding(20, ISSUER, "library", ContextProvider.Kind.SKILL, "fixed-skill", "skills", "review-skill", 20)));
+        var connection = new TianshuContextProperties.Connection("library", 101, "xingyuan", "test", "tianji",
+                20, TARGET.bindingId(), TARGET.version(), Duration.ofSeconds(1), 1);
+        return new TianshuContextProperties(true, List.of(connection),
+                List.of(new TianshuContextProperties.Binding(20, ISSUER, "library", ContextProvider.Kind.PROMPT,
+                                "fixed", "prompts", "prompt-owner", "review", 10),
+                        new TianshuContextProperties.Binding(20, ISSUER, "library", ContextProvider.Kind.SKILL,
+                                "fixed-skill", "skills", null, "review-skill", 20)));
     }
+
     static TrustedIssuerRegistry issuers() {
         var registry = mock(TrustedIssuerRegistry.class);
         when(registry.findByIssuer(ISSUER.toString())).thenReturn(Optional.of(new TrustedIssuerRegistry.TrustedIssuerVO(ISSUER,
                 URI.create("https://idp.example/jwks"), "tenant:20", TrustedIssuerRegistry.RealmType.TENANT, "20", TrustedIssuerRegistry.Status.ACTIVE, 1)));
         return registry;
     }
-    private static DdcPromptResult prompt() {
-        return new DdcPromptResult().setResourceId(10L).setResourceKey("review").setVersionId(11L).setVersionNo(2L).setContentSha256(PROMPT_HASH).setTemplate("Review");
+    static DdcSiResourceDescriptor prompt(long versionId) {
+        return snapshot(DdcSiKindEnum.PROMPT, "prompts", "prompt-owner", "review", 10L, versionId, 2L, PROMPT_SPEC);
     }
-    private static List<DdcAiNodeDTO> nodes() {
-        return List.of(DdcAiNodeDTO.builder().path("").nodeType(DdcAiNodeTypeEnum.DIRECTORY).build(),
-                DdcAiNodeDTO.builder().path("SKILL.md").nodeType(DdcAiNodeTypeEnum.FILE).content("Review").build());
+
+    private static DdcSiResourceDescriptor snapshot(DdcSiKindEnum kind, String namespace, String owner, String key,
+            long id, long versionId, long version, String spec) {
+        String digest = sha256(spec);
+        var root = new DdcSiDependencyManifestVO.VersionIdentityVO("101", Long.toString(id), Long.toString(versionId),
+                Long.toString(version), kind, "test", digest);
+        return new DdcSiResourceDescriptor().setTenantId(101L).setBizCode("xingyuan").setEnvCode("test")
+                .setNamespaceCode(namespace).setOwnerAppCode(owner).setKind(kind).setResourceKey(key).setResourceId(id)
+                .setResolvedVersionId(versionId).setResolvedVersionNo(version).setActiveVersionNo(9)
+                .setDigestSha256(digest).setSpecJson(spec).setStatus(DdcSiLifecycleStatusEnum.PUBLISHED)
+                .setSourceType(DdcSiSourceTypeEnum.CONSOLE)
+                .setDependencyManifest(DdcSiDependencyManifestVO.create(root, null, List.of(), List.of()));
     }
+
+    private static String sha256(String source) {
+        try {
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(source.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException unavailable) {
+            throw new AssertionError(unavailable);
+        }
+    }
+
     static ContextProvider.Request request(long tenant, URI issuer, boolean prompt, boolean skill) {
+        return request(tenant, issuer, prompt, skill, PROMPT_HASH);
+    }
+
+    private static ContextProvider.Request request(long tenant, URI issuer, boolean prompt, boolean skill, String promptDigest) {
         var policy = new ExecutionPolicyDTO(Duration.ofSeconds(30), Duration.ofSeconds(5), Duration.ofSeconds(2), 4, 0, 1000, 100,
                 BigDecimal.ONE, "USD", 1, Set.of(), "retry-v1", "approval-v1");
         var definition = new AgentDefinitionSpecDTO("assistant", 2, "CONFIG", null, "1", "1",
-                new DefinitionDependenciesDTO(prompt ? List.of(new DefinitionResourceRef("fixed", 2, PROMPT_HASH)) : List.of(),
+                new DefinitionDependenciesDTO(prompt ? List.of(new DefinitionResourceRef("fixed", 2, promptDigest)) : List.of(),
                         skill ? List.of(new DefinitionResourceRef("fixed-skill", 3, SKILL_HASH)) : List.of(), List.of(), "route-v1", "policy-v1"), policy, Map.of());
         var snapshot = new AgentExecutionSnapshot(definition, "a".repeat(64), policy, new AgentInputDTO("private-input", null, null), null);
         var actor = TrustedAgentActor.verified(tenant, TrustedAgentActor.SubjectType.USER, "alice", issuer.toString());
