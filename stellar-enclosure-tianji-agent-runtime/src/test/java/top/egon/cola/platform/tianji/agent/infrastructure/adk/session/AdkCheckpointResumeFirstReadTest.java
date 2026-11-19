@@ -36,6 +36,18 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class AdkCheckpointResumeFirstReadTest {
+    @Test
+    void runtimeV2WithoutASessionCannotBeReclassifiedAsTheLegacyFirstInputResume() {
+        var serviceActor = new TrustedAgentActor(40001, TrustedAgentActor.SubjectType.SERVICE, "process", "a".repeat(64));
+        var runtime = new AgentRunAuthorization.Request(serviceActor, "runtime-v2", "fixed-si-agent", 1,
+                "b".repeat(64), "c".repeat(64), "d".repeat(64), "fixed-policy", false,
+                Instant.parse("2026-11-06T00:01:00Z"));
+        // RUNTIME_V2 restores its frozen SI bundle from the run ledger at the queued worker
+        // boundary.  The independently authorized legacy session cut is not an alternate path.
+        assertThrows(IllegalArgumentException.class, () -> new ResumeRequest(runtime,
+                new ResumeCommand(runtime.runId(), "resume-command", 1), "e".repeat(64)));
+    }
+
     private static final TrustedAgentActor OWNER = new TrustedAgentActor(40001, TrustedAgentActor.SubjectType.USER, "fixture", "a".repeat(64));
     private static final String APP = "tianji";
     private static final String SESSION = "session";

@@ -10,6 +10,7 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.validation.annotation.Validated;
 import top.egon.cola.component.agentflow.adapter.adk.AdkAgentExecutorAdapter.TemplateResolver;
+import top.egon.cola.component.agentflow.adapter.adk.AdkAgentExecutorAdapter.RegisteredTemplateVO;
 import top.egon.cola.component.agentflow.agentic.AgenticPlanVO;
 import top.egon.cola.component.agentflow.api.capability.CallPermitVO;
 import top.egon.cola.component.agentflow.api.context.ContextFragmentResult;
@@ -23,6 +24,7 @@ import top.egon.cola.component.agentflow.api.execution.AgentExecutor;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextBO;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
 import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization.Decision;
@@ -50,6 +52,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -80,12 +83,21 @@ public class AgentRuntimeExecutionService {
     private final TransactionTemplate receiptTransaction;
     @Qualifier("tianjiRuntimeToolExecutionService")
     private final AgentRuntimeToolExecutionService tools;
+    @Qualifier("tianjiFrozenTemplateBindings")
+    private final FrozenTemplateBindings frozenTemplates;
     private final String workerId = UUID.randomUUID().toString();
 
     public AgentRuntimeExecutionService(AgentLedgerService ledger, AgentRunAuthorization authorization, AgentExecutor executor,
                                         TianjiHostContextConverter contextMapper, ScheduledThreadPoolExecutor control,
                                         AgentRuntimeCallReceiptStore receipts, TransactionTemplate receiptTransaction) {
         this(ledger, authorization, executor, contextMapper, control, receipts, receiptTransaction, null);
+    }
+
+    public AgentRuntimeExecutionService(AgentLedgerService ledger, AgentRunAuthorization authorization, AgentExecutor executor,
+                                        TianjiHostContextConverter contextMapper, ScheduledThreadPoolExecutor control,
+                                        AgentRuntimeCallReceiptStore receipts, TransactionTemplate receiptTransaction,
+                                        AgentRuntimeToolExecutionService tools) {
+        this(ledger, authorization, executor, contextMapper, control, receipts, receiptTransaction, tools, null);
     }
 
     boolean usesLedger(AgentLedgerService candidate) { return ledger == candidate; }
@@ -124,6 +136,62 @@ public class AgentRuntimeExecutionService {
                 && registered.contentSha256().equals(pinned.contentSha256());
     }
 
+    /** Hands one immutable registration across the executor's asynchronous worker boundary. */
+    public static final class FrozenTemplateBindings implements TemplateResolver {
+        private final TemplateResolver registrations;
+        private final ConcurrentHashMap<BindingKey, PreparedBinding> active = new ConcurrentHashMap<>();
+
+        public FrozenTemplateBindings(TemplateResolver hostRegistry, AgenticTemplateConverter converter) {
+            registrations = verifiedTemplates(Objects.requireNonNull(hostRegistry, "host registry"),
+                    Objects.requireNonNull(converter, "template converter"));
+        }
+
+        public Binding prepare(AgentExecutionCommand.TemplateVO expected, ContextScopeVO scope, FrozenSiBundleVO bundle) {
+            Objects.requireNonNull(bundle, "fixed SI bundle");
+            var key = BindingKey.of(expected, scope);
+            if (active.containsKey(key)) throw unavailable();
+            var registration = registrations.resolve(expected, scope);
+            if (registration == null) throw unavailable();
+            var configuration = TemplateConfigurationVO.fromExactWire(expected.configuration());
+            for (var leaf : registration.plan().agents()) {
+                var ref = leaf.instructionRef();
+                var fixedRef = new TemplateDependencyRefVO(ref.key(), ref.version(), ref.contentSha256());
+                String agentKey = configuration.agenticPlan() == null ? expected.key() : leaf.agentKey();
+                if (!bundle.instruction(agentKey, fixedRef).equals(registration.leaves().get(leaf.agentKey()).instruction())) {
+                    throw TianjiSiExecutionBundleService.unavailable();
+                }
+            }
+            var prepared = new PreparedBinding(registration);
+            if (active.putIfAbsent(key, prepared) != null) throw unavailable();
+            return () -> active.remove(key, prepared);
+        }
+
+        @Override
+        public RegisteredTemplateVO resolve(AgentExecutionCommand.TemplateVO expected, ContextScopeVO scope) {
+            var prepared = active.get(BindingKey.of(expected, scope));
+            return prepared == null ? null : prepared.registration;
+        }
+
+        public interface Binding extends AutoCloseable {
+            @Override void close();
+        }
+
+        private static final class PreparedBinding {
+            private final RegisteredTemplateVO registration;
+            private PreparedBinding(RegisteredTemplateVO registration) { this.registration = registration; }
+        }
+
+        private record BindingKey(ContextScopeVO scope, String key, long version, String contentSha256,
+                                  String executorRef, Map<String, Object> configuration) {
+            static BindingKey of(AgentExecutionCommand.TemplateVO expected, ContextScopeVO scope) {
+                Objects.requireNonNull(expected, "expected template");
+                Objects.requireNonNull(scope, "execution scope");
+                return new BindingKey(scope, expected.key(), expected.version(), expected.contentSha256(),
+                        expected.executorRef(), expected.configuration());
+            }
+        }
+    }
+
     public AgentRunDTO executeQueued(@NotNull @Valid TrustedAgentActor actor, @NotNull @Valid GetAgentRunQuery query) {
         Objects.requireNonNull(actor, "actor");
         Objects.requireNonNull(query, "query");
@@ -134,6 +202,8 @@ public class AgentRuntimeExecutionService {
         var queued = material.run();
         if (AgentRunTransitions.terminal(queued.status())) return queued;
         if (queued.status() != AgentRunStatusEnum.QUEUED) throw revisionConflict();
+        TianjiSiExecutionBundleService.verifyFrozenBundle(actor, material.template(), material.siBundle());
+        if (ADK_EXECUTOR_REF.equals(material.template().getExecutorRef()) && frozenTemplates == null) throw unavailable();
         if (!queued.deadlineAt().isAfter(ledger.databaseNow())) {
             return ledger.expireDeadline(actor, query, queued.revision());
         }
@@ -144,7 +214,9 @@ public class AgentRuntimeExecutionService {
         var claim = ledger.claimRuntimeV2(actor, query, queued.revision(), workerId, LEASE_DURATION);
         var claimed = ledger.runtimeExecutionMaterial(actor, query);
         if (AgentRunTransitions.terminal(claimed.run().status())) return claimed.run();
-        if (!material.authorization().equals(claimed.authorization()) || !claim.run().equals(claimed.run())) {
+        TianjiSiExecutionBundleService.verifyFrozenBundle(actor, claimed.template(), claimed.siBundle());
+        if (!material.authorization().equals(claimed.authorization()) || !claim.run().equals(claimed.run())
+                || !material.siBundle().equals(claimed.siBundle())) {
             throw revisionConflict();
         }
         Decision afterClaim = authorize(claimed, AgentRunAuthorization.Boundary.MODEL);
@@ -189,12 +261,17 @@ public class AgentRuntimeExecutionService {
         var timer = control.scheduleWithFixedDelay(() -> checkLease(actor, claim, stop, cancellation),
                 1, 1, TimeUnit.SECONDS);
         AgentExecutionResult result;
+        FrozenTemplateBindings.Binding templateBinding = null;
         try {
             Duration remaining = Duration.between(ledger.databaseNow(), deadline);
             if (!remaining.isPositive()) {
                 result = stoppedResult(query, LeaseHeartbeat.DEADLINE_EXPIRED);
             } else {
-                AgentExecutionHandle handle = executor.execute(executionCommand(material), contextMapper.toTarget(context));
+                var command = executionCommand(material);
+                if (ADK_EXECUTOR_REF.equals(material.template().getExecutorRef())) {
+                    templateBinding = frozenTemplates.prepare(command.getTemplate(), scope, material.siBundle());
+                }
+                AgentExecutionHandle handle = executor.execute(command, contextMapper.toTarget(context));
                 var completion = handle.completion().toCompletableFuture();
                 var observed = CompletableFuture.anyOf(completion, stop).get(remaining.toNanos(), TimeUnit.NANOSECONDS);
                 result = switch (observed) {
@@ -214,6 +291,7 @@ public class AgentRuntimeExecutionService {
             var reason = failure instanceof CompletionException && failure.getCause() != null ? failure.getCause() : failure;
             result = executionFailed(query, reason);
         } finally {
+            if (templateBinding != null) templateBinding.close();
             timer.cancel(false);
             cancellation.complete(null);
         }

@@ -92,6 +92,35 @@ class TianshuContextConfigurationTest {
     }
 
     @Test
+    void linkedRunAdmissionBindsItsIdentityTenantAndFixedSiDataTenant() {
+        var authority = configuration.tianjiSiExecutionAuthority(properties(), transport(), bindings(), PROCESS,
+                idp(Set.of("20")), credentials);
+        var tenantResolver = configuration.tianshuContextTenantResolver();
+        var invocation = invocation(TARGET, PROCESS);
+        var actor = verifiedServiceActor(20);
+        var connection = properties().connections().getFirst();
+        var scope = new top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.ScopeVO(
+                connection.bizCode(), "main", connection.env(), "owner", connection.appCode());
+        var material = mock(top.egon.cola.platform.tianji.agent.si.TianshuTemplateResolver.ResolvedAgentExecutionBundle.class);
+        assertSame(material, authority.read(actor, scope, dataTenant -> {
+            assertEquals(101L, dataTenant);
+            assertEquals(Optional.of("20"), tenantResolver.resolve(invocation, null));
+            return material;
+        }));
+        assertThrows(StatusRuntimeException.class, () -> tenantResolver.resolve(invocation, null));
+        assertThrows(top.egon.cola.platform.tianji.agent.domain.AgentLedgerException.class,
+                () -> authority.read(verifiedServiceActor(21), scope, unrelated -> {
+                    throw new AssertionError("Foreign realm must not enter the native transport frame");
+                }));
+    }
+
+    private static top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor verifiedServiceActor(long tenant) {
+        return top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.verified(tenant,
+                top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor.SubjectType.SERVICE, "process-worker",
+                ISSUER.toASCIIString());
+    }
+
+    @Test
     void requestIdReadinessSanitizesFailuresWithoutInitializingAnEngine() {
         var provider = configuration.tianjiTianshuContextProvider(properties(),
                 transport(), issuers(), catalog, bindings(), PROCESS, idp(Set.of("20")), credentials);

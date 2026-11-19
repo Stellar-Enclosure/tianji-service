@@ -107,6 +107,27 @@ class RuntimeCompatibilityIT {
         assertUnavailable(verifier);
     }
 
+    @Test
+    void originalPreSiRuntimeWireKeepsItsHashAndRejectsNullOrInventedManifestFields() throws Exception {
+        var codec = new AgentJsonCodec();
+        var template = AgentJsonCodecTest.runtimeTemplate(HASH);
+        var command = AgentJsonCodecTest.runtimeCommand(template);
+        var original = codec.runtimeSnapshot("b".repeat(64), "run-history", command, template);
+        String stored = codec.writeRuntimeSnapshot(original);
+        assertEquals("bc6dbfaae66889153d1b935b507370ba3dc8c344a0a77ea20828ad22a1c9d95f", original.snapshotSha256());
+        assertEquals(stored, codec.writeRuntimeSnapshot(codec.readRuntimeSnapshot(stored)));
+        assertNull(codec.readRuntimeSnapshot(stored).siBundle());
+        assertEquals(AgentLedgerService.RunProfileEnum.RUNTIME_V2, codec.persistedProfile(stored));
+        var nullUpgrade = codec.readObject(stored);
+        nullUpgrade.put("siBundle", null);
+        assertThrows(IllegalStateException.class,
+                () -> codec.readRuntimeSnapshot(codec.write(nullUpgrade, AgentJsonCodec.MAX_SNAPSHOT_BYTES)));
+        var unknown = codec.readObject(stored);
+        unknown.put("closureDigest", HASH);
+        assertThrows(IllegalStateException.class,
+                () -> codec.persistedProfile(codec.write(unknown, AgentJsonCodec.MAX_SNAPSHOT_BYTES)));
+    }
+
     private static void assertPackagedManifest() throws Exception {
         try (var manifest = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/manifest.json");
              var runtime = RuntimeCompatibilityIT.class.getResourceAsStream("/db/tianji-agent/" + MIGRATION);

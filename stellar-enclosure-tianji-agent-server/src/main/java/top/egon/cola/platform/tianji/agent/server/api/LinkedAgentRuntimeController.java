@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLinkedSubmissionService;
 import top.egon.cola.platform.tianji.agent.server.security.TianjiAgentAccess;
@@ -53,6 +54,8 @@ public class LinkedAgentRuntimeController {
     private final Environment environment;
     @Qualifier("tianjiServiceExecutionGrantIssuer")
     private final ObjectProvider<TianjiServiceExecutionGrantIssuer> issuers;
+    @Qualifier("tianjiSiExecutionBundleService")
+    private final ObjectProvider<TianjiSiExecutionBundleService> bundles;
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     ResponseEntity<AgentErrorDTO> invalidCommand() {
@@ -70,7 +73,12 @@ public class LinkedAgentRuntimeController {
         var issuer = issuers.getIfAvailable();
         try {
             var run = submissions.submitRuntimeV2(authorized.actor(), command, () -> issuer != null
-                    && environment.getProperty(AgentRuntimeTemplateController.NEW_ADMISSION, Boolean.class, false));
+                    && environment.getProperty(AgentRuntimeTemplateController.NEW_ADMISSION, Boolean.class, false),
+                    template -> {
+                        var preparation = bundles.getIfAvailable();
+                        if (preparation == null) throw unavailable();
+                        return preparation.prepare(authorized.actor(), template);
+                    });
             if (!validRevision(run.revision())) throw unavailable();
             if (run.status() == AgentRunStatusEnum.QUEUED) {
                 if (issuer == null) throw unavailable();

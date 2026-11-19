@@ -2,6 +2,12 @@ package top.egon.cola.platform.tianji.agent.infrastructure.persistence;
 
 import org.junit.jupiter.api.Test;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentInputDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentEventDTO;
@@ -13,6 +19,13 @@ import top.egon.cola.platform.tianji.contract.agent.ExecutionPolicyOverrideDTO;
 import top.egon.cola.platform.tianji.contract.agent.StartAgentRunCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -26,6 +39,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class AgentJsonCodecTest {
     private final AgentJsonCodec codec = new AgentJsonCodec();
+    static final String SI_PROMPT_SPEC = "{\"promptText\":\"Approved governed instruction\"}";
+    static final String SI_PROMPT_DIGEST = rawSiDigest(SI_PROMPT_SPEC);
 
     @Test
     void native_authorization_and_future_unknown_event_types_keep_the_existing_json_envelope() {
@@ -158,6 +173,141 @@ class AgentJsonCodecTest {
         assertNotEquals(codec.processLinkHash(link), codec.processLinkHash(changed));
         var differentTrace = new StartAgentRunCommand("review", 1, null, "key", "business", "trace-b", command.input(), null);
         assertNotEquals(codec.linkedRequestHash(command, link), codec.linkedRequestHash(differentTrace, link));
+    }
+
+    @Test
+    void historical_runtime_snapshot_keeps_original_hash_without_inventing_si_evidence() throws Exception {
+        var template = runtimeTemplate("a".repeat(64));
+        var command = runtimeCommand(template);
+        var original = codec.runtimeSnapshot("b".repeat(64), "run-history", command, template);
+        String stored = codec.writeRuntimeSnapshot(original);
+        assertEquals(Set.of("runtimeProfile", "snapshotSha256", "ownerSha256", "runId", "command", "template"),
+                codec.readObject(stored).keySet());
+        var loaded = codec.readRuntimeSnapshot(stored);
+        assertEquals("bc6dbfaae66889153d1b935b507370ba3dc8c344a0a77ea20828ad22a1c9d95f", original.snapshotSha256());
+        assertEquals(original.snapshotSha256(), loaded.snapshotSha256());
+        assertEquals(stored, codec.writeRuntimeSnapshot(loaded));
+        assertNull(loaded.getClass().getDeclaredMethod("siBundle").invoke(loaded),
+                "pre-SI persisted history must remain explicitly uninstrumented");
+    }
+
+    @Test
+    void si_snapshot_binds_the_complete_manifest_and_all_material_under_its_hash() throws Exception {
+        var template = runtimeTemplate(SI_PROMPT_DIGEST);
+        var command = runtimeCommand(template);
+        var bundle = frozenBundle(31L, template, SI_PROMPT_SPEC);
+        var snapshot = codec.runtimeSnapshot("b".repeat(64), "run-frozen", command, template, bundle);
+        String stored = codec.writeRuntimeSnapshot(snapshot);
+        var loaded = codec.readRuntimeSnapshot(stored);
+        assertEquals(bundle, loaded.siBundle());
+        assertEquals(bundle.closureDigest(), loaded.siBundle().closureDigest());
+        assertEquals(snapshot.snapshotSha256(), loaded.snapshotSha256());
+        assertEquals(AgentLedgerService.RunProfileEnum.RUNTIME_V2, codec.persistedProfile(stored));
+        assertNotEquals(codec.runtimeSnapshot("b".repeat(64), "run-frozen", command, template).snapshotSha256(),
+                snapshot.snapshotSha256());
+        var altered = frozenBundle(31L, template, "{\"promptText\":\"A different immutable instruction\"}");
+        assertNotEquals(snapshot.snapshotSha256(),
+                codec.runtimeSnapshot("b".repeat(64), "run-frozen", command, template, altered).snapshotSha256());
+        assertFalse(snapshot.toString().contains("Approved governed instruction"));
+        assertFalse(stored.contains("accessToken"));
+        assertFalse(stored.contains("clientSecret"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void si_snapshot_rejects_missing_null_unknown_numeric_and_tampered_material() throws Exception {
+        var template = runtimeTemplate(SI_PROMPT_DIGEST);
+        var snapshot = codec.runtimeSnapshot("b".repeat(64), "run-frozen", runtimeCommand(template), template,
+                frozenBundle(31L, template, SI_PROMPT_SPEC));
+        String stored = codec.writeRuntimeSnapshot(snapshot);
+        for (String mutation : List.of("null", "remove", "digest", "body", "version", "numeric", "unknown")) {
+            Map<String, Object> wire = codec.readObject(stored);
+            Map<String, Object> bundle = (Map<String, Object>) wire.get("siBundle");
+            Map<String, Object> manifest = (Map<String, Object>) bundle.get("manifest");
+            switch (mutation) {
+                case "null" -> wire.put("siBundle", null);
+                case "remove" -> wire.remove("siBundle");
+                case "digest" -> manifest.put("closureDigest", "f".repeat(64));
+                case "body" -> ((Map<String, Object>) ((List<?>) bundle.get("resources")).getFirst())
+                        .put("specJson", "{\"modelKey\":\"another-model\"}");
+                case "version" -> ((Map<String, Object>) manifest.get("root")).put("versionNo", "2");
+                case "numeric" -> ((Map<String, Object>) manifest.get("root")).put("versionId", 201);
+                case "unknown" -> bundle.put("accessToken", "untrusted-never-accepted");
+                default -> throw new AssertionError(mutation);
+            }
+            assertThrows(IllegalStateException.class,
+                    () -> codec.readRuntimeSnapshot(codec.write(wire, AgentJsonCodec.MAX_SNAPSHOT_BYTES)), mutation);
+        }
+    }
+
+    @Test
+    void only_new_si_snapshots_have_the_larger_bounded_material_budget() throws Exception {
+        var template = runtimeTemplate(SI_PROMPT_DIGEST);
+        var small = frozenBundle(31L, template, SI_PROMPT_SPEC);
+        String skillSpec = "{\"skillMarkdown\":\"" + "x".repeat(1_048_000) + "\"}";
+        var skill = new VersionIdentityVO("31", "103", "203", "1", DdcSiKindEnum.SKILL, "test", rawSiDigest(skillSpec));
+        var nodes = new java.util.ArrayList<>(small.manifest().nodes()); nodes.add(skill);
+        var edges = new java.util.ArrayList<>(small.manifest().edges()); edges.add(new EdgeVO("201", "203"));
+        var manifest = DdcSiDependencyManifestVO.create(small.manifest().root(), null, nodes, edges);
+        var resources = new java.util.ArrayList<>(small.resources());
+        resources.add(new SiResourceVO(skill, "large-approved-skill", "agent-owner", skillSpec));
+        var large = new FrozenSiBundleVO(small.bizCode(), small.namespaceCode(), small.envCode(),
+                small.ownerAppCode(), small.callerAppCode(), manifest, resources);
+        var command = runtimeCommand(template);
+        String stored = codec.writeRuntimeSnapshot(codec.runtimeSnapshot("b".repeat(64), "run-large", command, template, large));
+        assertTrue(stored.getBytes(StandardCharsets.UTF_8).length > AgentJsonCodec.MAX_SNAPSHOT_BYTES);
+        assertEquals(large, codec.readRuntimeSnapshot(stored).siBundle());
+        assertEquals(AgentLedgerService.RunProfileEnum.RUNTIME_V2, codec.persistedProfile(stored));
+        command.setInput(Map.of("oversized", "x".repeat(AgentJsonCodec.MAX_SNAPSHOT_BYTES)));
+        assertThrows(IllegalArgumentException.class, () -> codec.runtimeRequestHash(command));
+        assertThrows(IllegalStateException.class,
+                () -> codec.readRuntimeSnapshot(stored + " ".repeat(AgentJsonCodec.MAX_SI_SNAPSHOT_BYTES)));
+    }
+
+    static FrozenSiBundleVO frozenBundle(long tenantId, AgentRuntimeTemplateCommand template, String promptSpec) {
+        String promptDigest = rawSiDigest(promptSpec);
+        String agentSpec = "{\"modelKey\":\"" + template.getConfiguration().modelRef()
+                + "\",\"systemInstruction\":\"Use the approved prompt\"}";
+        var root = new VersionIdentityVO(Long.toString(tenantId), "101", "201",
+                Long.toString(template.getTemplateVersion()), DdcSiKindEnum.AGENT, "test", rawSiDigest(agentSpec));
+        var prompt = new VersionIdentityVO(Long.toString(tenantId), "102", "202",
+                Long.toString(template.getConfiguration().instructionRef().version()), DdcSiKindEnum.PROMPT,
+                "test", promptDigest);
+        var manifest = DdcSiDependencyManifestVO.create(root, null, List.of(prompt), List.of(new EdgeVO("201", "202")));
+        return new FrozenSiBundleVO("fixture-biz", "default", "test", "agent-owner", "tianji-caller", manifest,
+                List.of(new SiResourceVO(root, template.getTemplateKey(), "agent-owner", agentSpec),
+                        new SiResourceVO(prompt, template.getConfiguration().instructionRef().key(), "agent-owner", promptSpec)));
+    }
+
+    static String rawSiDigest(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException unsupportedRuntime) {
+            throw new IllegalStateException(unsupportedRuntime);
+        }
+    }
+
+    static AgentRuntimeTemplateCommand runtimeTemplate(String instructionDigest) {
+        var empty = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
+                "required", List.of(), "additionalProperties", false));
+        var limits = new AgentRuntimeTemplateCommand.TechnicalLimitsVO(Duration.ofMinutes(1),
+                Duration.ofSeconds(10), Duration.ofSeconds(10), 2, 2, 1, 4096, 1024);
+        return new AgentRuntimeTemplateCommand("billing", 1,
+                AgentRuntimeTemplateCommand.RuntimeProfileEnum.RUNTIME_V2, "agent-executor", empty, empty, empty,
+                new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
+                        new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("approved-instructions", 1,
+                                instructionDigest), "registered-model", List.of(), null), limits);
+    }
+
+    static LinkedAgentRuntimeCommand runtimeCommand(AgentRuntimeTemplateCommand template) throws Exception {
+        Instant deadline = Instant.parse("2026-11-19T23:00:00Z");
+        String schemaDigest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(ProcessTypedJson.canonicalBytes(template.getInputSchema().toWire())));
+        return new LinkedAgentRuntimeCommand("runtime-history", new AgentProcessLink("process-source",
+                WorkerScopeTypeEnum.BPMN, "instance-history", "occurrence-history", template.contentSha256(),
+                deadline.minusSeconds(30)), "node-history", template.getTemplateKey(), template.getTemplateVersion(),
+                template.contentSha256(), "c".repeat(64), schemaDigest, schemaDigest, Map.of(), Map.of(),
+                template.getLimits(), deadline, "correlation-history");
     }
 
     static AgentDefinitionSpecDTO spec(long version, Map<String, Object> configuration, Set<String> tools) {

@@ -10,6 +10,8 @@ import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLinkedSubmissionService;
@@ -26,6 +28,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
 import top.egon.cola.platform.tianji.contract.orchestration.WorkerScopeTypeEnum;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianquan.jianshen.starter.permission.PermissionExecutionGuard;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceIdentityPrincipal;
@@ -44,7 +47,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -75,6 +80,9 @@ class LinkedAgentRuntimeControllerTest {
              "attemptDeadlineAt":"2026-11-11T11:02:00Z","correlationId":"corr-101"}
             """.formatted(HASH, HASH, HASH, HASH, HASH, AgentRuntimeTemplateControllerTest.LIMITS);
 
+    private final TianjiSiExecutionBundleService bundleService = mock(TianjiSiExecutionBundleService.class);
+    private final AgentRuntimeTemplateCommand selectedTemplate = new AgentRuntimeTemplateCommand();
+    private final FrozenSiBundleVO preparedBundle = mock(FrozenSiBundleVO.class);
     private final AgentLinkedSubmissionService submissions = mock(AgentLinkedSubmissionService.class);
     private final TianjiServiceExecutionGrantIssuer issuer = mock(TianjiServiceExecutionGrantIssuer.class);
     private final PermissionExecutionGuard permissions = mock(PermissionExecutionGuard.class);
@@ -100,12 +108,14 @@ class LinkedAgentRuntimeControllerTest {
                 ISSUER, URI.create("https://idp.example/jwks"), "tenant:20", TrustedIssuerRegistry.RealmType.TENANT, "20",
                 TrustedIssuerRegistry.Status.ACTIVE, 1)));
         SecurityContextHolder.getContext().setAuthentication(new IdpAuthenticationToken(principal, List.of(), ISSUER));
-        var beans = new StaticListableBeanFactory(Map.of("tianjiServiceExecutionGrantIssuer", issuer));
+        var beans = new StaticListableBeanFactory(Map.of("tianjiServiceExecutionGrantIssuer", issuer,
+                "tianjiSiExecutionBundleService", bundleService));
         var clock = Clock.fixed(NOW, ZoneOffset.UTC);
         var access = new TianjiAgentAccess(permissions, clock);
         var bindings = new TianjiLinkedDispatchBindings(new TianjiLinkedDispatchProperties(true, false, List.of(binding)), issuers, clock);
         var controller = new LinkedAgentRuntimeController(submissions, access, bindings, environment,
-                beans.getBeanProvider(TianjiServiceExecutionGrantIssuer.class));
+                beans.getBeanProvider(TianjiServiceExecutionGrantIssuer.class),
+                beans.getBeanProvider(TianjiSiExecutionBundleService.class));
         mvc = MockMvcBuilders.standaloneSetup(controller).addFilters(new VerifiedAgentIssuerFilter())
                 .setControllerAdvice(new AgentApiErrors(), new AgentRequestBodyAdvice(access)).build();
     }
@@ -116,11 +126,14 @@ class LinkedAgentRuntimeControllerTest {
 
     @Test void accepts_an_exact_linked_runtime_command_on_the_private_v2_route() throws Exception {
         environment.withProperty(AgentRuntimeTemplateController.NEW_ADMISSION, "true");
-        when(submissions.submitRuntimeV2(eq(actor), any(), any())).thenAnswer(call -> {
+        when(bundleService.prepare(actor, selectedTemplate)).thenReturn(preparedBundle);
+        when(submissions.submitRuntimeV2(eq(actor), any(), any(), any())).thenAnswer(call -> {
             LinkedAgentRuntimeCommand command = call.getArgument(1);
             assertTrue(((BooleanSupplier) call.getArgument(2)).getAsBoolean());
             assertTrue(link.equals(command.getLink()));
             assertTrue(command.getInput().equals(Map.of("text", "example")));
+            Function<AgentRuntimeTemplateCommand, FrozenSiBundleVO> preparation = call.getArgument(3);
+            assertThat(preparation.apply(selectedTemplate)).isSameAs(preparedBundle);
             return queued;
         });
         when(submissions.resolveRuntimeV2(actor, query)).thenReturn(Optional.of(new LinkedAgentSubmissionDTO(false, queued)));
@@ -131,11 +144,12 @@ class LinkedAgentRuntimeControllerTest {
                 .andExpect(jsonPath("$.revision").value(1)).andExpect(jsonPath("$.input").doesNotExist());
         verify(issuer).ensureRuntime(any(), eq(principal), eq(binding), any(), eq(queued));
         verify(permissions, times(3)).requireExecution(TianjiAgentPermissions.LINKED_RUNTIME_SUBMIT_API);
+        verify(bundleService).prepare(actor, selectedTemplate);
     }
 
     @Test void keeps_exact_replay_and_returns_existing_conflict_when_new_admission_is_off() throws Exception {
         var existing = new AtomicBoolean();
-        when(submissions.submitRuntimeV2(eq(actor), any(), any())).thenAnswer(call -> {
+        when(submissions.submitRuntimeV2(eq(actor), any(), any(), any())).thenAnswer(call -> {
             assertFalse(((BooleanSupplier) call.getArgument(2)).getAsBoolean());
             if (!existing.get()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_FEATURE_NOT_AVAILABLE, "disabled");
             LinkedAgentRuntimeCommand command = call.getArgument(1);
@@ -154,12 +168,26 @@ class LinkedAgentRuntimeControllerTest {
         mvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON).content(BODY.replace("nx-101", "nx-changed")))
                 .andExpect(status().isConflict()).andExpect(jsonPath("$.code").value("TIANJI_IDEMPOTENCY_CONFLICT"));
         verify(issuer).ensureRuntime(any(), eq(principal), eq(binding), any(), eq(queued));
+        verifyNoInteractions(bundleService);
+    }
+
+    @Test void unavailable_frozen_material_prevents_linked_start_and_grant_issuance() throws Exception {
+        environment.withProperty(AgentRuntimeTemplateController.NEW_ADMISSION, "true");
+        when(bundleService.prepare(actor, selectedTemplate)).thenThrow(TianjiSiExecutionBundleService.unavailable());
+        when(submissions.submitRuntimeV2(eq(actor), any(), any(), any())).thenAnswer(call -> {
+            Function<AgentRuntimeTemplateCommand, FrozenSiBundleVO> preparation = call.getArgument(3);
+            preparation.apply(selectedTemplate);
+            throw new AssertionError("Missing SI material must stop admission");
+        });
+        mvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON).content(BODY))
+                .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE"));
+        verifyNoInteractions(issuer);
     }
 
     @Test void refuses_to_acknowledge_an_old_stored_revision_that_cannot_be_represented() throws Exception {
         var old = new AgentRunDTO(RUN_ID, "extract", 1, null, AgentRunStatusEnum.QUEUED, null, false, 0, 0, 1,
                 NOW.plusSeconds(120), NOW, null);
-        when(submissions.submitRuntimeV2(eq(actor), any(), any())).thenReturn(old);
+        when(submissions.submitRuntimeV2(eq(actor), any(), any(), any())).thenReturn(old);
         mvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON).content(BODY))
                 .andExpect(status().isServiceUnavailable()).andExpect(jsonPath("$.code").value("TIANJI_DEPENDENCY_UNAVAILABLE"))
                 .andExpect(jsonPath("$.revision").doesNotExist());
@@ -176,7 +204,7 @@ class LinkedAgentRuntimeControllerTest {
         assertThatThrownBy(() -> mvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON)
                 .content(BODY.replace("ps-main", "other-source")))).hasCauseInstanceOf(AccessDeniedException.class);
         verifyNoInteractions(submissions, issuer);
-        when(submissions.submitRuntimeV2(eq(actor), any(), any())).thenThrow(
+        when(submissions.submitRuntimeV2(eq(actor), any(), any(), any())).thenThrow(
                 new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DISPATCH_EXPIRED, "expired"));
         mvc.perform(post(PATH).contentType(MediaType.APPLICATION_JSON).content(BODY.replace("11:00:30Z", "10:59:59Z")
                         .replace("11:02:00Z", "11:00:00Z")))

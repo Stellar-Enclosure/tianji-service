@@ -5,6 +5,7 @@ import org.springframework.beans.factory.SmartInitializingSingleton;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
@@ -17,6 +18,7 @@ import top.egon.cola.component.rpc.consumer.reference.RpcServiceTargetVO;
 import top.egon.cola.component.rpc.context.identity.RpcProcessIdentity;
 import top.egon.cola.component.rpc.contract.identity.RpcServiceIdentity;
 import top.egon.cola.component.tianshu.api.client.DdcSiCatalogClient;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
 import top.egon.cola.platform.tianquan.shoubing.contract.ServiceTokenContext;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties;
 import top.egon.cola.platform.tianquan.shoubing.starter.autoconfigure.IdpStarterProperties.RpcConsumerModeEnum;
@@ -33,8 +35,8 @@ import java.util.Set;
 import java.util.function.Supplier;
 
 /** Binds published Prompt and Skill reads to the approved native SI Service. */
-@Configuration(proxyBeanMethods = false)
-@ConditionalOnProperty(prefix = "stellar.tianji.agent.context.tianshu", name = "enabled", havingValue = "true")
+@Configuration(value = "tianjiTianshuContextConfiguration", proxyBeanMethods = false)
+@ConditionalOnExpression("${stellar.tianji.agent.context.tianshu.enabled:false} or (" + TianshuContextConfiguration.RUN_ADMISSION + ")")
 @EnableConfigurationProperties(TianshuContextProperties.class)
 public class TianshuContextConfiguration {
     static final String SERVICE = "egon.tianshu.v1.DdcSiResourceGrpcService";
@@ -42,9 +44,12 @@ public class TianshuContextConfiguration {
     private static final String GROUP = "tianshu";
     private static final String VERSION = "1.0.0";
     private static final String SI_RPC = "egon.cola.component.tianshu.si.rpc.";
+    static final String RUN_ADMISSION = "${stellar.tianji.agent.api.enabled:false} and "
+            + "${stellar.tianji.agent.linked.enabled:false} and ${stellar.tianji.agent.runtime-v2.enabled:false}";
     private static final ScopedValue<CatalogAuthorityVO> READ_AUTHORITY = ScopedValue.newInstance();
 
     @Bean("tianshuContextPrerequisites")
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.context.tianshu", name = "enabled", havingValue = "true")
     static BeanFactoryPostProcessor tianshuContextPrerequisites(Environment environment) {
         return ignored -> {
             if (!environment.getProperty("stellar.tianji.agent.runtime.enabled", Boolean.class, false)
@@ -56,6 +61,7 @@ public class TianshuContextConfiguration {
     }
 
     @Bean("tianjiTianshuContextProvider")
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.context.tianshu", name = "enabled", havingValue = "true")
     TianshuContextProvider tianjiTianshuContextProvider(TianshuContextProperties properties,
             Environment environment, @Qualifier("trustedIssuerRegistry") TrustedIssuerRegistry issuers,
             @Qualifier("ddcSiCatalogRpcClient") DdcSiCatalogClient catalog,
@@ -68,21 +74,47 @@ public class TianshuContextConfiguration {
         credentials.validateConfiguration();
         properties.bindings().forEach(binding -> TianshuContextProvider.requireIssuer(binding, issuers));
         var readers = new HashMap<String, TianshuContextProvider.Ports>();
-        Duration transportDeadline = Binder.get(environment).bind(SI_RPC + "default-timeout", Duration.class).orElse(null);
         for (var connection : properties.connections()) {
             if (properties.bindings().stream().noneMatch(binding -> binding.connectionId().equals(connection.id()))) throw invalid();
-            RpcServiceTargetVO target = definitions.resolve(connection.bindingId(),
-                    new RpcServiceIdentity(SERVICE, GROUP, VERSION), Set.of(METHOD)).target();
-            if (!connection.bindingId().equals(environment.getProperty(SI_RPC + "binding-id"))
-                    || connection.bindingVersion() != environment.getProperty(SI_RPC + "binding-version", Long.class, 0L)
-                    || connection.bindingVersion() != target.version()
-                    || !connection.timeout().equals(transportDeadline)
-                    || !target.methods().equals(Set.of(METHOD)) || !process.env().equals(connection.env())) throw invalid();
-            CatalogAuthorityVO authority = verifiedAuthority(connection, process, target, idp);
+            CatalogAuthorityVO authority = executionAuthority(connection, environment, definitions, process, idp);
             readers.put(connection.id(), new TianshuContextProvider.Ports(connection.scope(), catalog, connection.timeout(),
                     connection.maxConcurrent(), authority));
         }
         return new TianshuContextProvider(properties, readers, issuers, Clock.systemUTC());
+    }
+
+    @Bean("tianjiSiExecutionAuthority")
+    @ConditionalOnExpression(RUN_ADMISSION)
+    TianjiSiExecutionBundleService.ExecutionAuthority tianjiSiExecutionAuthority(TianshuContextProperties properties,
+            @Qualifier("environment") Environment environment,
+            @Qualifier("rpcReferenceDefinitionResolver") RpcReferenceDefinitionResolver definitions,
+            @Qualifier("rpcProcessIdentity") RpcProcessIdentity process,
+            @Qualifier("idpStarterProperties") IdpStarterProperties idp,
+            @Qualifier("idpRpcClientCredentialInterceptorFactory") IdpRpcClientCredentialInterceptorFactory credentials) {
+        if (properties.connections().isEmpty() || !environment.getProperty(SI_RPC + "enabled", Boolean.class, false)) throw invalid();
+        credentials.validateConfiguration();
+        return (actor, scope, read) -> {
+            var selected = properties.connections().stream().filter(connection ->
+                    connection.identityTenantId() == actor.tenantId() && connection.bizCode().equals(scope.bizCode())
+                            && connection.env().equals(scope.envCode()) && connection.appCode().equals(scope.callerAppCode()))
+                    .toList();
+            if (selected.size() != 1) throw TianjiSiExecutionBundleService.unavailable();
+            var connection = selected.getFirst();
+            var approved = executionAuthority(connection, environment, definitions, process, idp);
+            return withAuthority(approved, () -> read.apply(connection.tianshuTenantId()));
+        };
+    }
+
+    private static CatalogAuthorityVO executionAuthority(TianshuContextProperties.Connection connection,
+            Environment environment, RpcReferenceDefinitionResolver definitions, RpcProcessIdentity process, IdpStarterProperties idp) {
+        Duration transportDeadline = Binder.get(environment).bind(SI_RPC + "default-timeout", Duration.class).orElse(null);
+        RpcServiceTargetVO target = definitions.resolve(connection.bindingId(),
+                new RpcServiceIdentity(SERVICE, GROUP, VERSION), Set.of(METHOD)).target();
+        if (!connection.bindingId().equals(environment.getProperty(SI_RPC + "binding-id"))
+                || connection.bindingVersion() != environment.getProperty(SI_RPC + "binding-version", Long.class, 0L)
+                || connection.bindingVersion() != target.version() || !connection.timeout().equals(transportDeadline)
+                || !target.methods().equals(Set.of(METHOD)) || !process.env().equals(connection.env())) throw invalid();
+        return verifiedAuthority(connection, process, target, idp);
     }
 
     private static CatalogAuthorityVO verifiedAuthority(TianshuContextProperties.Connection connection, RpcProcessIdentity process,
@@ -126,6 +158,7 @@ public class TianshuContextConfiguration {
     }
 
     @Bean("tianshuRpcRequestIdGuard")
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.context.tianshu", name = "enabled", havingValue = "true")
     SmartInitializingSingleton tianshuRpcRequestIdGuard(@Qualifier("tianjiTianshuContextProvider") TianshuContextProvider provider) {
         return () -> {
             // The shared native runtime uses the existing process-wide ID engine.

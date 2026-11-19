@@ -39,6 +39,7 @@ import top.egon.cola.platform.tianji.agent.application.run.AgentRunDispatcher;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRuntimeExecutionService;
 import top.egon.cola.platform.tianji.agent.application.run.AgenticTemplateConverter;
 import top.egon.cola.platform.tianji.agent.application.run.AgenticTemplateConverterImpl;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
 import top.egon.cola.platform.tianji.agent.application.context.DefaultContextAssembler;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverterImpl;
@@ -130,8 +131,9 @@ public class TianjiAgentRuntimeAutoConfiguration {
         new AgentStorageVerifier(dataSource).verifyRuntimeStorage();
         String storeRef = flowProperties.session().storeRef();
         SessionStore sessions = beans.getBean("inMemory".equals(storeRef) ? "agentSessionStore" : storeRef, SessionStore.class);
+        var frozenTemplates = new AgentRuntimeExecutionService.FrozenTemplateBindings(hostRegistry, templateConverter);
         var adk = new AdkAgentExecutorAdapter(new AgenticPlanCompiler(clock), new SpringAiExecutionModelAdapter(),
-                new McpToolAdapter(), AgentRuntimeExecutionService.verifiedTemplates(hostRegistry, templateConverter));
+                new McpToolAdapter(), frozenTemplates);
         var executor = new DefaultAgentExecutor(clock, validator,
                 new top.egon.cola.component.agentflow.context.DefaultContextAssembler(clock, validator), timers, sessions,
                 Map.of(AgentRuntimeExecutionService.ADK_EXECUTOR_REF, adk));
@@ -140,7 +142,8 @@ public class TianjiAgentRuntimeAutoConfiguration {
         receiptTransaction.setTimeout(5);
         var tools = toolExecution.getIfAvailable();
         if (tools != null && !tools.usesLedger(ledger)) throw new IllegalStateException("TIANJI_RUNTIME_TOOL_LEDGER_MISMATCH");
-        return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts, receiptTransaction, tools);
+        return new AgentRuntimeExecutionService(ledger, authorization, executor, hostConverter, control, receipts,
+                receiptTransaction, tools, frozenTemplates);
     }
 
     @Bean("tianshuTemplateResolver")
@@ -148,6 +151,24 @@ public class TianjiAgentRuntimeAutoConfiguration {
     @ConditionalOnMissingBean(TianshuTemplateResolver.class)
     TianshuTemplateResolver tianshuTemplateResolver(DdcSiCatalogClient catalogClient) {
         return new TianshuTemplateResolver(catalogClient);
+    }
+
+    @Bean("tianjiSiExecutionBundleService")
+    @ConditionalOnBean(name = {"tianshuTemplateResolver", "tianjiSiExecutionAuthority"})
+    @ConditionalOnMissingBean(TianjiSiExecutionBundleService.class)
+    @ConditionalOnProperty(prefix = "stellar.tianji.agent.runtime-v2", name = "enabled", havingValue = "true")
+    TianjiSiExecutionBundleService tianjiSiExecutionBundleService(
+            @Qualifier("tianshuTemplateResolver") TianshuTemplateResolver resolver,
+            @Qualifier("tianjiSiExecutionAuthority") TianjiSiExecutionBundleService.ExecutionAuthority authority,
+            @Qualifier("environment") Environment environment) {
+        String client = "egon.cola.component.tianshu.si.client.";
+        var scope = new TianjiSiExecutionBundleService.ScopeVO(
+                environment.getRequiredProperty(client + "biz-code"),
+                environment.getRequiredProperty(client + "namespace-code"),
+                environment.getRequiredProperty(client + "env-code"),
+                environment.getProperty("stellar.tianji.agent.si-execution.owner-app-code"),
+                environment.getRequiredProperty(client + "app-code"));
+        return new TianjiSiExecutionBundleService(resolver, scope, authority);
     }
 
     @Bean("tianjiAgentRuntimeV2AdmissionGuard")

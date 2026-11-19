@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.contract.agent.AgentDefinitionSpecDTO;
 import top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult;
 import top.egon.cola.platform.tianji.contract.agent.AgentRunStatusEnum;
@@ -43,11 +44,15 @@ import java.util.TreeSet;
 
 final class AgentJsonCodec {
     static final int MAX_SNAPSHOT_BYTES = 1_048_576;
+    // 4 MiB prepared material, JSON string escaping and the existing bounded request/template envelope.
+    static final int MAX_SI_SNAPSHOT_BYTES = 10 * 1_048_576;
     static final int MAX_EVENT_BYTES = 1_048_576;
     static final int MAX_RESULT_BYTES = 2_097_152;
     private static final TypeReference<Map<String, Object>> JSON_OBJECT = new TypeReference<>() { };
     private static final Set<String> RUNTIME_SNAPSHOT_FIELDS = Set.of("runtimeProfile", "snapshotSha256", "ownerSha256",
             "runId", "command", "template");
+    private static final Set<String> SI_RUNTIME_SNAPSHOT_FIELDS = Set.of("runtimeProfile", "snapshotSha256", "ownerSha256",
+            "runId", "command", "template", "siBundle");
     private static final Set<String> LEGACY_SNAPSHOT_FIELDS = Set.of("definition", "definitionContentSha256",
             "effectivePolicy", "input", "businessKey");
 
@@ -131,28 +136,53 @@ final class AgentJsonCodec {
     RuntimeSnapshotVO runtimeSnapshot(String ownerSha256, String runId, LinkedAgentRuntimeCommand command,
                                       AgentRuntimeTemplateCommand template) {
         return new RuntimeSnapshotVO(ownerSha256, runId, command, template,
-                runtimeSnapshotHash(ownerSha256, runId, commandWire(command), template.toWire()));
+                runtimeSnapshotHash(ownerSha256, runId, commandWire(command), template.toWire()), null);
+    }
+
+    RuntimeSnapshotVO runtimeSnapshot(String ownerSha256, String runId, LinkedAgentRuntimeCommand command,
+                                      AgentRuntimeTemplateCommand template, FrozenSiBundleVO siBundle) {
+        FrozenSiBundleVO frozen = FrozenSiBundleVO.fromExactWire(Objects.requireNonNull(siBundle, "siBundle").toWire());
+        return new RuntimeSnapshotVO(ownerSha256, runId, command, template,
+                runtimeSnapshotHash(ownerSha256, runId, commandWire(command), template.toWire(), frozen), frozen);
     }
 
     String writeRuntimeSnapshot(RuntimeSnapshotVO snapshot) {
-        return canonical(Map.of("runtimeProfile", "RUNTIME_V2", "snapshotSha256", snapshot.snapshotSha256(),
-                "ownerSha256", snapshot.ownerSha256(), "runId", snapshot.runId(),
-                "command", commandWire(snapshot.command()), "template", snapshot.template().toWire()));
+        var wire = new LinkedHashMap<String, Object>();
+        wire.put("runtimeProfile", "RUNTIME_V2"); wire.put("snapshotSha256", snapshot.snapshotSha256());
+        wire.put("ownerSha256", snapshot.ownerSha256()); wire.put("runId", snapshot.runId());
+        wire.put("command", commandWire(snapshot.command())); wire.put("template", snapshot.template().toWire());
+        if (snapshot.siBundle() != null) wire.put("siBundle", snapshot.siBundle().toWire());
+        return canonical(wire, snapshot.siBundle() == null ? MAX_SNAPSHOT_BYTES : MAX_SI_SNAPSHOT_BYTES);
     }
 
     RuntimeSnapshotVO readRuntimeSnapshot(String json) {
-        Map<String, Object> wire = strictObject(json);
-        if (!RUNTIME_SNAPSHOT_FIELDS.equals(wire.keySet()) || !"RUNTIME_V2".equals(wire.get("runtimeProfile"))
+        Map<String, Object> wire = strictObject(json, MAX_SI_SNAPSHOT_BYTES);
+        boolean hasSiBundle = SI_RUNTIME_SNAPSHOT_FIELDS.equals(wire.keySet());
+        if (!hasSiBundle && json.getBytes(StandardCharsets.UTF_8).length > MAX_SNAPSHOT_BYTES) throw invalidRuntimeData();
+        if ((!hasSiBundle && !RUNTIME_SNAPSHOT_FIELDS.equals(wire.keySet())) || !"RUNTIME_V2".equals(wire.get("runtimeProfile"))
                 || !(wire.get("snapshotSha256") instanceof String digest)
                 || !(wire.get("ownerSha256") instanceof String ownerSha256)
                 || !(wire.get("runId") instanceof String runId)) throw invalidRuntimeData();
         Map<String, Object> commandWire = exactObject(wire.get("command"));
         var command = strictRuntime.convertValue(commandWire, LinkedAgentRuntimeCommand.class);
         var template = AgentRuntimeTemplateCommand.fromExactWire(exactObject(wire.get("template")));
+        FrozenSiBundleVO siBundle = null;
+        if (hasSiBundle) {
+            try {
+                Map<String, Object> bundleWire = exactObject(wire.get("siBundle"));
+                siBundle = FrozenSiBundleVO.fromExactWire(bundleWire);
+                if (!canonical(siBundle.toWire(), MAX_SI_SNAPSHOT_BYTES).equals(canonical(bundleWire, MAX_SI_SNAPSHOT_BYTES))) throw invalidRuntimeData();
+            } catch (IllegalArgumentException malformed) {
+                throw invalidRuntimeData();
+            }
+        }
+        String expectedHash = siBundle == null
+                ? runtimeSnapshotHash(ownerSha256, runId, commandWire, template.toWire())
+                : runtimeSnapshotHash(ownerSha256, runId, commandWire, template.toWire(), siBundle);
         if (!command.isLinkedRuntimeConsistent()
                 || !canonical(commandWire(command)).equals(canonical(commandWire))
-                || !runtimeSnapshotHash(ownerSha256, runId, commandWire, template.toWire()).equals(digest)) throw invalidRuntimeData();
-        return new RuntimeSnapshotVO(ownerSha256, runId, freezeCommand(command), template, digest);
+                || !expectedHash.equals(digest)) throw invalidRuntimeData();
+        return new RuntimeSnapshotVO(ownerSha256, runId, freezeCommand(command), template, digest, siBundle);
     }
 
     AgentRuntimeTemplateCommand readRuntimeDefinition(String json) {
@@ -167,10 +197,13 @@ final class AgentJsonCodec {
     }
 
     AgentLedgerService.RunProfileEnum persistedProfile(String json) {
-        Map<String, Object> content = strictObject(json);
+        Map<String, Object> content = strictObject(json, MAX_SI_SNAPSHOT_BYTES);
+        if (!SI_RUNTIME_SNAPSHOT_FIELDS.equals(content.keySet())
+                && json.getBytes(StandardCharsets.UTF_8).length > MAX_SNAPSHOT_BYTES) throw invalidRuntimeData();
         if (content.containsKey("runtimeProfile")) {
             if (!"RUNTIME_V2".equals(content.get("runtimeProfile"))
-                    || !RUNTIME_SNAPSHOT_FIELDS.equals(content.keySet())) throw invalidRuntimeData();
+                    || (!RUNTIME_SNAPSHOT_FIELDS.equals(content.keySet())
+                    && !SI_RUNTIME_SNAPSHOT_FIELDS.equals(content.keySet()))) throw invalidRuntimeData();
             return AgentLedgerService.RunProfileEnum.RUNTIME_V2;
         }
         var fields = new TreeSet<>(content.keySet());
@@ -190,7 +223,11 @@ final class AgentJsonCodec {
     }
 
     private Map<String, Object> strictObject(String json) {
-        if (json == null || json.getBytes(StandardCharsets.UTF_8).length > MAX_SNAPSHOT_BYTES) throw invalidRuntimeData();
+        return strictObject(json, MAX_SNAPSHOT_BYTES);
+    }
+
+    private Map<String, Object> strictObject(String json, int maxBytes) {
+        if (json == null || json.getBytes(StandardCharsets.UTF_8).length > maxBytes) throw invalidRuntimeData();
         try {
             return exactObject(strictRuntime.readValue(json, JSON_OBJECT));
         } catch (JsonProcessingException | IllegalArgumentException malformed) {
@@ -225,8 +262,19 @@ final class AgentJsonCodec {
                 ProcessTypedJson.canonicalBytes(Map.of("command", command, "template", template), MAX_SNAPSHOT_BYTES));
     }
 
+    private static String runtimeSnapshotHash(String ownerSha256, String runId, Map<String, Object> command,
+                                              Map<String, Object> template, FrozenSiBundleVO bundle) {
+        return ProcessTypedJson.sha256("tianji-agent-runtime-snapshot-si-v1", ownerSha256.getBytes(StandardCharsets.UTF_8),
+                runId.getBytes(StandardCharsets.UTF_8), ProcessTypedJson.canonicalBytes(
+                        Map.of("command", command, "template", template, "siBundle", bundle.toWire()), MAX_SI_SNAPSHOT_BYTES));
+    }
+
     private static String canonical(Object wire) {
-        return new String(ProcessTypedJson.canonicalBytes(wire, MAX_SNAPSHOT_BYTES), StandardCharsets.UTF_8);
+        return canonical(wire, MAX_SNAPSHOT_BYTES);
+    }
+
+    private static String canonical(Object wire, int maxBytes) {
+        return new String(ProcessTypedJson.canonicalBytes(wire, maxBytes), StandardCharsets.UTF_8);
     }
 
     private static IllegalStateException invalidRuntimeData() {
@@ -242,7 +290,9 @@ final class AgentJsonCodec {
     }
 
     record RuntimeSnapshotVO(String ownerSha256, String runId, LinkedAgentRuntimeCommand command,
-                             AgentRuntimeTemplateCommand template, String snapshotSha256) { }
+                             AgentRuntimeTemplateCommand template, String snapshotSha256, FrozenSiBundleVO siBundle) {
+        @Override public String toString() { return "AgentJsonCodec.RuntimeSnapshotVO[redacted]"; }
+    }
 
     String definitionHash(AgentDefinitionSpecDTO spec) {
         Map<String, Object> content = new TreeMap<>();

@@ -23,6 +23,12 @@ import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.component.outbox.store.OutboxStore;
 import top.egon.cola.component.outbox.transaction.OutboxAfterCommitBuffer;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
 import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO;
 import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactEvidenceVO.DecisionEnum;
 import top.egon.cola.platform.tianji.agent.application.run.AgentResultArtifactQuery.PurposeEnum;
@@ -70,6 +76,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -78,6 +85,8 @@ import static org.mockito.Mockito.*;
 /** Real JDBC Outbox/ledger test with a controlled receiver client, only in a supplied fresh loopback database. */
 @Timeout(90)
 class AgentTerminalOutboxPostgresTest {
+    private static final String PROMPT_SPEC = "{\"promptText\":\"Fixed terminal Outbox fixture instruction\"}";
+
     @Test
     @EnabledIfSystemProperty(named = "tianji.agent.outbox.runtime-v2.postgres.test.url", matches = ".+")
     void runtime_terminal_completion_and_close_rollback_with_real_outbox_then_publish_exactly_once() throws Exception {
@@ -123,8 +132,9 @@ class AgentTerminalOutboxPostgresTest {
                 var template = runtimeTemplate();
                 ledger.publishRuntimeTemplate(owner, template, () -> true, (actor, request) -> deadline -> true);
                 var command = runtimeCommand(ledger, template, "complete");
-                var run = linked.submitRuntimeV2(owner, command, () -> true);
+                var run = linked.submitRuntimeV2(owner, command, () -> true, siAdmission(owner));
                 var query = new GetAgentRunQuery(run.runId());
+                assertEquals(runtimeBundle(owner, template), ledger.runtimeExecutionMaterial(owner, query).siBundle());
                 var claim = ledger.claimRuntimeV2(owner, query, run.revision(), "worker-one", Duration.ofSeconds(30));
                 var output = new AgentExecutionResult(run.runId(), AgentRunStatusEnum.COMPLETED, Map.of("value", "中文"),
                         null, null, null, null, "NONE");
@@ -166,7 +176,7 @@ class AgentTerminalOutboxPostgresTest {
             verify(client).receiveV2(eq(event), any(byte[].class), isNull());
 
             var cancel = runtimeCommand(ledger, template, "cancel");
-            var waiting = linked.submitRuntimeV2(owner, cancel, () -> true);
+            var waiting = linked.submitRuntimeV2(owner, cancel, () -> true, siAdmission(owner));
             var close = new LinkedAgentLookupQuery(cancel.getIdempotencyKey(), cancel.getLink());
             admin.execute("""
                     CREATE FUNCTION tianji_agent.test_v2_terminal_outbox_failure() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -193,7 +203,7 @@ class AgentTerminalOutboxPostgresTest {
             var artifactTemplate = runtimeArtifactTemplate();
             ledger.publishRuntimeTemplate(owner, artifactTemplate, () -> true, (actor, request) -> deadline -> true);
             var artifactCommand = runtimeCommand(ledger, artifactTemplate, "artifact");
-            var pendingArtifact = linked.submitRuntimeV2(owner, artifactCommand, () -> true);
+            var pendingArtifact = linked.submitRuntimeV2(owner, artifactCommand, () -> true, siAdmission(owner));
             var artifactQuery = new GetAgentRunQuery(pendingArtifact.runId());
             var artifactClaim = ledger.claimRuntimeV2(owner, artifactQuery, pendingArtifact.revision(), "worker-one", Duration.ofSeconds(30));
             var artifactOutput = new AgentExecutionResult(pendingArtifact.runId(), AgentRunStatusEnum.COMPLETED, originalArtifact.toWire(),
@@ -233,7 +243,7 @@ class AgentTerminalOutboxPostgresTest {
 
             permission.set(DecisionEnum.DENY);
             var deniedCommand = runtimeCommand(ledger, artifactTemplate, "denied-artifact");
-            var pendingDenial = linked.submitRuntimeV2(owner, deniedCommand, () -> true);
+            var pendingDenial = linked.submitRuntimeV2(owner, deniedCommand, () -> true, siAdmission(owner));
             var deniedQuery = new GetAgentRunQuery(pendingDenial.runId());
             var deniedClaim = ledger.claimRuntimeV2(owner, deniedQuery, pendingDenial.revision(), "worker-one", Duration.ofSeconds(30));
             var deniedOutput = new AgentExecutionResult(pendingDenial.runId(), AgentRunStatusEnum.COMPLETED, originalArtifact.toWire(),
@@ -345,7 +355,7 @@ class AgentTerminalOutboxPostgresTest {
                 "required", List.of(), "additionalProperties", false));
         var output = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties",
                 Map.of("value", Map.of("type", "string")), "required", List.of("value"), "additionalProperties", false));
-        var config = new TemplateConfigurationVO(new TemplateDependencyRefVO("fixture", 1, "a".repeat(64)),
+        var config = new TemplateConfigurationVO(new TemplateDependencyRefVO("fixture", 1, bodySha(PROMPT_SPEC)),
                 "model", List.of(), null);
         var limits = new TechnicalLimitsVO(Duration.ofMinutes(2), Duration.ofSeconds(20), Duration.ofSeconds(10), 1, 1, 1, 2000, 100);
         return new AgentRuntimeTemplateCommand("linked-runtime", 1, RuntimeProfileEnum.RUNTIME_V2,
@@ -378,6 +388,37 @@ class AgentTerminalOutboxPostgresTest {
     private static String schemaSha(ProcessSchemaVO schema) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(ProcessTypedJson.canonicalBytes(schema.toWire())));
+        } catch (NoSuchAlgorithmException invalid) {
+            throw new IllegalStateException(invalid);
+        }
+    }
+
+    private static Function<AgentRuntimeTemplateCommand, FrozenSiBundleVO> siAdmission(TrustedAgentActor owner) {
+        return template -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            return runtimeBundle(owner, template);
+        };
+    }
+
+    private static FrozenSiBundleVO runtimeBundle(TrustedAgentActor owner, AgentRuntimeTemplateCommand template) {
+        String spec = "{\"modelKey\":\"" + template.getConfiguration().modelRef()
+                + "\",\"systemInstruction\":\"Fixed terminal Outbox root instruction\"}";
+        String rootId = "artifact-runtime".equals(template.getTemplateKey()) ? "502" : "501";
+        String rootVersionId = "artifact-runtime".equals(template.getTemplateKey()) ? "602" : "601";
+        var root = new VersionIdentityVO(Long.toString(owner.tenantId()), rootId, rootVersionId,
+                Long.toString(template.getTemplateVersion()), DdcSiKindEnum.AGENT, "test", bodySha(spec));
+        var prompt = new VersionIdentityVO(Long.toString(owner.tenantId()), "503", "603", "1",
+                DdcSiKindEnum.PROMPT, "test", bodySha(PROMPT_SPEC));
+        var manifest = DdcSiDependencyManifestVO.create(root, null, List.of(prompt),
+                List.of(new EdgeVO(root.versionId(), prompt.versionId())));
+        return new FrozenSiBundleVO("process", "outbox", "test", null, "tianji", manifest, List.of(
+                new SiResourceVO(root, template.getTemplateKey(), null, spec),
+                new SiResourceVO(prompt, template.getConfiguration().instructionRef().key(), null, PROMPT_SPEC)));
+    }
+
+    private static String bodySha(String content) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content.getBytes(StandardCharsets.UTF_8)));
         } catch (NoSuchAlgorithmException invalid) {
             throw new IllegalStateException(invalid);
         }

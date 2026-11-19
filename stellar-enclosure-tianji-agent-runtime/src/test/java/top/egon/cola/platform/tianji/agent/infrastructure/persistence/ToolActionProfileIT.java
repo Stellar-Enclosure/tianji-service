@@ -11,6 +11,12 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.agentflow.api.context.ContextScopeVO;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionContextVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
 import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartToolTransport;
 import top.egon.cola.platform.tianji.agent.application.tool.FixedBpmnStartReceiptRead;
@@ -53,12 +59,17 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRunt
 import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand.TechnicalLimitsVO;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSchemaVO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessTypedJson;
 
 import java.sql.Timestamp;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
@@ -79,6 +90,7 @@ class ToolActionProfileIT {
     private static final long TENANT = 41;
     private static final String ISSUER = "https://idp.example/41";
     private static final String HASH = "a".repeat(64);
+    private static final String PROMPT_SPEC = "{\"promptText\":\"Approved governed instruction\"}";
     private static final TrustedAgentActor OWNER = TrustedAgentActor.verified(TENANT, TrustedAgentActor.SubjectType.SERVICE, "process-source", ISSUER);
     private static final TrustedAgentActor EXECUTOR = TrustedAgentActor.verified(TENANT, TrustedAgentActor.SubjectType.SERVICE, "process-executor", ISSUER);
     private static final ToolDescriptor TOOL = new ToolDescriptor("process.approvedStart", 1, "approved_start", "Fixed approval and effect",
@@ -435,6 +447,56 @@ class ToolActionProfileIT {
         return new ApprovedObservation("process-primary", ISSUER, "https://process.example/api", binding, proof, OWNER, verified.plusSeconds(90));
     }
 
+    private static FrozenSiBundleVO runtimeBundle(AgentRuntimeTemplateCommand template, ToolDescriptor descriptor) {
+        String agentSpec = "{\"modelKey\":\"registered-model\",\"systemInstruction\":\"Fixed governed tool root\"}";
+        String mcpSpec = mcpSpec(descriptor);
+        var root = new VersionIdentityVO(Long.toString(TENANT), "101", "201", "1", DdcSiKindEnum.AGENT, "test", bodySha(agentSpec));
+        var prompt = new VersionIdentityVO(Long.toString(TENANT), "102", "202", "1", DdcSiKindEnum.PROMPT, "test", bodySha(PROMPT_SPEC));
+        var mcp = new VersionIdentityVO(Long.toString(TENANT), "103", "203", Long.toString(descriptor.version()),
+                DdcSiKindEnum.MCP, "test", bodySha(mcpSpec));
+        // SI protects the published JSON bytes; the original runtime descriptor digest is
+        // independently retained in template/tool grants and is checked by the real tool service.
+        assertNotEquals(descriptor.reference().contentSha256(), mcp.digestSha256());
+        var manifest = DdcSiDependencyManifestVO.create(root, null, List.of(prompt, mcp), List.of(
+                new EdgeVO(root.versionId(), prompt.versionId()), new EdgeVO(root.versionId(), mcp.versionId())));
+        return new FrozenSiBundleVO("process", "governed-tools", "test", null, "tianji", manifest, List.of(
+                new SiResourceVO(root, template.getTemplateKey(), null, agentSpec),
+                new SiResourceVO(prompt, "instructions", null, PROMPT_SPEC),
+                new SiResourceVO(mcp, "governed-tool-server", null, mcpSpec)));
+    }
+
+    private static String mcpSpec(ToolDescriptor descriptor) {
+        var tool = Map.of("toolId", descriptor.key(), "name", descriptor.name(), "description", descriptor.description(),
+                "inputSchema", toolSchema(descriptor.input()), "outputSchema", toolSchema(descriptor.output()),
+                "requiredPermissions", List.of("tianji:tools:execute"), "riskLevel", "HIGH",
+                "idempotent", descriptor.policy().risk() == ToolPolicy.Risk.IDEMPOTENT_WRITE, "enabled", true);
+        var spec = Map.ofEntries(Map.entry("schemaVersion", "mcp-server-v2"), Map.entry("sourceType", "INTERNAL_SERVICE"),
+                Map.entry("protocolVersion", "2026-07-28"), Map.entry("transport", "STREAMABLE_HTTP"),
+                Map.entry("endpoint", "http://tool-fixture.fixture.svc.cluster.local:8080/mcp"),
+                Map.entry("serviceBinding", Map.of("bindingId", "controlled-tool-fixture", "revision", "1",
+                        "serviceName", "tool-fixture", "namespace", "fixture", "port", 8080)),
+                Map.entry("capabilityFingerprint", descriptor.reference().contentSha256()),
+                Map.entry("args", List.of()), Map.entry("env", Map.of()), Map.entry("headers", Map.of()),
+                Map.entry("tools", List.of(tool)), Map.entry("dependencies", List.of()), Map.entry("resources", List.of()),
+                Map.entry("apps", List.of()), Map.entry("remoteMounts", List.of()));
+        return new String(ProcessTypedJson.canonicalBytes(spec), StandardCharsets.UTF_8);
+    }
+
+    private static Map<String, Object> toolSchema(ToolSchema schema) {
+        var properties = new java.util.TreeMap<String, Object>();
+        schema.fields().forEach((name, type) -> properties.put(name, Map.of("type", type.name().toLowerCase(java.util.Locale.ROOT))));
+        return Map.of("type", "object", "properties", properties, "required", schema.required().stream().sorted().toList(),
+                "additionalProperties", false);
+    }
+
+    private static String bodySha(String content) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException invalid) {
+            throw new IllegalStateException(invalid);
+        }
+    }
+
     private static final class Fixture {
         private final DriverManagerDataSource source;
         private final JdbcTemplate jdbc;
@@ -511,7 +573,7 @@ class ToolActionProfileIT {
         private Active runtimeRun(ToolDescriptor descriptor, String key) {
             var template = new AgentRuntimeTemplateCommand(key, 1, RuntimeProfileEnum.RUNTIME_V2, "runtime-executor",
                     EMPTY_SCHEMA, EMPTY_SCHEMA, EMPTY_SCHEMA, new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
-                    new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("instructions", 1, HASH), "registered-model",
+                    new AgentRuntimeTemplateCommand.TemplateDependencyRefVO("instructions", 1, bodySha(PROMPT_SPEC)), "registered-model",
                     List.of(new AgentRuntimeTemplateCommand.TemplateDependencyRefVO(descriptor.key(), descriptor.version(), descriptor.reference().contentSha256())), null), LIMITS);
             ledger.publishRuntimeTemplate(OWNER, template, () -> true, (actor, requested) -> clock -> true);
             Instant deadline = now().plusSeconds(160);
@@ -519,8 +581,10 @@ class ToolActionProfileIT {
             var command = new LinkedAgentRuntimeCommand(key, new AgentProcessLink("process-source", WorkerScopeTypeEnum.BPMN,
                     "instance", key, template.contentSha256(), deadline.minusSeconds(40)), "runtime-node-1", key,
                     1, template.contentSha256(), HASH, schema, schema, Map.of(), Map.of(), LIMITS, deadline, "correlation");
-            var queued = tx(() -> ledger.startLinkedRuntimeV2(OWNER, command));
+            var bundle = runtimeBundle(template, descriptor);
+            var queued = tx(() -> ledger.startLinkedRuntimeV2(OWNER, command, bundle));
             var query = new GetAgentRunQuery(queued.runId());
+            assertEquals(bundle, ledger.runtimeExecutionMaterial(OWNER, query).siBundle());
             var claim = ledger.claimRuntimeV2(OWNER, query, queued.revision(), "runtime-executor", Duration.ofMinutes(2));
             return new Active(ledger.runtimeExecutionMaterial(OWNER, query).authorization(), claim);
         }

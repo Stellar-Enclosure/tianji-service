@@ -14,6 +14,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.application.run.AgentTerminalEventPublisher;
 import top.egon.cola.platform.tianji.agent.domain.AgentExecutionSnapshot;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunLease;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunTransitions;
@@ -1085,6 +1087,12 @@ public final class AgentLedgerService {
 
     /** Trusted internal entry point called within the linked-submission fence transaction. */
     public AgentRunDTO startLinkedRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command) {
+        return startLinkedRuntimeV2(actor, command, null);
+    }
+
+    /** Persists already prepared SI material inside the existing LOCAL run transaction; performs no remote lookup. */
+    public AgentRunDTO startLinkedRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command,
+                                           FrozenSiBundleVO siBundle) {
         if (actor == null || actor.subjectType() != TrustedAgentActor.SubjectType.SERVICE || "LEGACY".equals(actor.issuerFingerprint())
                 || !TransactionSynchronizationManager.isActualTransactionActive()
                 || TransactionSynchronizationManager.isCurrentTransactionReadOnly()
@@ -1101,12 +1109,13 @@ public final class AgentLedgerService {
         requireDispatchTime(input.getLink());
         var template = runtimeTemplate(actor, input.getTemplateKey(), input.getTemplateVersion());
         validateRuntimePins(input, template);
+        verifyFrozenSi(actor, template, siBundle);
         var createdAt = now();
         if (!input.getLink().dispatchNotAfter().isAfter(createdAt)) throw dispatchExpired();
         Instant effectiveDeadline = runtimeDeadline(createdAt, input);
         if (!effectiveDeadline.isAfter(createdAt)) throw dispatchExpired();
         String runId = UUID.randomUUID().toString();
-        var snapshot = json.runtimeSnapshot(actor.identityFingerprint(), runId, input, template);
+        var snapshot = json.runtimeSnapshot(actor.identityFingerprint(), runId, input, template, siBundle);
         int inserted = repository.insertRun(actor, runId, input.getTemplateKey(), input.getTemplateVersion(),
                 input.getIdempotencyKey(), requestSha256, null, input.getCorrelationId(), effectiveDeadline,
                 json.writeRuntimeSnapshot(snapshot), 1L, createdAt);
@@ -1133,6 +1142,11 @@ public final class AgentLedgerService {
         return transaction.execute(status -> runtimeMaterial(actor, requireLockedRun(actor, query)));
     }
 
+    /** Structural, owner-bound history for receipt replay, observation and drain; never an execution grant. */
+    public RuntimeExecutionMaterialVO runtimeReceiptMaterial(TrustedAgentActor actor, GetAgentRunQuery query) {
+        return transaction.execute(status -> runtimeReceiptMaterial(actor, requireLockedRun(actor, query)));
+    }
+
     public ClaimedAgentRun claimRuntimeV2(TrustedAgentActor actor, GetAgentRunQuery query, long expectedRevision,
                                          String owner, Duration leaseDuration) {
         return claim(actor, query, expectedRevision, owner, leaseDuration, RunProfileEnum.RUNTIME_V2);
@@ -1140,7 +1154,12 @@ public final class AgentLedgerService {
 
     public record RuntimeExecutionMaterialVO(AgentRunDTO run, AgentRuntimeTemplateCommand template,
                                              LinkedAgentRuntimeCommand command, String snapshotSha256,
-                                             AgentRunAuthorization.Request authorization) {
+                                             AgentRunAuthorization.Request authorization, FrozenSiBundleVO siBundle) {
+        public RuntimeExecutionMaterialVO(AgentRunDTO run, AgentRuntimeTemplateCommand template,
+                                          LinkedAgentRuntimeCommand command, String snapshotSha256,
+                                          AgentRunAuthorization.Request authorization) {
+            this(run, template, command, snapshotSha256, authorization, null);
+        }
         @Override public String toString() { return "AgentLedgerService.RuntimeExecutionMaterialVO[redacted]"; }
     }
 
@@ -1220,7 +1239,7 @@ public final class AgentLedgerService {
         return transaction.execute(status -> {
             var stored = requireLockedRun(actor, query);
             if (runtimeProfile(stored) == RunProfileEnum.RUNTIME_V2) {
-                var material = runtimeMaterial(actor, stored);
+                var material = runtimeReceiptMaterial(actor, stored);
                 return new LinkedRunEvidenceVO(material.run(), material.command().getLink(), material.authorization());
             }
             var legacy = executionMaterial(actor, stored);
@@ -1229,12 +1248,19 @@ public final class AgentLedgerService {
     }
 
     private RuntimeExecutionMaterialVO runtimeMaterial(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {
+        var material = runtimeReceiptMaterial(actor, stored);
+        if (material.siBundle() == null) throw runtimeUnavailable();
+        return material;
+    }
+
+    private RuntimeExecutionMaterialVO runtimeReceiptMaterial(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {
         var pinned = verifyRuntime(actor, stored).snapshot();
         var run = stored.run();
         var authorization = new AgentRunAuthorization.Request(actor, run.runId(), run.definitionKey(), run.definitionVersion(),
                 pinned.command().getTemplateSha256(), stored.requestHash(), pinned.snapshotSha256(),
                 pinned.command().getConfigurationSha256(), false, run.deadlineAt());
-        return new RuntimeExecutionMaterialVO(run, pinned.template(), pinned.command(), pinned.snapshotSha256(), authorization);
+        return new RuntimeExecutionMaterialVO(run, pinned.template(), pinned.command(), pinned.snapshotSha256(), authorization,
+                pinned.siBundle());
     }
 
     private VerifiedRunProfileVO verifyRunProfile(TrustedAgentActor actor, JdbcAgentLedgerRepository.StoredRun stored) {
@@ -1275,8 +1301,19 @@ public final class AgentLedgerService {
             var template = runtimeTemplate(actor, run.definitionKey(), run.definitionVersion());
             if (!snapshot.template().equals(template)) throw runtimeUnavailable();
             validateRuntimePins(command, template);
+            if (snapshot.siBundle() != null) verifyFrozenSi(actor, template, snapshot.siBundle());
             return new VerifiedRunProfileVO(RunProfileEnum.RUNTIME_V2, snapshot, binding);
         } catch (DataAccessException | IllegalArgumentException | IllegalStateException malformed) {
+            throw runtimeUnavailable();
+        }
+    }
+
+    private static void verifyFrozenSi(TrustedAgentActor actor, AgentRuntimeTemplateCommand template,
+                                        FrozenSiBundleVO bundle) {
+        if (bundle == null) throw runtimeUnavailable();
+        try {
+            TianjiSiExecutionBundleService.verifyFrozenBundle(actor, template, bundle);
+        } catch (IllegalArgumentException | IllegalStateException malformed) {
             throw runtimeUnavailable();
         }
     }
@@ -1467,7 +1504,11 @@ public final class AgentLedgerService {
         String normalizedOwner = owner.trim();
         return transaction.execute(status -> {
             JdbcAgentLedgerRepository.StoredRun previous = requireLockedRun(actor, query);
-            if (verifyRunProfile(actor, previous).profile() != expectedProfile) throw runtimeUnavailable();
+            var verified = verifyRunProfile(actor, previous);
+            if (verified.profile() != expectedProfile
+                    || expectedProfile == RunProfileEnum.RUNTIME_V2 && verified.snapshot().siBundle() == null) {
+                throw runtimeUnavailable();
+            }
             JdbcAgentLedgerRepository.StoredRun claimed = repository.claim(actor, query.runId(), expectedRevision,
                     normalizedOwner, leaseMillis).orElseThrow(() -> new AgentLedgerException(
                             AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, "Agent run cannot be claimed"));
@@ -1541,7 +1582,7 @@ public final class AgentLedgerService {
     public AgentRunLease renewRuntimeLease(TrustedAgentActor actor, AgentRunLease lease, Duration leaseDuration) {
         return transaction.execute(status -> {
             var stored = requireLockedRun(actor, new GetAgentRunQuery(lease.runId()));
-            verifyRuntime(actor, stored);
+            if (verifyRuntime(actor, stored).snapshot().siBundle() == null) throw runtimeUnavailable();
             var renewed = repository.renew(actor, lease, leaseMillis(leaseDuration)).orElseThrow(() ->
                     new AgentLedgerException(AgentErrorCodeEnum.TIANJI_LEASE_EXPIRED, "Agent Runtime lease is no longer current"));
             return new AgentRunLease(lease.runId(), lease.owner(), lease.epoch(), renewed.leaseExpiresAt());

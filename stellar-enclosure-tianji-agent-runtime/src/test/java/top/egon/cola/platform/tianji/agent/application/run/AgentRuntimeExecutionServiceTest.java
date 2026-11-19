@@ -18,6 +18,12 @@ import top.egon.cola.component.agentflow.api.execution.AgentExecutionHandle;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionResult;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutor;
 import top.egon.cola.component.agentflow.api.session.SessionStore;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextBO;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
 import top.egon.cola.platform.tianji.agent.application.tool.AgentRuntimeToolExecutionService;
@@ -55,6 +61,11 @@ import top.egon.cola.platform.tianji.contract.orchestration.automation.ProcessSc
 
 import java.time.Duration;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -76,19 +87,131 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.when;
 
 class AgentRuntimeExecutionServiceTest {
     private static final TrustedAgentActor ACTOR = new TrustedAgentActor(24, TrustedAgentActor.SubjectType.SERVICE, "process");
     private static final GetAgentRunQuery QUERY = new GetAgentRunQuery("fixed-run");
     private static final Instant NOW = Instant.parse("2026-11-14T05:00:00Z");
+    private static final String FIXED_INSTRUCTION = "Instruction from the committed SI prompt version";
+    private static final String PROMPT_SPEC = "{\"promptText\":\"" + FIXED_INSTRUCTION + "\"}";
 
     private final AgentLedgerService ledger = mock(AgentLedgerService.class);
     private final AdkAgentRunExecutor legacy = mock(AdkAgentRunExecutor.class);
     private final AgentRuntimeExecutionService runtime = mock(AgentRuntimeExecutionService.class);
+
+    @Test
+    void missingPersistedSiProvenanceStopsBeforeAuthorityClaimAndExecutor() {
+        try (var fixture = new RuntimeFixture(List.of(), null, false, false)) {
+            // The historical five-field material has no committed SI closure.  A worker must
+            // reject it before it can consume a fresh grant or claim a lease.
+            assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                    assertThrows(AgentLedgerException.class,
+                            () -> fixture.service.executeQueued(fixture.actor, QUERY)).code());
+            verifyNoInteractions(fixture.authorization, fixture.executor);
+            verify(ledger, never()).claimRuntimeV2(any(), any(), anyLong(), anyString(), any());
+        }
+    }
+
+    @Test
+    void claimedMaterialCannotReplaceTheCommittedSiClosureUnderTheSameAuthorization() {
+        try (var fixture = new RuntimeFixture()) {
+            when(fixture.authorization.authorize(fixture.request, AgentRunAuthorization.Boundary.CLAIM))
+                    .thenReturn(AgentRunAuthorization.Decision.ALLOW);
+            when(ledger.runtimeExecutionMaterial(fixture.actor, QUERY)).thenReturn(
+                    new RuntimeExecutionMaterialVO(fixture.run(AgentRunStatusEnum.QUEUED, 1), fixture.template,
+                            fixture.command, fixture.request.snapshotSha256(), fixture.request, fixture.bundle),
+                    new RuntimeExecutionMaterialVO(fixture.running, fixture.template, fixture.command,
+                            fixture.request.snapshotSha256(), fixture.request, frozenBundle(List.of(), "Replaced root body")));
+
+            assertEquals(AgentErrorCodeEnum.TIANJI_REVISION_CONFLICT, assertThrows(AgentLedgerException.class,
+                    () -> fixture.service.executeQueued(fixture.actor, QUERY)).code());
+            verify(fixture.authorization, never()).authorize(any(), eq(AgentRunAuthorization.Boundary.MODEL));
+            verifyNoInteractions(fixture.executor);
+        }
+    }
+
+    @Test
+    void fixedInstructionRegistrationCrossesTheAsyncBoundaryWithoutConsultingAnActiveReplacement() {
+        try (var fixture = new RuntimeFixture(List.of(), null, true, true)) {
+            when(fixture.authorization.authorize(any(), any())).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+            when(ledger.get(fixture.actor, QUERY)).thenReturn(fixture.running);
+            var done = fixture.run(AgentRunStatusEnum.COMPLETED, 3);
+            when(ledger.finish(eq(fixture.actor), eq(fixture.lease), eq(2L), any())).thenReturn(done);
+            var observedCommand = new java.util.concurrent.atomic.AtomicReference<AgentExecutionCommand.TemplateVO>();
+            var observedScope = new java.util.concurrent.atomic.AtomicReference<ContextScopeVO>();
+            var handle = mock(AgentExecutionHandle.class);
+            when(handle.completion()).thenReturn(CompletableFuture.completedFuture(completed()));
+            when(fixture.executor.execute(any(), any())).thenAnswer(call -> {
+                AgentExecutionCommand command = call.getArgument(0);
+                AgentExecutionContextVO context = call.getArgument(1);
+                observedCommand.set(command.getTemplate());
+                observedScope.set(context.scope());
+                // A host registry rotation after capture cannot change this persisted run's instruction.
+                doAnswer(next -> registered(next.getArgument(0), "new active text"))
+                        .when(fixture.hostRegistry).resolve(any(), any());
+                var registration = CompletableFuture.supplyAsync(() -> fixture.bindings.resolve(command.getTemplate(), context.scope()))
+                        .get(2, TimeUnit.SECONDS);
+                assertEquals(FIXED_INSTRUCTION, registration.leaves().get("root").instruction());
+                var foreignScope = new ContextScopeVO(context.scope().namespace(), context.scope().tenantKey(),
+                        "different-owner", context.scope().instanceKey(), context.scope().sessionKey(), context.scope().purpose());
+                assertNull(fixture.bindings.resolve(command.getTemplate(), foreignScope));
+                return handle;
+            });
+
+            assertSame(done, fixture.service.executeQueued(fixture.actor, QUERY));
+            assertNull(fixture.bindings.resolve(observedCommand.get(), observedScope.get()));
+            verify(fixture.hostRegistry, times(1)).resolve(any(), any());
+        }
+    }
+
+    @Test
+    void identicalInstructionReferenceWithDifferentBodyNeverReachesTheExecutor() {
+        try (var fixture = new RuntimeFixture(List.of(), null, true, true)) {
+            when(fixture.authorization.authorize(any(), any())).thenReturn(AgentRunAuthorization.Decision.ALLOW);
+            doAnswer(call -> registered(call.getArgument(0), "unpublished body"))
+                    .when(fixture.hostRegistry).resolve(any(), any());
+            when(ledger.get(fixture.actor, QUERY)).thenReturn(fixture.running);
+            var failed = fixture.run(AgentRunStatusEnum.FAILED, 3);
+            when(ledger.finish(eq(fixture.actor), eq(fixture.lease), eq(2L), any())).thenAnswer(call -> {
+                var result = call.<top.egon.cola.platform.tianji.contract.agent.AgentExecutionResult>getArgument(3);
+                assertEquals(AgentRunStatusEnum.FAILED, result.status());
+                assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE.name(), result.errorCode());
+                return failed;
+            });
+
+            assertSame(failed, fixture.service.executeQueued(fixture.actor, QUERY));
+            verifyNoInteractions(fixture.executor);
+        }
+    }
+
+    @Test
+    void closedBindingCannotResolveAgainOrRemoveALaterBinding() {
+        try (var fixture = new RuntimeFixture(List.of(), null, true, true)) {
+            var expected = new AgentExecutionCommand.TemplateVO("review", 1, fixture.request.definitionSha256(),
+                    AgentRuntimeExecutionService.ADK_EXECUTOR_REF, fixture.template.getConfiguration().toWire(),
+                    mock(AgentExecutionCommand.SchemaValidator.class));
+            var scope = new ContextScopeVO("tianji", "24", fixture.actor.identityFingerprint(), QUERY.runId(), QUERY.runId(), "EXECUTE");
+            assertNull(fixture.bindings.resolve(expected, scope));
+            verifyNoInteractions(fixture.hostRegistry);
+            var first = fixture.bindings.prepare(expected, scope, fixture.bundle);
+            assertNotNull(fixture.bindings.resolve(expected, scope));
+            assertThrows(AgentLedgerException.class, () -> fixture.bindings.prepare(expected, scope, fixture.bundle));
+            first.close();
+            assertNull(fixture.bindings.resolve(expected, scope));
+            var second = fixture.bindings.prepare(expected, scope, fixture.bundle);
+            first.close();
+            assertNotNull(fixture.bindings.resolve(expected, scope));
+            second.close();
+            assertNull(fixture.bindings.resolve(expected, scope));
+            verify(fixture.hostRegistry, times(2)).resolve(any(), any());
+        }
+    }
 
     @Test
     void deniesClaimBeforeCallingTheNeutralExecutor() {
@@ -228,7 +351,7 @@ class AgentRuntimeExecutionServiceTest {
 
     @Test
     void fixedToolRequestUsesTheClaimedRuntimeScopeAndRejectsAChangedReferenceBeforeDispatch() {
-        var pinned = new TemplateDependencyRefVO("invoice-start", 3, "b".repeat(64));
+        var pinned = new TemplateDependencyRefVO("invoice-start", 3, sha256(toolSpec("invoice-start")));
         var host = mock(AgentRuntimeToolExecutionService.class);
         try (var fixture = new RuntimeFixture(List.of(pinned), host)) {
             when(fixture.authorization.authorize(eq(fixture.request), any())).thenReturn(AgentRunAuthorization.Decision.ALLOW);
@@ -425,6 +548,58 @@ class AgentRuntimeExecutionServiceTest {
         return spring;
     }
 
+    private static String toolSpec(String key) {
+        return "{\"tools\":[{\"toolId\":\"" + key + "\",\"name\":\"" + key + "\",\"enabled\":true}]}";
+    }
+
+    private static String sha256(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException(unavailable);
+        }
+    }
+
+    private static FrozenSiBundleVO frozenBundle(List<TemplateDependencyRefVO> tools, String rootInstruction) {
+        String rootSpec = "{\"modelKey\":\"model\",\"systemInstruction\":\"" + rootInstruction + "\"}";
+        var root = new VersionIdentityVO("24", "101", "201", "1", DdcSiKindEnum.AGENT, "prod", sha256(rootSpec));
+        var prompt = new VersionIdentityVO("24", "102", "202", "1", DdcSiKindEnum.PROMPT, "prod", sha256(PROMPT_SPEC));
+        var nodes = new ArrayList<VersionIdentityVO>();
+        nodes.add(prompt);
+        var edges = new ArrayList<EdgeVO>();
+        edges.add(new EdgeVO(root.versionId(), prompt.versionId()));
+        var resources = new ArrayList<SiResourceVO>();
+        resources.add(new SiResourceVO(root, "review", null, rootSpec));
+        resources.add(new SiResourceVO(prompt, "instruction", null, PROMPT_SPEC));
+        for (int index = 0; index < tools.size(); index++) {
+            var ref = tools.get(index);
+            var identity = new VersionIdentityVO("24", Integer.toString(103 + index), Integer.toString(203 + index),
+                    Long.toString(ref.version()), DdcSiKindEnum.MCP, "prod", ref.contentSha256());
+            nodes.add(identity);
+            edges.add(new EdgeVO(root.versionId(), identity.versionId()));
+            resources.add(new SiResourceVO(identity, ref.key(), null, toolSpec(ref.key())));
+        }
+        var manifest = DdcSiDependencyManifestVO.create(root, null, nodes, edges);
+        return new FrozenSiBundleVO("platform", "main", "prod", null, "tianji", manifest, resources);
+    }
+
+    private static AdkAgentExecutorAdapter.RegisteredTemplateVO registered(AgentExecutionCommand.TemplateVO expected,
+                                                                          String instruction) {
+        var configuration = AgentRuntimeTemplateCommand.TemplateConfigurationVO.fromExactWire(expected.configuration());
+        var ref = configuration.instructionRef();
+        var dependency = new AgenticPlanVO.DependencyRefVO(ref.key(), ref.version(), ref.contentSha256());
+        var leaf = new AgenticPlanVO.LeafVO("root", dependency, configuration.modelRef(), List.of());
+        var plan = new AgenticPlanVO(AgenticPlanVO.StrategyEnum.REASONING, List.of(leaf), List.of(), null, 1,
+                "root", AgenticPlanVO.MergeEnum.OUTPUT_AGENT, List.of(),
+                new AgenticPlanVO.RootTerminalVO(AgenticPlanVO.TerminationModeEnum.ROOT_TERMINAL));
+        var model = new ModelRegistrationVO("model", "fixture-model", mock(ChatModel.class), 8192, 1024, prompt -> 10);
+        var binding = new AdkAgentExecutorAdapter.RegisteredLeafVO(dependency, instruction, "model", model, List.of(),
+                (run, key, round) -> new AdkAgentExecutorAdapter.LeafDecisionVO(true, null));
+        return new AdkAgentExecutorAdapter.RegisteredTemplateVO(expected.key(), expected.version(), expected.contentSha256(),
+                plan, Map.of("root", binding), Map.of());
+    }
+
     private final class RuntimeFixture implements AutoCloseable {
         private final TrustedAgentActor actor = new TrustedAgentActor(24, TrustedAgentActor.SubjectType.SERVICE,
                 "process", "c".repeat(64));
@@ -439,23 +614,37 @@ class AgentRuntimeExecutionServiceTest {
         private Runnable heartbeatCheck;
         private final AnnotationConfigApplicationContext mappers = mapperContext();
         private final AgentRuntimeExecutionService service;
+        private final AgentRuntimeTemplateCommand template;
+        private final LinkedAgentRuntimeCommand command;
+        private final FrozenSiBundleVO bundle;
+        private final AdkAgentExecutorAdapter.TemplateResolver hostRegistry = mock(AdkAgentExecutorAdapter.TemplateResolver.class);
+        private final AgentRuntimeExecutionService.FrozenTemplateBindings bindings;
 
         private RuntimeFixture() { this(List.of(), null); }
 
         private RuntimeFixture(List<TemplateDependencyRefVO> tools, AgentRuntimeToolExecutionService host) {
-            service = new AgentRuntimeExecutionService(ledger, authorization, executor,
-                    mappers.getBean("tianjiHostContextConverter", TianjiHostContextConverter.class), control,
-                    mock(AgentRuntimeCallReceiptStore.class), mock(TransactionTemplate.class), host);
+            this(tools, host, true, false);
+        }
+
+        private RuntimeFixture(List<TemplateDependencyRefVO> tools, AgentRuntimeToolExecutionService host,
+                               boolean fixedSi, boolean adk) {
             var limits = new AgentRuntimeTemplateCommand.TechnicalLimitsVO(Duration.ofSeconds(30), Duration.ofSeconds(2),
                     Duration.ofSeconds(2), 2, 1, 1, 8192, 1024);
             var schema = ProcessSchemaVO.fromWire(Map.of("type", "object", "properties", Map.of(),
                     "required", List.of(), "additionalProperties", false));
             var config = new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
-                    new TemplateDependencyRefVO("instruction", 1, "f".repeat(64)), "model", tools, null);
-            var template = new AgentRuntimeTemplateCommand("review", 1, AgentRuntimeTemplateCommand.RuntimeProfileEnum.RUNTIME_V2,
-                    "registered-executor", schema, schema, schema, config, limits);
-            var command = new LinkedAgentRuntimeCommand().setInput(Map.of()).setParameters(Map.of()).setLimits(limits)
+                    new TemplateDependencyRefVO("instruction", 1, sha256(PROMPT_SPEC)), "model", tools, null);
+            template = new AgentRuntimeTemplateCommand("review", 1, AgentRuntimeTemplateCommand.RuntimeProfileEnum.RUNTIME_V2,
+                    adk ? AgentRuntimeExecutionService.ADK_EXECUTOR_REF : "registered-executor", schema, schema, schema, config, limits);
+            command = new LinkedAgentRuntimeCommand().setInput(Map.of()).setParameters(Map.of()).setLimits(limits)
                     .setNodeExecutionRef("bpmn-node").setAttemptDeadlineAt(deadline).setTemplateSha256(request.definitionSha256());
+            bundle = fixedSi ? frozenBundle(tools, "Frozen root instruction") : null;
+            bindings = adk ? new AgentRuntimeExecutionService.FrozenTemplateBindings(hostRegistry,
+                    mappers.getBean("agenticTemplateConverter", AgenticTemplateConverter.class)) : null;
+            when(hostRegistry.resolve(any(), any())).thenAnswer(call -> registered(call.getArgument(0), FIXED_INSTRUCTION));
+            service = new AgentRuntimeExecutionService(ledger, authorization, executor,
+                    mappers.getBean("tianjiHostContextConverter", TianjiHostContextConverter.class), control,
+                    mock(AgentRuntimeCallReceiptStore.class), mock(TransactionTemplate.class), host, bindings);
             when(control.scheduleWithFixedDelay(any(Runnable.class), eq(1L), eq(1L), eq(TimeUnit.SECONDS))).thenAnswer(call -> {
                 heartbeatCheck = call.getArgument(0);
                 return mock(ScheduledFuture.class);
@@ -463,8 +652,8 @@ class AgentRuntimeExecutionServiceTest {
             when(ledger.databaseNow()).thenReturn(NOW);
             when(ledger.runtimeExecutionMaterial(actor, QUERY))
                     .thenReturn(new RuntimeExecutionMaterialVO(run(AgentRunStatusEnum.QUEUED, 1), template, command,
-                            request.snapshotSha256(), request), new RuntimeExecutionMaterialVO(running, template, command,
-                            request.snapshotSha256(), request));
+                            request.snapshotSha256(), request, bundle), new RuntimeExecutionMaterialVO(running, template, command,
+                            request.snapshotSha256(), request, bundle));
             when(ledger.claimRuntimeV2(eq(actor), eq(QUERY), eq(1L), anyString(), any())).thenReturn(new ClaimedAgentRun(running, lease));
         }
 

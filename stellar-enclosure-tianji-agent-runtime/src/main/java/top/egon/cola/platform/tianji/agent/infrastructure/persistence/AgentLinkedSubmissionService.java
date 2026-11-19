@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import javax.sql.DataSource;
 import org.springframework.dao.DataAccessException;
@@ -14,6 +15,8 @@ import org.springframework.jdbc.datasource.DataSourceTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
 import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.contract.agent.AgentErrorCodeEnum;
@@ -24,6 +27,7 @@ import top.egon.cola.platform.tianji.contract.orchestration.AgentProcessLink;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentLookupQuery;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentStartCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.LinkedAgentSubmissionDTO;
+import top.egon.cola.platform.tianji.contract.orchestration.automation.AgentRuntimeTemplateCommand;
 import top.egon.cola.platform.tianji.contract.orchestration.automation.LinkedAgentRuntimeCommand;
 
 /** Atomically fences one service-owned process occurrence against late submission and cancellation. */
@@ -56,11 +60,43 @@ public final class AgentLinkedSubmissionService {
     }
 
     public AgentRunDTO submitRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command, BooleanSupplier newAdmissionEnabled) {
+        return submitRuntimeV2(actor, command, newAdmissionEnabled, template -> { throw TianjiSiExecutionBundleService.unavailable(); });
+    }
+
+    /** Resolves the exact SI publication without holding the LOCAL dispatch lock. */
+    public AgentRunDTO submitRuntimeV2(TrustedAgentActor actor, LinkedAgentRuntimeCommand command,
+                                     BooleanSupplier newAdmissionEnabled,
+                                     Function<AgentRuntimeTemplateCommand, FrozenSiBundleVO> prepare) {
         requireService(actor); requireOwnedTransaction();
+        Objects.requireNonNull(newAdmissionEnabled);
+        Objects.requireNonNull(prepare);
         var input = json.immutableRuntimeCommand(command);
         var query = new LinkedAgentLookupQuery(input.getIdempotencyKey(), input.getLink());
-        return submit(actor, query, json.runtimeRequestHash(input), true, Objects.requireNonNull(newAdmissionEnabled),
-                () -> ledger.startLinkedRuntimeV2(actor, input));
+        String requestHash = json.runtimeRequestHash(input);
+        Optional<AgentRuntimeTemplateCommand> selection = transact(() -> {
+            var rows = find(actor, query.idempotencyKey(), false);
+            if (!rows.isEmpty()) {
+                if (rows.size() != 1 || !matches(rows.getFirst(), query.link())) throw conflict();
+                var fence = rows.getFirst();
+                if (fence.closed()) throw dispatchClosed();
+                if (fence.runId() != null) {
+                    if (!requestHash.equals(fence.requestSha256())) throw conflict();
+                    return Optional.empty();
+                }
+            }
+            if (!newAdmissionEnabled.getAsBoolean()) return Optional.empty();
+            ledger.requireDispatchTime(query.link());
+            var template = ledger.runtimeTemplate(actor, input.getTemplateKey(), input.getTemplateVersion());
+            if (!input.getTemplateSha256().equals(template.contentSha256())) throw conflict();
+            return Optional.of(template);
+        });
+        FrozenSiBundleVO prepared = selection.map(template -> {
+            var bundle = prepare.apply(template);
+            if (bundle == null) throw TianjiSiExecutionBundleService.unavailable();
+            return bundle;
+        }).orElse(null);
+        return submit(actor, query, requestHash, true, newAdmissionEnabled,
+                () -> ledger.startLinkedRuntimeV2(actor, input, prepared));
     }
 
     private AgentRunDTO submit(TrustedAgentActor actor, LinkedAgentLookupQuery query, String requestHash,
@@ -70,7 +106,7 @@ public final class AgentLinkedSubmissionService {
             if (!runtimeV2) ledger.requireDispatchTime(query.link());
             insertFence(actor, query, false);
             Fence fence = lockedFence(actor, query);
-            if (fence.closed()) throw new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DISPATCH_CLOSED, "Linked Agent dispatch is closed");
+            if (fence.closed()) throw dispatchClosed();
             if (fence.runId() != null && !requestHash.equals(fence.requestSha256())) throw conflict();
             if (runtimeV2 && fence.runId() != null) return verifyRun(actor, query.link(), fence.runId(), requestHash, true);
             if (runtimeV2 && !newAdmissionEnabled.getAsBoolean()) {
@@ -196,7 +232,7 @@ public final class AgentLinkedSubmissionService {
 
     private AgentRunDTO verifyRun(TrustedAgentActor actor, AgentProcessLink link, String runId, String requestHash, boolean runtimeV2) {
         if (runtimeV2) {
-            var material = ledger.runtimeExecutionMaterial(actor, new GetAgentRunQuery(runId));
+            var material = ledger.runtimeReceiptMaterial(actor, new GetAgentRunQuery(runId));
             if (!link.equals(material.command().getLink()) || requestHash == null
                     || !requestHash.equals(material.authorization().requestSha256())) throw unavailable();
             return material.run();
@@ -227,6 +263,9 @@ public final class AgentLinkedSubmissionService {
     }
     private static AgentLedgerException conflict() {
         return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, "Linked Agent submission conflicts with an existing intent");
+    }
+    private static AgentLedgerException dispatchClosed() {
+        return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DISPATCH_CLOSED, "Linked Agent dispatch is closed");
     }
     private static AgentLedgerException unavailable() {
         return new AgentLedgerException(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, "Linked Agent submission is unavailable");

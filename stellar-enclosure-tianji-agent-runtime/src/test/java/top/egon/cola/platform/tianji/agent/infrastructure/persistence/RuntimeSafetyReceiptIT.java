@@ -107,7 +107,7 @@ class RuntimeSafetyReceiptIT {
             Duration.ofSeconds(10), 2, 2, 1, 4096, 1024);
     private static final AgentRuntimeTemplateCommand V2_TEMPLATE = new AgentRuntimeTemplateCommand("billing", 1,
             RuntimeProfileEnum.RUNTIME_V2, "agent-executor", V2_INPUT, V2_EMPTY, V2_EMPTY,
-            new TemplateConfigurationVO(new TemplateDependencyRefVO("approved-instructions", 1, HASH), "registered-model", List.of(), null),
+            new TemplateConfigurationVO(new TemplateDependencyRefVO("approved-instructions", 1, AgentJsonCodecTest.SI_PROMPT_DIGEST), "registered-model", List.of(), null),
             V2_LIMITS);
     private static RuntimeCompatibilityIT.Fixture database;
     private static AgentRuntimeBindingStore bindings;
@@ -196,9 +196,22 @@ class RuntimeSafetyReceiptIT {
         var grantLedger = new AgentLedgerService(database.source());
         var submissions = new AgentLinkedSubmissionService(database.source(), grantLedger);
         var command = linkedRuntimeCommand("runtime-grant");
-        var run = submissions.submitRuntimeV2(V2_SERVICE, command, () -> true);
+        var preparations = new AtomicInteger();
+        var run = submissions.submitRuntimeV2(V2_SERVICE, command, () -> true, selected -> {
+            assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+            assertFalse(TransactionSynchronizationManager.hasResource(database.source()));
+            assertEquals(V2_TEMPLATE, selected);
+            preparations.incrementAndGet();
+            return AgentJsonCodecTest.frozenBundle(V2_TEST_TENANT, selected, AgentJsonCodecTest.SI_PROMPT_SPEC);
+        });
         assertEquals(1L, run.revision());
-        assertEquals(run, submissions.submitRuntimeV2(V2_SERVICE, command, () -> false));
+        assertEquals(run, submissions.submitRuntimeV2(V2_SERVICE, command, () -> false,
+                selected -> { throw new AssertionError("Replay must not consult an unavailable SI authority"); }));
+        assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
+                () -> submissions.submitRuntimeV2(V2_SERVICE,
+                        linkedRuntimeCommand(command.getIdempotencyKey(), command.getAttemptDeadlineAt()).setInput(Map.of("amount", 12)),
+                        () -> true, selected -> { throw new AssertionError("Conflict must precede SI preparation"); })).code());
+        assertEquals(1, preparations.get());
         var store = new AgentServiceExecutionGrantStore(database.source(), grantLedger);
         var resource = URI.create("https://runtime.example/tianji");
         var subject = new AgentServiceExecutionGrant.Subject(V2_SERVICE.subjectId(), "process", "platform",
@@ -279,8 +292,9 @@ class RuntimeSafetyReceiptIT {
         var restoredStart = new AtomicReference<AgentRunDTO>();
         var rolledBack = linkedRuntimeCommand("atomic-rollback");
         var failure = new IllegalStateException("Test forced rollback after linked start");
+        var rolledBackBundle = AgentJsonCodecTest.frozenBundle(V2_TEST_TENANT, V2_TEMPLATE, AgentJsonCodecTest.SI_PROMPT_SPEC);
         var thrown = assertThrows(IllegalStateException.class, () -> inTransaction(() -> {
-            restoredStart.set(v2Ledger.startLinkedRuntimeV2(V2_SERVICE, rolledBack));
+            restoredStart.set(v2Ledger.startLinkedRuntimeV2(V2_SERVICE, rolledBack, rolledBackBundle));
             throw failure;
         }));
         assertEquals(failure, thrown);
@@ -291,6 +305,13 @@ class RuntimeSafetyReceiptIT {
         var run = startRuntime(command);
         assertEquals(AgentRunStatusEnum.QUEUED, run.status());
         assertEquals(List.of(1, 1, 1), runtimeFacts(run.runId()));
+        var material = v2Ledger.runtimeExecutionMaterial(V2_SERVICE, new GetAgentRunQuery(run.runId()));
+        assertNotNull(material.siBundle());
+        assertEquals(AgentJsonCodecTest.frozenBundle(V2_TEST_TENANT, V2_TEMPLATE, AgentJsonCodecTest.SI_PROMPT_SPEC), material.siBundle());
+        assertEquals(material.siBundle().closureDigest(), runtime.queryForObject("""
+                SELECT execution_snapshot #>> '{siBundle,manifest,closureDigest}'
+                FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?
+                """, String.class, V2_TEST_TENANT, run.runId()));
         assertEquals(run, startRuntime(command));
         assertEquals(List.of(1, 1, 1), runtimeFacts(run.runId()));
         assertEquals(AgentErrorCodeEnum.TIANJI_IDEMPOTENCY_CONFLICT, assertThrows(AgentLedgerException.class,
@@ -448,6 +469,81 @@ class RuntimeSafetyReceiptIT {
         assertEquals(List.of(1, 0, 0), counters(new Run(V2_SERVICE, lease, lease.expiresAt())));
     }
 
+    @Test
+    void preSiHistoryCanBeReadReplayedAndDrainedButCannotAcquireExecution() {
+        var command = linkedRuntimeCommand("historical-pre-si");
+        var run = seedHistoricalRuntime(command);
+        var query = new GetAgentRunQuery(run.runId());
+        String original = runtime.queryForObject("""
+                SELECT execution_snapshot::text FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?
+                """, String.class, V2_TEST_TENANT, run.runId());
+        var receipt = v2Ledger.runtimeReceiptMaterial(V2_SERVICE, query);
+        assertNull(receipt.siBundle());
+        assertEquals(run, inTransaction(() -> v2Ledger.startLinkedRuntimeV2(V2_SERVICE, command)));
+        assertEquals(AgentLedgerService.RunProfileEnum.RUNTIME_V2, v2Ledger.verifyPersistedProfile(V2_SERVICE, query));
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                assertThrows(AgentLedgerException.class, () -> v2Ledger.runtimeExecutionMaterial(V2_SERVICE, query)).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                assertThrows(AgentLedgerException.class, () -> v2Ledger.claimRuntimeV2(V2_SERVICE, query, run.revision(),
+                        "forbidden-pre-si-worker", Duration.ofSeconds(20))).code());
+        assertThrows(AgentLedgerService.RuntimeProfileRequiredException.class, () -> v2Ledger.executionMaterial(V2_SERVICE, query));
+        var current = startRuntime(linkedRuntimeCommand("new-si-legacy-resume-boundary"));
+        assertThrows(AgentLedgerService.RuntimeProfileRequiredException.class,
+                () -> v2Ledger.executionMaterial(V2_SERVICE, new GetAgentRunQuery(current.runId())));
+        assertEquals(AgentRunStatusEnum.CANCELLED, v2Ledger.cancel(V2_SERVICE,
+                new CancelAgentRunCommand(run.runId(), "drain-history", run.revision(), "Authorized history drain")).status());
+        assertEquals(original, runtime.queryForObject("""
+                SELECT execution_snapshot::text FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?
+                """, String.class, V2_TEST_TENANT, run.runId()));
+    }
+
+    @Test
+    void missingSiForNewAdmissionAndTamperedStoredClosureFailBeforeAnyExecutionWrite() {
+        var command = linkedRuntimeCommand("new-without-si");
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE, assertThrows(AgentLedgerException.class,
+                () -> inTransaction(() -> v2Ledger.startLinkedRuntimeV2(V2_SERVICE, command))).code());
+        assertEquals(0, runtime.queryForObject("""
+                SELECT count(*) FROM tianji_agent.agent_run WHERE tenant_id=? AND idempotency_key=?
+                """, Integer.class, V2_TEST_TENANT, command.getIdempotencyKey()));
+        var managed = linkedRuntimeCommand("tampered-closure");
+        var run = startRuntime(managed);
+        assertEquals(1, database.admin().update("""
+                UPDATE tianji_agent.agent_run SET execution_snapshot=jsonb_set(execution_snapshot,
+                  '{siBundle,manifest,closureDigest}',to_jsonb(?::text)) WHERE tenant_id=? AND run_id=?
+                """, "f".repeat(64), V2_TEST_TENANT, run.runId()));
+        var query = new GetAgentRunQuery(run.runId());
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                assertThrows(AgentLedgerException.class, () -> v2Ledger.runtimeReceiptMaterial(V2_SERVICE, query)).code());
+        assertEquals(AgentErrorCodeEnum.TIANJI_DEPENDENCY_UNAVAILABLE,
+                assertThrows(AgentLedgerException.class, () -> v2Ledger.claimRuntimeV2(V2_SERVICE, query, run.revision(),
+                        "tampered-worker", Duration.ofSeconds(20))).code());
+        assertEquals(run.revision(), runtime.queryForObject("""
+                SELECT revision FROM tianji_agent.agent_run WHERE tenant_id=? AND run_id=?
+                """, Long.class, V2_TEST_TENANT, run.runId()));
+    }
+
+    private static AgentRunDTO seedHistoricalRuntime(LinkedAgentRuntimeCommand command) {
+        var codec = new AgentJsonCodec();
+        String runId = UUID.randomUUID().toString();
+        var snapshot = codec.runtimeSnapshot(V2_SERVICE.identityFingerprint(), runId, command, V2_TEMPLATE);
+        var created = now(runtime);
+        var repository = new JdbcAgentLedgerRepository(runtime, codec);
+        return inTransaction(() -> {
+            assertEquals(1, repository.insertRun(V2_SERVICE, runId, command.getTemplateKey(), command.getTemplateVersion(),
+                    command.getIdempotencyKey(), codec.runtimeRequestHash(command), null, command.getCorrelationId(),
+                    command.getAttemptDeadlineAt(), codec.writeRuntimeSnapshot(snapshot), 1L, created));
+            bindings.create(V2_SERVICE, new RuntimeBindingBO().setTenantId(V2_TEST_TENANT).setRunId(runId)
+                    .setProfile("RUNTIME_V2").setSnapshotSha256(snapshot.snapshotSha256())
+                    .setTemplateSha256(command.getTemplateSha256()).setConfigurationSha256(command.getConfigurationSha256())
+                    .setPolicy(command.getLimits()).setNodeExecutionRef(command.getNodeExecutionRef())
+                    .setAttemptDeadlineAt(command.getAttemptDeadlineAt()));
+            repository.insertEvent(V2_TEST_TENANT, new top.egon.cola.platform.tianji.contract.agent.AgentEventDTO(
+                    UUID.randomUUID().toString(), runId, 1, "RUN_QUEUED", null, null, null, created,
+                    command.getCorrelationId(), "1", Map.of("status", "QUEUED")));
+            return v2Ledger.runtimeReceiptMaterial(V2_SERVICE, new GetAgentRunQuery(runId)).run();
+        });
+    }
+
     private static top.egon.cola.platform.tianji.agent.domain.ClaimedAgentRun claimRuntime(String key) {
         return claimRuntime(linkedRuntimeCommand(key));
     }
@@ -474,7 +570,8 @@ class RuntimeSafetyReceiptIT {
     }
 
     private static AgentRunDTO startRuntime(LinkedAgentRuntimeCommand command) {
-        return inTransaction(() -> v2Ledger.startLinkedRuntimeV2(V2_SERVICE, command));
+        var prepared = AgentJsonCodecTest.frozenBundle(V2_TEST_TENANT, V2_TEMPLATE, AgentJsonCodecTest.SI_PROMPT_SPEC);
+        return inTransaction(() -> v2Ledger.startLinkedRuntimeV2(V2_SERVICE, command, prepared));
     }
 
     private static LinkedAgentRuntimeCommand linkedRuntimeCommand(String key) {
