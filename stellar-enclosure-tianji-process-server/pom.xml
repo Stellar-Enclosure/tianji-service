@@ -147,6 +147,21 @@
         <finalName>stellar-enclosure-tianji-process-server</finalName>
         <plugins>
             <plugin>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>process-runtime-classpath</id>
+                        <phase>generate-test-resources</phase>
+                        <goals><goal>build-classpath</goal></goals>
+                        <configuration>
+                            <includeScope>runtime</includeScope>
+                            <outputFile>${project.build.directory}/process-runtime-classpath.txt</outputFile>
+                            <regenerateFile>true</regenerateFile>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+            <plugin>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <configuration>
                     <annotationProcessorPaths combine.children="append">

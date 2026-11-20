@@ -15,6 +15,7 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionCommand;
 import top.egon.cola.component.agentflow.api.execution.AgentExecutionHandle;
@@ -30,8 +31,16 @@ import top.egon.cola.component.outbox.delivery.DeliveryHandler;
 import top.egon.cola.component.outbox.delivery.DeliveryResult;
 import top.egon.cola.component.outbox.store.OutboxStore;
 import top.egon.cola.component.outbox.transaction.OutboxAfterCommitBuffer;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.EdgeVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiDependencyManifestVO.VersionIdentityVO;
+import top.egon.cola.component.tianshu.model.si.DdcSiKindEnum;
 import top.egon.cola.platform.tianji.agent.application.context.TianjiHostContextConverter;
 import top.egon.cola.platform.tianji.agent.application.run.AgentRuntimeExecutionService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.FrozenSiBundleVO;
+import top.egon.cola.platform.tianji.agent.application.run.TianjiSiExecutionBundleService.SiResourceVO;
+import top.egon.cola.platform.tianji.agent.domain.AgentLedgerException;
 import top.egon.cola.platform.tianji.agent.domain.AgentRunAuthorization;
 import top.egon.cola.platform.tianji.agent.domain.TrustedAgentActor;
 import top.egon.cola.platform.tianji.agent.infrastructure.persistence.AgentLedgerService;
@@ -80,9 +89,13 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -107,6 +120,8 @@ class AgentTaskSnapshotIT {
     private static final String AS_SCHEMA = "tianji_agent";
     private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(8);
     private static final String DESTINATION = "process-fusion-inbox";
+    private static final String PROMPT_TEXT = "Fixed Process fusion instruction";
+    private static final String PROMPT_SPEC = canonicalSpec(Map.of("promptText", PROMPT_TEXT));
 
     @Test
     void start_seals_the_exact_template_and_allowed_inputs_before_first_node_and_replay_keeps_them() throws Exception {
@@ -160,6 +175,57 @@ class AgentTaskSnapshotIT {
                 assertEquals("PENDING", restarted.dispatchState(revoked));
                 assertEquals(1, agent.runCount());
             }
+        }
+    }
+
+    @Test
+    void frozenExecutionFixtureMatchesThePublishedPrompt() {
+        var actor = TrustedAgentActor.verified(20, TrustedAgentActor.SubjectType.SERVICE, BRIDGE_ACTOR.subjectId(), ISSUER);
+        var selected = withFixedInstruction(template(1));
+        var bundle = executionFixture(actor, selected);
+        TianjiSiExecutionBundleService.verifyFrozenBundle(actor, selected, bundle);
+        assertEquals(PROMPT_TEXT, bundle.instruction(selected.getTemplateKey(), selected.getConfiguration().instructionRef()));
+        var nextVersion = withFixedInstruction(template(2));
+        assertThrows(AgentLedgerException.class,
+                () -> TianjiSiExecutionBundleService.verifyFrozenBundle(actor, nextVersion, bundle));
+    }
+
+    private static AgentRuntimeTemplateCommand withFixedInstruction(AgentRuntimeTemplateCommand template) {
+        var config = template.getConfiguration();
+        var instruction = config.instructionRef();
+        return template.setConfiguration(new AgentRuntimeTemplateCommand.TemplateConfigurationVO(
+                new AgentRuntimeTemplateCommand.TemplateDependencyRefVO(instruction.key(), instruction.version(), bodyDigest(PROMPT_SPEC)),
+                config.modelRef(), config.toolRefs(), config.agenticPlan()));
+    }
+
+    private static FrozenSiBundleVO executionFixture(TrustedAgentActor actor, AgentRuntimeTemplateCommand template) {
+        assertFalse(TransactionSynchronizationManager.isActualTransactionActive());
+        var config = template.getConfiguration();
+        var reference = config.instructionRef();
+        String rootSpec = canonicalSpec(Map.of("modelKey", config.modelRef(), "systemInstruction", PROMPT_TEXT));
+        String tenantId = Long.toString(actor.tenantId());
+        String agentsResourceId = TEMPLATE.equals(template.getTemplateKey()) ? "501" : "502";
+        long agentVersionBase = TEMPLATE.equals(template.getTemplateKey()) ? 600 : 700;
+        var root = new VersionIdentityVO(tenantId, agentsResourceId, Long.toString(agentVersionBase + template.getTemplateVersion()),
+                Long.toString(template.getTemplateVersion()), DdcSiKindEnum.AGENT, "test", bodyDigest(rootSpec));
+        var prompt = new VersionIdentityVO(tenantId, "503", Long.toString(800 + reference.version()),
+                Long.toString(reference.version()), DdcSiKindEnum.PROMPT, "test", bodyDigest(PROMPT_SPEC));
+        var manifest = DdcSiDependencyManifestVO.create(root, null, List.of(prompt),
+                List.of(new EdgeVO(root.versionId(), prompt.versionId())));
+        return new FrozenSiBundleVO("process", "fusion", "test", null, "tianji", manifest, List.of(
+                new SiResourceVO(root, template.getTemplateKey(), null, rootSpec),
+                new SiResourceVO(prompt, reference.key(), null, PROMPT_SPEC)));
+    }
+
+    private static String canonicalSpec(Map<String, String> fields) {
+        return new String(ProcessTypedJson.canonicalBytes(fields), StandardCharsets.UTF_8);
+    }
+
+    private static String bodyDigest(String content) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException unavailable) {
+            throw new IllegalStateException(unavailable);
         }
     }
 
@@ -261,6 +327,7 @@ class AgentTaskSnapshotIT {
         }
 
         AgentRuntimeTemplateCommand publish(AgentRuntimeTemplateCommand template) {
+            withFixedInstruction(template);
             ledger.publishRuntimeTemplate(owner, template, () -> true, (actor, observed) -> deadline -> true);
             definitions.add(new TianjiLinkedDispatchProperties.Definition(template.getTemplateKey(), template.getTemplateVersion(), template.contentSha256()));
             return template;
@@ -328,10 +395,13 @@ class AgentTaskSnapshotIT {
                 runId.set(run.runId());
                 return null;
             }).when(grantIssuer).ensureRuntime(any(), any(), any(), any(), any());
-            var factory = new StaticListableBeanFactory(Map.of("grantIssuer", grantIssuer));
+            var bundleService = mock(TianjiSiExecutionBundleService.class);
+            when(bundleService.prepare(any(), any())).thenAnswer(call -> executionFixture(call.getArgument(0), call.getArgument(1)));
+            var factory = new StaticListableBeanFactory(Map.of("grantIssuer", grantIssuer, "executionBundle", bundleService));
             var runtimeController = new LinkedAgentRuntimeController(submissions, access, bindings,
                     new MockEnvironment().withProperty("stellar.tianji.agent.runtime-v2.enabled", "true"),
-                    factory.getBeanProvider(TianjiServiceExecutionGrantIssuer.class));
+                    factory.getBeanProvider(TianjiServiceExecutionGrantIssuer.class),
+                    factory.getBeanProvider(TianjiSiExecutionBundleService.class));
             var legacyController = new LinkedAgentDispatchController(submissions, access, bindings, properties,
                     factory.getBeanProvider(TianjiLinkedServiceAdmission.class));
             return MockMvcBuilders.standaloneSetup(runtimeController, legacyController)
